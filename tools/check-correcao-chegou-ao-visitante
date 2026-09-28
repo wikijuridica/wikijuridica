@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""check-correcao-chegou-ao-visitante — o texto corrigido está mesmo no ar?
+
+POR QUE EXISTE. Em 2026-08-07 corrigi a citação legal de 20 páginas, commitei,
+publiquei e fui conferir com `curl | grep 'gravíssima'`. A palavra aparecia, e
+eu concluí que o deploy não tinha funcionado. Investiguei a cadeia inteira —
+ingest, contentstore, publish, cache de borda — até descobrir que:
+
+  1. a correção ESTAVA no ar desde o primeiro deploy;
+  2. as ocorrências que eu via eram legítimas: outras seções da mesma página, e
+     o rótulo da fonte em `source_provenance[].source_name`;
+  3. eu ainda comparei `ls` (hora local, -03) com `date -u`, e li um arquivo
+     recém-escrito como se fosse de três horas antes.
+
+Três leituras erradas em sequência, todas com o dado certo na mão. Grep de
+palavra solta não responde "a correção chegou": responde "essa palavra existe
+em algum lugar do HTML".
+
+O QUE ESTA FERRAMENTA RESPONDE, por página corrigida:
+  - o trecho NOVO está no HTML servido?           (a correção chegou)
+  - o trecho ANTIGO sumiu do HTML servido?        (não sobrou o texto errado)
+  - o servido bate com o estoque?                 (repo e mundo dizem o mesmo)
+
+Ela lê os pares `old`/`new` do arquivo de dados do gerador de reparo — a mesma
+evidência que autorizou a correção — e confere um a um. Sem heurística, sem
+palavra solta: o trecho literal que mudou.
+
+CDN vs SERVIDOR. Confere pelos dois caminhos quando `--local` é dado: se o
+servidor local está certo e o domínio está errado, o problema é cache de borda,
+não conteúdo — e a mensagem diz isso, em vez de mandar investigar o pipeline
+inteiro.
+
+Uso:
+    tools/check-correcao-chegou-ao-visitante
+    tools/check-correcao-chegou-ao-visitante --dados tools/<gerador>.data.json
+    tools/check-correcao-chegou-ao-visitante --local http://127.0.0.1:8089
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from html import unescape
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PAGES_JSON = ROOT / "content/pages.json"
+V2_PAGES = ROOT / "data/editorial/v2_pages"
+DADOS_PADRAO = ROOT / "tools/generate-v2-citation-attribution-repair-20260807.data.json"
+DOMINIO = "https://wikijuridica.com.br"
+UA = "wikijuridica-check/1.0 (+https://wikijuridica.com.br)"
+
+REDE = (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError)
+
+
+def texto_visivel(html: str) -> str:
+    """HTML -> texto corrido, para comparar frase com frase.
+
+    Sem isso, um trecho que o render quebrou em duas tags nunca casaria, e a
+    checagem acusaria falso negativo — o defeito clássico de conferir HTML com
+    substring crua.
+    """
+    sem_script = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", html)
+    sem_tag = re.sub(r"(?s)<[^>]+>", " ", sem_script)
+    return re.sub(r"\s+", " ", unescape(sem_tag)).strip()
+
+
+def normalizar(texto: str) -> str:
+    return re.sub(r"\s+", " ", texto or "").strip()
+
+
+def assinatura(texto: str) -> str:
+    """Forma comparável entre o JSON e o HTML renderizado.
+
+    O render envolve a citação numa tag própria ("art. <span>171</span>, II"), e
+    remover a tag deixa um espaço no meio da frase: `art. 171 , II`. Comparar
+    substring crua acusa AUSENTE um texto que está na tela — foi o falso
+    negativo que me fez investigar ingest, contentstore e cache atrás de um
+    defeito que não existia. Remover todo espaço em branco elimina a diferença
+    sem inventar equivalência: os trechos conferidos têm dezenas de caracteres,
+    então colisão acidental não é risco real.
+    """
+    return re.sub(r"\s+", "", (texto or "").casefold())
+
+
+def buscar(url: str, timeout: float = 25.0) -> tuple[int, str]:
+    pedido = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "X-Warming-Request": "true",
+        "Accept": "text/html",
+    })
+    with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+        return resposta.status, resposta.read().decode("utf-8", "replace")
+
+
+def caminho_por_intent() -> dict[str, str]:
+    with open(PAGES_JSON, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+    return {p["unique_intent_id"]: p["path"]
+            for p in paginas if p.get("unique_intent_id") and p.get("path")}
+
+
+def registro_publicado() -> dict[str, str]:
+    """intent -> texto visível do que o publicador gravou (fonte do render)."""
+    with open(PAGES_JSON, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+    saida: dict[str, str] = {}
+    for pagina in paginas:
+        intent = pagina.get("unique_intent_id")
+        if not intent:
+            continue
+        partes = [pagina.get("summary") or ""]
+        for secao in pagina.get("body_sections") or []:
+            partes.append(secao.get("heading") or "")
+            partes.append(secao.get("text") or "")
+            for paragrafo in secao.get("paragraphs") or []:
+                partes.append(paragrafo if isinstance(paragrafo, str) else "")
+        for item in pagina.get("faq") or []:
+            partes.append(item.get("question") or item.get("q") or "")
+            partes.append(item.get("answer") or item.get("a") or "")
+        saida[intent] = normalizar(" ".join(partes))
+    return saida
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dados", default=os.fspath(DADOS_PADRAO))
+    parser.add_argument("--local", default="", help="base do servidor local, ex.: http://127.0.0.1:8089")
+    parser.add_argument("--pausa", type=float, default=0.4)
+    args = parser.parse_args()
+
+    with open(args.dados, encoding="utf-8") as handle:
+        correcoes = json.load(handle)["correcoes"]
+
+    caminhos = caminho_por_intent()
+    publicado = registro_publicado()
+
+    por_intent: dict[str, list[dict]] = {}
+    for correcao in correcoes:
+        por_intent.setdefault(correcao["intent_id"], []).append(correcao)
+
+    print("=== A CORREÇÃO CHEGOU AO VISITANTE? ===")
+    print("páginas conferidas: %d  |  trechos: %d\n" % (len(por_intent), len(correcoes)))
+
+    falhas: list[str] = []
+    fora_do_ar: list[str] = []
+    ok_total = 0
+    for intent in sorted(por_intent):
+        caminho = caminhos.get(intent)
+        if not caminho:
+            fora_do_ar.append(intent)
+            print("  %-44s NÃO PUBLICADA (sem rota em pages.json)" % intent[:44])
+            continue
+        try:
+            status, html = buscar(DOMINIO + caminho)
+        except REDE as erro:
+            falhas.append("%s: rede %s" % (intent, str(erro)[:60]))
+            print("  %-44s ERRO DE REDE: %s" % (intent[:44], str(erro)[:40]))
+            continue
+        if status != 200:
+            falhas.append("%s: HTTP %d" % (intent, status))
+            print("  %-44s HTTP %d" % (intent[:44], status))
+            continue
+
+        servido = assinatura(texto_visivel(html))
+        no_estoque = assinatura(publicado.get(intent, ""))
+        novos_ausentes = []
+        antigos_presentes = []
+        for correcao in por_intent[intent]:
+            # SUPERSESSAO (2026-08-19). Uma correcao pode ter sido REFINADA depois por outra
+            # correcao juridica — o texto no ar fica CERTO e este registro fica velho. Sem
+            # tratar isso, o check acusa "texto novo ausente" numa pagina impecavel, e o
+            # falso-verde inverso e pior: o operador aprende a ignorar o vermelho.
+            #
+            # Caso que originou: tra-multa-farol-apagado-rodovia-dia, faq[0].a. A correcao
+            # de 07/08 abria com "Sim, para a hipotese especifica...", contradizendo o corpo
+            # da propria frase (o art. 40, par. 2, DISPENSA o veiculo com DRL). Em 12/08 o
+            # commit dc00f037 trocou para "Nao, justamente na hipotese...". O ar esta certo.
+            #
+            # A entrada superseded exige `texto_vigente_comeca_com`, e o check CONFERE esse
+            # texto no que esta servido: se nem ele estiver la, a falha volta a valer. Marcar
+            # como superseded nao e desculpa — e uma afirmacao verificavel.
+            superseda = correcao.get("superseded_by")
+            if superseda:
+                vigente = assinatura(superseda.get("texto_vigente_comeca_com", ""))
+                if vigente and vigente in servido:
+                    continue
+                novos_ausentes.append(
+                    "%s [superseded por %s, mas o texto vigente declarado NAO esta no ar]"
+                    % (correcao.get("dispositivo", "?"), superseda.get("commit", "?")))
+                continue
+            if assinatura(correcao["new"]) not in servido:
+                novos_ausentes.append(correcao.get("dispositivo", "?"))
+            if assinatura(correcao["old"]) in servido:
+                antigos_presentes.append(correcao.get("dispositivo", "?"))
+
+        # Divergência entre o que o publicador gravou e o que o servidor entrega:
+        # separa "publiquei errado" de "publiquei certo e o cache entrega velho".
+        desalinhado = []
+        for correcao in por_intent[intent]:
+            novo = assinatura(correcao["new"])
+            if novo in no_estoque and novo not in servido:
+                desalinhado.append(correcao.get("dispositivo", "?"))
+
+        if not novos_ausentes and not antigos_presentes:
+            ok_total += 1
+            print("  %-44s OK  (%d trecho(s))" % (intent[:44], len(por_intent[intent])))
+        else:
+            if novos_ausentes:
+                falhas.append("%s: texto novo AUSENTE (%s)" % (intent, ", ".join(novos_ausentes)))
+            if antigos_presentes:
+                falhas.append("%s: texto antigo AINDA NO AR (%s)" % (intent, ", ".join(antigos_presentes)))
+            print("  %-44s FALHOU  novo_ausente=%d antigo_presente=%d%s"
+                  % (intent[:44], len(novos_ausentes), len(antigos_presentes),
+                     "  [pages.json está CERTO -> é cache/borda]" if desalinhado else ""))
+        time.sleep(args.pausa)
+
+    if args.local and falhas:
+        print("\n--- reconferindo as falhas no servidor local (sem CDN) ---")
+        for intent in sorted(por_intent):
+            if not any(intent in f for f in falhas):
+                continue
+            caminho = caminhos.get(intent)
+            if not caminho:
+                continue
+            try:
+                status, html = buscar(args.local.rstrip("/") + caminho)
+            except REDE as erro:
+                print("  %-44s local inacessível: %s" % (intent[:44], str(erro)[:40]))
+                continue
+            servido = assinatura(texto_visivel(html))
+            certos = sum(1 for c in por_intent[intent]
+                         if assinatura(c["new"]) in servido)
+            print("  %-44s local: %d/%d trechos corretos%s"
+                  % (intent[:44], certos, len(por_intent[intent]),
+                     "  -> conteúdo OK, problema é CACHE DE BORDA" if certos == len(por_intent[intent]) else ""))
+
+    print("\n%d página(s) OK, %d falha(s), %d não publicada(s)"
+          % (ok_total, len({f.split(":")[0] for f in falhas}), len(fora_do_ar)))
+    if falhas:
+        print("\nfalhas:")
+        for falha in falhas:
+            print("  " + falha)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

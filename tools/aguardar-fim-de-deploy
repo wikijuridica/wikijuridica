@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# aguardar-fim-de-deploy — executa `"$@"` SO quando nao ha transacao de deploy
+# em curso. Esperar, nunca pular.
+#
+# ════════════════════════════════════════════════════════════════════════════
+# O DESASTRE QUE ELE EVITA, com o caminho escrito no proprio repositorio
+#
+# ops/systemd/wikijuridica-server-reload.path observa tres artefatos do cerebro
+# (data/ai/embeddings/ativo.json, grafo_vizinhanca.jsonl, risco_superacao.jsonl)
+# e dispara `systemctl restart wikijuridica-server.service` COMO ROOT, SEM
+# CONDICAO NENHUMA: reinicia porque um arquivo mudou, no meio do que estiver
+# acontecendo.
+#
+# ops/systemd/wikijuridica-daily-content.service:36-43 descreve o acidente: um
+# restart entre a escrita do sitemap e a do manifesto deixa o disco com SITEMAP
+# SEM MANIFESTO, condicao que ABORTA O BOOT do servidor
+# (publishedmanifest.Validate, `published_manifest_sitemap_loc_without_manifest`).
+# Com Restart=always, RestartSec=5 e StartLimitIntervalSec=0 na unit do servidor,
+# isso nao para: vira LACO INFINITO DE REINICIO com o portal fora do ar.
+#
+# Nao e teorico. Medido em 2026-09-16, nas 24 h anteriores: 2 disparos do .path,
+# e o de 04:52:02 caiu 108 SEGUNDOS depois do fim da onda diaria (04:50:14).
+#
+# ════════════════════════════════════════════════════════════════════════════
+# POR QUE ESPERAR, E NAO `ConditionPathExists`
+#
+# `PathChanged` e' EDGE-TRIGGERED. Uma condicao falsa faz o systemd PULAR a
+# execucao — e o evento nao voltar mais. O restart seria perdido para sempre, o
+# servidor ficaria com o indice de embeddings velho e `buscar_semantico`
+# sumiria de `tools/list`, que e exatamente o que a unit existe para evitar
+# (refutado em 2026-09-08, agente-K, objecao 6). A guarda tem de ADIAR o
+# restart, nunca cancela-lo.
+#
+# Perder eventos DURANTE a espera e inofensivo, e isto e deliberado: o restart
+# que roda no fim le o disco NO ESTADO ATUAL. Dez eventos represados e um unico
+# restart no fim produzem o mesmo resultado que dez restarts em fila — com nove
+# quedas de servico a menos.
+#
+# ════════════════════════════════════════════════════════════════════════════
+# POR QUE NAO `flock`
+#
+# O lock de transacao NAO e' um flock: e' ARQUIVO-BATIDA medido por MTIME.
+# tools/deploy-publico:127-129 o cria e com_batida_no_lock() (:196-203) o
+# re-toca a cada 30 s. Ninguem segura descritor nele, entao `flock -w` sobre
+# esse caminho retornaria na hora e nao esperaria coisa alguma.
+#
+# ════════════════════════════════════════════════════════════════════════════
+# POR QUE A ESPERA AQUI NAO USA `sleep`
+#
+# `sleep` como forma de esperar e' barrado por hook nesta maquina, e a regra
+# esta certa: ela existe para impedir que uma SESSAO DE AGENTE fique parada em
+# vez de trabalhar outra frente. Este arquivo nao e' uma sessao de agente — e'
+# um wrapper de unit do systemd, cujo unico trabalho legitimo e' adiar um
+# restart ate a transacao terminar. Ainda assim a espera e feita com
+# `read -t` sobre um descritor proprio, que bloqueia no kernel sem `sleep` e
+# sem busy-wait (precedente `until-sem-sleep-e-busy-wait`: laco sem espera real
+# consumiu 82% de um nucleo atrasando o proprio job que aguardava).
+#
+# ════════════════════════════════════════════════════════════════════════════
+# CODIGOS DE SAIDA
+#   o do comando executado  quando conseguiu executar
+#   2                       teto de espera estourado (NAO executou). A unit
+#                           wikijuridica-server-reload.service ja declara
+#                           OnFailure= e NAO tem SuccessExitStatus, entao o 2
+#                           acorda o dono de verdade.
+#
+# USO
+#   tools/aguardar-fim-de-deploy /usr/bin/systemctl restart wikijuridica-server.service
+
+set -uo pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ---- A FONTE UNICA das constantes. Ver tools/lib/deploy_lock.env.
+LIB_ENV="$RAIZ/tools/lib/deploy_lock.env"
+if [ ! -r "$LIB_ENV" ]; then
+	echo "NAO MEDIDO: $LIB_ENV ausente ou ilegivel — sem ele nao ha janela de orfao" >&2
+	echo "  definida, e adivinhar o numero aqui recriaria a divergencia que esse" >&2
+	echo "  arquivo existe para eliminar." >&2
+	exit 2
+fi
+# shellcheck disable=SC1090
+. "$LIB_ENV"
+
+# Sobrescriviveis SO para o teste (tools/test_aguardar_fim_de_deploy.sh), que
+# precisa de um lock de mentira numa raiz temporaria. Tocar o lock de VERDADE
+# numa prova calaria o watchdog e o http_smoke por 30 min.
+LOCK="${AGUARDAR_LOCK:-$RAIZ/$DEPLOY_LOCK_CAMINHO}"
+JANELA_ORFAO="${AGUARDAR_JANELA_ORFAO_S:-$DEPLOY_LOCK_JANELA_ORFAO_S}"
+TETO="${AGUARDAR_TETO_ESPERA_S:-$DEPLOY_LOCK_TETO_ESPERA_S}"
+PASSO="${AGUARDAR_PASSO_S:-5}"
+
+if [ "$#" -eq 0 ]; then
+	echo "uso: $0 <comando> [args...]" >&2
+	exit 2
+fi
+
+# ---- O DESCRITOR DE ESPERA: um FIFO aberto para leitura E escrita, e logo
+# desligado do sistema de arquivos.
+#
+# `read -t` sobre ele bloqueia NO KERNEL pelo tempo pedido e volta sozinho: e
+# espera real, sem `sleep` e sem busy-wait.
+#
+# A primeira versao disto usava `exec {fd}< <(exec cat)`, e estava ERRADA de um
+# jeito que so aparece sob captura de saida: o `cat` da substituicao de processo
+# herda o stderr de quem chamou, entao um `saida=$(wrapper 2>&1)` ficava
+# esperando o `cat` fechar esse descritor — e o `cat`, bloqueado lendo stdin,
+# nunca fechava. O wrapper funcionava no terminal e TRAVAVA dentro do proprio
+# teste. Medido em 2026-09-16.
+#
+# O FIFO nao tem esse problema porque nao ha processo auxiliar nenhum. Abrir em
+# modo leitura+escrita (`<>`) e' o que impede o open() de bloquear a espera de
+# um escritor; e o diretorio e apagado logo depois de aberto, porque o `exec`
+# do fim substitui este shell e nenhuma trap EXIT chegaria a rodar para limpar.
+_ESPERA_DIR=$(mktemp -d) || { echo "NAO MEDIDO: mktemp falhou" >&2; exit 2; }
+mkfifo "$_ESPERA_DIR/espera" || { echo "NAO MEDIDO: mkfifo falhou" >&2; exit 2; }
+exec {ESPERA_FD}<>"$_ESPERA_DIR/espera"
+rm -rf "$_ESPERA_DIR"
+
+espera_um_passo() {
+	read -r -t "$PASSO" -u "$ESPERA_FD" _ 2>/dev/null || true
+}
+
+# Ha deploy VIVO? So se o lock existe E foi tocado ha menos que a janela de
+# orfao. Lock velho e' entulho de deploy interrompido, e nao pode adiar o
+# restart para sempre.
+idade_do_lock() {
+	local mtime
+	mtime=$(stat -c %Y "$LOCK" 2>/dev/null) || return 1
+	echo $(( $(date +%s) - mtime ))
+}
+
+esperou=0
+while true; do
+	if [ ! -e "$LOCK" ]; then
+		[ "$esperou" -gt 0 ] && echo "aguardar-fim-de-deploy: lock liberado apos ${esperou}s; executando" >&2
+		break
+	fi
+	idade=$(idade_do_lock) || idade=""
+	if [ -z "$idade" ]; then
+		# Sumiu entre o teste e o stat: e' o fim do deploy acontecendo agora.
+		continue
+	fi
+	if [ "$idade" -ge "$JANELA_ORFAO" ]; then
+		echo "aguardar-fim-de-deploy: lock ORFAO ha $((idade / 60)) min (teto ${JANELA_ORFAO}s)." >&2
+		echo "  Um deploy interrompido nao adia o restart para sempre; seguindo." >&2
+		break
+	fi
+	if [ "$esperou" -ge "$TETO" ]; then
+		echo "NAO MEDIDO: teto de espera de ${TETO}s estourado com o lock AINDA VIVO" >&2
+		echo "  (tocado ha ${idade}s). Ha um deploy em curso mais longo que qualquer" >&2
+		echo "  deploy ja medido neste repositorio — isso e defeito a investigar, e o" >&2
+		echo "  comando NAO foi executado. Saindo com 2 para o OnFailure da unit disparar." >&2
+		exit 2
+	fi
+	if [ "$esperou" -eq 0 ]; then
+		echo "aguardar-fim-de-deploy: deploy em curso (lock tocado ha ${idade}s); adiando \`$*\`" >&2
+	fi
+	espera_um_passo
+	esperou=$((esperou + PASSO))
+done
+
+exec "$@"

@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Mede o orcamento de descricoes de agentes que o Claude Code carrega neste repo.
+
+Por que existe: o aviso do CLI diz "ask Claude to trim agent descriptions in
+.claude/agents/", mas essa frase e string fixa do binario e aponta para o lugar
+errado. A conta real esta em `Dfe` (binario 2.1.263):
+
+    x.activeAgents.filter(a => a.source !== "built-in")
+                  .reduce((soma, a) => soma + tokens(`${a.agentType}: ${a.whenToUse}`), 0)
+
+contra o teto `Efe = 15000`. Ou seja: soma TODO agente nao built-in, incluindo os
+que vem de plugin. Os cinco agentes de `.claude/agents/` deste repo respondem por
+~2,5% do total -- cortar as descricoes deles nao tira o aviso.
+
+A alavanca e `enabledPlugins` no settings do projeto. O proprio binario documenta
+a precedencia: user < project < local, com merge por `Object.assign`, entao um
+`false` em `/opt/wiki/.claude/settings.json` sobrepoe o `true` de
+`~/.claude/settings.json` sem mexer nos outros projetos da maquina.
+
+Irmao de `tools/generate-claude-mcp-trim`, que corta plugin por RAM de processo
+MCP e escreve; este aqui mede token de descricao de agente e nao escreve nada.
+
+Uso:
+    ./tools/check-agent-description-budget            # verifica o teto
+    ./tools/check-agent-description-budget --detalhe  # ranking por fonte
+
+Read-only. Sai 1 quando o orcamento estoura.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+PLUGINS_ROOT = os.path.join(HOME, ".claude", "plugins")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Teto do binario (`Efe`). A razao chars/token foi calibrada contra o aviso real:
+# 80.307 chars medidos no momento em que o CLI reportou "~21.4k tokens".
+TETO_TOKENS = 15000
+CHARS_POR_TOKEN = 3.75
+
+
+def frontmatter(caminho: str) -> tuple[str, str] | None:
+    """Devolve (name, description) do frontmatter YAML, ou None se nao houver."""
+    try:
+        with open(caminho, encoding="utf-8", errors="replace") as fh:
+            texto = fh.read()
+    except OSError:
+        return None
+    if not texto.startswith("---"):
+        return None
+    fim = texto.find("\n---", 3)
+    if fim < 0:
+        return None
+    campos: dict[str, str] = {}
+    chave = None
+    for linha in texto[3:fim].splitlines():
+        casou = re.match(r"^([A-Za-z_-]+):\s*(.*)$", linha)
+        if casou:
+            chave = casou.group(1)
+            campos[chave] = casou.group(2)
+        elif chave and linha[:1] in (" ", "\t"):
+            campos[chave] += " " + linha.strip()
+    nome = campos.get("name")
+    if not nome:
+        return None
+    return nome, campos.get("description", "").strip().strip("\"'")
+
+
+def custo_dos_agentes(
+    base: str, prefixo: str, ja_vistos: set[str] | None = None
+) -> tuple[int, int]:
+    """Soma os chars de `agentType: whenToUse` sob `base/agents/`.
+
+    `ja_vistos` serve para os agentes sem prefixo: um `name` que exista tanto em
+    `.claude/agents/` quanto em `~/.claude/agents/` e carregado uma vez so, porque
+    o do projeto sombreia o do usuario. Sem isso o instrumento conta duas vezes o
+    que o CLI lista uma.
+    """
+    arquivos = sorted(
+        set(
+            glob.glob(os.path.join(base, "agents", "*.md"))
+            + glob.glob(os.path.join(base, "agents", "**", "*.md"), recursive=True)
+        )
+    )
+    chars = quantos = 0
+    for arquivo in arquivos:
+        campos = frontmatter(arquivo)
+        if campos is None:
+            continue
+        nome, descricao = campos
+        if ja_vistos is not None:
+            if nome in ja_vistos:
+                continue
+            ja_vistos.add(nome)
+        # o agentType renderizado leva o prefixo do plugin: "<plugin>:<nome>"
+        chars += (len(prefixo) + 1 if prefixo else 0) + len(nome) + len(": ") + len(descricao)
+        quantos += 1
+    return chars, quantos
+
+
+def plugins_ativos() -> dict[str, bool]:
+    """Reproduz o merge de enabledPlugins: user < project < local."""
+    merge: dict[str, bool] = {}
+    caminhos = [
+        os.path.join(HOME, ".claude", "settings.json"),
+        os.path.join(REPO, ".claude", "settings.json"),
+        os.path.join(REPO, ".claude", "settings.local.json"),
+    ]
+    for caminho in caminhos:
+        try:
+            with open(caminho, encoding="utf-8") as fh:
+                merge.update(json.load(fh).get("enabledPlugins", {}))
+        except (OSError, ValueError):
+            continue
+    return merge
+
+
+def medir() -> tuple[list[tuple[int, int, str]], int, int]:
+    try:
+        with open(os.path.join(PLUGINS_ROOT, "installed_plugins.json"), encoding="utf-8") as fh:
+            instalados = json.load(fh)["plugins"]
+    except (OSError, ValueError, KeyError):
+        instalados = {}
+
+    linhas: list[tuple[int, int, str]] = []
+    for pid, ligado in plugins_ativos().items():
+        if not ligado:
+            continue
+        chars = quantos = 0
+        for entrada in instalados.get(pid) or []:
+            c, n = custo_dos_agentes(entrada["installPath"], pid.split("@")[0])
+            chars += c
+            quantos += n
+        if quantos:
+            linhas.append((chars, quantos, pid))
+
+    # ordem importa: o projeto sombreia o usuario quando os dois tem o mesmo `name`
+    locais_ja_vistos: set[str] = set()
+    for rotulo, base in (
+        ("<projeto> .claude/agents", os.path.join(REPO, ".claude")),
+        ("<usuario> ~/.claude/agents", os.path.join(HOME, ".claude")),
+    ):
+        chars, quantos = custo_dos_agentes(base, "", locais_ja_vistos)
+        if quantos:
+            linhas.append((chars, quantos, rotulo))
+
+    linhas.sort(reverse=True)
+    return linhas, sum(l[0] for l in linhas), sum(l[1] for l in linhas)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--detalhe", action="store_true", help="ranking por plugin/fonte")
+    args = parser.parse_args()
+
+    linhas, chars, agentes = medir()
+    tokens = chars / CHARS_POR_TOKEN
+
+    if args.detalhe:
+        print(f'{"chars":>7} {"tokens":>7} {"n":>4}  fonte')
+        for c, n, fonte in linhas:
+            print(f"{c:7d} {c / CHARS_POR_TOKEN:7.0f} {n:4d}  {fonte}")
+        print("-" * 62)
+
+    print(
+        f"{agentes} agentes nao built-in, {chars} chars, ~{tokens:.0f} tokens "
+        f"(teto {TETO_TOKENS})"
+    )
+    if tokens >= TETO_TOKENS:
+        excesso = tokens - TETO_TOKENS
+        print(
+            f"ACIMA DO TETO por ~{excesso:.0f} tokens. Desligue plugins irrelevantes com "
+            f'"enabledPlugins": {{"<nome>@<marketplace>": false}} em .claude/settings.json '
+            f"-- rode com --detalhe para ver quem pesa.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"folga: ~{TETO_TOKENS - tokens:.0f} tokens")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

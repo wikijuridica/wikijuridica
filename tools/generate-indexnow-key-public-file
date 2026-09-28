@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""generate-indexnow-key-public-file — materializa o arquivo de posse do IndexNow.
+
+O protocolo IndexNow exige que o site sirva `https://<host>/<key>.txt` com o
+conteúdo sendo EXATAMENTE a chave. Quem cria a chave é `cmd/provision-indexnow-key`
+(`internal/indexnow.ProvisionKey`), e o comentário de `internal/indexnow/provision.go:39`
+é explícito: o provisionamento **não muta `public/`** — ele grava só o registro
+`data/ops/indexnow_key.json` e a entrada privada de release
+`data/ops/indexnow_key_proof.txt`. Materializar o arquivo público é papel da
+promoção controlada; hoje nenhuma ferramenta faz isso fora da transação, então
+`public/<key>.txt` simplesmente não existe e `internal/indexnow.validateKeyFile`
+recusa a submissão ("public key proof is missing").
+
+Esta ferramenta fecha essa lacuna operacional escrevendo o arquivo a partir do
+registro já provisionado — nunca gerando chave nova, nunca rotacionando.
+
+Contrato honrado byte a byte (internal/indexnow/indexnow.go:219-249):
+  - caminho  = <root>/public/<key>.txt (ou <out-dir>/<key>.txt);
+  - conteúdo = a chave crua, SEM quebra de linha final (KeyFileContent(key) == key;
+    `validateKeyFile` compara `string(data) != KeyFileContent(key)`, então um "\n"
+    reprovaria a validação do Go);
+  - modo 0644 (mesmo modo que `internal/publicrelease/promotion_safe_io.go:127`
+    aplica aos artefatos promovidos);
+  - escrita atômica: tmp no MESMO diretório -> chmod -> fsync -> rename -> fsync do
+    diretório. O chmod acontece ANTES do rename para que o arquivo nunca apareça
+    com o 0600 herdado do mkstemp;
+  - idempotente: se o arquivo já tem os bytes certos, nada é reescrito (preserva
+    mtime, que alimenta hash/snapshot da transação e `check-artifact-freshness`).
+
+`--out-dir` existe para reparo pós-snapshot: o snapshot de release copia `public/`,
+então o default já cobre o fluxo normal, mas um release já materializado em
+`releases/<id>/public` pode ser completado sem refazer o snapshot. Nesse modo o
+alvo é `<out-dir>/<key>.txt` (o `public/` NÃO é reanexado).
+
+A escrita em `public/` é serializada pelo MESMO flock canônico que
+`internal/publicstatelease` usa (`data/ops/.public-state.lock`), para nunca
+corromper uma transação de release viva. O lock é adquirido em modo não-bloqueante
+com orçamento explícito (`--lock-timeout`), nunca espera passiva infinita.
+
+Uso:
+    ./tools/generate-indexnow-key-public-file
+    ./tools/generate-indexnow-key-public-file --root /opt/wiki
+    ./tools/generate-indexnow-key-public-file --out-dir /opt/wiki/releases/<id>/public
+    ./tools/generate-indexnow-key-public-file --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import time
+
+DEFAULT_ROOT = "/opt/wiki"
+KEY_RECORD_REL_PATH = "data/ops/indexnow_key.json"
+PUBLIC_STATE_LOCK_REL_PATH = "data/ops/.public-state.lock"
+KEY_RECORD_SCHEMA_VERSION = "indexnow_key_v1"
+PROVISIONER = "./tools/go-modern run ./cmd/provision-indexnow-key --root <raiz>"
+
+# Espelha internal/indexnow.ValidateKey (indexnow.go:203-216). A chave vira
+# COMPONENTE DE NOME DE ARQUIVO, então esta validação é defesa contra travessia de
+# caminho a partir de um JSON corrompido, não enfeite.
+MIN_KEY_LENGTH = 8
+MAX_KEY_LENGTH = 128
+KEY_ALLOWED_EXTRA = "-"
+FILE_MODE = 0o644
+
+
+class ToolError(Exception):
+    """Falha determinística com mensagem acionável para o operador."""
+
+
+def validate_key(key: str) -> None:
+    if len(key) < MIN_KEY_LENGTH or len(key) > MAX_KEY_LENGTH:
+        raise ToolError(
+            f"chave com tamanho {len(key)} fora da faixa permitida "
+            f"[{MIN_KEY_LENGTH},{MAX_KEY_LENGTH}] (internal/indexnow.ValidateKey)"
+        )
+    for char in key:
+        if not (char.isascii() and (char.isalnum() or char in KEY_ALLOWED_EXTRA)):
+            raise ToolError(
+                f"chave contém caractere não permitido {char!r} "
+                "(permitidos: a-z A-Z 0-9 -); registro corrompido, não escreva nada"
+            )
+
+
+def load_key(root: pathlib.Path) -> str:
+    record_path = root / KEY_RECORD_REL_PATH
+    try:
+        raw = record_path.read_bytes()
+    except FileNotFoundError:
+        raise ToolError(
+            f"registro de chave ausente em {record_path}; provisione antes com: {PROVISIONER}"
+        )
+    except OSError as exc:
+        raise ToolError(f"não foi possível ler {record_path}: {exc}")
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ToolError(f"registro de chave corrompido em {record_path}: {exc}")
+    if not isinstance(record, dict):
+        raise ToolError(f"registro de chave em {record_path} não é um objeto JSON")
+    schema = str(record.get("schema_version") or "").strip()
+    if schema != KEY_RECORD_SCHEMA_VERSION:
+        raise ToolError(
+            f"schema_version={schema!r} inesperado em {record_path} "
+            f"(esperado {KEY_RECORD_SCHEMA_VERSION!r}); reprovando em vez de adivinhar o formato"
+        )
+    key = str(record.get("key") or "").strip()
+    if not key:
+        raise ToolError(f"campo 'key' vazio ou ausente em {record_path}; reprovisione com: {PROVISIONER}")
+    validate_key(key)
+    return key
+
+
+def acquire_public_state_lock(root: pathlib.Path, timeout_seconds: float):
+    """Toma o flock canônico do estado público (o mesmo de internal/publicstatelease).
+
+    O arquivo de lock NÃO é criado aqui: o bootstrap dele tem estrutura própria
+    (lock + anchor com mesmo inode, ownership verificada) que só o código Go sabe
+    montar. Ausência do lock significa repositório sem estado público inicializado.
+    """
+    lock_path = root / PUBLIC_STATE_LOCK_REL_PATH
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise ToolError(
+            f"lock canônico de estado público ausente em {lock_path}; ele é criado pelo "
+            f"provisionamento Go — rode antes: {PROVISIONER}"
+        )
+    except OSError as exc:
+        raise ToolError(f"não foi possível abrir o lock {lock_path}: {exc}")
+
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError as exc:
+            if exc.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                os.close(fd)
+                raise ToolError(f"falha ao travar {lock_path}: {exc}")
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise ToolError(
+                    f"lock de estado público ocupado por outra transação em {lock_path} "
+                    f"(orçamento de {timeout_seconds:g}s esgotado); NÃO escrevi nada — "
+                    "reexecute quando o release corrente terminar"
+                )
+            time.sleep(0.1)
+
+
+def release_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def resolve_target_dir(root: pathlib.Path, out_dir: str | None) -> pathlib.Path:
+    if out_dir:
+        target_dir = pathlib.Path(out_dir)
+        if not target_dir.is_absolute():
+            target_dir = (pathlib.Path.cwd() / target_dir).resolve()
+        if not target_dir.is_dir():
+            raise ToolError(
+                f"--out-dir {target_dir} não existe ou não é diretório; aponte para o "
+                "diretório public/ de um release já materializado (não crio árvore de release)"
+            )
+        return target_dir
+    target_dir = root / "public"
+    if not target_dir.is_dir():
+        raise ToolError(
+            f"{target_dir} não existe; o diretório público é criado pelo build/release "
+            "(./tools/go-modern run ./cmd/build public)"
+        )
+    return target_dir
+
+
+def atomic_write(target: pathlib.Path, payload: bytes) -> None:
+    directory = target.parent
+    fd, tmp_name = tempfile.mkstemp(prefix=".indexnow-key.", dir=str(directory))
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        # chmod ANTES do rename: se o processo morrer no meio, o alvo não aparece
+        # com o 0600 herdado do mkstemp.
+        os.chmod(tmp_path, FILE_MODE)
+        os.replace(tmp_path, target)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def materialize(target: pathlib.Path, key: str) -> str:
+    """Escreve o arquivo de posse e devolve o estado: written|rewritten|mode-fixed|unchanged."""
+    payload = key.encode("ascii")  # KeyFileContent(key) == key, sem "\n" final.
+    if target.is_symlink():
+        raise ToolError(
+            f"{target} é link simbólico; a prova de posse tem que ser arquivo regular "
+            "(internal/indexnow.validateKeyFile recusa symlink)"
+        )
+    existing = None
+    if target.exists():
+        if not target.is_file():
+            raise ToolError(f"{target} existe e não é arquivo regular; recusando escrever por cima")
+        existing = target.read_bytes()
+    if existing == payload:
+        mode = target.stat().st_mode & 0o777
+        if mode == FILE_MODE:
+            return "unchanged"
+        os.chmod(target, FILE_MODE)
+        return "mode-fixed"
+    atomic_write(target, payload)
+    return "written" if existing is None else "rewritten"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="generate-indexnow-key-public-file",
+        description="Materializa public/<key>.txt a partir de data/ops/indexnow_key.json.",
+    )
+    parser.add_argument("--root", default=DEFAULT_ROOT, help=f"raiz do repositório (default: {DEFAULT_ROOT})")
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="diretório public/ de destino (reparo pós-snapshot, ex.: releases/<id>/public)",
+    )
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=30.0,
+        help="orçamento em segundos para o flock de estado público (default: 30)",
+    )
+    parser.add_argument("--json", action="store_true", help="saída em JSON de uma linha")
+    args = parser.parse_args(argv)
+
+    root = pathlib.Path(args.root)
+    if not root.is_dir():
+        print(f"generate-indexnow-key-public-file: --root {root} não é diretório", file=sys.stderr)
+        return 1
+
+    try:
+        key = load_key(root)
+        target_dir = resolve_target_dir(root, args.out_dir)
+        target = target_dir / f"{key}.txt"
+        lock_fd = acquire_public_state_lock(root, args.lock_timeout)
+        try:
+            state = materialize(target, key)
+        finally:
+            release_lock(lock_fd)
+    except ToolError as exc:
+        print(f"generate-indexnow-key-public-file: {exc}", file=sys.stderr)
+        return 1
+
+    fingerprint = f"{key[:4]}…{key[-4:]}"
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "tool": "generate-indexnow-key-public-file",
+                    "state": state,
+                    "path": str(target),
+                    "bytes": len(key),
+                    "mode": "0644",
+                    "key_fingerprint": fingerprint,
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(
+            f"generate-indexnow-key-public-file: {state} path={target} bytes={len(key)} "
+            f"mode=0644 key={fingerprint}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

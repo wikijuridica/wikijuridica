@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""generate-indexnow-direct-submit — avisa Bing/Yandex que o acervo existe.
+
+POR QUE NAO USA cmd/generate-indexnow-submit: aquele comando exige
+publicrelease.CommittedPromotionDataArtifacts — a evidencia da transacao P4, que
+le .release-staging/promotion_manifest.json. Essa transacao nunca rodou neste
+repositorio: as 9.400 paginas foram ao ar por cmd/publish-v2-direct, o caminho
+direto criado sob a politica "publicar e corrigir". Sem a transacao, a
+autorizacao falha com public_release_committed_artifacts_promotion_absent.
+
+Forjar .release-staging seria fabricar evidencia — a fraude que o contrato do
+projeto proibe. Entao esta ferramenta valida de outro jeito, e mais FORTE:
+
+  - POSSE, por HTTP real: baixa https://<host>/<key>.txt do dominio publico e
+    confere que o conteudo e exatamente a chave. E o que o protocolo IndexNow
+    de fato exige, e prova mais que qualquer evidencia local — um manifesto de
+    release afirma o que o disco tem; isto verifica o que o mundo recebe.
+  - EXISTENCIA, por amostra: confere que uma amostra das URLs responde 200 no
+    dominio publico antes de submeter. Submeter URL morta queima confianca no
+    protocolo.
+  - COERENCIA, por ARTEFATO: a fonte e o sitemap ja validado por
+    publishedmanifest.Validate, e cada loc e reconferida aqui contra o arquivo
+    em public/. Ate a DEC-025 a fonte era o published_manifest; depois dela o
+    sitemap passou a conter tambem as 206 rotas de hub de area, que por desenho
+    nao tem registro editorial — ler o manifesto deixaria essas URLs de fora.
+
+ALCANCE REAL, declarado para nao criar ilusao: o Google NAO participa do
+IndexNow — nunca incorporou o protocolo, testado desde 2021. Quem consome e
+Bing, Yandex, Naver, Seznam e Yep. Vale porque o Bing alimenta a busca do
+ChatGPT, e porque os robos de IA ja sao 38% do trafego deste site. Para o
+Google, o canal continua sendo o sitemap.
+
+EVIDENCIA: data/ops/indexnow_direct_submissions.jsonl guarda a resposta REAL da
+API — status HTTP e corpo. Nenhum campo e escrito como sucesso sem a chamada
+correspondente ter acontecido.
+
+Uso:
+    tools/generate-indexnow-direct-submit --dry-run
+    tools/generate-indexnow-direct-submit
+    tools/generate-indexnow-direct-submit --limite 500
+    tools/generate-indexnow-direct-submit --de-arquivo alvos.txt   # so o que mudou
+"""
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import random
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SITE = os.path.join(ROOT, "content/site.json")
+MANIFEST = os.path.join(ROOT, "data/editorial/published_manifest.jsonl")
+CHAVE = os.path.join(ROOT, "data/ops/indexnow_key.json")
+EVIDENCIA = os.path.join(ROOT, "data/ops/indexnow_direct_submissions.jsonl")
+
+# LEDGER POR URL — "esta URL ja foi submetida alguma vez, quando e com que
+# resposta", SEM reconstrucao impossivel.
+#
+# O DEFEITO MEDIDO (2026-09-03): data/ops/indexnow_submission_state.json tem
+# 10.177 URLs, mas so 3.374 carregam submitted_at — as outras 6.803 tem so a
+# semente de 2026-08-12, cujo proprio seed_note diz "nao afirma submissao".
+# indexnow_direct_submissions.jsonl (EVIDENCIA, acima) guarda first_url/
+# last_url/url_count POR LOTE: um intervalo alfabetico nao prova quais URLs
+# estavam dentro (a submissao de 12/08 mandou 2.679 URLs espalhadas por uma
+# faixa que contem as 9.835 da epoca).
+#
+# O estado compartilhado (ESTADO_COMPARTILHADO, abaixo) nao resolve isto
+# porque ele SOBRESCREVE: guarda so a ULTIMA submissao aceita por URL, e nem
+# essa carrega o ENDPOINT (agregador/bing/yandex sao endpoints DIFERENTES do
+# mesmo protocolo — ver ENDPOINTS mais abaixo). Uma URL submetida ao yandex
+# num dia e ao bing depois perde, em silencio, o registro do primeiro envio.
+# Esse apagamento e proposital PARA O CALCULO DO DELTA (e por isso o estado
+# compartilhado nao muda aqui) — mas significa que ele nunca poderia responder
+# "esta URL ja foi submetida ao bing alguma vez?" sem reconstrucao.
+#
+# A DECISAO: ledger NOVO, append-only, uma linha por URL por lote REALMENTE
+# POSTado — aceito OU recusado, os dois sao um evento real que aconteceu e
+# merecem registro (um 403 e resposta digna de memoria, nao apagamento). Seguir
+# o padrao ja em uso neste repositorio para historico por evento
+# (data/ops/page_content_revision.jsonl, o proprio EVIDENCIA acima): "ultima
+# linha da mesma URL vale", sem exigir estrutura nova nem tocar no que o
+# incremental ja usa para o delta por content_sha256.
+LEDGER_URL_STATE = os.path.join(ROOT, "data/ops/indexnow_url_state.jsonl")
+
+# ESTADO COMPARTILHADO COM O SUBMISSOR INCREMENTAL — a peca que faltava.
+#
+# `generate-indexnow-incremental-submit` mantem, por URL, o content_sha256 da
+# ultima submissao ACEITA, e submete so o delta. Ate 2026-08-26 esta ferramenta
+# NAO escrevia nesse estado: quando ela submetia o acervo, o incremental nao
+# ficava sabendo e resubmetia tudo na execucao seguinte.
+#
+# O cabecalho do incremental ja avisava que ligar os dois ao mesmo evento
+# produziria SUBMISSAO DUPLA -- "o anti-padrao que ja rendeu 403 a este dominio".
+# Mas o aviso dependia de disciplina de quem liga; o defeito era estrutural, e
+# esta e a correcao estrutural: quem submete MARCA, e o outro ve que ja foi.
+#
+# Tambem torna seguro dar ao incremental um timer proprio, que e o que desacopla
+# o frescor da onda diaria -- hoje, se a onda morre na etapa 3/9, o IndexNow do
+# portal inteiro fica mudo (ultima submissao: 2026-08-20).
+ESTADO_COMPARTILHADO = os.path.join(ROOT, "data/ops/indexnow_submission_state.json")
+REVISAO_CONTEUDO = os.path.join(ROOT, "data/ops/page_content_revision.jsonl")
+
+
+def _hashes_de_conteudo(urls, base):
+    """content_sha256 por URL, pelo MESMO criterio do incremental: registro de
+    revisao quando existe, hash do HTML servido quando a rota e derivada."""
+    revisao = {}
+    if os.path.isfile(REVISAO_CONTEUDO):
+        with open(REVISAO_CONTEUDO, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                    revisao[registro["path"]] = registro["content_sha256"]
+                except Exception:
+                    continue
+    saida = {}
+    for url in urls:
+        rota = url[len(base):] if url.startswith(base) else ""
+        if not rota:
+            continue
+        if rota in revisao:
+            saida[url] = (revisao[rota], "page_content_revision")
+            continue
+        alvo = os.path.join(ROOT, "public", rota.strip("/"), "index.html")
+        if rota == "/":
+            alvo = os.path.join(ROOT, "public", "index.html")
+        if not os.path.isfile(alvo):
+            continue
+        with open(alvo, "rb") as handle:
+            saida[url] = (hashlib.sha256(handle.read()).hexdigest(), "public_html")
+    return saida
+
+
+def registrar_no_estado_compartilhado(urls_aceitas, base, agora, status):
+    """Marca no estado do incremental as URLs que ESTA ferramenta submeteu e
+    tiveram lote aceito. Falha aqui NAO derruba a submissao: o anuncio ja
+    aconteceu, e perder o registro causa no maximo um reenvio -- enquanto
+    abortar por causa dele perderia a submissao inteira."""
+    if not urls_aceitas:
+        return 0
+    try:
+        estado = {}
+        if os.path.isfile(ESTADO_COMPARTILHADO):
+            with open(ESTADO_COMPARTILHADO, encoding="utf-8") as handle:
+                estado = json.load(handle)
+        estado.setdefault("schema_version", "indexnow_submission_state_v1")
+        registros = estado.setdefault("urls", {})
+        hashes = _hashes_de_conteudo(urls_aceitas, base)
+        marcadas = 0
+        for url in urls_aceitas:
+            par = hashes.get(url)
+            if not par:
+                continue
+            registros[url] = {
+                "content_sha256": par[0],
+                "hash_source": par[1],
+                "submitted_at": agora,
+                "http_status": status,
+                "submitted_by": "generate-indexnow-direct-submit",
+            }
+            marcadas += 1
+        estado["last_run_at"] = agora
+        tmp = ESTADO_COMPARTILHADO + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(estado, handle, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(tmp, ESTADO_COMPARTILHADO)
+        return marcadas
+    except Exception as erro:
+        print("  aviso: nao consegui atualizar %s (%s) — o incremental pode resubmeter"
+              % (os.path.relpath(ESTADO_COMPARTILHADO, ROOT), erro), file=sys.stderr)
+        return 0
+
+
+def registrar_ledger_url_state(urls, indice_lote, endpoint, status, agora, kinds=None):
+    """Acrescenta UMA linha por URL do lote a LEDGER_URL_STATE — aceito OU
+    recusado, sempre: um 403 e uma resposta real, e apaga-la do historico
+    seria o mesmo apagamento que ESTADO_COMPARTILHADO ja faz por design (e
+    que este ledger existe para nao repetir).
+
+    UNICO PONTO DE ESCRITA para os dois caminhos de submissao (incremental e
+    direto): generate-indexnow-incremental-submit NUNCA fala com a API por
+    conta propria — ele sempre delega o POST real a este script via
+    `--de-arquivo` (subprocess). Cobrir aqui cobre os dois por construcao,
+    sem duplicar a escrita em dois lugares que poderiam divergir.
+
+    Mesma postura de registrar_no_estado_compartilhado: nao aborta a
+    submissao se a escrita falhar (o anuncio ao IndexNow ja aconteceu) e
+    IMPRIME o erro — nunca engole em silencio.
+    """
+    if not urls:
+        return 0
+    try:
+        os.makedirs(os.path.dirname(LEDGER_URL_STATE), exist_ok=True)
+        with open(LEDGER_URL_STATE, "a", encoding="utf-8") as handle:
+            for url in urls:
+                linha = {
+                    "schema_version": "indexnow_url_state_v1",
+                    "url": url,
+                    "lote": indice_lote,
+                    "url_count": len(urls),
+                    "endpoint": endpoint,
+                    "http_status": status,
+                    "submitted_at": agora,
+                    # Campo aditivo (2026-09-16). Leitor antigo ignora chave
+                    # desconhecida, entao o schema_version nao muda. E o que
+                    # permite cruzar anuncio com retorno de rastreio na borda
+                    # por `(url, submitted_at, kind)` e responder, daqui a um
+                    # mes, se a rotacao ajudou — em vez de discutir por opiniao.
+                    "kind": (kinds or {}).get(url, KIND_PADRAO),
+                }
+                handle.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+        return len(urls)
+    except Exception as erro:
+        print("  aviso: nao consegui gravar %s (%s) — o historico por URL deste lote fica incompleto"
+              % (os.path.relpath(LEDGER_URL_STATE, ROOT), erro), file=sys.stderr)
+        return 0
+
+
+ENDPOINT_PADRAO = "https://api.indexnow.org/indexnow"
+
+# ★ POR QUE EXISTE ESCOLHA DE ENDPOINT (2026-08-19)
+#
+# O IndexNow tem o agregador (api.indexnow.org) e os endpoints diretos de cada
+# buscador participante. Ate hoje esta ferramenta so falava com o agregador —
+# 43 lotes, 41.572 URLs, 42 respostas 200 — e o resultado medido foi assimetrico
+# ao ponto de nao poder ser coincidencia:
+#
+#   yandexbot  cobriu 95,5% do acervo (9.481 de 9.926)
+#   bingbot    cobriu  0,7%          (   71 de 9.926, 9.906 nunca pedidas)
+#
+# Os dois sao participantes do MESMO protocolo e receberam o MESMO anuncio. O
+# canal para o Bing, na pratica, nao estava entregando. Verificado em 2026-08-19
+# que https://www.bing.com/indexnow aceita a mesma chave e o mesmo payload
+# (HTTP 200 com URLs reais do acervo), entao passa a ser alvo selecionavel.
+#
+# Isto NAO afrouxa a regra de nao reenviar URL inalterada: o alvo aqui sao URLs
+# que aquele buscador NUNCA pediu — primeira submissao para ele, nao reenvio.
+ENDPOINTS = {
+    "agregador": ENDPOINT_PADRAO,
+    "bing": "https://www.bing.com/indexnow",
+    "yandex": "https://yandex.com/indexnow",
+}
+ENDPOINT = ENDPOINT_PADRAO
+# O protocolo documenta 10.000 URLs por requisicao, mas o agregador NAO aceitou
+# isso aqui: medido em 2026-08-06, lotes de 10, 100 e 1.000 responderam 200 e o
+# lote unico de 9.400 respondeu 403 SiteVerificationNotCompleted — a mesma chave,
+# no mesmo minuto, com a mesma prova de posse. Ou seja, o erro anunciava
+# verificacao pendente mas o gatilho era o tamanho.
+#
+# 1.000 e o maior lote com 200 comprovado. Usar o teto documentado em vez do
+# teto medido faria a submissao inteira falhar com uma mensagem que aponta para
+# a causa errada.
+MAX_URLS = 1000
+# POR QUE a URL foi anunciada — a proveniencia que permite medir o efeito.
+#
+# Sem isto, "anunciamos 10 mil URLs e o rastreio subiu" e opiniao: nao da para
+# separar pagina nova de reanuncio de rotacao. Quem SABE o motivo e o
+# incremental (e so ele), entao ele manda o rotulo junto com a URL, em arquivo
+# de duas colunas, e aqui o rotulo so e repassado ao ledger.
+#
+# `delta` e o padrao para lista de uma coluna — o formato que `deploy-publico`
+# escreve e que nao vai mudar por causa deste campo.
+KIND_PADRAO = "delta"
+KINDS_CONHECIDOS = ("delta", "backlog", "rotacao", "prioridade", "manual")
+# DUAS identidades, porque sao duas coisas diferentes no fio.
+#
+# USER_AGENT vale para as requisicoes que esta ferramenta faz ao PROPRIO portal
+# (prova de posse da chave e amostra de URLs vivas). Sao sondas nossas, saem com
+# X-Warming-Request e por contrato ficam FORA da metrica de audiencia — trocar
+# o UA delas por um de crawler faria o portal medir o proprio eco.
+USER_AGENT = "wikijuridica-indexnow/1.0 (+interno; nao-indexar)"
+# USER_AGENT_SAIDA vale para o POST ao endpoint IndexNow, que e host de
+# TERCEIRO (api.indexnow.org, www.bing.com, yandex.com). Ali o portal sai para a
+# rede e a identidade e uma so: WikijuridicaBot, com a URL que documenta o
+# agente e o proposito (CLAUDE.md secao 11, internal/wikijuridicabot).
+#
+# MEDIDO em 2026-09-05, GET (nunca POST, que submeteria URL de verdade):
+#   api.indexnow.org/indexnow   canonico 400/136 B | antigo 400/136 B
+#   www.bing.com/indexnow       canonico 200/22.592 B | antigo 200/22.592 B
+#   yandex.com/indexnow         canonico 302/0 B | antigo 302/0 B
+# Nenhum dos tres discrimina por User-Agent.
+USER_AGENT_SAIDA = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+                    "+https://wikijuridica.com.br/bot/; anuncio-de-publicacao)")
+
+
+def pedir(url, timeout=20.0):
+    pedido = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "X-Warming-Request": "true",
+        "Accept-Encoding": "identity",
+    })
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return resposta.status, resposta.read()
+    except urllib.error.HTTPError as erro:
+        return erro.code, b""
+    except Exception:
+        return 0, b""
+
+
+def e_gemea_de_rota_conhecida(url: str, conhecidas: set) -> bool:
+    """`/x/index.md` deriva de `/x/` quando `/x/` esta no sitemap; nada mais.
+
+    Reconhecedor estreito de proposito: so o sufixo exato `/index.md`, so
+    quando a rota-mae consta do conjunto anunciado. `/x/index.md.txt`,
+    `/x/outro.md` e endereco de dominio alheio continuam de fora.
+
+    ATENCAO AO NOME: esta funcao diz que a gemea E DERIVAVEL de rota conhecida
+    — ela NAO decide se a gemea deve ser anunciada. Quem decide e
+    `particiona_pedidas`, e desde 2026-09-16 o padrao e NAO anunciar.
+    """
+    sufixo = "/index.md"
+    if not url.endswith(sufixo):
+        return False
+    return url[: -len("index.md")] in conhecidas
+
+
+def particiona_pedidas(pedidas, conhecidas, incluir_gemea=False):
+    """Deriva o conjunto A ANUNCIAR de uma lista que pode trazer chave de purga.
+
+    Devolve `(anunciar, gemeas_descartadas, fora)`.
+
+    POR QUE PARTICIONAR, e nao aceitar-ou-recusar (2026-09-16).
+
+    `deploy-publico:1506` monta a lista do IndexNow reusando VERBATIM o que
+    `generate-page-content-revision --purge-targets` imprime. Aquela lista e de
+    CHAVES DE CACHE DA BORDA, e por isso ela emite duas linhas por rota
+    (`generate-page-content-revision:738-741`): `/x/` e `/x/index.md` sao dois
+    objetos distintos no cache, e a gemea so sai de la se for purgada por nome.
+    Para a purga isso e correto. Para o anuncio e um ERRO DE CATEGORIA: o indice
+    do buscador tem UMA entrada por documento canonico, nao uma por chave.
+
+    A gemea diz isso de si mesma. Medido em 2026-09-16 na borda,
+    `/sumulas/stj-409/index.md` responde 200 com
+
+        link: <https://wikijuridica.com.br/sumulas/stj-409/>; rel="canonical"
+
+    Ou seja: o proprio artefato declara que o canonico e o HTML. Anuncia-lo ao
+    IndexNow e pedir indexacao de um endereco que se autodeclara duplicata.
+
+    O CUSTO MEDIDO do erro de categoria, na origem (`indexnow_url_state.jsonl`,
+    que tem uma linha por URL por lote REALMENTE POSTado):
+
+      - 2.422 de 13.941 eventos desde 2026-09-04 eram `.md` (17,4%), em 1.968
+        URLs distintas, TODAS com HTTP 200 — anuncio aceito e desperdicado.
+      - No lote de 2026-09-16T15:50:19: 254 URLs, sendo 127 HTML e 127 gemeas,
+        e as 127 maes estavam no MESMO lote. Exatamente 50% de duplicata.
+      - Antes de 2026-09-10 esse numero era ZERO por construcao: ate o commit
+        224fb9ba a lista com gemea REPROVAVA inteira. A guarda daquele dia
+        nasceu para reentregar NOVE gemeas que tinham tomado 503 na migracao do
+        socket, e virou canal permanente para 1.968.
+
+    As DUAS pontas anteriores estavam erradas, e por isso aqui nao se escolhe
+    entre elas:
+
+      - recusar a lista inteira (ate 2026-09-10) calava o IndexNow em todo
+        deploy, porque a lista SEMPRE traz gemea;
+      - aceitar a gemea (2026-09-10 a 2026-09-16) poluiu metade do anuncio.
+
+    Particionar entrega o que cada consumidor precisa: anuncia-se a mae, a
+    gemea sai da lista, e `fora` — endereco que o portal nao publica — CONTINUA
+    REPROVANDO a execucao. Esse controle e a razao de ser da funcao e nao se
+    afrouxa: derivar nunca pode virar inventar.
+
+    `incluir_gemea=True` (flag `--incluir-gemea-markdown`) preserva a
+    capacidade de 2026-09-10 — reentregar a gemea para tirar um 5xx do indice
+    do Bing — como ATO DELIBERADO, nomeado na linha de comando, em vez de
+    efeito colateral de toda publicacao.
+    """
+    anunciar, gemeas, fora = [], [], []
+    for url in pedidas:
+        if url in conhecidas:
+            anunciar.append(url)
+        elif e_gemea_de_rota_conhecida(url, conhecidas):
+            if incluir_gemea:
+                anunciar.append(url)
+            else:
+                gemeas.append(url)
+        else:
+            fora.append(url)
+    return anunciar, gemeas, fora
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limite", type=int, default=0, help="submete no maximo N URLs (0 = todas)")
+    parser.add_argument("--de-arquivo", dest="de_arquivo", default="",
+                        help="submete a lista de URLs deste arquivo (uma por linha) em vez do sitemap inteiro")
+    parser.add_argument("--endpoint", choices=sorted(ENDPOINTS), default="agregador",
+                        help="para qual endpoint IndexNow submeter (padrao: agregador)")
+    parser.add_argument("--amostra", type=int, default=10, help="quantas URLs conferir antes de submeter")
+    parser.add_argument("--incluir-gemea-markdown", dest="incluir_gemea_markdown",
+                        action="store_true",
+                        help="anuncia tambem a gemea /x/index.md das rotas da lista. "
+                             "NAO e o padrao: a gemea declara rel=canonical para o HTML, "
+                             "entao anuncia-la e pedir indexacao de duplicata. Use so para "
+                             "reentrega deliberada (tirar 5xx do indice do Bing).")
+    args = parser.parse_args()
+    # O endpoint escolhido vale para TODA a execucao e vai gravado no ledger,
+    # para que a evidencia diga a quem cada lote foi anunciado.
+    endpoint = ENDPOINTS[args.endpoint]
+
+    with open(SITE, encoding="utf-8") as handle:
+        base = json.load(handle)["base_url"].rstrip("/")
+    host = base.split("//", 1)[-1]
+    with open(CHAVE, encoding="utf-8") as handle:
+        chave = json.load(handle)["key"]
+
+    # A FONTE E O SITEMAP, e nao mais so o published_manifest.
+    #
+    # Ate a DEC-025 as duas listas eram a mesma coisa, e ler o manifesto era o
+    # jeito mais direto de garantir coerencia. Depois dela o sitemap passou a
+    # conter tambem as 206 rotas de hub de area, que por desenho NAO tem registro
+    # editorial — sao navegacao derivada do acervo, aceitas por pertinencia ao
+    # conjunto que o validador recalcula. Continuar lendo o manifesto deixaria
+    # justamente essas 206 URLs novas fora da submissao.
+    #
+    # A COERENCIA NAO AFROUXA, muda de prova: o sitemap ja passou por
+    # publishedmanifest.Validate, que so o aceita se cada loc for registro de
+    # manifesto OU hub derivada com HTML em public/. Aqui a checagem e refeita do
+    # lado de fora, no artefato: toda URL submetida tem de existir como arquivo
+    # em public/. Submeter URL morta queima confianca com o buscador, e a
+    # verificacao por arquivo pega isso sem depender de nenhuma formula duplicada
+    # em Python.
+    sitemaps = sorted(glob.glob(os.path.join(ROOT, "public/sitemaps/pages-*.xml")))
+    if not sitemaps:
+        print("REPROVADO: nenhum shard de sitemap em public/sitemaps/", file=sys.stderr)
+        return 1
+    urls = []
+    vistos = set()
+    for caminho in sitemaps:
+        with open(caminho, encoding="utf-8") as handle:
+            for loc in re.findall(r"<loc>([^<]+)</loc>", handle.read()):
+                if loc not in vistos:
+                    vistos.add(loc)
+                    urls.append(loc)
+
+    sem_artefato = []
+    for url in urls:
+        rota = url[len(base):] if url.startswith(base) else ""
+        if not rota:
+            sem_artefato.append(url)
+            continue
+        alvo = os.path.join(ROOT, "public", rota.strip("/"), "index.html")
+        if rota == "/":
+            alvo = os.path.join(ROOT, "public", "index.html")
+        if not os.path.isfile(alvo):
+            sem_artefato.append(url)
+    if sem_artefato:
+        print("REPROVADO: %d loc(s) do sitemap sem HTML em public/ — nao se submete URL sem artefato:"
+              % len(sem_artefato), file=sys.stderr)
+        for url in sem_artefato[:5]:
+            print("  %s" % url, file=sys.stderr)
+        return 1
+
+    # --de-arquivo restringe a submissao a um subconjunto, para o gancho
+    # incremental do deploy: o protocolo existe para dizer "esta URL mudou
+    # AGORA", e reenviar o acervo inteiro a cada publicacao desperdica cota e
+    # dilui o sinal.
+    #
+    # A lista recebida NAO substitui a verificacao: cada URL dela tem de estar no
+    # conjunto que o sitemap anuncia. Aceitar URL de fora seria abrir mao da
+    # coerencia que este comando existe para garantir — bastaria um arquivo mal
+    # gerado para submeter endereco que o portal nao publica.
+    # Vai gravado em CADA registro de lote da evidencia: quantas gemeas a lista
+    # trazia e nao foram anunciadas. Zero e informacao tanto quanto N — e o que
+    # permite ao gate medir a poluicao por FLUXO, sem reconstruir historico.
+    gemeas_descartadas = 0
+    kinds = {}
+    if args.de_arquivo:
+        # DUAS COLUNAS, a segunda opcional: `url` ou `url<TAB>kind`.
+        #
+        # Compativel para tras de proposito: `deploy-publico:1506` escreve uma
+        # coluna e continua valendo, com kind=delta. Rotulo desconhecido nao e
+        # aceito em silencio — rotulo errado contamina a medicao que ele existe
+        # para permitir, e um campo de proveniencia que aceita qualquer coisa
+        # nao e proveniencia.
+        pedidas, kinds = [], {}
+        with open(args.de_arquivo, encoding="utf-8") as handle:
+            for numero, linha in enumerate(handle, 1):
+                linha = linha.strip()
+                if not linha:
+                    continue
+                partes = linha.split("\t")
+                url = partes[0].strip()
+                kind = partes[1].strip() if len(partes) > 1 and partes[1].strip() else KIND_PADRAO
+                if kind not in KINDS_CONHECIDOS:
+                    print("REPROVADO: linha %d de %s traz kind desconhecido %r (conhecidos: %s)"
+                          % (numero, os.path.basename(args.de_arquivo), kind,
+                             ", ".join(KINDS_CONHECIDOS)), file=sys.stderr)
+                    return 1
+                pedidas.append(url)
+                kinds[url] = kind
+        conhecidas = set(urls)
+        # A GEMEA EM MARKDOWN E ROTA ANUNCIADA, e o sitemap nao a lista.
+        #
+        # Medido em 2026-09-10: o Bing mantinha DEZ URLs marcadas como 5xx no
+        # relatorio da conta, e as nove identificadas no log de origem sao todas
+        # gemeas `/x/index.md` que tomaram 503 em 2026-09-02, na janela de
+        # ~16 h em que o socket do systemd estava em migracao. As nove respondem
+        # 200 hoje (conferido uma a uma na borda, com UA proprio e
+        # X-Warming-Request). Quem retem o erro e o indice do Bing, e o unico
+        # jeito de dizer a ele que a URL voltou e reentregar por IndexNow.
+        #
+        # A gemea nao esta no sitemap por decisao de SEO — o canal de maquina
+        # (CLAUDE.md secao 7) tem caminho proprio para nao dividir chave de
+        # cache, e anuncia-la ao lado do HTML canonico criaria duas entradas
+        # para o mesmo conteudo. Isso NAO a torna endereco desconhecido: ela e
+        # servida pelo processo Go, sai pelo MCP, pelo A2A e pelo /api/v1/lote,
+        # e o `llms.txt` a documenta.
+        #
+        # SUPERADO EM 2026-09-16, e o paragrafo fica pelo que ele ensina.
+        #
+        # O que estava certo acima: a gemea nao e endereco inventado, e o 5xx
+        # retido no indice do Bing so se corrige reentregando a URL. O que
+        # estava ERRADO: transformar isso no comportamento PADRAO de uma lista
+        # que, por vir de `--purge-targets`, traz a gemea de TODA rota mudada.
+        # A capacidade de 2026-09-10 continua existindo, agora sob
+        # `--incluir-gemea-markdown`; o padrao anuncia so a mae. O racional
+        # medido — inclusive o rel=canonical que a propria gemea serve — esta
+        # no docstring de `particiona_pedidas`.
+        anunciar, gemeas, fora = particiona_pedidas(
+            pedidas, conhecidas, args.incluir_gemea_markdown)
+        if fora:
+            print("REPROVADO: %d URL(s) do arquivo nao estao no sitemap publicado:" % len(fora),
+                  file=sys.stderr)
+            for url in fora[:5]:
+                print("  %s" % url, file=sys.stderr)
+            return 1
+        if gemeas:
+            # IMPRIME SEMPRE que descartar. Foi a AUSENCIA deste numero que
+            # deixou 1.968 gemeas passarem sem ninguem ver: a submissao dizia
+            # "254 URLs" e nao dizia que 127 eram duplicata.
+            print("gemeas .md descartadas: %d (declaram rel=canonical para o HTML; "
+                  "--incluir-gemea-markdown reentrega de proposito)" % len(gemeas))
+        if not pedidas:
+            print("nada a submeter: a lista veio vazia")
+            return 0
+        if not anunciar:
+            print("nada a submeter: a lista so tinha gemea .md (%d), e a mae nao mudou"
+                  % len(gemeas))
+            return 0
+        gemeas_descartadas = len(gemeas)
+        urls = anunciar
+
+    if args.limite:
+        urls = urls[:args.limite]
+
+    print("=== SUBMISSAO INDEXNOW ===")
+    print("host            : %s" % host)
+    print("URLs a submeter : %d (rotas canonicas do sitemap%s)"
+          % (len(urls),
+             ", COM a gemea .md por pedido explicito" if args.incluir_gemea_markdown else ""))
+
+    # 1. Posse, verificada no dominio publico.
+    local_chave = "%s/%s.txt" % (base, chave)
+    status, corpo = pedir(local_chave)
+    conteudo = corpo.decode("utf-8", "replace").strip()
+    if status != 200 or conteudo != chave:
+        print("\nREPROVADO: prova de posse invalida em %s" % local_chave, file=sys.stderr)
+        print("  status=%s  conteudo_bate=%s" % (status, conteudo == chave), file=sys.stderr)
+        print("  gere com tools/generate-indexnow-key-public-file e republique.", file=sys.stderr)
+        return 1
+    print("prova de posse  : 200 e conteudo confere (%s.txt)" % chave[:8])
+
+    # 2. Existencia, por amostra — submeter URL morta queima confianca.
+    #
+    # SEMENTE FIXA REMOVIDA EM 2026-09-16. `random.Random(20260806)` sorteava
+    # SEMPRE o mesmo subconjunto para a mesma lista de entrada: a amostra
+    # "aleatoria" era uma constante disfarcada, e uma rota quebrada fora dela
+    # nunca seria conferida por mais que a ferramenta rodasse. Amostra de
+    # verificacao existe para ter chance de achar o defeito, entao ela sorteia
+    # de verdade — e a semente do sorteio vai gravada na evidencia, que e o que
+    # torna o sorteio auditavel sem torna-lo previsivel.
+    semente_amostra = random.SystemRandom().randrange(2 ** 63)
+    sorteador = random.Random(semente_amostra)
+    amostra = sorteador.sample(urls, min(args.amostra, len(urls)))
+    mortas = [u for u in amostra if pedir(u)[0] != 200]
+    if mortas:
+        print("\nREPROVADO: %d de %d URLs da amostra nao respondem 200:" % (len(mortas), len(amostra)),
+              file=sys.stderr)
+        for url in mortas[:5]:
+            print("  %s" % url, file=sys.stderr)
+        return 1
+    print("amostra viva    : %d/%d respondem 200" % (len(amostra), len(amostra)))
+
+    if len(urls) > MAX_URLS:
+        print("lotes           : %d (teto do protocolo: %d URLs por requisicao)"
+              % ((len(urls) + MAX_URLS - 1) // MAX_URLS, MAX_URLS))
+
+    if args.dry_run:
+        print("\n--dry-run: nada foi submetido.")
+        return 0
+
+    agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    falhas = 0
+    for inicio in range(0, len(urls), MAX_URLS):
+        lote = urls[inicio:inicio + MAX_URLS]
+        payload = {
+            "host": host,
+            "key": chave,
+            "keyLocation": local_chave,
+            "urlList": lote,
+        }
+        pedido = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json; charset=utf-8",
+                     "User-Agent": USER_AGENT_SAIDA},
+            method="POST")
+        # CABECALHOS DE COTA — o teto que vale e o que o OPERADOR declara.
+        #
+        # Ate 2026-09-16 esta ferramenta lia so status e corpo, entao se o
+        # endpoint anunciasse cota em cabecalho (X-RateLimit-*, Retry-After) o
+        # numero passava e ninguem via. Frente irma mediu exatamente isso no
+        # DJEN: o CNJ publica `X-Ratelimit-Limit: 20` na RESPOSTA, e a cota nao
+        # estava em documentacao nenhuma. Sem capturar, a unica forma de
+        # descobrir um teto externo seria bater nele — e ai ja e tarde.
+        #
+        # O que se sabe HOJE, medido e nao suposto: em 112 lotes e 72.945 URLs
+        # registradas, a UNICA resposta nao-2xx foi um 403
+        # `SiteVerificationNotCompleted` em 2026-08-06, e ele foi de TAMANHO de
+        # lote (9.400 URLs), nao de frequencia. Nenhum cabecalho de cota foi
+        # observado ate agora — mas "nao observado" so vira "nao existe" depois
+        # de olhar, e e para isso que estes campos entram na evidencia.
+        cabecalhos = {}
+        try:
+            with urllib.request.urlopen(pedido, timeout=60) as resposta:
+                status, corpo = resposta.status, resposta.read()[:400]
+                cabecalhos = dict(resposta.headers)
+        except urllib.error.HTTPError as erro:
+            status, corpo = erro.code, erro.read()[:400]
+            cabecalhos = dict(erro.headers or {})
+        except Exception as erro:
+            status, corpo = 0, str(erro)[:200].encode()
+        cota_declarada = {nome: valor for nome, valor in cabecalhos.items()
+                          if nome.lower().startswith("x-ratelimit")
+                          or nome.lower().startswith("x-rate-limit")
+                          or nome.lower() in ("retry-after", "ratelimit-limit",
+                                              "ratelimit-remaining", "ratelimit-reset")}
+
+        # 200 = aceito; 202 = aceito e chave em verificacao. Ambos sao sucesso
+        # pelo protocolo; qualquer outro codigo NAO e apresentado como sucesso.
+        sucesso = status in (200, 202)
+        if not sucesso:
+            falhas += 1
+        registro = {
+            "schema_version": "indexnow_direct_submission_v1",
+            "submitted_at": agora,
+            "host": host,
+            "endpoint": endpoint,
+            "url_count": len(lote),
+            "first_url": lote[0],
+            "last_url": lote[-1],
+            "http_status": status,
+            "response_excerpt": corpo.decode("utf-8", "replace"),
+            "success": sucesso,
+            "ownership_proof_verified_over_http": True,
+            # Quantas gemeas .md a lista trazia e NAO foram anunciadas (campo
+            # novo em 2026-09-16). Com `first_url`/`last_url` so, um lote de
+            # 254 em que 127 eram duplicata era indistinguivel de um lote
+            # limpo — foi assim que o defeito viveu seis dias.
+            "dropped_markdown_twins": gemeas_descartadas,
+            "markdown_twins_included_on_purpose": bool(args.incluir_gemea_markdown),
+            # Cota declarada PELO OPERADOR nesta resposta. Dicionario vazio e
+            # informacao: significa "este endpoint nao declarou teto aqui", e e
+            # o que sustenta, com medicao, nao haver teto diario a respeitar
+            # alem do tamanho do lote.
+            "operator_rate_limit_headers": cota_declarada,
+            "liveness_sample_seed": semente_amostra,
+        }
+        os.makedirs(os.path.dirname(EVIDENCIA), exist_ok=True)
+        with open(EVIDENCIA, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+        print("  lote de %5d URLs -> HTTP %s %s" % (len(lote), status, "OK" if sucesso else "FALHOU"))
+        # Ledger por URL: TODO lote realmente POSTado, aceito ou recusado —
+        # ver o docstring de registrar_ledger_url_state sobre por que um 403
+        # tambem merece linha.
+        indice_lote = inicio // MAX_URLS + 1
+        registrar_ledger_url_state(lote, indice_lote, endpoint, status, agora, kinds)
+        if sucesso:
+            marcadas = registrar_no_estado_compartilhado(lote, base, agora, status)
+            if marcadas:
+                print("    %d URL(s) marcadas no estado compartilhado (o incremental nao as repete)"
+                      % marcadas)
+            # A ASSIMETRIA QUE ESCONDEU O DEFEITO (2026-09-16). `_hashes_de_conteudo`
+            # resolve `public/<rota>/index.html`; para `/x/index.md` esse caminho e
+            # `public/x/index.md/index.html`, que nao existe — entao a gemea era
+            # POSTada de verdade e sumia do estado compartilhado, calada. Resultado
+            # medido: 1.968 gemeas com HTTP 200 no ledger por URL e ZERO no estado,
+            # que e a fonte de `check-indexnow-backlog`. Submeter sem registrar nao
+            # e detalhe de contabilidade: e um ponto cego, e ponto cego se IMPRIME.
+            if marcadas < len(lote):
+                print("    ATENCAO: %d de %d URL(s) POSTadas NAO entraram no estado "
+                      "compartilhado (sem HTML em public/ para hashear) — o incremental "
+                      "as tratara como nunca submetidas"
+                      % (len(lote) - marcadas, len(lote)), file=sys.stderr)
+
+        if cota_declarada:
+            print("    cota declarada pelo operador: %s"
+                  % ", ".join("%s=%s" % par for par in sorted(cota_declarada.items())))
+
+        # 429 = O OPERADOR MANDOU PARAR, e parar aqui nao e margem nossa: e a
+        # unica forma de teto que a Regra 18 admite, porque e causa externa
+        # medida, dita pelo proprio operador, na resposta. Continuar mandando
+        # depois de um 429 e o que transforma um freio temporario em bloqueio.
+        if status == 429:
+            espera = cabecalhos.get("Retry-After") or cabecalhos.get("retry-after")
+            print("\nPARANDO: o endpoint respondeu 429 (Too Many Requests).", file=sys.stderr)
+            print("  Este e o teto EXTERNO, declarado pelo operador — respeita-se.", file=sys.stderr)
+            if espera:
+                print("  Retry-After: %s" % espera, file=sys.stderr)
+            enviados = inicio + len(lote)
+            if enviados < len(urls):
+                print("  %d de %d URL(s) ficaram sem anunciar; a proxima execucao continua."
+                      % (len(urls) - enviados, len(urls)), file=sys.stderr)
+            break
+
+    print("\nevidencia       : %s" % os.path.relpath(EVIDENCIA, ROOT))
+    print("historico por URL: %s" % os.path.relpath(LEDGER_URL_STATE, ROOT))
+    if falhas:
+        print("ATENCAO: %d lote(s) reprovado(s). O Google nao usa IndexNow — o sitemap continua sendo o canal dele."
+              % falhas, file=sys.stderr)
+        return 1
+    print("OK: acervo submetido a Bing/Yandex e demais consumidores do protocolo.")
+    print("    (o Google NAO participa do IndexNow; para ele o canal e o sitemap.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

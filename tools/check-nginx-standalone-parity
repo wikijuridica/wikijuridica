@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Diff MECANICO entre o vhost vivo e o nginx dedicado — antes de migrar.
+
+POR QUE ESTE CHECK EXISTE (2026-08-13)
+--------------------------------------
+`ops/nginx/standalone/` foi escrito em 2026-08-06 e nao acompanhou as ~15
+correcoes que o vhost vivo recebeu em 11 e 12/08. Migrar a partir dele
+REGREDIRIA o site em varias frentes ao mesmo tempo, e cada uma so apareceria
+depois, em producao:
+
+  - `gzip_types` sem `text/xml`  -> sitemap de 684 KB volta a sair CRU;
+  - sem `absolute_redirect off`  -> todo 301 sai com a porta interna no Location;
+  - `try_files $uri/index.html`  -> reintroduz 200/200 em /x e /x/ (duplicata);
+  - rate limit 600 r/m vs 3000   -> o proprio aquecimento levaria 429 em massa;
+  - allowlist sem duckassistbot e mistralai-* -> bot valioso volta a contar na zona;
+  - sem os `more_set_headers` de Vary e Link -> quebra o contrato de negociacao.
+
+Uma lista de memoria nao pega isso: a auditoria que produziu a lista acima errou
+um dos quatro itens que citou de cabeca (afirmou que faltava X-Robots-Tag em
+/contato/advogado/, e o standalone TEM). Por isso o diff e mecanico e a lista e
+derivada do arquivo, nao da lembranca de quem revisa.
+
+O QUE ELE COMPARA
+-----------------
+Diretivas que decidem RESPOSTA (nao formatacao): cada `nome + argumentos`
+normalizado, NOS DOIS SENTIDOS.
+
+  - o que existe no vivo e falta no dedicado -> FAIL (migrar assim regride);
+  - o que EMITE CABECALHO e existe so no dedicado -> FAIL, salvo declaracao;
+  - qualquer outro extra no dedicado -> informativo, porque instancia propria
+    legitimamente tem o que o vhost hospedado nao precisa (load_module, events,
+    open_file_cache).
+
+MEIA PARIDADE NAO E PARIDADE (2026-09-05). O gate era subset de mao unica.
+`tools/test_paridade_bidirecional.sh` provava o buraco desde 28/08 com um caso
+concreto — `more_set_headers 'Vary: Accept-Encoding'` posto so no dedicado
+passava batido — e o teste NUNCA RODOU: o glob da qualidade-diaria alcancava
+`tools/test_*.py` e teste em shell dependia de alguem lembrar de acrescentar
+linha propria. Detector cego mais teste cego: o defeito ficou oito dias no ar
+sem sinal.
+
+E O QUE ELE LE (a mesma classe de falso-verde, de novo)
+-------------------------------------------------------
+Os arquivos NAO sao mais uma lista fixa: sao derivados dos `include` de cada
+lado, recursivamente, restritos ao repositorio. A lista fixa envelheceu — o
+cabecalho abaixo afirmava que os unicos includes do dedicado eram `mime.types`
+e `security-headers.conf`, e em 2026-09-05 ele ja incluia
+`social-headers-publico.conf` (2x) e `social-headers-privado.conf`, com 18
+`more_set_headers` que a instancia carrega e este gate nao abria. E exatamente
+o falso-verde de 13/08 documentado abaixo, com os papeis trocados: la o check
+lia arquivo A MAIS (morto), aqui lia A MENOS (vivo).
+
+READ-ONLY.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+VIVO = [RAIZ / "ops" / "nginx" / "wikijuridica.conf"]
+# EXATAMENTE o que a instancia carrega — nem um arquivo a mais, nem um a menos.
+#
+# A unit sobe com `-c ops/nginx/standalone/nginx.conf`, e daqui em diante quem
+# diz quais arquivos entram e o proprio arquivo, por `arquivos_carregados()`.
+# Ate 2026-09-05 esta lista era escrita a mao e afirmava que os unicos includes
+# eram `mime.types` e `security-headers.conf` — verdade em 13/08, falsa desde
+# que a rede social acrescentou `social-headers-publico.conf` e
+# `social-headers-privado.conf`. Os antigos `standalone/server.conf` e
+# `standalone/bot-policy.conf`, escritos em 06/08, continuam sem ser carregados
+# por ninguem, e agora ficam de fora por medicao e nao por lembranca.
+#
+# FALSO-VERDE QUE ISTO JA PRODUZIU (apanhado por auditoria adversarial em
+# 2026-08-13, antes do cutover): com os dois arquivos mortos na lista, a
+# comparacao fazia UNIAO de tudo — uma diretiva que o gerador PERDESSE aparecia
+# como "presente" so por existir na versao morta de 06/08. O check anunciou
+# "paridade 100%" sem poder afirma-la. E um check de paridade que le arquivo que
+# a instancia nao carrega mede a intencao de quem escreveu, nao o que roda.
+DEDICADO = [RAIZ / "ops" / "nginx" / "standalone" / "nginx.conf"]
+
+# Arquivos que a instancia dedicada carrega e que NAO tem contraparte possivel
+# no vhost hospedado: a superficie /redesocial/ so existe na instancia propria,
+# entao os cabecalhos dela sobram no dedicado por construcao, nao por
+# divergencia. Declarar aqui e o que permite ao gate cobrar TODO o resto.
+EXCLUSIVOS_DO_DEDICADO = {
+    "social-headers-publico.conf",
+    "social-headers-privado.conf",
+}
+
+# Diretivas que EMITEM cabecalho: se sobram no dedicado, o cliente recebe
+# resposta diferente da que o vhost vivo da. E o unico grupo em que "extra no
+# dedicado" e divergencia, e nao extensao legitima de instancia propria.
+EMITEM_CABECALHO = {"add_header", "more_set_headers", "expires", "proxy_hide_header"}
+
+# Extras de cabecalho medidos, justificados e aceitos — um por linha, com o
+# motivo. Entrada que deixar de existir no arquivo REPROVA, para a lista nunca
+# virar autorizacao de fantasma pronta a absolver uma linha futura.
+#
+# Hoje esta VAZIA, e isso e medicao, nao descuido. Enquanto a comparacao era um
+# conjunto global, o `more_set_headers` de `Cache-Control: ... immutable` da
+# folha aparecia como extra e precisou ser declarado aqui. Comparado por
+# location, ele deixou de ser extra — o escopo em que vive nao tem contraparte
+# do lado hospedado, onde quem emite esse cabecalho e o Go (cacheControlDaFolha).
+# A propria guarda de "declaracao sem lastro" foi quem apontou isso, na primeira
+# execucao depois da troca de regua.
+EXTRAS_DE_CABECALHO_AUTORIZADOS: dict[str, str] = {}
+
+
+# ═══ SEGUNDO CRITERIO: O GERADOR ESTA ATRAS DO QUE ESTA IMPLANTADO (2026-09-08) ═
+#
+# O DEFEITO QUE ISTO FECHA. `user rafael rafael;`, `variables_hash_max_size`,
+# `if_modified_since before` e os dois `proxy_cache_path` sao diretiva de
+# contexto main/http. `ops/nginx/wikijuridica.conf` (VIVO, acima) e um
+# FRAGMENTO de vhost -- comeca em `server {}`, sem `http {}` -- entao essas
+# cinco diretivas NUNCA vao aparecer em `vivo[escopo]`, por maior que fique
+# DECIDEM_RESPOSTA. A comparacao vivo-vs-dedicado deste arquivo e estruturalmente
+# CEGA para essa classe inteira, e foi exatamente ela que regrediu em producao
+# entre 86e41b41/ba7f0238 (2026-09-02, correcao direta no dedicado) e hoje: o
+# gerador nunca foi atualizado, e este check nao tinha como acusar.
+#
+# A COMPARACAO QUE FALTAVA e a que o proprio gerador ja faz, so que no caminho
+# de ESCRITA (GUARDA DE PERDA, `tools/generate-nginx-standalone`): o que o
+# gerador PRODUZIRIA agora contra o que esta DE FATO implantado. Aqui a mesma
+# funcao `linhas_decisivas()` roda de novo, fora do caminho de escrita (este
+# check e READ-ONLY: gera para um arquivo TEMPORARIO, nunca para o destino
+# real).
+#
+# BASELINE, e nao silencio. Medido em 2026-09-08: depois de portar as cinco
+# diretivas de main/http + a allowlist de extensao (que motivou este check) e,
+# na sessao seguinte, os buffers de proxy de 2026-09-01, o `open_file_cache
+# off` de 2026-08-29 e as 4 linhas de continuacao do `log_format` (ref=/warm=,
+# ae=, ocs=, inm=/ims=), regenerar ainda perderia 53 linhas -- TODAS pre-existentes, do
+# MESMO "COLISAO DE FONTE-DE-VERDADE" que o cabecalho de
+# ops/nginx/wikijuridica.conf ja declara como "trabalho de engenharia
+# pendente" desde 2026-08-26: a superficie /redesocial/ inteira (locations,
+# maps de negociacao, os includes social-headers-*.conf, feed/rss, a
+# allowlist de hash da folha CSS) foi hand-editada so no dedicado e nunca
+# portada ao vhost. Portar aquilo e tarefa maior, fora do escopo desta
+# correcao -- listar aqui e o que impede o gate de mascarar divida alheia como
+# se fosse regressao nova, e evita que ele fique permanentemente vermelho por
+# um debito ja conhecido e ja documentado. Linha removida da baseline sem
+# reaparecer no dedicado tambem reprova (mesma guarda de "declaracao sem
+# lastro" de EXTRAS_DE_CABECALHO_AUTORIZADOS, abaixo).
+PERDA_CONHECIDA_NA_REGERACAO: frozenset[str] = frozenset({
+    # 2026-09-10: o teto de corpo da rota de escrita da comunidade entra na
+    # baseline pelo MESMO motivo que as outras linhas de /redesocial/ acima — a
+    # superficie inteira e hand-editada so no dedicado. E o dedicado e quem
+    # SERVE: `systemctl cat wikijuridica-nginx` mostra
+    # `ExecStart=/usr/sbin/nginx -c /opt/wiki/ops/nginx/standalone/nginx.conf`,
+    # entao esta diretiva ja vale em producao. O numero casa com
+    # `cmd/social/media.go:tetoDoCorpoMultipart` (22 MiB = 4 x 5 MiB + texto +
+    # moldura MIME), e e MAIS ESTRITO que o `client_max_body_size 100M` que o
+    # nginx do sistema declara em main/http.
+    'client_max_body_size 22m;',
+    '"~." "same-origin";',
+    r'"~^(?<wj_hub>/(?:administrativo|aereo|autonomos|bancario|cidadania|constitucional|consumidor|criminal|diarios|digital|educacao|empresarial|familia|glossario|imobiliario|inpi|investimentos|jurisprudencia|leis|lgpd|noticias|previdenciario|procedimentos|saude|seguros|servidor|sucessoes|sumulas|telecom-energia|trabalhista|transito|tributario)/)(\?|$)" $wj_hub;',
+    r'"~^(?<wj_limpa1>/[^?]*?)[)\],]+:?$" $wj_limpa1;',
+    '"~^(?<wj_limpa2>/[^?]*?)(?:%60|`)+$" $wj_limpa2;',
+    '"~^/(?<wj_area>administrativo|aereo|autonomos|bancario|cidadania|constitucional|consumidor|criminal|diarios|digital|educacao|empresarial|familia|glossario|imobiliario|inpi|investimentos|jurisprudencia|leis|lgpd|noticias|previdenciario|procedimentos|saude|seguros|servidor|sucessoes|sumulas|telecom-energia|trabalhista|transito|tributario)/" "area-$wj_area";',
+    '"~^/(?<wj_area_pag>[a-z0-9-]+)/pagina/$" /$wj_area_pag/;',
+    '"~^//+(?<wj_sem_dupla>[^?]+)$" /$wj_sem_dupla;',
+    '"~^/feed/?$" /feed.xml;',
+    '"~^/rss/?$" /rss.xml;',
+    r'"~^/sitema\.xml$" /sitemap.xml;',
+    'charset_types application/atom+xml;',
+    'default "strict-origin-when-cross-origin";',
+    'default_type application/atom+xml;',
+    'default_type application/rss+xml;',
+    'if ($wj_equivalente) {',
+    'if ($wj_pontuacao_residual) {',
+    'include /opt/wiki/ops/nginx/social-headers-privado.conf;',
+    'include /opt/wiki/ops/nginx/social-headers-publico.conf;',
+    'limit_req zone=wj_social_escrita burst=10 nodelay;',
+    'location = /api/v1/redesocial/lote {',
+    'location = /feed.xml {',
+    'location = /rss.xml {',
+    'location = /sitemaps/ {',
+    'location @fallback_social {',
+    'location ^~ /.well-known/agent-skills/ {',
+    'location ^~ /.well-known/skills/ {',
+    'location ^~ /api/v1/redesocial/ {',
+    'location ^~ /assets/ {',
+    'location ^~ /redesocial/ {',
+    'location ^~ /redesocial/assets/ {',
+    r'location ~ "^/assets/wj-[0-9a-f]{16}\.css$" {',
+    'map $cookie_wjsession $wj_social_referrer {',
+    'map $request_uri $wj_equivalente {',
+    'map $request_uri $wj_pontuacao_residual {',
+    "more_set_headers -s '200 304' 'Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable';",
+    'proxy_cache off;',
+    'proxy_cache wj_social;',
+    'proxy_cache_bypass $cookie_wjsession;',
+    'proxy_cache_key "$scheme://$proxy_host$request_uri";',
+    'proxy_cache_key "fbs:$scheme$host$request_uri:$wj_markdown";',
+    'proxy_cache_valid 200 10m;',
+    'proxy_cache_valid 200 365d;',
+    'proxy_no_cache $cookie_wjsession;',
+    'proxy_pass http://127.0.0.1:8091;',
+    'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+    'proxy_set_header X-Forwarded-Proto $scheme;',
+    'return 301 $wj_equivalente;',
+    'return 301 $wj_pontuacao_residual;',
+    'try_files $uri =404;',
+    'try_files $uri @fallback_social;',
+    'try_files /feed.xml @fallback;',
+    'try_files /rss.xml @fallback;',
+    'types { }',
+})
+
+
+def _carrega_gerador():
+    """Importa tools/generate-nginx-standalone como modulo (sem extensao .py,
+    SourceFileLoader), para REUSAR `linhas_decisivas()` -- o mesmo criterio que
+    ja existia dentro do gerador (GUARDA DE PERDA) -- em vez de manter dois
+    criterios de "o que decide resposta" divergentes neste repositorio. Seguro
+    de importar: todo o trabalho do gerador esta atras de
+    `if __name__ == "__main__"`.
+    """
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate-nginx-standalone")
+    loader = importlib.machinery.SourceFileLoader("generate_nginx_standalone_parity", caminho)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)
+    return modulo, caminho
+
+
+def linhas_perdidas_na_regeracao() -> tuple[set[str], str | None]:
+    """O que existe HOJE no dedicado e SUMIRIA se alguem rodasse o gerador
+    agora. Roda o gerador para um arquivo TEMPORARIO -- nunca `--saida` padrao,
+    que e o destino real -- e reaproveita `linhas_decisivas()` dos dois lados.
+    """
+    modulo, caminho_gerador = _carrega_gerador()
+    if not DEDICADO[0].is_file():
+        return set(), None
+    with tempfile.TemporaryDirectory(prefix="wj-nginx-parity-") as tmp:
+        saida = pathlib.Path(tmp) / "gerado.conf"
+        resultado = subprocess.run(
+            [sys.executable, caminho_gerador, "--saida", str(saida)],
+            capture_output=True,
+            text=True,
+        )
+        if resultado.returncode != 0 or not saida.is_file():
+            erro = resultado.stderr.strip() or resultado.stdout.strip()
+            return set(), f"gerador falhou (exit {resultado.returncode}): {erro[:300]}"
+        gerado_txt = saida.read_text(encoding="utf-8")
+    dedicado_txt = DEDICADO[0].read_text(encoding="utf-8")
+    perdidas = modulo.linhas_decisivas(dedicado_txt) - modulo.linhas_decisivas(gerado_txt)
+    return perdidas, None
+
+
+def arquivos_carregados(raizes: list[pathlib.Path]) -> list[pathlib.Path]:
+    """Segue os `include` a partir das raizes, so dentro do repositorio.
+
+    Lista fixa de arquivos e a origem dos dois falsos-verdes que este check ja
+    teve. Derivar do proprio arquivo faz o gate acompanhar quem acrescenta um
+    include sem lembrar de vir aqui.
+    """
+    vistos: list[pathlib.Path] = []
+    fila = list(raizes)
+    while fila:
+        atual = fila.pop(0)
+        try:
+            resolvido = atual.resolve()
+        except OSError:
+            continue
+        if resolvido in {p.resolve() for p in vistos} or not resolvido.is_file():
+            continue
+        vistos.append(resolvido)
+        for linha in resolvido.read_text(encoding="utf-8", errors="replace").splitlines():
+            limpa = linha.split("#", 1)[0].strip().rstrip(";").strip()
+            if not limpa.startswith("include "):
+                continue
+            alvo = limpa.split(None, 1)[1].strip()
+            if "*" in alvo:
+                # glob de include nao e usado aqui; se passar a ser, o gate
+                # precisa aprender a expandir em vez de ignorar em silencio.
+                continue
+            caminho = pathlib.Path(alvo)
+            if not caminho.is_absolute():
+                caminho = resolvido.parent / caminho
+            try:
+                caminho.resolve().relative_to(RAIZ)
+            except (ValueError, OSError):
+                continue  # fora do repositorio (mime.types do sistema)
+            fila.append(caminho)
+    return vistos
+
+# Diretivas cujo VALOR muda o que o cliente recebe. Presenca sem valor igual ja
+# e divergencia relatavel.
+DECIDEM_RESPOSTA = {
+    "add_header", "more_set_headers", "gzip_types", "gzip", "gzip_vary", "brotli",
+    "brotli_static", "brotli_types", "absolute_redirect", "try_files", "return",
+    "error_page", "limit_req", "limit_req_zone", "limit_req_status", "expires",
+    "proxy_hide_header", "proxy_pass", "index", "root", "internal", "map",
+    "log_format", "access_log", "open_file_cache", "open_file_cache_valid",
+    "charset", "server_tokens", "load_module", "include",
+}
+
+
+FORA_DE_LOCATION = "(fora de location)"
+
+# Palavras que de fato abrem bloco no nginx. Serve de guarda para nao ler
+# `${variavel}` nem `{16}` de regex como se fossem bloco de uma linha.
+ABREM_BLOCO = {
+    "http", "server", "location", "if", "map", "types", "events", "upstream",
+    "limit_except", "geo", "split_clients", "stream",
+}
+
+
+def diretivas_por_escopo(raizes):
+    """escopo -> nome -> conjunto de linhas normalizadas, mais a origem de cada.
+
+    CONJUNTO GLOBAL NAO E PARIDADE (2026-09-05). A comparacao era um set de
+    linhas do arquivo inteiro, sem nocao de bloco — e o incidente que originou
+    `test_paridade_bidirecional.sh` e precisamente esse: a mesma linha
+    `more_set_headers -s '200 304' 'Vary: Accept-Encoding'` aparece 5 vezes no
+    vivo e 6 no dedicado, entao tirar (ou por) uma delas NUM location nao muda
+    o conjunto, e o gate dizia `pass` com a resposta real ja divergente.
+    Comparar por location e o que torna a diferenca visivel.
+
+    O escopo e a cadeia de `location` aninhados. Diretiva de nivel http/server
+    cai em FORA_DE_LOCATION — inclusive a que vem de um arquivo `include`, que
+    e lido do inicio e nao herda a pilha de quem o incluiu. Nao e perda: o que
+    distingue esses casos e a ORIGEM, devolvida junto, e e por ela que os
+    cabecalhos exclusivos da superficie social sao reconhecidos.
+    """
+    escopos: dict[str, dict[str, set[str]]] = {}
+    origens: dict[tuple[str, str], set[str]] = {}
+
+    def anota(pilha: list[str], corpo: str, arquivo: str) -> None:
+        corpo = corpo.strip().rstrip(";").strip()
+        nome = corpo.split()[0] if corpo.split() else ""
+        if nome not in DECIDEM_RESPOSTA:
+            return
+        # normaliza espaco interno para o diff nao acusar formatacao
+        normal = re.sub(r"\s+", " ", corpo)
+        escopo = " > ".join(p for p in pilha if p.startswith("location")) or FORA_DE_LOCATION
+        escopos.setdefault(escopo, {}).setdefault(nome, set()).add(normal)
+        origens.setdefault((escopo, normal), set()).add(arquivo)
+
+    for caminho in arquivos_carregados(list(raizes)):
+        pilha: list[str] = []
+        for linha in caminho.read_text(encoding="utf-8", errors="replace").splitlines():
+            limpa = linha.split("#", 1)[0].strip()
+            if not limpa:
+                continue
+            # BLOCO DE UMA LINHA. `location = /metrics { return 404; }` e
+            # `if ($wj_negocia) { return 418; }` existem nos dois arquivos e nao
+            # terminam em `{` nem sao `}`: caiam como diretiva de nome
+            # `location`/`if`, fora de DECIDEM_RESPOSTA, e o `return` de dentro
+            # sumia dos dois lados. Cegueira simetrica nao falseia o veredito,
+            # mas esconde justamente o tipo de linha que decide resposta.
+            #
+            # A guarda por palavra-chave de bloco NAO e enfeite: `{` e `}`
+            # aparecem dentro de regex de location (`wj-[0-9a-f]{16}`,
+            # `[a-z0-9-]{1,20}`) e de `${variavel}` no corpo de um `map`, e um
+            # casamento ingenuo de "abre e fecha na mesma linha" leria
+            # `default ", <https://.../${wj_gemea}` como um bloco chamado
+            # `default ", <https://.../$`.
+            uma_linha = re.match(r"^(?P<rotulo>[^{}]+?)\s*\{(?P<corpo>[^{}]*)\}$", limpa)
+            if uma_linha and uma_linha.group("rotulo").split()[0] in ABREM_BLOCO:
+                rotulo = re.sub(r"\s+", " ", uma_linha.group("rotulo").strip())
+                for pedaco in uma_linha.group("corpo").split(";"):
+                    anota(pilha + [rotulo], pedaco, caminho.name)
+                continue
+            if limpa.endswith("{"):
+                pilha.append(re.sub(r"\s+", " ", limpa[:-1].strip()))
+                continue
+            if limpa == "}":
+                if pilha:
+                    pilha.pop()
+                continue
+            anota(pilha, limpa, caminho.name)
+    return escopos, origens
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mostrar-extras", action="store_true", help="lista tambem o que so existe no dedicado")
+    args = ap.parse_args()
+
+    faltando_arquivos = [str(p) for p in DEDICADO if not p.is_file()]
+    if faltando_arquivos:
+        print("check-nginx-standalone-parity: FAIL")
+        print(f"  - arquivos do nginx dedicado ausentes: {faltando_arquivos}")
+        return 1
+
+    vivo, _ = diretivas_por_escopo(VIVO)
+    dedicado, origem_dedicado = diretivas_por_escopo(DEDICADO)
+
+    # Location do vhost vivo que nao existe no dedicado: a mais grave das
+    # divergencias, porque nem chega a haver linha para comparar.
+    escopos_ausentes = sorted(set(vivo) - set(dedicado))
+    comuns = sorted(set(vivo) & set(dedicado))
+
+    divergencias = []
+    extras_de_cabecalho = []
+    autorizados_vistos = set()
+    for escopo in comuns:
+        for nome, linhas in sorted(vivo[escopo].items()):
+            for linha in sorted(linhas - dedicado[escopo].get(nome, set())):
+                divergencias.append((escopo, linha))
+        # O SENTIDO QUE FALTAVA. Cabecalho que sobra so no dedicado muda a
+        # resposta que o cliente recebe tanto quanto cabecalho que falta.
+        for nome, linhas in sorted(dedicado[escopo].items()):
+            if nome not in EMITEM_CABECALHO:
+                continue
+            for linha in sorted(linhas - vivo[escopo].get(nome, set())):
+                if origem_dedicado.get((escopo, linha), set()) & EXCLUSIVOS_DO_DEDICADO:
+                    continue
+                if linha in EXTRAS_DE_CABECALHO_AUTORIZADOS:
+                    autorizados_vistos.add(linha)
+                    continue
+                extras_de_cabecalho.append((escopo, linha))
+
+    # Autorizacao de fantasma tambem e defeito: a linha sumiu do arquivo e a
+    # declaracao ficou, pronta para absolver uma linha futura que ninguem mediu.
+    autorizados_ausentes = sorted(set(EXTRAS_DE_CABECALHO_AUTORIZADOS) - autorizados_vistos)
+
+    total_vivo = sum(len(v) for e in vivo.values() for v in e.values())
+    total_ded = sum(len(v) for e in dedicado.values() for v in e.values())
+    print(f"  diretivas que decidem resposta — vivo: {total_vivo} | dedicado: {total_ded}")
+    print(f"  escopos comparados: {len(comuns)} comuns, {len(set(dedicado) - set(vivo))} so no dedicado")
+
+    if args.mostrar_extras:
+        print("  presentes SO no dedicado (esperado para instancia propria):")
+        for escopo in sorted(dedicado):
+            for nome, linhas in sorted(dedicado[escopo].items()):
+                for linha in sorted(linhas - vivo.get(escopo, {}).get(nome, set())):
+                    print(f"      + [{escopo[:38]}] {linha[:104]}")
+
+    if escopos_ausentes:
+        print("check-nginx-standalone-parity: FAIL")
+        print(f"  - {len(escopos_ausentes)} location do vhost VIVO nao existe no nginx dedicado:")
+        for escopo in escopos_ausentes:
+            print(f"      - {escopo[:110]}")
+        return 1
+
+    if divergencias:
+        print("check-nginx-standalone-parity: FAIL")
+        print(f"  - {len(divergencias)} diretiva(s) do vhost VIVO ausentes no nginx dedicado:")
+        for escopo, linha in divergencias:
+            print(f"      - [{escopo[:38]}] {linha[:110]}")
+        print("  Migrar assim regride o site. Derive o dedicado do vhost vivo, nao do arquivo de 06/08.")
+        return 1
+
+    if extras_de_cabecalho:
+        print("check-nginx-standalone-parity: FAIL")
+        print(
+            f"  - {len(extras_de_cabecalho)} diretiva(s) de cabecalho SO no nginx dedicado:"
+        )
+        for escopo, linha in extras_de_cabecalho:
+            arquivos = ", ".join(sorted(origem_dedicado.get((escopo, linha), {"?"})))
+            print(f"      + [{escopo[:38]}] {linha[:104]}   [{arquivos}]")
+        print("  A resposta do dedicado difere da do vhost vivo. Leve a linha para o vivo,")
+        print("  ou declare o motivo em EXTRAS_DE_CABECALHO_AUTORIZADOS — nunca apague o gate.")
+        return 1
+
+    if autorizados_ausentes:
+        print("check-nginx-standalone-parity: FAIL")
+        print("  - declaracao sem lastro em EXTRAS_DE_CABECALHO_AUTORIZADOS:")
+        for linha in autorizados_ausentes:
+            print(f"      ? {linha[:110]}")
+        print("  A linha nao existe mais no dedicado. Remova a autorizacao.")
+        return 1
+
+    # SEGUNDO CRITERIO: o gerador esta atras do que esta implantado. Cobre a
+    # classe estrutural que vivo-vs-dedicado NAO alcanca — diretiva de contexto
+    # main/http, que nunca aparece no vivo por ele ser um fragmento de vhost
+    # (ver PERDA_CONHECIDA_NA_REGERACAO acima).
+    perdidas_na_regeracao, erro_regeracao = linhas_perdidas_na_regeracao()
+    if erro_regeracao:
+        print("check-nginx-standalone-parity: FAIL")
+        print(f"  - nao foi possivel regenerar para comparar: {erro_regeracao}")
+        return 1
+
+    novas_perdas = sorted(perdidas_na_regeracao - PERDA_CONHECIDA_NA_REGERACAO)
+    baseline_sem_lastro = sorted(PERDA_CONHECIDA_NA_REGERACAO - perdidas_na_regeracao)
+
+    if novas_perdas:
+        print("check-nginx-standalone-parity: FAIL")
+        print(f"  - {len(novas_perdas)} linha(s) que decidem resposta existem HOJE no dedicado")
+        print("    e SUMIRIAM se o gerador rodasse agora (gerador atras do implantado):")
+        for linha in novas_perdas:
+            print(f"      - {linha[:118]}")
+        print("  Porte a diretiva para o template do gerador (main/http) ou para o vhost vivo")
+        print("  (contexto server), ou declare em PERDA_CONHECIDA_NA_REGERACAO com o motivo —")
+        print("  nunca rode --forcar contra o destino real so para calar isto.")
+        return 1
+
+    if baseline_sem_lastro:
+        print("check-nginx-standalone-parity: FAIL")
+        print("  - declaracao sem lastro em PERDA_CONHECIDA_NA_REGERACAO:")
+        for linha in baseline_sem_lastro:
+            print(f"      ? {linha[:118]}")
+        print("  A linha nao se perderia mais na regeracao. Remova a autorizacao.")
+        return 1
+
+    print("check-nginx-standalone-parity: pass")
+    print("  toda diretiva de resposta do vhost vivo existe no nginx dedicado, no MESMO location")
+    print("  e nenhum cabecalho sobra no dedicado sem declaracao")
+    print(f"  regeracao: 0 linha(s) nova(s) perdida(s) ({len(PERDA_CONHECIDA_NA_REGERACAO)} na baseline conhecida)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

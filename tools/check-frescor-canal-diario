@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""check-frescor-canal-diario — o canal de conteúdo diário está realmente
+avançando, ou só publica estoque parado?
+
+POR QUE ESTE CHECK EXISTE (2026-08-27). O chefe mediu 48 páginas de canal no
+ar sem NADA novo: 21 `/diarios/` paradas em 25/08 e 27 `/noticias/` em 26/08,
+enquanto a onda diária relatava "ok" a cada execução. Nenhum gate existente
+comparava a data que a coleta trouxe com a data que o público recebe.
+
+A ARMADILHA QUE ESTE CHECK TEM DE EVITAR, e por que ele não é um comparador
+de datas ingênuo: `/jurisprudencia/` e `/sumulas/` também estão com
+`publication_date` estagnado — e ali isso é CORRETO, porque as fontes
+(STJ temas.csv, Informativo do STF) responderam **304 — fonte inalterada
+desde a última coleta**. Pior ainda: as páginas desses dois canais nem
+POPULAM o campo `publication_date` (é sempre vazio — elas datam pelo
+julgamento, não pela coleta), então comparar datas de página ali é
+comparar contra um campo que nunca existiu, garantido de acusar falso
+positivo. Por isso este check usa DOIS MODOS, por canal:
+
+  - `cadencia` (diarios, noticias): a fonte é reabastecida todo dia; a
+    página tem `publication_date` de verdade. Compara a data mais recente
+    JÁ COLETADA com a mais recente JÁ PUBLICADA, com folga de
+    `TOLERANCIA_DIAS_CADENCIA` — o tempo normal de a onda converter coleta
+    em página publicada.
+  - `sazonal` (jurisprudencia, sumulas): a fonte muda por edição/tema, não
+    por dia; frescor aqui é SAÚDE DA COLETA, não data de página. Fonte que
+    respondeu 304 (`ok=true`) está saudável mesmo parada há semanas — só
+    `ok=false` no ledger (`data/ops/daily_content_collect.jsonl`) é defeito.
+
+O ledger de coleta é a fonte de verdade para distinguir os dois casos: ele
+já registra, por fonte e por execução, se a resposta foi "inalterada (304)",
+"gravado: N registros" ou uma falha real (exit_code != 0). Este check NUNCA
+confunde os dois — é exatamente o defeito que ele foi escrito para não ter.
+
+O que ele NÃO faz: não decide SE uma página deveria existir (isso é dos
+geradores e do censo de severidade), não olha conteúdo, só a cadência.
+
+Uso:
+    tools/check-frescor-canal-diario
+    tools/check-frescor-canal-diario --raiz /caminho/de/teste
+    tools/check-frescor-canal-diario --json
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+RAIZ_PADRAO = Path(__file__).resolve().parent.parent
+
+LEDGER_REL = "data/ops/daily_content_collect.jsonl"
+MANIFEST_REL = "data/editorial/published_manifest.jsonl"
+V2_PAGES_REL = "data/editorial/v2_pages"
+
+# Tolerância do modo `cadencia`: 1 dia é o atraso NORMAL entre a coleta e a
+# publicação (a onda roda uma vez por madrugada e converte no mesmo ciclo);
+# gap maior que isso, com a coleta OK, é sinal de que o gerador ou a
+# publicação pararam de converter — não a coleta.
+TOLERANCIA_DIAS_CADENCIA = 1
+
+CANAIS = {
+    "diarios": {
+        "modo": "cadencia",
+        "fontes": ["diarios-municipais"],
+        "entrada_dirs": ["data/research/daily/diarios-municipais"],
+        "manifest_prefix": "/diarios/",
+    },
+    "noticias": {
+        "modo": "cadencia",
+        "fontes": ["noticias-oficiais"],
+        "entrada_dirs": ["data/research/daily/noticias-oficiais"],
+        "manifest_prefix": "/noticias/",
+    },
+    "jurisprudencia": {
+        "modo": "sazonal",
+        "fontes": ["stj-precedentes", "stf-informativo"],
+        "manifest_prefix": "/jurisprudencia/",
+    },
+    "sumulas": {
+        "modo": "sazonal",
+        "fontes": ["stj-precedentes"],
+        "manifest_prefix": "/sumulas/",
+    },
+}
+
+
+def ler_jsonl(caminho: Path):
+    if not caminho.exists():
+        return
+    with caminho.open(encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                yield json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+
+
+def dia_de(medido_em: str) -> str:
+    # `medido_em` é ISO-8601 com offset (`...+00:00`); os 10 primeiros
+    # caracteres bastam porque o produtor sempre grava em UTC.
+    return medido_em[:10]
+
+
+def status_por_fonte_por_dia(ledger_path: Path):
+    """Agrupa o ledger por (fonte, dia), guardando a ÚLTIMA execução do dia.
+
+    Uma fonte pode rodar várias vezes no mesmo dia (reexecução manual, retry
+    de onda) — o que importa para frescor é o veredito mais recente daquele
+    dia, não o primeiro.
+    """
+    por_fonte = defaultdict(dict)
+    for registro in ler_jsonl(ledger_path):
+        fonte = registro.get("fonte")
+        medido_em = registro.get("medido_em")
+        if not fonte or not medido_em:
+            continue
+        dia = dia_de(medido_em)
+        atual = por_fonte[fonte].get(dia)
+        if atual is None or medido_em >= atual["medido_em"]:
+            por_fonte[fonte][dia] = {
+                "medido_em": medido_em,
+                "ok": bool(registro.get("ok")),
+                "saida": registro.get("saida", ""),
+            }
+    return por_fonte
+
+
+def ultimo_dia_da_fonte(por_dia: dict):
+    if not por_dia:
+        return None, None
+    dia = max(por_dia.keys())
+    return dia, por_dia[dia]
+
+
+def dias_com_arquivo_de_coleta(raiz: Path, diretorios: list[str]) -> list[str]:
+    """Dias em que a coleta GRAVOU arquivo — pelo NOME do arquivo, não pelo conteúdo.
+
+    O nome importa e a distinção não é preciosismo: o coletor nomeia o arquivo
+    do dia com `time.Now().UTC()` (o dia em que ELE RODOU), não com a maior
+    data das edições que trouxe. Chamar isto de "máx. coletado" — como este
+    check chamava — descreve outra coisa: sugere a data mais recente do dado,
+    quando é a data da execução. Um arquivo de 2026-09-04 pode conter só
+    edições de 2026-08-28.
+
+    Para o que este check faz — saber se existe dado do dia em disco — a data
+    de execução é a medida certa. O nome é que precisava dizer a verdade.
+    """
+    datas = []
+    for relativo in diretorios:
+        for caminho in glob.glob(str(raiz / relativo / "*.jsonl")):
+            nome = Path(caminho).stem
+            if len(nome) == 10 and nome[4] == "-" and nome[7] == "-":
+                datas.append(nome)
+    return sorted(datas)
+
+
+def manifest_intents_publicados(raiz: Path, prefixo: str) -> set[str]:
+    ids = set()
+    for registro in ler_jsonl(raiz / MANIFEST_REL):
+        if registro.get("page_status") != "published":
+            continue
+        caminho = registro.get("path", "")
+        if caminho.startswith(prefixo):
+            intent_id = registro.get("unique_intent_id")
+            if intent_id:
+                ids.add(intent_id)
+    return ids
+
+
+def datas_publicadas_do_canal(raiz: Path, canal: str, intents_publicados: set[str]):
+    """Devolve (datas_nao_vazias, total_paginas_publicadas) do canal.
+
+    Casar por `practice_area == canal` (dado do próprio registro), não por
+    nome de arquivo — o nome do shard é convenção do gerador e pode mudar; o
+    campo é o contrato real.
+    """
+    datas = []
+    total = 0
+    for caminho in glob.glob(str(raiz / V2_PAGES_REL / "*.jsonl")):
+        for registro in ler_jsonl(Path(caminho)):
+            if registro.get("practice_area") != canal:
+                continue
+            intent_id = registro.get("intent_id")
+            if intent_id not in intents_publicados:
+                continue
+            total += 1
+            data = (registro.get("publication_date") or "").strip()
+            if data:
+                datas.append(data)
+    return sorted(datas), total
+
+
+def avalia_canal(raiz: Path, nome: str, config: dict, ledger_por_fonte: dict, hoje: str):
+    fontes = config["fontes"]
+    modo = config["modo"]
+
+    # SAÚDE DA COLETA — comum aos dois modos. O último dia CONHECIDO de cada
+    # fonte (não necessariamente hoje: se a onda ainda não rodou hoje, o
+    # último dia disponível é ontem, e isso não é falha nenhuma).
+    piores = []
+    for fonte in fontes:
+        dia, registro = ultimo_dia_da_fonte(ledger_por_fonte.get(fonte, {}))
+        if registro is None:
+            piores.append((fonte, None, False, "sem registro no ledger de coleta"))
+            continue
+        piores.append((fonte, dia, registro["ok"], registro["saida"]))
+
+    fontes_falhando = [p for p in piores if p[2] is False]
+
+    if modo == "sazonal":
+        if fontes_falhando:
+            motivos = "; ".join(f"{f}: {s}" for f, _, _, s in fontes_falhando)
+            return {
+                "canal": nome, "modo": modo, "veredito": "REPROVA",
+                "motivo": f"coleta falhou (ledger ok=false): {motivos}",
+            }
+        motivos = "; ".join(f"{f} ({d}): {s[:120]}" for f, d, _, s in piores)
+        return {
+            "canal": nome, "modo": modo, "veredito": "OK",
+            "motivo": f"fonte(s) saudável(is) — parado é correto quando a fonte "
+                      f"confirma 304/inalterada: {motivos}",
+        }
+
+    # modo == "cadencia"
+    if fontes_falhando:
+        motivos = "; ".join(f"{f}: {s}" for f, _, _, s in fontes_falhando)
+        # DUAS COISAS DIFERENTES, E CONFUNDI-LAS PRODUZ ALARME FALSO.
+        #
+        # "a coleta automática falhou" é defeito de processo e continua
+        # reprovando — sempre. Mas "o canal está estagnado" é uma afirmação
+        # sobre o DADO, e ela pode ser falsa mesmo com o ledger em ok=false:
+        # basta alguém ter recoletado por fora depois da falha.
+        #
+        # Medido em 2026-08-27: a coleta das 07:34 morreu num 4xx transitório e
+        # foi refeita à mão às 08:45, deixando 254 registros em disco. O gate
+        # dizia "canal estagnado" com o dado do dia ali, íntegro. Reprovar está
+        # certo; descrever errado, não — quem lê o alerta decide com a descrição.
+        #
+        # ★ E O TEXTO PASSOU A MENTIR EM 2026-09-04, quando o coletor de diários
+        # ganhou um estado que não existia: GRAVAR O ARQUIVO DO DIA E AINDA
+        # ASSIM FALHAR. Ele faz isso quando a janela volta cheia mas nenhuma
+        # edição é inédita (fonte parada) ou quando pagou texto novo sem índice
+        # novo — ver `cmd/collect-diarios-municipais/main.go`. Nesse caso não
+        # houve recoleta nenhuma, e chamar isso de "recoletado por outro
+        # caminho" manda quem lê o alerta procurar um operador que não existe.
+        # Pior: dizer "defeito é de processo, não de frescor" inverte o
+        # diagnóstico — o canal está estagnado, e a fonte é a causa.
+        #
+        # O ledger separa os dois casos: quando é o próprio coletor, a saída
+        # preservada (`tail -3` da execução que falhou) traz o `gravado:` que
+        # ele imprimiu antes de sair com exit 1.
+        arquivos = dias_com_arquivo_de_coleta(raiz, config["entrada_dirs"])
+        ha_dado_do_dia = bool(arquivos) and arquivos[-1] >= hoje
+        if ha_dado_do_dia:
+            gravou_e_falhou = any("gravado:" in (saida or "") for _, _, _, saida in fontes_falhando)
+            if gravou_e_falhou:
+                origem = ("a PRÓPRIA coleta gravou o arquivo do dia e ainda assim falhou — é o que o "
+                          "coletor faz quando a janela volta cheia sem nenhuma edição inédita (fonte "
+                          "parada) ou quando pagou texto novo sem índice novo. O canal NÃO avançou, e "
+                          "o arquivo em disco não desmente isso")
+            else:
+                origem = ("o arquivo do dia existe em disco e a saída registrada não diz que foi esta "
+                          "execução que o gravou — pode ser execução anterior de hoje que deu certo, ou "
+                          "recoleta manual. O ledger não distingue as duas; a falha registrada continua "
+                          "sendo defeito de processo")
+            return {
+                "canal": nome, "modo": modo, "veredito": "REPROVA",
+                "motivo": f"coleta falhou hoje (ledger ok=false) e há arquivo do dia em disco: {origem}: {motivos}",
+            }
+        return {
+            "canal": nome, "modo": modo, "veredito": "REPROVA",
+            "motivo": f"coleta falhou hoje (ledger ok=false) e não há dado do dia: {motivos}",
+        }
+
+    dias_coletados = dias_com_arquivo_de_coleta(raiz, config["entrada_dirs"])
+    ultimo_dia_coletado = dias_coletados[-1] if dias_coletados else None
+
+    intents_publicados = manifest_intents_publicados(raiz, config["manifest_prefix"])
+    datas_publicadas, total_publicadas = datas_publicadas_do_canal(raiz, nome, intents_publicados)
+
+    if total_publicadas == 0:
+        return {
+            "canal": nome, "modo": modo, "veredito": "OK",
+            "motivo": "nenhuma página publicada ainda neste canal — nada a comparar",
+        }
+
+    if not datas_publicadas:
+        # CONTRATO QUEBRADO: canal declarado `cadencia` (frescor medido por
+        # data de página) sem NENHUMA página com `publication_date` — a
+        # mesma condição que faria jurisprudencia/sumulas dar falso positivo
+        # se alguém copiasse a lógica sem o modo `sazonal`. Aqui ela é
+        # REAL: um canal de cadência tem que preencher a data.
+        return {
+            "canal": nome, "modo": modo, "veredito": "REPROVA",
+            "motivo": f"contrato quebrado: {total_publicadas} página(s) publicada(s) "
+                      f"em canal de CADÊNCIA sem nenhum `publication_date` preenchido",
+        }
+
+    max_publicado = datas_publicadas[-1]
+    gap_dias = (data_iso(hoje) - data_iso(max_publicado)).days
+
+    if gap_dias > TOLERANCIA_DIAS_CADENCIA:
+        return {
+            "canal": nome, "modo": modo, "veredito": "REPROVA",
+            "motivo": (
+                f"coleta OK mas publicação não avançou: máx. publicado {max_publicado}, "
+                f"último arquivo de coleta {ultimo_dia_coletado or 'nenhum arquivo'}, hoje {hoje} "
+                f"(gap {gap_dias}d > tolerância {TOLERANCIA_DIAS_CADENCIA}d)"
+            ),
+        }
+    return {
+        "canal": nome, "modo": modo, "veredito": "OK",
+        "motivo": f"máx. publicado {max_publicado}, último arquivo de coleta {ultimo_dia_coletado}, "
+                  f"hoje {hoje} (gap {gap_dias}d ≤ tolerância {TOLERANCIA_DIAS_CADENCIA}d)",
+    }
+
+
+def data_iso(texto: str) -> datetime:
+    return datetime.strptime(texto, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--raiz", default=str(RAIZ_PADRAO), help="raiz do repositório (teste usa outra)")
+    parser.add_argument("--json", action="store_true", help="saída em JSON")
+    parser.add_argument("--hoje", default=None, help="AAAA-MM-DD; teste usa outra (default: hoje em UTC)")
+    args = parser.parse_args()
+
+    raiz = Path(args.raiz)
+    hoje = args.hoje or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    ledger_por_fonte = status_por_fonte_por_dia(raiz / LEDGER_REL)
+
+    resultados = []
+    for nome, config in CANAIS.items():
+        resultados.append(avalia_canal(raiz, nome, config, ledger_por_fonte, hoje))
+
+    if args.json:
+        print(json.dumps(resultados, ensure_ascii=False, indent=2))
+    else:
+        for resultado in resultados:
+            print(f"[{resultado['veredito']:7s}] {resultado['canal']:15s} "
+                  f"({resultado['modo']:9s}) — {resultado['motivo']}")
+
+    reprovados = [r for r in resultados if r["veredito"] == "REPROVA"]
+    if reprovados:
+        if not args.json:
+            print(f"\nfrescor-canal-diario: {len(reprovados)} canal(is) estagnado(s) "
+                  f"além da tolerância.")
+        return 1
+    if not args.json:
+        print("\nfrescor-canal-diario: todos os canais saudáveis.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

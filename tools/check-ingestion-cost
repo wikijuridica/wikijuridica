@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""tools/check-ingestion-cost — READ-ONLY. Custo de INGESTAO da superficie de agente.
+
+O QUE ELE MEDE, e por que este numero e o que importa
+=====================================================
+
+Um agente de IA que queira levar este acervo para dentro do proprio contexto faz
+uma de tres coisas. O custo de cada uma foi medido em 2026-08-27, com sonda
+propria ("wikijuridica-ingestion-probe/1.0" + "X-Warming-Request: true"; e
+PROIBIDO usar User-Agent de bot real, isso e fraude neste repositorio):
+
+  (a) UMA pagina inteira, com proveniencia: 1 requisicao, 5.751 bytes crus
+      (2.428 na borda, gzip). A gemea ".md" ja resolve. Barato.
+  (b) TODAS as paginas de UMA area ("/saude/", 311 paginas): 312 requisicoes e
+      2.945.629 bytes crus. Um indice + uma requisicao POR PAGINA. E o N+1, e e
+      ele que domina o custo de ingestao.
+  (c) O que mudou e so isso: o digest (/api/v1/novidades) e o feed
+      (/changes.json) dizem QUAIS rotas mudaram, mas nenhum dos dois carrega
+      corpo — depois de saber, o agente cai no mesmo N+1 de (b).
+
+A correcao de (b) e (c) e o canal de lote (/api/v1/lote, NDJSON, corpo de varias
+paginas por requisicao). Este gate existe para que esse ganho NAO REGRIDA em
+silencio: rota removida, teto encolhido a ponto de anular o ganho, anuncio
+perdido nos descritores ou corpo que some do stream reprovam aqui.
+
+O QUE ELE NAO MEDE, de proposito
+================================
+
+  - Bytes na borda. A compressao ja e negociada pelo nginx do wiki (medido:
+    brotli em text/markdown e application/json na porta 8088) e depende da
+    borda, nao do codigo deste repositorio. O gate mede a ORIGEM (8089), onde o
+    numero e estavel e atribuivel a uma mudanca de codigo.
+  - Qualidade do texto. Ha gate proprio para isso.
+  - A semantica do filtro `desde`. Medido em 2026-08-27: TODAS as 10.102 rotas
+    respondem ao filtro "desde=ontem", porque o registro de revisao por conteudo
+    carimbou o acervo inteiro em 26/08. Isso e defeito de DADO, de outra frente,
+    e amarrar este gate a ele produziria vermelho por causa alheia — por isso o
+    cenario (c) so exige que o canal entregue CORPO numa requisicao, nunca que o
+    filtro discrimine.
+
+EXECUCAO
+
+  ./tools/check-ingestion-cost                  # mede a origem viva, exit 0/1
+  ./tools/check-ingestion-cost --json           # a mesma medicao em JSON
+  ./tools/check-ingestion-cost --autoteste      # falso positivo + falso negativo, sem rede
+  ./tools/check-ingestion-cost --origem http://127.0.0.1:8089
+
+Exit 0 = sem regressao. Exit 1 = regressao (ou origem inalcancavel: um gate de
+custo que nao consegue medir nao pode devolver verde).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ORIGEM_PADRAO = "http://127.0.0.1:8089"
+
+# Sonda propria. Nunca um User-Agent de bot real — o contrato deste repositorio
+# trata isso como fraude, e o header abaixo mantem a requisicao fora de qualquer
+# contagem de trafego.
+UA = "wikijuridica-ingestion-probe/1.0"
+CABECALHOS = {"User-Agent": UA, "X-Warming-Request": "true"}
+
+ROTA_LOTE = "/api/v1/lote"
+ROTA_NOVIDADES = "/api/v1/novidades"
+ROTA_CATALOGO = "/.well-known/ai-catalog.json"
+ROTA_OPENAPI = "/openapi.json"
+NDJSON = "application/x-ndjson"
+
+# ---------------------------------------------------------------------------
+# LIMIARES. Cada um tem ao lado o valor MEDIDO em 2026-08-27 que o justifica, e
+# a folga e deliberada: o gate reprova regressao de ordem de grandeza, nao
+# flutuacao. Limiar colado no numero medido vira alarme falso na primeira
+# pagina nova.
+# ---------------------------------------------------------------------------
+
+# (a) uma pagina com proveniencia. Medido: 1 requisicao, 5.751 bytes.
+A_MAX_REQUISICOES = 1
+A_MAX_BYTES = 65_536
+
+# (b) uma area inteira. Medido: 312 requisicoes pela gemea, 2 pelo lote (fator
+# 156). O piso de 20 reprova quando o lote deixa de ser um ganho de ordem de
+# grandeza — por exemplo se o teto de itens cair de 200 para 10.
+B_GANHO_MINIMO = 20.0
+# Teto de seguranca do percurso: se o lote precisar de mais requisicoes que isto
+# para cobrir UMA area, ele parou de ser lote. Tambem impede que este gate faca
+# centenas de chamadas quando algo regride.
+B_MAX_REQUISICOES_LOTE = 30
+# Piso de paginas por requisicao de lote. Medido: 200 (o teto do endpoint).
+B_MIN_PAGINAS_POR_REQUISICAO = 25.0
+
+# (c) o que mudou, com corpo. Uma requisicao tem de trazer corpo de varias
+# paginas. Medido: 50 paginas por requisicao no limite padrao.
+C_MIN_PAGINAS_COM_CORPO = 10
+
+# Area usada como amostra quando nenhuma e informada: a maior area sai da
+# medicao, nao de literal — ver escolher_area().
+AREA_MINIMA_PARA_MEDIR = 30
+
+
+def buscar(origem: str, caminho: str, timeout: float = 30.0):
+    """GET cru. Devolve (status, bytes, headers). Erro de rede vira status 0."""
+    requisicao = urllib.request.Request(origem + caminho, headers=CABECALHOS)
+    try:
+        with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
+            return resposta.status, resposta.read(), dict(resposta.headers)
+    except urllib.error.HTTPError as erro:
+        return erro.code, erro.read(), dict(erro.headers)
+    except (urllib.error.URLError, OSError) as erro:
+        return 0, str(erro).encode("utf-8"), {}
+
+
+def escolher_area(origem: str) -> tuple[str, int]:
+    """Descobre a maior area do acervo pela enumeracao real, nunca por literal.
+
+    Area escrita a mao no gate envelhece no dia em que o acervo muda de forma —
+    a mesma classe de defeito que este repositorio cataloga como 'descritor que
+    promete rota morta'.
+    """
+    status, corpo, _ = buscar(origem, "/api/v1/sitemap")
+    if status != 200:
+        return "", 0
+    try:
+        urls = json.loads(corpo)
+    except ValueError:
+        return "", 0
+    contagem: dict[str, int] = {}
+    for url in urls:
+        partes = url.split("//", 1)[-1].split("/")
+        if len(partes) < 3 or not partes[1] or not partes[2]:
+            continue  # home, hub de area e paginacao nao sao itens
+        contagem[partes[1]] = contagem.get(partes[1], 0) + 1
+    if not contagem:
+        return "", 0
+    area = max(contagem.items(), key=lambda par: (par[1], par[0]))
+    return area[0], area[1]
+
+
+def medir(origem: str) -> dict:
+    """Executa os tres cenarios contra a origem viva e devolve a medicao crua."""
+    inicio = time.time()
+    medicao: dict = {"origem": origem, "erros_de_sonda": []}
+
+    # --- cenario (a): UMA pagina com proveniencia ---------------------------
+    status, corpo, _ = buscar(origem, ROTA_NOVIDADES + "?limite=1")
+    caminho_amostra = ""
+    if status == 200:
+        try:
+            digest = json.loads(corpo)
+            itens = digest.get("itens") or []
+            if itens:
+                alternate = itens[0].get("alternate") or {}
+                href = alternate.get("href") or ""
+                caminho_amostra = "/" + href.split("//", 1)[-1].split("/", 1)[-1] if href else ""
+        except ValueError:
+            pass
+    else:
+        medicao["erros_de_sonda"].append(f"GET {ROTA_NOVIDADES} respondeu {status}")
+
+    cenario_a = {"requisicoes": 0, "bytes": 0, "tem_proveniencia": False, "caminho": caminho_amostra}
+    if caminho_amostra:
+        status, pagina, cabecalhos = buscar(origem, caminho_amostra)
+        cenario_a["requisicoes"] = 1
+        cenario_a["bytes"] = len(pagina)
+        cenario_a["status"] = status
+        cenario_a["content_type"] = cabecalhos.get("Content-Type", "")
+        texto = pagina.decode("utf-8", "replace")
+        # Proveniencia = front matter com fonte oficial e endereco canonico.
+        cenario_a["tem_proveniencia"] = ("sources:" in texto and "url:" in texto and texto.startswith("---"))
+    else:
+        medicao["erros_de_sonda"].append("nao foi possivel descobrir uma pagina de amostra")
+    medicao["cenario_a_uma_pagina"] = cenario_a
+
+    # --- cenario (b): UMA area inteira --------------------------------------
+    area, paginas_da_area = escolher_area(origem)
+    cenario_b: dict = {"area": area, "paginas": paginas_da_area}
+    if not area or paginas_da_area < AREA_MINIMA_PARA_MEDIR:
+        medicao["erros_de_sonda"].append("nenhuma area com paginas suficientes para medir o N+1")
+    else:
+        # Caminho HOJE: 1 requisicao no indice da area + 1 por pagina. As duas
+        # pontas sao contadas, nao estimadas: o indice e buscado de verdade e os
+        # links dele sao contados um a um.
+        status, indice, _ = buscar(origem, f"/{area}/index.md")
+        links = 0
+        if status == 200:
+            texto = indice.decode("utf-8", "replace")
+            links = len(set(re.findall(r"https?://[^/\s]+/" + re.escape(area) + r"/[a-z0-9\-]+/", texto)))
+        cenario_b["requisicoes_por_pagina"] = 1 + links
+        cenario_b["bytes_indice"] = len(indice)
+        cenario_b["links_no_indice"] = links
+
+        # Caminho pelo LOTE: percorre o cursor ate acabar, contando de verdade.
+        requisicoes = 0
+        bytes_lote = 0
+        paginas_lote = 0
+        caminho = f"{ROTA_LOTE}?area={area}&limite=200"
+        truncou = ""
+        while caminho and requisicoes < B_MAX_REQUISICOES_LOTE:
+            status, stream, cabecalhos = buscar(origem, caminho)
+            requisicoes += 1
+            if status != 200:
+                cenario_b["status_lote"] = status
+                medicao["erros_de_sonda"].append(f"GET {caminho} respondeu {status}")
+                break
+            cenario_b["status_lote"] = 200
+            cenario_b["content_type_lote"] = cabecalhos.get("Content-Type", "")
+            bytes_lote += len(stream)
+            linhas = stream.decode("utf-8", "replace").rstrip("\n").split("\n")
+            try:
+                fim = json.loads(linhas[-1])
+            except (ValueError, IndexError):
+                medicao["erros_de_sonda"].append("o lote nao terminou com a linha de controle")
+                break
+            if fim.get("tipo") != "fim":
+                medicao["erros_de_sonda"].append("a ultima linha do lote nao e o selo de integridade")
+                break
+            com_corpo = 0
+            for linha in linhas[:-1]:
+                try:
+                    registro = json.loads(linha)
+                except ValueError:
+                    continue
+                if registro.get("markdown"):
+                    com_corpo += 1
+            paginas_lote += com_corpo
+            truncou = fim.get("truncado_por", "") or truncou
+            proximo = fim.get("proximo") or ""
+            caminho = proximo if fim.get("restantes", 0) > 0 and proximo else ""
+        cenario_b["requisicoes_lote"] = requisicoes
+        cenario_b["bytes_lote"] = bytes_lote
+        cenario_b["paginas_no_lote"] = paginas_lote
+        cenario_b["truncado_por"] = truncou
+        # GANHO SO EXISTE SE O LOTE ENTREGOU. Dividir 943 por 1 quando essa
+        # unica requisicao devolveu 404 produziria "ganho 943x" no relatorio de
+        # um canal que nao respondeu — numero bonito sobre mundo errado, que e
+        # a classe de erro que este repositorio persegue.
+        if requisicoes and paginas_lote > 0:
+            cenario_b["ganho_em_requisicoes"] = round(cenario_b["requisicoes_por_pagina"] / requisicoes, 1)
+            cenario_b["paginas_por_requisicao"] = round(paginas_lote / requisicoes, 1)
+        else:
+            cenario_b["ganho_em_requisicoes"] = 0.0
+            cenario_b["paginas_por_requisicao"] = 0.0
+    medicao["cenario_b_area_inteira"] = cenario_b
+
+    # --- cenario (c): o que mudou, JA com corpo ------------------------------
+    ontem = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86_400))
+    status, stream, cabecalhos = buscar(origem, f"{ROTA_LOTE}?desde={ontem}")
+    cenario_c = {"desde": ontem, "status": status, "requisicoes": 1,
+                 "content_type": cabecalhos.get("Content-Type", ""), "bytes": len(stream),
+                 "paginas_com_corpo": 0}
+    if status == 200:
+        com_corpo = 0
+        for linha in stream.decode("utf-8", "replace").rstrip("\n").split("\n"):
+            try:
+                registro = json.loads(linha)
+            except ValueError:
+                continue
+            if registro.get("tipo") == "pagina" and registro.get("markdown"):
+                com_corpo += 1
+        cenario_c["paginas_com_corpo"] = com_corpo
+    medicao["cenario_c_incremental"] = cenario_c
+
+    # --- anuncio: rota que ninguem anuncia e rota que ninguem usa ------------
+    anuncio = {}
+    for rotulo, rota in (("ai_catalog", ROTA_CATALOGO), ("openapi", ROTA_OPENAPI)):
+        status, corpo, _ = buscar(origem, rota)
+        anuncio[rotulo] = status == 200 and (ROTA_LOTE in corpo.decode("utf-8", "replace")
+                                             or "/lote" in corpo.decode("utf-8", "replace"))
+    medicao["anuncio"] = anuncio
+
+    medicao["segundos"] = round(time.time() - inicio, 2)
+    return medicao
+
+
+def avaliar(medicao: dict) -> list[str]:
+    """Aplica os limiares a uma medicao. Funcao PURA — e por isso ela e testavel
+    sem rede, que e o que torna o autoteste de falso positivo possivel."""
+    falhas: list[str] = []
+
+    a = medicao.get("cenario_a_uma_pagina", {})
+    if a.get("requisicoes", 0) != A_MAX_REQUISICOES:
+        falhas.append(
+            f"(a) uma pagina com proveniencia custou {a.get('requisicoes')} requisicao(oes); "
+            f"o contrato e {A_MAX_REQUISICOES} (a gemea .md)")
+    elif a.get("bytes", 0) > A_MAX_BYTES:
+        falhas.append(f"(a) a pagina de amostra pesa {a.get('bytes')} bytes, acima do teto de {A_MAX_BYTES}")
+    elif not a.get("tem_proveniencia"):
+        falhas.append("(a) a gemea .md veio sem front matter com fonte oficial: ingestao sem proveniencia")
+
+    b = medicao.get("cenario_b_area_inteira", {})
+    if "requisicoes_lote" not in b:
+        falhas.append("(b) o canal de lote nao pode ser medido: sem ele, uma area inteira volta a custar 1 requisicao por pagina")
+    else:
+        if b.get("status_lote") != 200:
+            falhas.append(f"(b) {ROTA_LOTE} respondeu {b.get('status_lote')}")
+        if NDJSON not in (b.get("content_type_lote") or ""):
+            falhas.append(f"(b) o lote respondeu Content-Type={b.get('content_type_lote')!r}, esperado {NDJSON}")
+        if b.get("requisicoes_lote", 0) >= B_MAX_REQUISICOES_LOTE:
+            falhas.append(
+                f"(b) o lote gastou {b.get('requisicoes_lote')} requisicoes para cobrir a area "
+                f"'{b.get('area')}' — no teto de seguranca de {B_MAX_REQUISICOES_LOTE}, deixou de ser lote")
+        ganho = b.get("ganho_em_requisicoes", 0.0)
+        if ganho < B_GANHO_MINIMO:
+            falhas.append(
+                f"(b) ganho de {ganho}x sobre o caminho pagina-a-pagina "
+                f"({b.get('requisicoes_por_pagina')} -> {b.get('requisicoes_lote')} requisicoes), "
+                f"abaixo do piso de {B_GANHO_MINIMO}x")
+        por_requisicao = b.get("paginas_por_requisicao", 0.0)
+        if por_requisicao < B_MIN_PAGINAS_POR_REQUISICAO:
+            falhas.append(
+                f"(b) o lote entregou {por_requisicao} pagina(s) com corpo por requisicao, "
+                f"abaixo do piso de {B_MIN_PAGINAS_POR_REQUISICAO}")
+
+    c = medicao.get("cenario_c_incremental", {})
+    if c.get("status") != 200:
+        falhas.append(f"(c) {ROTA_LOTE}?desde=… respondeu {c.get('status')}: nao ha canal incremental COM corpo")
+    elif c.get("paginas_com_corpo", 0) < C_MIN_PAGINAS_COM_CORPO:
+        falhas.append(
+            f"(c) o canal incremental trouxe {c.get('paginas_com_corpo')} pagina(s) com corpo numa requisicao, "
+            f"abaixo do piso de {C_MIN_PAGINAS_COM_CORPO} — o agente volta ao N+1 depois do digest")
+
+    anuncio = medicao.get("anuncio", {})
+    for rotulo in ("ai_catalog", "openapi"):
+        if not anuncio.get(rotulo):
+            falhas.append(f"o canal de lote nao esta anunciado em {rotulo}: rota que ninguem anuncia e rota que ninguem usa")
+
+    return falhas
+
+
+# ---------------------------------------------------------------------------
+# AUTOTESTE — falso positivo E falso negativo, sem rede.
+#
+# O caso SAUDAVEL usa os numeros REAIS medidos em 2026-08-27 (area saude: 311
+# paginas, 312 requisicoes pagina-a-pagina, 2 pelo lote). Se avaliar() reprovasse
+# esse conjunto, o gate estaria inventando defeito — e um detector que inventa
+# defeito custa tanto quanto um que os esconde: manda consertar o que esta certo.
+#
+# O caso REGREDIDO e o mesmo acervo com o lote desligado. Se avaliar() aprovasse
+# esse conjunto, o gate seria decoracao.
+# ---------------------------------------------------------------------------
+
+def _medicao_saudavel() -> dict:
+    return {
+        "cenario_a_uma_pagina": {"requisicoes": 1, "bytes": 5_751, "tem_proveniencia": True},
+        "cenario_b_area_inteira": {
+            "area": "saude", "paginas": 311,
+            "requisicoes_por_pagina": 312, "requisicoes_lote": 2,
+            "status_lote": 200, "content_type_lote": NDJSON,
+            "paginas_no_lote": 311, "ganho_em_requisicoes": 156.0,
+            "paginas_por_requisicao": 155.5,
+        },
+        "cenario_c_incremental": {"status": 200, "paginas_com_corpo": 50},
+        "anuncio": {"ai_catalog": True, "openapi": True},
+    }
+
+
+def _medicao_regredida() -> dict:
+    regredida = _medicao_saudavel()
+    regredida["cenario_b_area_inteira"] = {"area": "saude", "paginas": 311, "requisicoes_por_pagina": 312}
+    regredida["cenario_c_incremental"] = {"status": 404, "paginas_com_corpo": 0}
+    regredida["anuncio"] = {"ai_catalog": False, "openapi": False}
+    return regredida
+
+
+def _medicao_lote_encolhido() -> dict:
+    """Regressao SUTIL: o canal existe, responde 200 e devolve NDJSON — so que o
+    teto caiu de 200 para 10 paginas. E a regressao que passaria despercebida
+    num gate que so conferisse status."""
+    encolhida = _medicao_saudavel()
+    encolhida["cenario_b_area_inteira"].update({
+        "requisicoes_lote": 32, "ganho_em_requisicoes": 9.8,
+        "paginas_por_requisicao": 9.7, "paginas_no_lote": 311,
+    })
+    return encolhida
+
+
+def autoteste() -> int:
+    problemas = []
+
+    falhas = avaliar(_medicao_saudavel())
+    if falhas:
+        problemas.append("FALSO POSITIVO: a medicao real de 2026-08-27 foi reprovada -> " + " | ".join(falhas))
+    else:
+        print("ok  falso positivo: os numeros medidos em 2026-08-27 passam sem nenhuma acusacao")
+
+    falhas = avaliar(_medicao_regredida())
+    if not falhas:
+        problemas.append("FALSO NEGATIVO: acervo com o canal de lote desligado foi aprovado")
+    else:
+        print(f"ok  falso negativo: lote desligado reprova com {len(falhas)} acusacao(oes)")
+
+    falhas = avaliar(_medicao_lote_encolhido())
+    if not falhas:
+        problemas.append("FALSO NEGATIVO: teto do lote encolhido de 200 para 10 paginas foi aprovado")
+    else:
+        print(f"ok  regressao sutil (teto 200 -> 10) reprova com {len(falhas)} acusacao(oes)")
+
+    for problema in problemas:
+        print("FALHA  " + problema)
+    return 1 if problemas else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Custo de ingestao da superficie de agente (read-only).")
+    parser.add_argument("--origem", default=ORIGEM_PADRAO, help=f"origem HTTP a sondar (padrao {ORIGEM_PADRAO})")
+    parser.add_argument("--json", action="store_true", help="imprime a medicao crua em JSON")
+    parser.add_argument("--autoteste", action="store_true", help="exercita avaliar() sem rede (falso positivo e falso negativo)")
+    args = parser.parse_args()
+
+    if args.autoteste:
+        return autoteste()
+
+    medicao = medir(args.origem)
+    falhas = avaliar(medicao)
+
+    if args.json:
+        medicao["falhas"] = falhas
+        print(json.dumps(medicao, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if falhas else 0
+
+    a = medicao["cenario_a_uma_pagina"]
+    b = medicao["cenario_b_area_inteira"]
+    c = medicao["cenario_c_incremental"]
+    print(f"origem: {medicao['origem']}  ({medicao['segundos']}s)")
+    print(f"(a) uma pagina com proveniencia .. {a.get('requisicoes')} req, {a.get('bytes')} bytes, "
+          f"proveniencia={'sim' if a.get('tem_proveniencia') else 'NAO'}  [{a.get('caminho')}]")
+    print(f"(b) area '{b.get('area')}' ({b.get('paginas')} paginas) .. pagina-a-pagina: "
+          f"{b.get('requisicoes_por_pagina')} req | lote: {b.get('requisicoes_lote')} req, "
+          f"{b.get('paginas_no_lote')} paginas, {b.get('bytes_lote')} bytes  "
+          f"=> ganho {b.get('ganho_em_requisicoes')}x")
+    print(f"(c) incremental com corpo ........ {c.get('requisicoes')} req, "
+          f"{c.get('paginas_com_corpo')} paginas com corpo, {c.get('bytes')} bytes")
+    print(f"anuncio: ai-catalog={'sim' if medicao['anuncio'].get('ai_catalog') else 'NAO'} "
+          f"openapi={'sim' if medicao['anuncio'].get('openapi') else 'NAO'}")
+    for erro in medicao["erros_de_sonda"]:
+        print("  sonda: " + erro)
+
+    if falhas:
+        print()
+        for falha in falhas:
+            print("FALHA  " + falha)
+        return 1
+    print("\nsem regressao de custo de ingestao")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# backup-host-state — versiona a configuracao do HOST que serve a WikiJuridica.
+#
+# Criado em 2026-09-04. Ate aqui, as units do wiki em /etc/systemd/system, o
+# /etc/logrotate.d/wikijuridica, o /etc/audit/rules.d/wikijuridica.rules e as
+# configs de energia/locale/apt so existiam em /etc — sem copia nenhuma. O
+# backup-server-encrypted.sh do projeto vizinho, que foi removido hoje, NUNCA
+# teve glob wikijuridica*: a lacuna e anterior a ele e sobreviveu a ele.
+#
+# Estrategia: copiar para dentro do repo (ops/host-state/), que ja tem backup
+# funcionando via wikijuridica-backup.timer -> generate-backup-wiki. Sem
+# servico novo, sem disco novo, e com historico de diff a cada mudanca.
+#
+# AUDITORIA 2026-09-04 (segunda passagem) — tres defeitos corrigidos:
+#
+#   1. O glob /etc/systemd/system/wikijuridica* casa TAMBEM o diretorio de
+#      drop-ins `wikijuridica-backup.service.d`. A versao anterior fazia
+#      `sudo cat` nele, o cat falhava com "Is a directory", e o fallback
+#      gravava um ARQUIVO com o texto "# sem permissao de leitura" — mentira
+#      sobre a causa e perda silenciosa do unico drop-in do wiki (justamente o
+#      10-host-state.conf que chama este script). Agora o diretorio e tratado
+#      como diretorio e cada .conf dele e copiado.
+#
+#   2. `sudo cat "$f" > destino || true` TRUNCA o destino antes de o cat rodar.
+#      Qualquer falha de leitura deixava para tras um arquivo de 0 byte com
+#      cara de backup — backup falso, que e pior que backup ausente. Agora o
+#      conteudo e lido para variavel ANTES de tocar no destino, e falha vira
+#      linha no stderr (journal) + codigo de saida != 0.
+#
+#   3. O cabecalho anterior afirmava "46 units". A contagem medida e outra e
+#      muda a cada unit nova; o numero agora e MEDIDO e gravado em
+#      units-copiadas.txt em vez de afirmado em comentario.
+#
+# Cobertura ampliada na mesma passagem: as units cloudflared-wikijuridica*
+# (producao — os 5 tuneis — que a versao anterior citava no inventario mas
+# nunca copiava) e as configs de host criadas/alteradas em 2026-09-04
+# (logrotate dos snapshots, locale.conf, sysctl.conf, apt, hdd-safety-net e o
+# wrapper /usr/local/bin/du).
+#
+# Este script roda como ExecStartPre=- de wikijuridica-backup.service (User=rafael),
+# entao o `sudo` precisa ser sem senha e sem tty. Se o NOPASSWD sair, o script
+# NAO finge sucesso: reclama no journal e sai != 0 (o `-` do drop-in impede que
+# isso derrube o backup do repositorio, que e o trabalho principal da unit).
+set -euo pipefail
+
+DESTINO="/opt/wiki/ops/host-state"
+mkdir -p "$DESTINO"/{systemd,etc}
+
+FALHAS=0
+
+# Le um arquivo (com sudo, para os 0600 de root) e so grava no destino se a
+# grava_se_mudou <destino> — escreve a stdin no destino SO quando o conteudo
+# muda de verdade, e marca MUDOU=1 quando escreve.
+#
+# POR QUE, medido em 2026-09-08: este script roda no ExecStartPre do
+# wikijuridica-backup.service e reescrevia TODOS os arquivos de ops/host-state/
+# a cada execucao, mesmo sem nada ter mudado no host. Resultado: oito arquivos
+# permanentemente modificados no `git status` de QUALQUER sessao
+# (CHECKLIST-REBOOT.md, GERADO_EM.txt, sysctl-declarado.txt,
+# units-copiadas.txt, units-habilitadas.txt, etc/{du,find,sysctl.conf}), ruido
+# que esconde mudanca de verdade e que duas sessoes concorrentes precisam
+# aprender a ignorar -- e ignorar ruido e como se perde sinal.
+#
+# O `GERADO_EM.txt` era o pior: um carimbo de RELOGIO que muda sempre por
+# construcao, entao ele sozinho garantia diff eterno. Agora ele so e reescrito
+# quando algo mais mudou -- ou seja, ele passa a datar a ULTIMA MUDANCA REAL do
+# host, que e a pergunta que alguem faz ao abrir o arquivo, em vez de datar a
+# ultima execucao do cron.
+# A MARCA E ARQUIVO, NAO VARIAVEL, e o motivo e o pior tipo de defeito de shell:
+# `algo | grava_se_mudou destino` roda a funcao num SUBSHELL, entao um
+# `MUDOU=1` la dentro morre com o subshell e o pai nunca ve. O carimbo ficaria
+# eternamente sem ser escrito e ninguem notaria, porque o sintoma e a AUSENCIA
+# de uma linha. Arquivo atravessa o subshell.
+MARCA_DE_MUDANCA="$(mktemp -t backup-host-state-mudou.XXXXXX)"
+trap 'rm -f "$MARCA_DE_MUDANCA"' EXIT
+
+grava_se_mudou() {
+	local destino="$1"
+	local novo
+	novo="$(cat)"
+	if [ -f "$destino" ] && [ "$novo" = "$(cat "$destino" 2>/dev/null)" ]; then
+		return 0
+	fi
+	printf '%s\n' "$novo" >"$destino.tmp" && mv -f "$destino.tmp" "$destino"
+	printf '1' >>"$MARCA_DE_MUDANCA"
+}
+
+mudou_algo() { [ -s "$MARCA_DE_MUDANCA" ]; }
+
+# leitura deu certo. Nunca deixa arquivo vazio para tras.
+copiar() {
+	local origem="$1" destino="$2" conteudo
+	if ! sudo test -e "$origem"; then
+		return 0 # nao existe neste host: ausencia legitima, nao e falha
+	fi
+	if conteudo=$(sudo cat "$origem" 2>&1); then
+		# GUARDA DE SEGREDO. Este destino e um diretorio VERSIONADO: o que entrar
+		# aqui vai para a historia do git e nao sai mais. Medido em 2026-09-04:
+		# nenhuma unit do wiki traz credencial inline (as duas com modo 0600,
+		# wikijuridica-efeito-deploy.{service,timer}, apenas apontam
+		# EnvironmentFile=-/opt/wiki/.env.local). Mas o script copia por glob, e um
+		# `Environment=CHAVE=valor` acrescentado amanha entraria sem ninguem ver.
+		# Na duvida NAO copia: prefere-se lacuna visivel a vazamento irreversivel.
+		if printf '%s' "$conteudo" | grep -qiE '(Environment=[A-Za-z_]*(TOKEN|SECRET|KEY|PASS|SENHA|CREDENTIAL))|BEGIN [A-Z ]*PRIVATE KEY|(api[_-]?key|bearer)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_-]{16}'; then
+			printf 'backup-host-state: RECUSADO %s — parece conter segredo; nao entra em diretorio versionado\n' "$origem" >&2
+			FALHAS=$((FALHAS + 1))
+			return 0
+		fi
+		printf '%s\n' "$conteudo" | grava_se_mudou "$destino"
+	else
+		rm -f "$destino.tmp"
+		printf 'backup-host-state: FALHA lendo %s: %s\n' "$origem" "$conteudo" >&2
+		FALHAS=$((FALHAS + 1))
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# units do wiki e dos tuneis instaladas em /etc/systemd/system
+# ---------------------------------------------------------------------------
+copiadas=0
+for u in /etc/systemd/system/wikijuridica* /etc/systemd/system/cloudflared-wikijuridica*; do
+	[ -e "$u" ] || continue
+	nome=$(basename "$u")
+
+	if [ -d "$u" ]; then
+		# diretorio de drop-ins (*.service.d): copia cada fragmento.
+		# O `rm -f` remove o ARQUIVO homonimo que a versao com defeito deixava
+		# aqui (o "# sem permissao de leitura"); sem isso o mkdir abaixo falha.
+		[ -f "$DESTINO/systemd/$nome" ] && rm -f "$DESTINO/systemd/$nome"
+		mkdir -p "$DESTINO/systemd/$nome"
+		for frag in "$u"/*; do
+			[ -f "$frag" ] || continue
+			copiar "$frag" "$DESTINO/systemd/$nome/$(basename "$frag")"
+			copiadas=$((copiadas + 1))
+		done
+		continue
+	fi
+
+	if [ -L "$u" ]; then
+		alvo=$(readlink -f "$u" || true)
+		if [ -n "$alvo" ] && [ -e "$alvo" ]; then
+			estado="alvo presente"
+		else
+			estado="ALVO AUSENTE — unit quebrada"
+			printf 'backup-host-state: symlink quebrado: %s -> %s\n' "$u" "$(readlink "$u")" >&2
+			FALHAS=$((FALHAS + 1))
+		fi
+		printf '# symlink -> %s (%s)\n' "$alvo" "$estado" >"$DESTINO/systemd/$nome.link"
+		# se o alvo NAO mora no repo, o conteudo nao esta versionado em lugar nenhum
+		case "$alvo" in
+		/opt/wiki/*) : ;;
+		*) [ -e "$alvo" ] && copiar "$alvo" "$DESTINO/systemd/$nome" ;;
+		esac
+		copiadas=$((copiadas + 1))
+		continue
+	fi
+
+	copiar "$u" "$DESTINO/systemd/$nome"
+	copiadas=$((copiadas + 1))
+done
+
+# ---------------------------------------------------------------------------
+# configs de /etc de que o wiki depende e que nao vivem no repo
+# ---------------------------------------------------------------------------
+for f in /etc/logrotate.d/wikijuridica \
+	/etc/logrotate.d/wikijuridica-snapshots \
+	/etc/audit/rules.d/wikijuridica.rules \
+	/etc/default/earlyoom \
+	/etc/tmpfiles.d/cpu-energia.conf \
+	/etc/systemd/journald.conf \
+	/etc/systemd/sleep.conf.d/10-servidor-nao-suspende.conf \
+	/etc/systemd/logind.conf.d/10-tampa-nao-suspende.conf \
+	/etc/systemd/logind.conf.d/no-suspend.conf \
+	/etc/locale.conf \
+	/etc/default/locale \
+	/etc/sysctl.conf \
+	/etc/apt/apt.conf.d/20auto-upgrades \
+	/etc/apt/apt.conf.d/50unattended-upgrades \
+	/etc/profile.d/hdd-safety-net.sh \
+	/usr/local/bin/du \
+	/usr/local/bin/find \
+	/usr/local/bin/lsof \
+	/usr/local/bin/purga-lenta; do
+	copiar "$f" "$DESTINO/etc/$(basename "$f")"
+done
+
+# NOTA 2026-09-04 (auditoria adversarial de juncoes): find/lsof/purga-lenta
+# entraram nesta lista hoje. Ate aqui so o `du` era capturado, e a rede de
+# seguranca de /mnt/hdd tem QUATRO pecas que so fazem sentido juntas: o
+# /etc/profile.d/hdd-safety-net.sh e os tres wrappers de /usr/local/bin.
+# O /usr/local/bin/find carrega 6,3 KB de doutrina cara ("o wrapper pode mudar
+# a PRIORIDADE do trabalho, nunca o RESULTADO"), escrita depois de tres versoes
+# que falharam pelo mesmo motivo disfarcado; nao estando capturado, uma
+# reinstalacao do host perderia a v4 e sobreviveriam apenas os .bak das versoes
+# v2/v3, que sao justamente as defeituosas. O purga-lenta entra pelo mesmo
+# motivo: o cabecalho dele guarda a medicao de que systemd-run so aceita
+# CAMINHO de dispositivo, nunca MAJ:MIN, sob pena de o teto de banda ser
+# aceito pelo systemd e nunca chegar ao kernel.
+
+# NOTA 2026-09-10: `no-suspend.conf` entrou nesta lista hoje. A lista citava
+# `10-tampa-nao-suspende.conf`, que NAO existe mais em /etc. E nao foi rename,
+# como a primeira versao desta nota afirmou: `no-suspend.conf` e de 2026-02-21 e
+# o 10-tampa nasceu em 2026-09-04 e foi apagado depois — o mais novo morreu, o
+# mais velho ficou. Efeito: a guarda anti-suspensao VIVA nunca foi copiada, e a
+# unica copia versionada era a do arquivo morto, sem as diretivas de tecla e de
+# idle (HandleSuspendKey, HandleHibernateKey, IdleAction). Backup de guarda pela
+# metade e pior que nenhum: restaurar aquela copia devolveria um host que aceita
+# o botao de suspender. O nome antigo fica na lista porque `copiar` ignora o que
+# nao existe, e a copia velha fica no disco como registro historico — o
+# CHECKLIST-REBOOT (a.8) avisa para NAO restaura-la.
+
+# ---------------------------------------------------------------------------
+# configuracao da SESSAO do dono (X11/XFCE) de que a disponibilidade depende
+# ---------------------------------------------------------------------------
+# Estes arquivos nao vivem em /etc e sao invisiveis para o resto deste script,
+# mas decidem se a tela apaga, se a sessao tranca e se o botao de vigilia do
+# painel existe. Sem eles versionados, reinstalar o host perde o botao e a
+# escolha do dono. `copiar` usa sudo mas roda como rafael: ler o proprio $HOME
+# funciona igual.
+mkdir -p "$DESTINO/user" "$DESTINO/user/panel"
+for f in "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" \
+	"$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml" \
+	"$HOME/.config/autostart/vigilia.desktop" \
+	"$HOME/.local/share/applications/vigilia-apagar-tela.desktop"; do
+	copiar "$f" "$DESTINO/user/$(basename "$f")"
+done
+# SO os rc de plugin que existe de verdade. O painel deixa `<tipo>-<id>.rc`
+# orfao para tras quando um plugin e criado e descartado (medido em 2026-09-10:
+# um `xfce4-panel --add=genmon` que nao pegou deixou `genmon-8.rc` com
+# `Command=` vazio, e uma renumeracao transitoria deixou `battery-18.rc`).
+# Copiar orfao e versionar lixo — e pior, um `genmon-8.rc` com Command vazio no
+# host-state parece configuracao boa para quem restaurar. A lista de ids
+# registrados sai do XML, nao do xfconf: esta unit roda sem sessao D-Bus.
+IDS_REGISTRADOS=$(python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    t = ET.parse(sys.argv[1])
+except Exception:
+    raise SystemExit(0)
+import re
+for p in t.getroot().iter("property"):
+    m = re.fullmatch(r"plugin-(\d+)", p.get("name") or "")
+    if m:
+        print(m.group(1))
+' "$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" 2>/dev/null | tr '\n' ' ')
+for f in "$HOME"/.config/xfce4/panel/*.rc; do
+	[ -e "$f" ] || continue
+	id_rc=$(basename "$f" .rc)
+	id_rc=${id_rc##*-}
+	case " $IDS_REGISTRADOS " in
+	*" $id_rc "*) copiar "$f" "$DESTINO/user/panel/$(basename "$f")" ;;
+	*) printf 'backup-host-state: rc orfao ignorado (plugin %s nao registrado): %s\n' "$id_rc" "$f" >&2 ;;
+	esac
+done
+# Dos lancadores, SO os desta frente. Os outros (launcher-7, -11, -20/*) sao do
+# escritorio e do token do dono, doze deles com modo 0600 por decisao dele:
+# copiar para um diretorio versionado como 0644 e um rebaixamento de privacidade
+# que ninguem pediu, e a historia do git nao esquece. O criterio desta secao e "o
+# arquivo decide se a tela apaga ou se o botao existe" — o `xfce4-panel.xml`
+# copiado acima ja guarda a LISTA de todos os plugins, que e o que faz o painel
+# do dono voltar depois de uma reinstalacao.
+#
+# DIVIDA CONHECIDA: o glob largo da primeira versao desta secao (2026-09-10,
+# commit 520632c7) JA levou os doze para a historia. Eles nao saem daqui: apagar
+# do indice exige `git rm`, que o guard desta maquina barra por desenho, e
+# reescrever historia e decisao do dono. Nao ha segredo neles (a guarda de
+# segredo acima deu zero ocorrencia e o repo e privado), e a partir deste commit
+# eles param de ser atualizados. Se o dono quiser expurgo, e ele quem decide.
+for f in "$HOME"/.config/xfce4/panel/launcher-*/*vigilia*.desktop; do
+	[ -e "$f" ] || continue
+	# launcher-22/x.desktop viraria "x.desktop" e colidiria entre lancadores:
+	# o nome no destino carrega o diretorio do plugin.
+	copiar "$f" "$DESTINO/user/panel/$(basename "$(dirname "$f")")-$(basename "$f")"
+done
+# COPIA VELHA que o host nao tem mais. Este script nunca PODA: ele so escreve.
+# Um plugin removido do painel deixa o rc dele no host-state para sempre, e quem
+# restaurar leva de volta configuracao de plugin que nao existe. Poda automatica
+# em diretorio versionado e apagar trabalho por conta propria, e isso o contrato
+# desta maquina proibe — entao aqui a divergencia e DENUNCIADA, nao apagada.
+for f in "$DESTINO/user/panel"/*.rc; do
+	[ -e "$f" ] || continue
+	[ -e "$HOME/.config/xfce4/panel/$(basename "$f")" ] && continue
+	printf 'backup-host-state: copia sem origem (o host nao tem mais): %s\n' "$f" >&2
+done
+
+# A escolha viva do dono (vigilia ligada ou nao) e estado, nao configuracao:
+# entra como inventario para o CHECKLIST-REBOOT saber o que reaplicar.
+{
+	printf 'vigilia (escolha salva): %s\n' \
+		"$([ -s "$HOME/.config/vigilia/estado" ] && cat "$HOME/.config/vigilia/estado" || echo 'nunca usada')"
+	# NAO usa `xfconf-query`: ele fala D-Bus de SESSAO e esta unit roda sem uma.
+	# Medido em 2026-09-10: `env -i xfconf-query ...` falha com "Cannot autolaunch
+	# D-Bus without X11 $DISPLAY", entao a execucao do timer gravava a linha VAZIA
+	# e a execucao interativa gravava o array cheio — flip-flop eterno no
+	# `git status`, que reescrevia o GERADO_EM.txt e apagava o sinal de mudanca
+	# real (o defeito que o cabecalho deste script diz ter matado em 2026-09-08).
+	# A informacao ja esta no xfce4-panel.xml copiado tres linhas acima.
+	ids=$(python3 -c '
+import sys, xml.etree.ElementTree as ET
+try:
+    t = ET.parse(sys.argv[1])
+except Exception as e:
+    print("indisponivel (%s)" % e); raise SystemExit(0)
+for p in t.getroot().iter("property"):
+    if p.get("name") == "panel-1":
+        for c in p:
+            if c.get("name") == "plugin-ids":
+                print(" ".join(v.get("value") for v in c)); raise SystemExit(0)
+print("indisponivel (sem panel-1/plugin-ids no XML)")
+' "$DESTINO/user/xfce4-panel.xml" 2>/dev/null ||
+		echo 'indisponivel (XML do painel ilegivel)')
+	printf 'plugin-ids do painel 1: %s\n' "$ids"
+} | grava_se_mudou "$DESTINO/user/vigilia-estado.txt"
+
+# ---------------------------------------------------------------------------
+# inventario, para detectar drift
+# ---------------------------------------------------------------------------
+{ systemctl list-unit-files --state=enabled --no-pager 2>/dev/null |
+	grep -E "wikijuridica|cloudflared" | awk '{print $1, $2}' ||
+	true; } | grava_se_mudou "$DESTINO/units-habilitadas.txt"
+
+printf 'units e drop-ins copiados nesta execucao: %s\n' "$copiadas" | grava_se_mudou "$DESTINO/units-copiadas.txt"
+
+# estado do kernel que o wiki declara
+/usr/sbin/sysctl -a 2>/dev/null |
+	grep -E "^(net\.ipv4\.tcp_congestion|net\.ipv4\.tcp_keepalive|kernel\.panic|vm\.overcommit)" \
+		2>/dev/null | grava_se_mudou "$DESTINO/sysctl-declarado.txt" || true
+
+# O carimbo data a ULTIMA MUDANCA REAL, nao a ultima execucao: reescreve-lo
+# sempre e o que fazia este diretorio aparecer modificado para sempre.
+if mudou_algo; then
+	printf 'Ultima mudanca real do host-state: %s\n' "$(date -Is)" >"$DESTINO/GERADO_EM.txt"
+fi
+
+if [ "$FALHAS" -gt 0 ]; then
+	printf 'backup-host-state: %s falha(s) — host-state INCOMPLETO em %s\n' "$FALHAS" "$DESTINO" >&2
+	exit 1
+fi
+echo "host-state atualizado em $DESTINO ($copiadas units/drop-ins)"

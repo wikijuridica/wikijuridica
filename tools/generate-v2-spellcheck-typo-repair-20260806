@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""generate-v2-spellcheck-typo-repair-20260806.
+
+Corrige defeitos ORTOGRÁFICOS reais apanhados pelo gate ptbr-spellcheck
+(passo 25 da cadeia, hunspell pt_BR sobre refined_public_prose) na rodada de
+2026-08-05/06: o gate reprovou 869 tokens; a triagem com contexto KWIC
+(.agents/runtime/staging/ptbr_spellcheck_triage_20260806.jsonl) separou o
+vocabulário legítimo (siglas, instituições, latinismos, estrangeirismos de
+contexto — que entram em content/ptbr_spellcheck_allowlist.txt, o canal
+sancionado) dos ERROS DE PÁGINA, que se corrigem AQUI, no draft de
+data/editorial/v2_pages/ (fonte), nunca na superfície derivada.
+
+Primeiro alvo confirmado por leitura de codepoints: `const-imunidade-parlamentar`
+(constitucional-inf2.jsonl) tem "puni­vel" — SOFT HYPHEN (U+00AD) no lugar
+do "í" de "punível". Varredura PCRE `\\x{00ad}` confirmou ser a ÚNICA ocorrência
+de soft-hyphen em todo o estoque; zero ocorrências de U+200B/200C/200D/FEFF/
+2028/2029.
+
+## Por que gerador, e não edição manual
+
+Contrato do repo: JSONL editorial só muda por gerador. Mesmo padrão de
+`generate-v2-oab-phrase-repair-20260805`: lease de época, lock exclusivo, CAS
+pelo sha256 da LINHA atual (aborta se outra frente tocou o registro), CAS por
+TRECHO (só substitui se o texto atual contiver exatamente o trecho esperado,
+1 hit), demais linhas preservadas byte a byte, word_count recalculado pela
+fórmula do ingest (bodyWordCount), escrita atômica com fsync, idempotente.
+NÃO committa.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.spellcheck-typo-repair-20260806.lock"
+
+# intent_id -> (shard, sha256 da linha esperada, trecho atual, trecho novo)
+# Alvos adicionais da triagem 20260806 entram aqui com o próprio sha da linha
+# viva no momento da inclusão (idempotência: alvo já aplicado vira "already").
+REPAIRS: dict[str, tuple[str, str, str, str]] = {
+    "const-imunidade-parlamentar": (
+        "data/editorial/v2_pages/constitucional-inf2.jsonl",
+        "2f1544e5d9c6d102bf83661bcfcdf123cdb24d3fe41dfc6be07cae035b39cdc1",
+        "puni­vel",
+        "punível",
+    ),
+}
+
+# Caracteres que NENHUM texto novo pode reintroduzir (a classe do defeito).
+FORBIDDEN_CODEPOINTS = ("­", "​", "‌", "‍", "﻿", " ", " ")
+
+TEXT_FIELDS = ("opening",)
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def preflight() -> None:
+    problems: list[str] = []
+    for intent, (_shard, _digest, before, after) in sorted(REPAIRS.items()):
+        for codepoint in FORBIDDEN_CODEPOINTS:
+            if codepoint in after:
+                problems.append(
+                    f"{intent}: texto novo reintroduz U+{ord(codepoint):04X}"
+                )
+        if before == after:
+            problems.append(f"{intent}: texto novo idêntico ao atual")
+        if not before or not after:
+            problems.append(f"{intent}: trecho vazio")
+    if problems:
+        for problem in problems:
+            print(f"PREFLIGHT FALHOU: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(REPAIRS)} correção(ões), sem codepoints proibidos")
+
+
+def word_count(record: dict) -> int:
+    """Reproduz `bodyWordCount` de internal/v2ingest/validate.go:984.
+
+    Soma abertura + heading e texto de cada seção + Q e A de cada FAQ,
+    tokenizando o texto com acentos removidos. A remoção do soft-hyphen MUDA a
+    contagem ("puni­vel" tokeniza como 2 palavras; "punível" como 1) —
+    declarar sem recalcular derruba a página no ingest
+    (`declared_word_count_incoherent`, tolerância 10%).
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def _replace_in_record(record: dict, before: str, after: str) -> int:
+    """Substitui o trecho onde quer que esteja no corpo visível (1 hit total)."""
+    hits = 0
+    if before in (record.get("opening") or ""):
+        hits += record["opening"].count(before)
+    for section in record.get("sections") or []:
+        hits += (section.get("heading") or "").count(before)
+        hits += (section.get("text") or "").count(before)
+    for item in record.get("faq") or []:
+        hits += (item.get("q") or "").count(before)
+        hits += (item.get("a") or "").count(before)
+    if hits != 1:
+        return hits
+    if before in (record.get("opening") or ""):
+        record["opening"] = record["opening"].replace(before, after)
+        return 1
+    for section in record.get("sections") or []:
+        if before in (section.get("heading") or ""):
+            section["heading"] = section["heading"].replace(before, after)
+            return 1
+        if before in (section.get("text") or ""):
+            section["text"] = section["text"].replace(before, after)
+            return 1
+    for item in record.get("faq") or []:
+        if before in (item.get("q") or ""):
+            item["q"] = item["q"].replace(before, after)
+            return 1
+        if before in (item.get("a") or ""):
+            item["a"] = item["a"].replace(before, after)
+            return 1
+    return 1
+
+
+def apply_repair(intent: str, shard: str, digest: str, before: str, after: str) -> int:
+    path = ROOT / shard
+    lines = path.read_bytes().decode("utf-8").split("\n")
+    trailing_newline = lines and lines[-1] == ""
+    if trailing_newline:
+        lines = lines[:-1]
+
+    output: list[str] = []
+    changed = 0
+    already = 0
+    for number, raw in enumerate(lines, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard}: linha em branco {number}")
+        record = json.loads(raw)
+        if record.get("intent_id") != intent:
+            output.append(raw)
+            continue
+
+        body = json.dumps(record, ensure_ascii=False)
+        if before not in body:
+            expected = word_count(record)
+            if record.get("word_count") != expected:
+                record["word_count"] = expected
+                output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                changed += 1
+                print(f"  word_count corrigido: {intent} -> {expected}")
+                continue
+            already += 1
+            output.append(raw)
+            continue
+
+        current = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        if current != digest:
+            raise SystemExit(
+                f"CAS FALHOU em {shard}:{number} ({intent}): linha atual não é a esperada.\n"
+                f"  esperado: {digest}\n  atual:    {current}\n"
+                "Outra frente tocou este registro. Reler o conteúdo vivo antes de reaplicar."
+            )
+
+        hits = _replace_in_record(record, before, after)
+        if hits != 1:
+            raise SystemExit(
+                f"{shard}:{number} ({intent}): trecho esperado aparece {hits}x no corpo "
+                "visível (deveria ser 1). Abortado sem escrever."
+            )
+        record["word_count"] = word_count(record)
+        output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        changed += 1
+
+    if changed == 0 and already == 0:
+        raise SystemExit(f"{shard}: intent {intent} não encontrado")
+
+    if changed:
+        payload = "\n".join(output)
+        if trailing_newline:
+            payload += "\n"
+        atomic_write(path, payload.encode("utf-8"))
+
+    print(f"{shard} ({intent}): reescritos={changed} já_aplicados={already}")
+    return changed
+
+
+def main() -> int:
+    preflight()
+    total = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for intent, (shard, digest, before, after) in sorted(REPAIRS.items()):
+                    total += apply_repair(intent, shard, digest, before, after)
+    except StockEpochBusy as error:
+        print(
+            f"generate-v2-spellcheck-typo-repair-20260806: estoque ocupado: {error}",
+            file=sys.stderr,
+        )
+        return 75
+    if total:
+        print("OK. Reingerir o estoque para o espelho refletir a correção.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""generate-v2-second-official-source-from-corpus-20260806 — a lei que a página já cita vira fonte registrada.
+
+O DEFEITO. 1.002 páginas de faixa comercial têm UMA única fonte oficial. Fonte
+insuficiente é risco sob o Provimento OAB 205/2021 e, pela política de
+"publicar e corrigir", entra como MÉDIO — publica e vira fila de refinamento.
+
+A OPORTUNIDADE. Muitas dessas páginas CITAM artigos de diplomas que já estão em
+`data/legal-corpus/`, baixados do Planalto com URL oficial, data de coleta e
+SHA-256 do documento. A fonte existe, foi verificada, e apenas não está
+registrada no campo `official_sources` da página.
+
+Isso não é inventar fonte: é registrar a que a página já usa.
+
+O QUE ENTRA, e o critério é estrito:
+  - página de faixa comercial com exatamente 1 fonte;
+  - a citação nomeia o diploma EXPLICITAMENTE na frase ("art. 1.723 do Código
+    Civil"), forma possessiva — nunca por inferência de proximidade, cuja
+    acurácia é 99,2% apenas no caso fácil (measure-citation-diploma-accuracy);
+  - o diploma está no corpus com `confiavel_para_acusar_divergencia: true`;
+  - o artigo citado EXISTE no diploma;
+  - a URL do diploma ainda não está entre as fontes da página.
+
+O `anchor_claim` é o texto do próprio dispositivo, copiado do documento oficial
+— domínio público (Lei 9.610/1998, art. 8º, IV). É metadado de proveniência, que
+registra o que a fonte sustenta; NÃO vai para o corpo da página, e o contrato do
+corpus (`uso: referencia_de_conferencia_nunca_corpo_de_pagina`) continua
+respeitado.
+
+`verified_at` recebe a data REAL de coleta gravada no corpus, não a data de hoje.
+O ingest recusa verificação com mais de 90 dias (OfficialSourceVerificationMax
+AgeDays), e datar o que não foi verificado seria fraude de evidência.
+
+UMA fonte por página, a do diploma mais citado por ela. O objetivo é sair de
+"fonte única", não empilhar referência.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, CAS pelo sha256 da LINHA
+viva, páginas sob supersessão PULADAS (editá-las quebra a cadeia autenticada),
+word_count recalculado pela fórmula do ingest, escrita atômica com fsync,
+idempotente. NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-second-official-source-from-corpus-20260806 --dry-run
+    tools/generate-v2-second-official-source-from-corpus-20260806 --limite 120
+    tools/generate-v2-second-official-source-from-corpus-20260806
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import contextlib
+import fcntl
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.second-official-source-20260806.lock"
+CORPUS = ROOT / "data/legal-corpus"
+SHARDS = ROOT / "data/editorial/v2_pages"
+SUPERSEDED = ROOT / "data/editorial/v2_superseded"
+SEVERITY = ROOT / "data/editorial/v2_publication_severity.jsonl"
+INVENTARIO = ROOT / "data/ops/citation_inventory.jsonl"
+
+ANCHOR_MAX = 320
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", (value or "").lower())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len(re.findall(r"[^\W_]+", folded, re.UNICODE))
+
+
+def word_count(record: dict) -> int:
+    """bodyWordCount, internal/v2ingest/validate.go:984. official_sources não entra."""
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def carregar_corpus() -> dict:
+    corpus = {}
+    for caminho in sorted(CORPUS.glob("*.json")):
+        with open(caminho, encoding="utf-8") as handle:
+            dados = json.load(handle)
+        if not dados.get("confiavel_para_acusar_divergencia"):
+            continue
+        if not dados.get("source_url") or not dados.get("fetched_at"):
+            continue
+        corpus[dados.get("slug") or caminho.stem] = dados
+    return corpus
+
+
+def intents_protegidos() -> set:
+    protegidos = set()
+    for caminho in sorted(SUPERSEDED.glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                intent = json.loads(linha).get("intent_id")
+                if intent:
+                    protegidos.add(intent)
+    return protegidos
+
+
+def carregar_gerador_inventario():
+    caminho = ROOT / "tools/generate-citation-inventory"
+    spec = importlib.util.spec_from_loader(
+        "gci", importlib.machinery.SourceFileLoader("gci", os.fspath(caminho)))
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+def diploma_explicito(gerador, frase: str, artigo: str) -> bool:
+    """A frase escreve a lei logo depois do artigo, na forma possessiva?"""
+    alvo = artigo.replace(".", "")
+    for marca in gerador.ARTICLE_RE.finditer(frase):
+        numero = gerador.NUMBER_RE.match(frase[marca.end():])
+        if not numero or numero.group(1).replace(".", "") != alvo:
+            continue
+        depois = frase[marca.end():marca.end() + 90]
+        if re.match(r"\s*[\d.]+\s*[ºo°]?\s*(?:[,\s]*(?:§+\s*[\d.ºo°]+"
+                    r"|inc(?:iso)?s?\.?\s*[IVXLC]+|al[íi]neas?\s*[a-z]\)?"
+                    r"|[IVXLC]+\b|[a-z]\)))*\s*,?\s*d[oaes]s?\s+[A-ZÀ-Ý]", depois):
+            return True
+    return False
+
+
+def planejar(corpus, protegidos, limite):
+    """Uma fonte nova por página, com o artigo que a ancora."""
+    comerciais = {}
+    with open(SEVERITY, encoding="utf-8") as handle:
+        for linha in handle:
+            registro = json.loads(linha)
+            if registro.get("lane") != "comercial":
+                continue
+            if (registro.get("official_sources") or 0) > 1:
+                continue
+            comerciais[registro["intent_id"]] = registro
+
+    gerador = carregar_gerador_inventario()
+    candidatos = collections.defaultdict(collections.Counter)
+    artigo_de = {}
+    with open(INVENTARIO, encoding="utf-8") as handle:
+        for linha in handle:
+            registro = json.loads(linha)
+            intent = registro.get("intent_id")
+            if intent not in comerciais or intent in protegidos:
+                continue
+            diploma = registro.get("diploma")
+            if diploma not in corpus:
+                continue
+            artigo = (registro.get("article") or "").replace(".", "").upper()
+            if not artigo or artigo not in corpus[diploma]["articles"]:
+                continue
+            if not diploma_explicito(gerador, registro.get("claim") or "",
+                                     registro.get("article") or ""):
+                continue
+            candidatos[intent][diploma] += 1
+            artigo_de.setdefault((intent, diploma), registro.get("article"))
+
+    plano = {}
+    for intent, contagem in candidatos.items():
+        diploma, _ = contagem.most_common(1)[0]
+        plano[intent] = (diploma, artigo_de[(intent, diploma)])
+    if limite:
+        plano = dict(sorted(plano.items())[:limite])
+    return plano
+
+
+def montar_fonte(corpus, diploma, artigo):
+    dados = corpus[diploma]
+    chave = artigo.replace(".", "").upper()
+    texto = " ".join((dados["articles"].get(chave) or "").split())
+    # O caput, até o primeiro parágrafo/inciso — é o que o artigo enuncia.
+    caput = re.split(r"\s(?:§|Par[áa]grafo [úu]nico|I\s*-\s)", texto)[0]
+    if len(caput) > ANCHOR_MAX:
+        corte = caput.rfind(" ", 0, ANCHOR_MAX)
+        caput = caput[:corte if corte > 0 else ANCHOR_MAX].rstrip(" ,;") + "…"
+    return {
+        "name": f"{dados['nome']}, art. {artigo}",
+        # A URL QUE VAI PARA A PÁGINA É A DE CITAÇÃO, não a de conferência.
+        # São perguntas diferentes com respostas diferentes no mesmo diploma:
+        # `l10406compilada.htm` é o texto consolidado (de onde `anchor_claim`
+        # sai, via `source_url`), mas tem 5 âncoras — o leitor cairia no topo da
+        # lei. `l10406.htm` tem 4.030 e resolve no artigo. `citation_url` é
+        # medido em `generate-legal-corpus`; o fallback mantém registro antigo,
+        # de esquema v1, funcionando sem mudança de comportamento.
+        "url": dados.get("citation_url") or dados["source_url"],
+        "anchor_claim": caput,
+        "verified_at": dados["fetched_at"][:10],
+    }
+
+
+# O PLANALTO SERVE O MESMO ATO EM MAIS DE UMA URL, e a checagem "a URL ja esta
+# entre as fontes" nao enxerga isso (2026-09-16). Medido sobre o plano real de
+# 348 paginas: 235 das 271 que a ferramenta escreveria (86,7%) acrescentariam
+# uma SEGUNDA URL DO MESMO DIPLOMA -- `l10406.htm` ao lado de
+# `l10406compilada.htm`, `l8213cons.htm` ao lado de `l8213.htm`. O validador do
+# ingest conta as duas como fontes validas (os caminhos diferem) e o motivo
+# `official_sources_insufficient` sumiria; so que ele existe para exigir
+# referencia INDEPENDENTE -- ele mesmo diz que "repeticao cosmetica nao conta".
+# Limpar o motivo assim seria passar no gate sem resolver o que ele mede, que e
+# o que o CLAUDE.md secao 5 chama de fraude operacional.
+#
+# QUEM DECIDE IDENTIDADE DE ATO NESTE REPOSITORIO E O `internal/lexml`
+# (2026-09-16). Ate esta data a comparacao era um REGEX sobre o caminho da URL
+# --- uma SEGUNDA regua de "mesmo ato" convivendo com a primeira, e duas reguas
+# divergem em silencio. Medido sobre as 3.384 URLs do Planalto que o acervo e o
+# corpus de fato citam: o regex agrupa em 742 atos, o lexml em 883, e ha 3.181
+# pares que o lexml reconhece como o MESMO ato e o regex nao reconhecia --- a
+# comecar por `//planalto.gov.br/...` contra `//www.planalto.gov.br/...`, que
+# para o regex da Constituicao eram dois atos distintos, e por
+# `_ato2001-2004/2003/lei/l10.833.htm` contra `leis/2003/l10.833.htm`, cujo
+# numero pontuado o regex sequer casava. Cada um desses pares era uma duplicata
+# cosmetica que a guarda deixaria passar.
+#
+# A consulta e por `cmd/resolve-planalto-urn`, que expoe `URNForPlanaltoURL` por
+# stdin/stdout. Nao se copia a tabela de codigos canonicos para ca: copia de
+# regua e o defeito que esta guarda existe para nao repetir.
+#
+# O SILENCIO DO LEXML E "NAO SEI", E "NAO SEI" PULA. O lexml falha fechado por
+# desenho --- `caminhoPlanaltoCanonico` recusa afirmar que um caminho apenas
+# plausivel e o ato curado, para nao mintar proveniencia falsa. Medido nas mesmas
+# 3.384 URLs: ele silencia sobre 344 (10,2%), entre elas variantes REAIS de atos
+# curados (`del5452.htm` da CLT, `l8213.htm`, `l13105compilada.htm` do CPC) e a
+# propria URL canonica do Decreto-Lei 911/1969, que a tabela declara em
+# `decreto-lei/1965-1988/del0911.htm` e o detector de `planalto.go` nao casa
+# porque so admite a pasta por periodo ANTES de `decreto-lei/`. Essa e lacuna do
+# lexml, esta reportada, e NAO se contorna aqui com regex de reserva: o preco de
+# manter a segunda regua e maior que o de pular a proposta.
+#
+# Silencio tratado como "identidade propria da URL" seria FAIL-OPEN --- duas
+# variantes do mesmo ato viram dois atos e a duplicata e escrita. E silencio
+# tratado sempre como "nao sei" e fail-closed DEMAIS: medido em 2026-09-16, das
+# 36 paginas que a guarda antiga liberava, 6 seriam puladas por isso, e em 4
+# delas a fonte ja registrada nem era do Planalto (atos.cnj.jus.br,
+# processo.stj.jus.br, gov.br/susep) --- nao havia duplicata possivel.
+#
+# Por isso `resolve-planalto-urn` devolve, ao lado da URN, o HOST da URL: quando
+# o lexml silencia, a pergunta que resta e "esta fonte ja registrada disputa o
+# mesmo espaco de enderecos que a proposta?". Host diferente do host da
+# proposta (que por construcao o lexml resolveu) significa que ela nao pode ser
+# outra variante da MESMA URL do Planalto, e a proposta segue. Host igual com o
+# lexml calado e o unico "nao sei" de verdade, e esse PULA. Falso positivo custa
+# uma pagina que ficou sem refino nesta passada; falso negativo custaria a
+# duplicata cosmetica publicada.
+# Interativo, a ponte roda por `go-modern run`, que compila na hora e nunca
+# serve binario velho. Sob systemd isso nao serve: a unit tem ambiente minimo
+# (sem HOME/GOCACHE garantidos) e o compilador nao deveria ser dependencia de
+# runtime de uma esteira. Por isso a unit compila no ExecStartPre e aponta
+# WJ_RESOLVE_PLANALTO_URN_BIN para o binario. A variavel e EXPLICITA de
+# proposito: um fallback implicito para `bin/` serviria binario velho em
+# silencio, e a regua de identidade de ato e a ultima coisa que pode divergir
+# sem ninguem ver.
+_BIN_DA_PONTE = os.environ.get("WJ_RESOLVE_PLANALTO_URN_BIN", "").strip()
+BRIDGE = ((_BIN_DA_PONTE,) if _BIN_DA_PONTE
+          else ("./tools/go-modern", "run", "./cmd/resolve-planalto-urn"))
+
+# url -> (URN da norma inteira ou None, host sem `www.`). None na URN e um valor
+# de primeira classe aqui: e a resposta "esta regua nao afirma nada".
+_URN_DE_URL: dict[str, tuple[str | None, str]] = {}
+
+
+def resolver_urns(urls) -> None:
+    """Preenche o cache de URN para todas as `urls` em UMA chamada ao Go.
+
+    Uma chamada por URL custaria um `go run` por fonte; o protocolo do comando e
+    posicional justamente para permitir o lote.
+    """
+    pendentes = sorted({u for u in urls if u and u not in _URN_DE_URL})
+    if not pendentes:
+        return
+    entrada = "\n".join(pendentes) + "\n"
+    concluido = subprocess.run(BRIDGE, cwd=os.fspath(ROOT), input=entrada,
+                               capture_output=True, text=True)
+    if concluido.returncode != 0:
+        raise SystemExit(
+            f"resolve-planalto-urn falhou (exit {concluido.returncode}): "
+            f"{concluido.stderr.strip()}")
+    linhas = concluido.stdout.split("\n")
+    if linhas and linhas[-1] == "":
+        linhas.pop()
+    if len(linhas) != len(pendentes):
+        # Sem correspondencia posicional nao ha resposta: casar errado
+        # atribuiria a URN de um ato a outro, que e pior que nao medir.
+        raise SystemExit(
+            f"resolve-planalto-urn devolveu {len(linhas)} linhas para "
+            f"{len(pendentes)} URLs; a correspondencia posicional quebrou")
+    for url, linha in zip(pendentes, linhas):
+        urn, _, host = linha.partition("\t")
+        _URN_DE_URL[url] = (urn.strip() or None, host.strip())
+
+
+def _resposta(url: str) -> tuple[str | None, str]:
+    if url not in _URN_DE_URL:
+        resolver_urns([url])
+    return _URN_DE_URL[url]
+
+
+def ato_do_planalto(url: str) -> str | None:
+    """A URN LexML da norma inteira, ou None quando o lexml nao resolve a URL."""
+    if not url:
+        return None
+    return _resposta(url)[0]
+
+
+def host_da_url(url: str) -> str:
+    """O host minusculo e sem `www.`, medido pelo mesmo comando que resolve a URN."""
+    if not url:
+        return ""
+    return _resposta(url)[1]
+
+
+def mesmo_ato_ja_registrado(nova: str, atuais) -> str:
+    """Motivo para PULAR a proposta, ou "" quando ela pode seguir.
+
+    So se acrescenta fonte quando se PROVA que ela e de outro ato -- ou quando
+    a fonte ja registrada nem disputa o mesmo espaco de enderecos.
+    """
+    urn_nova = ato_do_planalto(nova)
+    host_nova = host_da_url(nova)
+    for atual in atuais:
+        if not atual:
+            continue
+        urn_atual = ato_do_planalto(atual)
+        if urn_nova is not None and urn_atual == urn_nova:
+            return (f"e o MESMO ato ({urn_nova}) que a pagina ja registra por "
+                    f"outra variante de URL")
+        # A REGRA E SIMETRICA, e e por isso que ela nao pula demais: so ha
+        # duplicata cosmetica a temer quando as duas URLs disputam o mesmo
+        # espaco de enderecos. Com o lexml calado sobre qualquer um dos lados e
+        # os hosts iguais, a colisao e POSSIVEL e nao se prova o contrario --
+        # pula. Com hosts diferentes ela e IMPOSSIVEL: uma URL do Planalto
+        # nunca e outra grafia de um ato de `atos.cnj.jus.br`.
+        if (urn_nova is None or urn_atual is None) and host_da_url(atual) == host_nova:
+            calada = nova if urn_nova is None else atual
+            return (f"o lexml nao resolve {calada} e a fonte ja registrada "
+                    f"({atual}) esta no mesmo host da proposta; sem URN nao se "
+                    f"prova que a proposta e de outro ato")
+    return ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limite", type=int, default=0,
+                        help="trata só as N primeiras, para medir antes de escalar")
+    args = parser.parse_args()
+
+    corpus = carregar_corpus()
+    protegidos = intents_protegidos()
+    plano = planejar(corpus, protegidos, args.limite)
+    print(f"corpus confiável            : {len(corpus)} diplomas")
+    print(f"páginas com fonte a registrar: {len(plano)}")
+    if not plano:
+        print("nada a fazer.")
+        return 0
+
+    por_shard = collections.defaultdict(dict)
+    # As URLs ja registradas entram no LOTE de resolucao de URN: uma chamada ao
+    # `resolve-planalto-urn` para o plano inteiro, nunca uma por fonte.
+    urls_para_resolver = set()
+    for caminho in sorted(glob.glob(os.fspath(SHARDS / "*.jsonl"))):
+        shard_rel = os.path.relpath(caminho, ROOT)
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if intent in plano:
+                    por_shard[shard_rel][intent] = plano[intent]
+                    for fonte_atual in registro.get("official_sources") or []:
+                        urls_para_resolver.add(fonte_atual.get("url") or "")
+    # Só as páginas ACHADAS em shard entram no lote: intent do plano sem shard
+    # não será tocado, e resolver a URN dele seria trabalho sobre o que não se
+    # vai escrever.
+    for alvos in por_shard.values():
+        for diploma, artigo in alvos.values():
+            urls_para_resolver.add(montar_fonte(corpus, diploma, artigo)["url"])
+    resolver_urns(urls_para_resolver)
+
+    faltando = set(plano) - {i for alvos in por_shard.values() for i in alvos}
+    if faltando:
+        print(f"AVISO: {len(faltando)} intents do plano não achados em shard", file=sys.stderr)
+
+    adicionadas = 0
+    ja_tinham = 0
+    divergiram = 0
+    mesmo_ato = 0
+    indecidiveis = 0
+    # O LEASE DE ESCRITA SÓ VALE PARA QUEM ESCREVE (2026-09-16). Até esta data
+    # `--dry-run` tomava o lease de época do estoque canônico antes de qualquer
+    # coisa e, com outra frente segurando a época, ABORTAVA com exit 75 sem
+    # imprimir uma linha do plano. Planejar é leitura: quem está impedido de
+    # escrever continua podendo medir quantas páginas sairiam de "fonte única"
+    # — e foi exatamente por isso que, em 2026-09-16, a pauta desta ferramenta
+    # (348 páginas) não pôde ser lida enquanto o estoque estava ocupado.
+    #
+    # O que NÃO afrouxou: a escrita continua inteira dentro do lease + lock
+    # exclusivo, e o CAS pela linha viva continua abortando a transação. O que
+    # muda é que, em dry-run, a divergência de linha vira AVISO contado e a
+    # página sai do plano — sem lock, a linha pode ter mudado legitimamente
+    # debaixo da leitura, e abortar aí seria confundir concorrência com defeito.
+    escrevendo = not args.dry_run
+    lease = canonical_stock_write_lease(ROOT) if escrevendo else contextlib.nullcontext()
+    trava = exclusive_lock(LOCK) if escrevendo else contextlib.nullcontext()
+    try:
+        with lease:
+            with trava:
+                for shard_rel in sorted(por_shard):
+                    caminho = ROOT / shard_rel
+                    linhas = caminho.read_bytes().decode("utf-8").split("\n")
+                    fim_com_newline = bool(linhas) and linhas[-1] == ""
+                    if fim_com_newline:
+                        linhas = linhas[:-1]
+                    saida = []
+                    mudou = False
+                    for numero, raw in enumerate(linhas, 1):
+                        if not raw.strip():
+                            saida.append(raw)
+                            continue
+                        registro = json.loads(raw)
+                        intent = registro.get("intent_id")
+                        alvo = por_shard[shard_rel].get(intent)
+                        if not alvo:
+                            saida.append(raw)
+                            continue
+                        diploma, artigo = alvo
+                        fonte = montar_fonte(corpus, diploma, artigo)
+                        atuais = registro.get("official_sources") or []
+                        if any((s.get("url") or "") == fonte["url"] for s in atuais):
+                            ja_tinham += 1
+                            saida.append(raw)
+                            continue
+                        motivo = mesmo_ato_ja_registrado(
+                            fonte["url"], [s.get("url") or "" for s in atuais])
+                        if motivo:
+                            if "MESMO ato" in motivo:
+                                mesmo_ato += 1
+                            else:
+                                indecidiveis += 1
+                            print(f"  PULADA {intent}: {fonte['name']} — {motivo}",
+                                  file=sys.stderr)
+                            saida.append(raw)
+                            continue
+                        if not fonte["anchor_claim"]:
+                            saida.append(raw)
+                            continue
+                        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+                        registro["official_sources"] = atuais + [fonte]
+                        registro["word_count"] = word_count(registro)
+                        nova = json.dumps(registro, ensure_ascii=False, sort_keys=True)
+                        atual = hashlib.sha256(
+                            caminho.read_bytes().decode("utf-8").split("\n")[numero - 1]
+                            .strip().encode("utf-8")).hexdigest()
+                        if atual != digest_antes:
+                            if escrevendo:
+                                raise SystemExit(
+                                    f"CAS DE LINHA FALHOU em {shard_rel}:{numero} ({intent})")
+                            divergiram += 1
+                            print(f"  AVISO {shard_rel}:{numero} ({intent}): a linha mudou durante o "
+                                  f"planejamento; fora do plano desta passada", file=sys.stderr)
+                            saida.append(raw)
+                            continue
+                        saida.append(nova)
+                        adicionadas += 1
+                        mudou = True
+                        print(f"  {intent} <- {fonte['name']}")
+                    if mudou and not args.dry_run:
+                        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+                        atomic_write(caminho, payload.encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    print(f"\nfontes registradas: {adicionadas} | já tinham: {ja_tinham} | "
+          f"mesmo ato por outra variante de URL (puladas): {mesmo_ato} | "
+          f"identidade de ato não resolvida pelo lexml (puladas): {indecidiveis} | "
+          f"linha divergente no plano: {divergiram}")
+    if args.dry_run:
+        print("--dry-run: nada escrito, e nenhum lease de escrita tomado.")
+    elif adicionadas:
+        print("Reingerir o estoque e republicar para o espelho refletir.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

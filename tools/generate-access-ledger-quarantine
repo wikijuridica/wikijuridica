@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""generate-access-ledger-quarantine — registra, sem apagar, as requisicoes que o
+proprio projeto gerou e ficaram gravadas no access log como trafego real.
+
+POR QUE EXISTE: `data/ops/access/access-*.jsonl` e append-only, e a regra do
+repositorio proibe apagar linha, reescrever arquivo ou reverter estado. Em
+2026-08-12 o harness de smoke do `cmd/check` instanciou o handler HTTP de
+PRODUCAO — middleware de log incluido — e varreu o `published_manifest` inteiro
+com dois User-Agents de Googlebot, sem mandar `X-Bot-Simulation`. Resultado
+medido: 19.253 linhas de "Googlebot" em 49 segundos, com `bot_simulation:false`
+e `warming:false`, mais 9.638 linhas da mesma varredura com User-Agent vazio.
+Como `tools/check-bot-traffic` so descartava linha com `warming` ou
+`bot_simulation`, essas requisicoes passavam pelo filtro criado exatamente para
+barra-las e eram contadas como Googlebot REAL — no mesmo dia em que a borda da
+Cloudflare registrou Googlebot real na ordem de DEZENAS.
+
+O harness ja foi corrigido em `internal/checks/checks.go` (commit 4e997e6e): toda
+requisicao sintetica do pacote passa a mandar o header. Isso protege o futuro. As
+linhas ja gravadas continuam mentindo, e e disso que este gerador trata.
+
+A saida e o meio-termo honesto, o mesmo que a borda ja adotou em
+`tools/generate-edge-telemetry-quarantine`: a linha fica onde esta, visivel e
+auditavel, e este ledger paralelo registra por que ela nao entra em nenhuma
+conta. Neutralizar declarando e diferente de sumir com a evidencia — quem abrir o
+repo daqui a um ano ve as duas coisas: que a metrica foi contaminada e que isso
+foi reconhecido.
+
+POR QUE E UM `generate-*` E NAO PARTE DO CHECK: em tools/, `check-*` e read-only
+e `generate-*` escreve — misturar os dois papeis e bug. E, mais importante,
+colocar a quarentena dentro do gate deixaria o gate se auto-absolver: ele acharia
+a varredura e no mesmo passo se daria permissao de ignora-la. Quarentenar e ato
+deliberado de quem revisou as linhas, nao efeito colateral de rodar um check.
+
+IDENTIDADE POR HASH, NAO POR NUMERO DE LINHA: o arquivo do dia recebe escrita
+continua do servidor vivo (foi de 31.082 para 31.139 linhas durante a propria
+auditoria). Numero de linha apontaria para outro registro em minutos; o sha256 do
+conteudo da linha e estavel para sempre.
+
+POR QUE UM ARQUIVO DE MEMBROS SEPARADO: um lote aqui tem dezenas de milhares de
+linhas, nao dez como na borda. Guardar cada hash numa entrada JSONL propria
+inchariam o ledger sem ganho. Entao cada lote vira UMA entrada com o resumo e a
+justificativa, e a lista de hashes vai para
+`data/ops/access_ledger_quarantine_members/<lote>.txt`, presa a entrada pelo
+campo `members_sha256` — digest do conjunto ordenado. Editar a lista depois de
+revisada quebra o digest e o check reprova: a exclusao continua sendo por
+conteudo, e continua sendo verificavel.
+
+O QUE A QUARENTENA NAO FAZ: nao e um "ignore tudo que for muito trafego". So a
+linha com hash registrado aqui deixa de contar. Qualquer varredura NOVA, que
+ninguem revisou, continua reprovando o `check-access-ledger-contamination` — que
+e exatamente o ponto de o gate existir.
+
+Uso:
+    tools/generate-access-ledger-quarantine --dry-run      # so mostra
+    tools/generate-access-ledger-quarantine --motivo "..." --revisor "..."
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import accessledger  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+import edgetelemetry  # noqa: E402
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+
+MOTIVO_PADRAO = (
+    "requisicao sintetica do harness de smoke do cmd/check gravada no access log "
+    "sem X-Bot-Simulation; nao e visita, e o proprio projeto batendo no proprio "
+    "handler"
+)
+
+
+def identidade(sessao):
+    """Identidade estavel do lote, derivada so do que o define."""
+    semente = "|".join([
+        sessao["source_file"],
+        sessao["ts_start"] or "",
+        sessao["ts_end"] or "",
+        sessao["user_agent"],
+    ])
+    return edgetelemetry.sha_linha(semente)[:16]
+
+
+def identidade_de_rota(achado):
+    """Identidade do lote CATEGORICO — a rota entra no lugar do user-agent.
+
+    O lote de sessao e definido por (arquivo, janela, user-agent), porque a
+    sessao E uma rajada de um agente so. O lote de rota bloqueada nao tem agente
+    unico — `detectar_rota_interna` agrupa por ROTA e a lista de user-agents e
+    consequencia, nao definicao. Reaproveitar `identidade()` aqui obrigaria a
+    inventar um user-agent representativo, e identidade derivada de campo
+    inventado deixa de ser estavel no dia em que outro agente aparecer.
+    """
+    semente = "|".join([
+        achado["source_file"],
+        achado["ts_start"] or "",
+        achado["ts_end"] or "",
+        "rota:" + achado["path"],
+    ])
+    return edgetelemetry.sha_linha(semente)[:16]
+
+
+def entrada_de_rota(achado, lote, membros, nome, agora, args):
+    """Registro de quarentena para achado CATEGORICO de rota bloqueada.
+
+    O QUE ESTA ENTRADA NAO TEM, e por que a ausencia e deliberada: nao ha
+    `requests_per_second`, `sweep_ratio`, `distinct_paths` nem `page_lines`.
+    Esses campos descrevem uma rajada de varredura e sao o resultado de uma
+    MEDICAO; aqui nao houve medicao nenhuma desse tipo, porque o veredito nao e
+    estatistico — vem da topologia (o nginx devolve 404 em /metrics antes de
+    chegar ao Go, entao nenhum cliente externo produz a linha). Preenche-los com
+    zero seria gravar numero que ninguem mediu, com cara de medicao, no arquivo
+    cuja unica razao de existir e nao deixar dado sintetico passar por real.
+
+    `detection` diz qual criterio produziu o lote, para quem ler a quarentena
+    depois nao precisar deduzir pela forma do registro.
+    """
+    return {
+        "schema_version": accessledger.SCHEMA,
+        "batch_id": lote,
+        "detection": "rota_bloqueada_no_ingress",
+        "source_file": achado["source_file"],
+        "path": achado["path"],
+        "user_agents": achado["user_agents"],
+        "ts_start": achado["ts_start"],
+        "ts_end": achado["ts_end"],
+        "line_count": achado["line_count"],
+        "source_flags": {"warming": False, "bot_simulation": False},
+        "reasons": achado["reasons"],
+        "member_count": len(membros),
+        "members_file": nome,
+        "members_sha256": accessledger.digest_membros(membros),
+        "quarantined_at": agora,
+        "justification": args.motivo,
+        "reviewer": args.revisor,
+    }
+
+
+def nome_dos_membros(sessao, lote):
+    base = sessao["source_file"]
+    if base.endswith(".jsonl"):
+        base = base[: -len(".jsonl")]
+    hora = (sessao["ts_start"] or "").replace(":", "").replace("-", "")
+    hora = hora.split("T")[-1] if "T" in hora else hora
+    return "%s--%s--%s.txt" % (base, hora or "sem-hora", lote[:8])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true",
+                        help="mostra o que seria quarentenado, sem gravar")
+    parser.add_argument("--motivo", default=MOTIVO_PADRAO,
+                        help="justificativa humana gravada em cada entrada")
+    parser.add_argument("--revisor", default="",
+                        help="quem revisou as sessoes (fica no registro)")
+    args = parser.parse_args()
+
+    entradas, hashes, problemas = accessledger.carregar_quarentena(ROOT)
+    if problemas:
+        # Gravar por cima de uma quarentena que nao se verifica seria empilhar
+        # julgamento novo sobre julgamento quebrado.
+        print("generate-access-ledger-quarantine: a quarentena existente esta "
+              "inconsistente — corrija antes de acrescentar:", file=sys.stderr)
+        for problema in problemas:
+            print("  - %s" % problema, file=sys.stderr)
+        return 2
+
+    achados, acervo = accessledger.detectar(ROOT, hashes_ignorados=hashes)
+    # As DUAS deteccoes, e nao so a estatistica. Ate 2026-08-12 este gerador
+    # chamava apenas `detectar`, enquanto `check-access-ledger-contamination`
+    # chamava tambem `detectar_rota_interna` — e o resultado era uma armadilha
+    # fechada: o check REPROVAVA por 50 linhas de /metrics em tres dias e o
+    # gerador respondia "nada novo a quarentenar". Gate que acusa sem que
+    # nenhuma ferramenta consiga resolver ensina o operador a ignorar o gate,
+    # que e como uma protecao real morre.
+    rotas = accessledger.detectar_rota_interna(ROOT, hashes_ignorados=hashes)
+
+    print("acervo=%s URLs | piso de rajada=%d linhas e %.0f req/s | razao de "
+          "varredura>=%.2f | cobertura>=%.0f%%"
+          % (acervo if acervo else "(desconhecido)", accessledger.MIN_LINHAS_RAJADA,
+             accessledger.MIN_TAXA_RAJADA_RPS, accessledger.MIN_RAZAO_VARREDURA,
+             100.0 * accessledger.MIN_COBERTURA_ACERVO))
+    print("lotes ja em quarentena: %d (%d linhas neutralizadas)"
+          % (len(entradas), len(hashes)))
+    print("sessoes contaminadas ainda NAO reconhecidas: %d (%d linhas)"
+          % (len(achados), sum(s["line_count"] for s in achados)))
+    print("rotas bloqueadas no ingress ainda NAO reconhecidas: %d (%d linhas)"
+          % (len(rotas), sum(r["line_count"] for r in rotas)))
+
+    if not achados and not rotas:
+        print("\nnada novo a quarentenar.")
+        return 0
+
+    print()
+    for sessao in achados:
+        lote = identidade(sessao)
+        print("  %s .. %s  %6d linhas | %6.1f req/s | razao %.2f | %d URLs distintas"
+              % (sessao["ts_start"], sessao["ts_end"], sessao["line_count"],
+                 sessao["requests_per_second"], sessao["sweep_ratio"],
+                 sessao["distinct_paths"]))
+        print("      arquivo=%s lote=%s" % (sessao["source_file"], lote))
+        print("      user_agent=%s" % (sessao["user_agent"] or "(vazio)"))
+        for motivo in sessao["reasons"]:
+            print("      -> %s" % motivo)
+
+    for achado in rotas:
+        lote = identidade_de_rota(achado)
+        print("  %s .. %s  %6d linhas | rota %s"
+              % (achado["ts_start"], achado["ts_end"], achado["line_count"], achado["path"]))
+        print("      arquivo=%s lote=%s" % (achado["source_file"], lote))
+        print("      user_agents=%s" % (", ".join(a or "(vazio)" for a in achado["user_agents"])))
+        for motivo in achado["reasons"]:
+            print("      -> %s" % motivo)
+
+    if args.dry_run:
+        print("\n--dry-run: nada foi gravado.")
+        return 0
+
+    agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    destino = accessledger.caminho_quarentena(ROOT)
+    membros_dir = accessledger.dir_membros(ROOT)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    os.makedirs(membros_dir, exist_ok=True)
+
+    novas = []
+    for sessao in achados:
+        lote = identidade(sessao)
+        membros = sorted(sessao["line_sha256"])
+        nome = nome_dos_membros(sessao, lote)
+        with open(os.path.join(membros_dir, nome), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(membros) + "\n")
+        novas.append({
+            "schema_version": accessledger.SCHEMA,
+            "batch_id": lote,
+            "source_file": sessao["source_file"],
+            "user_agent": sessao["user_agent"],
+            "ts_start": sessao["ts_start"],
+            "ts_end": sessao["ts_end"],
+            "span_seconds": sessao["span_seconds"],
+            "line_count": sessao["line_count"],
+            "distinct_paths": sessao["distinct_paths"],
+            "page_lines": sessao["page_lines"],
+            "requests_per_second": round(sessao["requests_per_second"], 3),
+            "sweep_ratio": round(sessao["sweep_ratio"], 4),
+            "bot_rules": sessao["bot_rules"],
+            "source_flags": {"warming": False, "bot_simulation": False},
+            "reasons": sessao["reasons"],
+            "member_count": len(membros),
+            "members_file": nome,
+            "members_sha256": accessledger.digest_membros(membros),
+            "quarantined_at": agora,
+            "justification": args.motivo,
+            "reviewer": args.revisor,
+        })
+
+    for achado in rotas:
+        lote = identidade_de_rota(achado)
+        membros = sorted(achado["line_sha256"])
+        nome = nome_dos_membros({"source_file": achado["source_file"],
+                                 "ts_start": achado["ts_start"]}, lote)
+        with open(os.path.join(membros_dir, nome), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(membros) + "\n")
+        novas.append(entrada_de_rota(achado, lote, membros, nome, agora, args))
+
+    # Append-only, igual ao ledger que ele descreve: a quarentena tambem e
+    # historico, e retirar uma entrada tem que ser um ato visivel no git.
+    with open(destino, "a", encoding="utf-8") as handle:
+        for entrada in sorted(novas, key=lambda e: (e["source_file"], e["ts_start"], e["batch_id"])):
+            handle.write(json.dumps(entrada, ensure_ascii=False, sort_keys=True) + "\n")
+
+    print("\nquarentena gravada em %s (%d lote(s), %d linhas)"
+          % (os.path.relpath(destino, ROOT), len(novas),
+             sum(e["member_count"] for e in novas)))
+    print("hashes por lote em %s/" % os.path.relpath(membros_dir, ROOT))
+    print("o access log original NAO foi tocado — nenhuma linha apagada ou reescrita.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

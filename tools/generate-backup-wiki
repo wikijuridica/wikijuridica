@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# tools/generate-backup-wiki — a copia de seguranca que o projeto nao tinha.
+#
+# ★ POR QUE EXISTE (2026-08-29, BUG-146 da caca aos bugs)
+#
+# Medido: `systemctl list-timers | grep -i backup` devolvia apenas
+# `dpkg-db-backup`, do sistema operacional. O /opt/wiki tem 12 GB em data/ e
+# 9,8 GB de historia em .git, e NENHUMA rota de backup. Um NVMe que morre leva
+# junto a historia inteira do projeto — cada pagina escrita, cada decisao
+# registrada, cada medicao que custou sessao.
+#
+# Nao e risco hipotetico: a propria caca achou um manifesto VERSIONADO
+# (data/editorial/stock_manifest.json) apontando por sha256 para um recibo de
+# ingest que nao existia em lugar nenhum do repositorio. Dado sole-copy some sem
+# aviso, e so se descobre quando alguem vai busca-lo.
+#
+# ★ DESENHO, E POR QUE ASSIM
+#
+# DISCO FISICO DIFERENTE. O destino e /mnt/hdd (/dev/sda1), nao outra pasta do
+# mesmo NVMe onde /opt vive. Copia no mesmo disco protege contra `rm` acidental
+# e contra nada mais; o modo de falha que importa aqui e o disco morrer.
+#
+# MIRROR INCREMENTAL, nao bundle diario. `git clone --mirror` uma vez e `git
+# fetch` depois: a primeira sincronia paga os 9,8 GB, as seguintes pagam so o
+# delta. Bundle completo todo dia gravaria dezenas de GB por semana num disco
+# que tem 186 GB livres, e encheria o destino em pouco mais de um mes.
+#
+# O QUE ENTRA ALEM DO GIT:
+#  - .env.local e variantes: credenciais, unica copia, fora do versionamento por
+#    razao obvia. Vao com modo 0600 preservado.
+#  - TODO arquivo untracked E NAO IGNORADO, em $DESTINO/untracked/, preservando o
+#    caminho relativo. Ate 2026-08-29 este cabecalho AFIRMAVA cobrir isso e o
+#    codigo nao cobria: copiava so o .env.local. Medido no dia em que foi
+#    corrigido: `git status --porcelain -z --untracked-files=all` devolvia 107
+#    arquivos e 83.342.109 bytes fora do espelho, entre eles
+#    .agents/runtime/nginx.conf.pre-etagoff-20260828 — config de PRODUCAO em
+#    copia unica. Comentario que mente e bug (R1 do contrato do dado real).
+#  - A SELECAO E POR ESTADO DO GIT, NUNCA POR PADRAO DE NOME. Um .gitignore para
+#    `.pre-*` / `.antes-*` esconderia justamente os snapshots de config de
+#    producao que sao copia unica. Aqui o criterio e "o git nao guarda" — que e
+#    exatamente a definicao de sole-copy — e o erro so pode ser para o lado
+#    seguro (copiar demais custa 80 MB; copiar de menos custa o arquivo).
+#  - NAO entra public/ (regeneravel por cmd/build) nem var/ (cache de runtime):
+#    ambos estao no .gitignore, entao a propria regra acima ja os exclui, sem
+#    lista paralela para desatualizar.
+#
+# ADITIVO, NUNCA ESPELHADO. A copia do untracked nao apaga nada no destino: se um
+# arquivo sumir da origem, ele CONTINUA no backup. Backup que apaga junto com a
+# origem nao protege contra o modo de falha que mais acontece — apagar sem
+# querer. O custo e o destino crescer; o beneficio e ele servir para alguma
+# coisa.
+#
+# VERIFICACAO, sempre. Backup que ninguem testa e fe, nao engenharia: cada
+# execucao roda `git -C <mirror> fsck --connectivity-only` e confere que o HEAD
+# do espelho bate com o da origem. Falhou a verificacao, o exit e 1 e o alerta
+# sai — porque backup silenciosamente corrompido e pior que backup ausente.
+
+set -u -o pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DESTINO="${WIKI_BACKUP_DIR:-/mnt/hdd/backups/wiki}"
+ESPELHO="$DESTINO/repo.git"
+SEGREDOS="$DESTINO/segredos"
+LEDGER="$RAIZ/data/ops/backup_wiki.jsonl"
+AGORA="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+falha() {
+	echo "backup-wiki: $*" >&2
+	exit "${2:-1}"
+}
+
+[ -d "$DESTINO" ] || falha "destino ausente: $DESTINO (o disco de backup esta montado?)" 2
+
+# Espaco: recusar antes de encher o disco e melhor que descobrir no meio.
+livre_kb=$(df -Pk "$DESTINO" | awk 'NR==2 {print $4}')
+precisa_kb=$(du --max-depth=0 -k "$RAIZ/.git" 2>/dev/null | awk '{print $1}')
+[ -n "${precisa_kb:-}" ] || precisa_kb=0
+if [ "$livre_kb" -lt "$((precisa_kb / 2))" ]; then
+	falha "espaco insuficiente em $DESTINO: livre=${livre_kb}KB, .git=${precisa_kb}KB" 2
+fi
+
+inicio=$(date +%s)
+
+# HEAD DA ORIGEM NO INSTANTE DO FETCH, nao no fim da execucao. A primeira
+# execucao real reprovou por isto: o clone levou 184 s, um commit entrou nesse
+# meio-tempo, e a verificacao final comparou o espelho com uma origem que ja
+# tinha andado. O espelho estava integro; a regua e que estava errada. Backup
+# correto reprovando e tao ruim quanto backup errado passando — treina a
+# ignorar o alerta.
+HEAD_ORIGEM="$(git -C "$RAIZ" rev-parse HEAD)"
+
+if [ ! -d "$ESPELHO" ]; then
+	echo "backup-wiki: primeira sincronia (espelho completo, paga o custo uma vez)"
+	git clone --mirror "$RAIZ" "$ESPELHO" || falha "clone do espelho falhou"
+else
+	echo "backup-wiki: sincronia incremental"
+	git -C "$ESPELHO" remote set-url origin "$RAIZ"
+	git -C "$ESPELHO" fetch --prune origin '+refs/*:refs/*' || falha "fetch incremental falhou"
+fi
+
+# Segredos e produto untracked: fora do git por desenho, mas sole-copy.
+mkdir -p "$SEGREDOS"
+chmod 700 "$SEGREDOS"
+# .env.social entrou em 2026-09-05 e NAO e redundante com o .env.local: a
+# WIKI_SOCIAL_KEK mora la sozinha, separada por isolamento de processo (a unit
+# do acervo tambem carrega o .env.local). Ela deriva, por HMAC com rotulo, a
+# chave que cifra o e-mail de cada conta e a do indice cego usado no login --
+# perder o arquivo e perder o acesso a TODAS as contas, e trocar tem o mesmo
+# efeito. E o unico segredo deste repositorio cuja perda destroi dado de
+# usuario em vez de exigir a reemissao de um token.
+for arquivo in .env.local .env.local.example .env.social; do
+	[ -f "$RAIZ/$arquivo" ] && cp -p "$RAIZ/$arquivo" "$SEGREDOS/$arquivo"
+done
+chmod -R go-rwx "$SEGREDOS"
+
+# BANCO SOCIAL — a excecao ao "var/ e regeneravel", e ela nao e detalhe.
+#
+# O criterio deste script e "o git nao guarda" = sole-copy, e var/ ficava de
+# fora porque tudo o que morava la era CACHE DE RUNTIME: apagar custa uma
+# regeneracao. O banco da rede social quebra essa premissa. Conta, perfil,
+# postagem, denuncia, decisao de moderacao e trilha NASCEM ali e nao existem em
+# nenhum outro lugar (DEC-045.1). Perder o arquivo e perder o dado do usuario,
+# e nenhum comando o regenera.
+#
+# `VACUUM INTO`, NUNCA `cp`. Com WAL ligado, o .db sozinho e uma foto ANTERIOR
+# ao ultimo checkpoint, e copiar .db + -wal + -shm em tres instantes diferentes
+# produz um arquivo que ABRE E MENTE -- a pior forma de backup que existe,
+# porque o erro so aparece quando alguem precisa restaurar. VACUUM INTO pede ao
+# proprio SQLite uma copia consistente do estado corrente, com uma transacao de
+# leitura segurando o ponto.
+#
+# Sem sqlite3 no PATH a copia NAO cai para cp: ela falha e avisa. Backup
+# silenciosamente corrompido e pior que backup ausente.
+# ★ A TRILHA POR BANCO, E POR QUE ELA NAO E ORNAMENTO (2026-09-05)
+#
+# Ate hoje o ledger nao tinha campo NENHUM sobre estes bancos: nao havia como
+# provar, lendo data/ops/backup_wiki.jsonl, que o dado de usuario tinha sido
+# salvo e passado no integrity_check. Pior — o desfecho do bloco era INVISIVEL
+# nos dois sentidos. Quando corria bem, nada registrava; quando corria mal,
+# `falha` saia do script ANTES do printf do ledger, e a unica linha que o ledger
+# jamais poderia conter era a de sucesso.
+#
+# Por isso o bloco agora ACUMULA o veredito por banco (como o fsck do espelho ja
+# faz mais abaixo) e o desfecho e roteado pelo `problema` do ledger: a linha e
+# gravada primeiro, o exit 1 vem depois. Ledger que so sabe dizer "ok" nao e
+# trilha, e uma coleção de silencios.
+BANCO_SOCIAL_DIR="$DESTINO/banco-social"
+TRILHA_SOCIAL="$(mktemp)" || falha "nao consegui abrir o arquivo de trabalho da trilha do banco social" 2
+[ -n "$TRILHA_SOCIAL" ] || falha "mktemp devolveu caminho vazio para a trilha do banco social" 2
+trap 'rm -f "$TRILHA_SOCIAL"' EXIT
+problema_social=""
+
+registra_problema_social() {
+	if [ -z "$problema_social" ]; then
+		problema_social="$1"
+	else
+		problema_social="$problema_social; $1"
+	fi
+}
+
+# REGISTRO DE ACESSO DA REDE SOCIAL — a segunda exceção ao "var/ é regenerável".
+#
+# O critério deste script é "o git não guarda" = sole-copy, e var/ ficava de
+# fora porque tudo ali era cache de runtime. O banco social já quebrou essa
+# premissa; var/ops/access-raw/ a quebra por um motivo diferente e mais duro.
+#
+# Desde 2026-09-05 o ledger versionado grava, para a superfície social, um
+# pseudônimo diário no lugar do IP — o endereço em claro passou a viver SÓ ali.
+#
+# O PRAZO DE SEIS MESES É PADRÃO PRÓPRIO, e não obrigação legal direta. A
+# afirmação anterior aqui dizia que o art. 15 do Marco Civil (Lei 12.965/2014)
+# "OBRIGA", e isso estava errado: o caput daquele artigo alcança o provedor
+# "constituído na forma de pessoa jurídica" que exerça a atividade "de forma
+# organizada, profissionalmente e com fins econômicos" — e o controlador deste
+# portal é pessoa natural. O prazo é adotado pelo PARÂMETRO do art. 15 e porque
+# o § 1º permite que autoridade requeira a guarda: sem registro guardado, uma
+# requisição judicial legítima encontra o nada.
+#
+# Perder este diretório continua sendo grave, e por dois motivos que não mudam:
+# não há de onde regenerar (a chave do HMAC é apagada junto com o bruto quando o
+# prazo vence), e é o único lugar onde o IP em claro existe depois que o ledger
+# versionado passou a gravar pseudônimo.
+#
+# A chave (var/ops/access-keys/) vai junto pela integridade do conjunto, não
+# porque perdê-la seja grave: o pseudônimo já gravado no git é definitivo de
+# qualquer forma.
+for diretorio_sensivel in var/ops/access-raw var/ops/access-keys; do
+	if [ -d "$RAIZ/$diretorio_sensivel" ]; then
+		destino_sensivel="$SEGREDOS/$(basename "$diretorio_sensivel")"
+		mkdir -p "$destino_sensivel"
+		chmod 700 "$destino_sensivel"
+		if cp -pr "$RAIZ/$diretorio_sensivel/." "$destino_sensivel/" 2>/dev/null; then
+			chmod -R go-rwx "$destino_sensivel"
+		else
+			registra_problema_social "copia de $diretorio_sensivel falhou"
+		fi
+	fi
+done
+
+if [ -d "$RAIZ/var/social" ]; then
+	mkdir -p "$BANCO_SOCIAL_DIR"
+	chmod 700 "$BANCO_SOCIAL_DIR"
+	bancos_copiados=0
+	for banco in "$RAIZ"/var/social/*.db; do
+		[ -f "$banco" ] || continue
+		nome="$(basename "$banco")"
+		copia="$BANCO_SOCIAL_DIR/$nome"
+		instante="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		bytes=0
+		integridade="nao_copiado"
+		chaves="nao_copiado"
+		sal="ausente_na_origem"
+		erro=""
+
+		if ! command -v sqlite3 >/dev/null 2>&1; then
+			echo "backup-wiki: ERRO — sqlite3 ausente e $nome NAO foi copiado." >&2
+			echo "backup-wiki:        cp de banco com WAL produz arquivo que abre e mente;" >&2
+			echo "backup-wiki:        instale sqlite3 ou o dado de usuario fica sem copia." >&2
+			erro="sqlite3 ausente: sem copia consistente"
+		else
+			# VACUUM INTO RECUSA DESTINO EXISTENTE — e era isso que condenava
+			# este bloco a funcionar UMA unica vez. Da segunda execucao em
+			# diante o comando devolveria "output file already exists", e o
+			# backup inteiro reprovaria por um banco que estava perfeito. O
+			# defeito nunca apareceu porque a guarda `[ -d var/social ]` acima
+			# nunca foi verdadeira ate 2026-09-05 03:02:15Z — o backup das
+			# 02:21:58Z do mesmo dia gravou "problema":"" sem ter copiado nada.
+			#
+			# A resolucao e escrever num parcial e PUBLICAR por mv, que e
+			# atomico no mesmo sistema de arquivos: nunca existe uma janela em
+			# que o destino tenha um banco meio escrito. A copia anterior do
+			# MESMO banco e substituida pelo estado mais novo dele — isso nao e
+			# a regra "aditivo, nunca espelhado" do untracked sendo quebrada, e
+			# a diferenca entre um arquivo que o git nao guarda e um banco que
+			# muda a cada denuncia. Nao substituir significaria nunca mais
+			# atualizar o backup do dado de usuario.
+			parcial="$copia.parcial-$$"
+			rm -f "$parcial"
+			if sqlite3 "$banco" "VACUUM INTO '$parcial'" 2>/dev/null && mv -f "$parcial" "$copia"; then
+				bancos_copiados=$((bancos_copiados + 1))
+			else
+				rm -f "$parcial"
+				echo "backup-wiki: ERRO — VACUUM INTO falhou para $nome" >&2
+				erro="VACUUM INTO falhou"
+			fi
+		fi
+
+		if [ -z "$erro" ]; then
+			bytes="$(stat -c%s "$copia" 2>/dev/null || echo 0)"
+
+			# O SAL VIAJA COM O BANCO, e sem ele a copia abre e mente de um jeito
+			# novo. O pseudonimo do denunciante na trilha de moderacao e derivado de
+			# <banco>.sal; restaurar o .db sozinho faz a primeira abertura gerar sal
+			# novo, e entao a mesma conta passa a ter outro pseudonimo. A trilha e
+			# append-only por TRIGGER (nao admite UPDATE), logo as linhas antigas
+			# NAO podem ser reescritas: elas ficam apontando para um pseudonimo que
+			# ninguem mais produz. A trilha continua integra e verificavel, e deixa
+			# de responder quem denunciou — que e exatamente o que as teses do STF
+			# de 26/06/2025 obrigam a saber responder. Falha silenciosa e permanente.
+			#
+			# Sal truncado nao e melhor que sal ausente: ele deriva pseudonimo
+			# diferente sem dar erro. Se a origem tem sal, a copia tem de ter os
+			# MESMOS bytes, e o cmp e quem responde por isso.
+			if [ -f "$banco.sal" ]; then
+				if install -m 600 "$banco.sal" "$copia.sal"; then
+					if cmp -s "$banco.sal" "$copia.sal"; then
+						sal="copiado"
+					else
+						sal="divergente"
+						erro="sal copiado diverge da origem: o pseudonimo da trilha mudaria na restauracao"
+					fi
+				else
+					sal="nao_copiado"
+					erro="sal nao foi copiado: a trilha restaurada perderia o vinculo com as contas"
+				fi
+			fi
+
+			# E a copia tem de ABRIR. Um .db integro na origem pode virar arquivo
+			# truncado no destino por disco cheio, e integrity_check e o unico jeito
+			# de descobrir isso agora em vez de na restauracao.
+			integridade="$(sqlite3 "$copia" "PRAGMA integrity_check;" 2>/dev/null || echo falhou)"
+			integridade="$(printf '%s' "$integridade" | tr '\n\r\t' '   ')"
+			if [ "$integridade" != "ok" ]; then
+				erro="${erro:+$erro; }nao passa em integrity_check: $integridade"
+			fi
+			# foreign_key_check devolve LINHA por violacao: saida vazia e o esperado.
+			violacoes="$(sqlite3 "$copia" "PRAGMA foreign_key_check;" 2>/dev/null || echo erro)"
+			if [ -z "$violacoes" ]; then
+				chaves="ok"
+			else
+				chaves="violacao"
+				erro="${erro:+$erro; }tem violacao de chave estrangeira"
+			fi
+		fi
+
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$nome" "$bytes" "$integridade" "$chaves" "$sal" "$instante" "$erro" >>"$TRILHA_SOCIAL"
+		[ -z "$erro" ] || registra_problema_social "$nome: $erro"
+	done
+	chmod -R go-rwx "$BANCO_SOCIAL_DIR"
+	echo "backup-wiki: banco social copiado por VACUUM INTO e verificado: $bancos_copiados arquivo(s)" >&2
+fi
+
+# O array vai para o ledger montado por json.dumps, e nao por printf: o veredito
+# do integrity_check e texto livre do motor e pode trazer aspas. JSONL com aspas
+# soltas e a linha que o proprio `carrega()` do check-backup-restauravel ja
+# aprendeu a pular — e linha pulada e medicao perdida.
+BANCOS_SOCIAIS_JSON="$(
+	nice -n 19 python3 - "$TRILHA_SOCIAL" <<'PYEOF'
+import json
+import sys
+
+registros = []
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for linha in fh:
+            linha = linha.rstrip("\n")
+            if not linha:
+                continue
+            campos = linha.split("\t")
+            if len(campos) != 7:
+                continue
+            nome, tamanho, integridade, chaves, sal, instante, problema = campos
+            registros.append({
+                "banco": nome,
+                "bytes": int(tamanho) if tamanho.isdigit() else 0,
+                "integrity_check": integridade,
+                "foreign_key_check": chaves,
+                "sal": sal,
+                "copiado_em": instante,
+                "problema": problema,
+            })
+except FileNotFoundError:
+    pass
+print(json.dumps(registros, ensure_ascii=False))
+PYEOF
+)" || BANCOS_SOCIAIS_JSON="[]"
+[ -n "${BANCOS_SOCIAIS_JSON:-}" ] || BANCOS_SOCIAIS_JSON="[]"
+
+# UNTRACKED NAO-IGNORADO — o que o espelho do git nao alcanca por definicao.
+# -z porque caminho de arquivo pode ter espaco e quebra de linha; --untracked-
+# -files=all porque o default agrupa por diretorio e devolveria "dir/" em vez
+# dos arquivos. Sem --ignored: o que esta no .gitignore (public/, var/,
+# .release-staging/) e regeneravel e fica de fora por construcao.
+UNTRACKED_DIR="$DESTINO/untracked"
+mkdir -p "$UNTRACKED_DIR"
+untracked_n=0
+untracked_bytes=0
+while IFS= read -r -d '' linha; do
+	case "$linha" in
+	'?? '*) ;;
+	*) continue ;;
+	esac
+	rel="${linha#?? }"
+	[ -f "$RAIZ/$rel" ] || continue
+	destino_arquivo="$UNTRACKED_DIR/$rel"
+	mkdir -p "$(dirname "$destino_arquivo")"
+	if cp -p "$RAIZ/$rel" "$destino_arquivo"; then
+		untracked_n=$((untracked_n + 1))
+		tam=$(stat -c%s "$RAIZ/$rel" 2>/dev/null || echo 0)
+		untracked_bytes=$((untracked_bytes + tam))
+	else
+		echo "backup-wiki: AVISO — falhou copiar untracked $rel" >&2
+	fi
+done < <(git -C "$RAIZ" status --porcelain -z --untracked-files=all)
+chmod -R go-rwx "$UNTRACKED_DIR"
+echo "backup-wiki: untracked copiados: $untracked_n arquivos, $untracked_bytes bytes"
+
+# VERIFICACAO — o passo que separa backup de fe.
+if ! git -C "$ESPELHO" fsck --connectivity-only --no-progress >/dev/null 2>&1; then
+	problema="fsck do espelho reprovou"
+elif [ "$(git -C "$ESPELHO" rev-parse HEAD)" != "$HEAD_ORIGEM" ]; then
+	problema="HEAD do espelho ($(git -C "$ESPELHO" rev-parse --short HEAD)) difere do que a origem tinha no fetch ($(git -C "$RAIZ" rev-parse --short "$HEAD_ORIGEM"))"
+else
+	problema=""
+fi
+
+# O banco social entra no MESMO campo `problema`, e nao num campo paralelo, por
+# um motivo de leitura: `ultimo_bom()` do check-backup-restauravel elege a
+# ultima execucao com `problema` vazio. Um campo separado faria uma execucao que
+# perdeu o dado de usuario continuar valendo como "ultimo backup OK".
+#
+# As aspas saem do RESUMO porque ele viaja num printf sem escape. O texto
+# integro, com as aspas que o motor devolver, esta preservado em
+# bancos_sociais[].problema, montado por json.dumps.
+if [ -n "$problema_social" ]; then
+	resumo_social="$(printf '%s' "$problema_social" | tr -d '"\\' | tr '\n\r\t' '   ')"
+	problema="${problema:+$problema; }banco social: $resumo_social"
+fi
+
+fim=$(date +%s)
+# TAMANHO SEM du RECURSIVO. /mnt/hdd tem rede de seguranca de sistema
+# (/etc/profile.d/hdd-safety-net.sh) que PROIBE `du` recursivo ali: o disco e
+# lento e uma varredura completa trava a maquina. A primeira execucao real deste
+# script bateu nessa guarda, o comando falhou, e o ledger saiu com JSON invalido
+# ("tamanho_kb":,). `du --max-depth=0` e a forma autorizada; se ainda assim
+# falhar, grava-se 0 em vez de quebrar a linha do ledger.
+tamanho_kb=$(du --max-depth=0 -k "$DESTINO" 2>/dev/null | awk '{print $1}')
+[ -n "${tamanho_kb:-}" ] || tamanho_kb=0
+commits=$(git -C "$ESPELHO" rev-list --count HEAD 2>/dev/null || echo 0)
+
+mkdir -p "$(dirname "$LEDGER")"
+# ADITIVO, E SEM SUBIR VERSAO DE ESQUEMA — porque nao ha versao a subir. Esta
+# linha nunca teve `schema_version`, e todos os leitores dela usam acesso por
+# chave com default (`registro.get(...)` no check-backup-restauravel), entao
+# `bancos_sociais` no fim nao quebra ninguem. Inventar um `schema_version: 2`
+# agora obrigaria cada leitor a tratar uma versao 1 que jamais existiu nas
+# linhas antigas, e a ausencia da chave ja diz tudo o que ela diria: linha
+# gravada antes de 2026-09-05 nao mediu banco social. E o mesmo criterio que o
+# proprio gate aplica a `untracked_arquivos` — chave ausente nao e defeito
+# retroativo; chave presente e vazia, sim.
+printf '{"checked_at":"%s","destino":"%s","commits":%s,"tamanho_kb":%s,"duracao_s":%s,"untracked_arquivos":%s,"untracked_bytes":%s,"head":"%s","problema":"%s","bancos_sociais":%s}\n' \
+	"$AGORA" "$DESTINO" "$commits" "$tamanho_kb" "$((fim - inicio))" \
+	"$untracked_n" "$untracked_bytes" "$HEAD_ORIGEM" "$problema" \
+	"$BANCOS_SOCIAIS_JSON" >>"$LEDGER"
+
+if [ -n "$problema" ]; then
+	echo "backup-wiki: VERIFICACAO REPROVOU — $problema" >&2
+	exit 1
+fi
+echo "backup-wiki: OK — $commits commits espelhados, $((tamanho_kb / 1024)) MB em $DESTINO, $((fim - inicio))s"
+exit 0

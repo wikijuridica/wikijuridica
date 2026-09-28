@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""generate-bot-registry-entry — registra UM bot novo nos 6 artefatos numa passada.
+
+O DEFEITO QUE ISTO CORRIGE, medido em 2026-09-03: registrar um bot hoje exige
+5 edições manuais coordenadas em 6 artefatos —
+`crawl.DefaultBotRegistry()` (internal/crawl/crawl.go), o JSON
+(`content/crawl_policy.json`), o robots.txt publicado (`public/robots.txt`),
+os DOIS maps do nginx (`ops/nginx/wikijuridica.conf` e
+`ops/nginx/standalone/nginx.conf`) e `tools/botagents.py` — e quatro gates
+reprovam se qualquer uma desandar. A sessão de 2026-09-03 fez essa receita à
+mão sete vezes (AdsBot-Google-Mobile, AI2Bot, PetalBot, SemrushBot, MJ12bot,
+AhrefsBot, DataForSeoBot); este script é essa receita, escrita uma vez.
+
+O QUE ELE NÃO FAZ, de propósito: não inventa `class`/`purpose`/`rate_tier`
+novos — esses três têm de já existir em `internal/crawl/crawl.go` (uma classe
+nova é decisão de arquitetura, feita à mão, com o comentário que explica por
+quê — ver BotClassSEOTool como precedente). Não decide se o bot é "bom":
+DEC-023 é permissiva por padrão, e a única recusa deste gerador é
+`policy_source` não verificável (R9).
+
+USO:
+    tools/generate-bot-registry-entry \
+        --token AI2Bot --purpose training --class training_bot \
+        --tier training_tier_standard \
+        --policy-source https://allenai.org/crawler
+
+    tools/generate-bot-registry-entry --regenerar   # só reaplica a cadeia,
+                                                      # sem entrada nova —
+                                                      # prova de idempotencia:
+                                                      # git diff --stat vazio.
+
+IDEMPOTÊNCIA: token já registrado com os MESMOS campos → no-op, exit 0. Token
+já registrado com campos DIFERENTES → recusa, mostra o diff, exit 1 (mudar um
+bot já registrado é decisão humana, não deste gerador).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CRAWL_GO = os.path.join(RAIZ, "internal", "crawl", "crawl.go")
+POLITICA = os.path.join(RAIZ, "content", "crawl_policy.json")
+BOTAGENTS = os.path.join(RAIZ, "tools", "botagents.py")
+NGINX_FILES = (
+    os.path.join(RAIZ, "ops", "nginx", "wikijuridica.conf"),
+    os.path.join(RAIZ, "ops", "nginx", "standalone", "nginx.conf"),
+)
+
+# Âncora de inserção: a linha do curinga "*" nunca muda de forma, e todo
+# cadastro novo entra IMEDIATAMENTE ANTES dela (ou antes do primeiro token
+# existente do qual o novo token é prefixo — ver posicao_de_insercao).
+ANCORA_REGISTRY = '{UserAgent: "*", Purpose: BotPurposeUnknownGuard'
+
+# purpose (o valor de crawl.BotPurposeX) -> função de tools/botagents.FUNCAO.
+# Deriva do MESMO mapeamento que crawl.ValidatePolicy já fecha por switch —
+# não é uma escolha nova deste gerador, é a leitura do que cada purpose
+# significa (ver ValidatePolicy em internal/crawl/crawl.go).
+PURPOSE_PARA_FUNCAO = {
+    "search_discovery": "search",
+    "user_triggered_fetch": "user",
+    "training": "training",
+    "ads_validation": "ads",
+    "seo_tool_crawl": "seo",
+}
+
+CLASSE_VALIOSA = "valuable_search_or_user_bot"
+
+PROBE_UA = "wikijuridica-superficie-probe/1.0"
+
+
+def erro(msg):
+    print("generate-bot-registry-entry: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def carrega_politica():
+    with open(POLITICA, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def sonda_policy_source(url, token, corpo_nao_conferivel):
+    """Confere policy_source: 200 obrigatório, token no corpo salvo com a
+    flag explícita (precedente: adidxbot, doc renderizada por JS)."""
+    if not url.startswith("https://"):
+        erro("policy_source precisa começar com https:// — recebido %r" % url)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": PROBE_UA,
+        "X-Warming-Request": "true",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            status = resp.status
+            corpo = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        erro("policy_source %s devolveu HTTP %s — sem fonte oficial, entrada recusada" % (url, e.code))
+    except Exception as e:  # noqa: BLE001 — qualquer falha de rede é recusa, não crash
+        erro("policy_source %s não respondeu: %s — sem fonte oficial, entrada recusada" % (url, e))
+    if status != 200:
+        erro("policy_source %s devolveu HTTP %s — sem fonte oficial, entrada recusada" % (url, status))
+    if corpo_nao_conferivel:
+        return
+    if token.lower() not in corpo.lower():
+        erro(
+            "policy_source %s respondeu 200 mas o token %r não aparece no corpo — "
+            "use --corpo-nao-conferivel 'MOTIVO' se a doc for real mas renderizada "
+            "por JS (precedente: adidxbot), nunca para inventar proveniência"
+            % (url, token)
+        )
+
+
+def entrada_existente(politica, token):
+    baixo = token.lower()
+    for e in politica["bot_registry"]:
+        if e["user_agent"].lower() == baixo:
+            return e
+    return None
+
+
+def eh_prefixo(a, b):
+    """a é prefixo PRÓPRIO de b, sem diferenciar maiúscula/minúscula."""
+    a, b = a.lower(), b.lower()
+    return a != b and b.startswith(a)
+
+
+def posicao_de_insercao(tokens_existentes, token_novo):
+    """Devolve o token EXISTENTE antes do qual o novo entra, ou None para
+    inserir na âncora (antes do "*"). Recusa (via erro()) se o novo token for
+    prefixo de um existente — essa ordem exige decisão humana (reordenar o
+    existente também), fora do escopo de um gerador aditivo."""
+    for existente in tokens_existentes:
+        if eh_prefixo(token_novo, existente):
+            erro(
+                "%r é prefixo de %r, já registrado — inserir aqui é reordenação, "
+                "não adição; resolva à mão (mesma classe de armadilha de "
+                "Applebot/Applebot-Extended)" % (token_novo, existente)
+            )
+    for existente in tokens_existentes:
+        if eh_prefixo(existente, token_novo):
+            return existente
+    return None
+
+
+def tokens_do_registro_go():
+    with open(CRAWL_GO, encoding="utf-8") as f:
+        texto = f.read()
+    inicio = texto.index("func DefaultBotRegistry()")
+    fim = texto.index("\n}\n", inicio)
+    corpo = texto[inicio:fim]
+    return [m.group(1) for m in re.finditer(r'UserAgent:\s*"([^"]+)"', corpo) if m.group(1) != "*"]
+
+
+def insere_no_registry_go(token, purpose, classe, tier, policy_source, comentario):
+    with open(CRAWL_GO, encoding="utf-8") as f:
+        texto = f.read()
+    tokens = tokens_do_registro_go()
+    antes_de = posicao_de_insercao(tokens, token)
+    linha_nova = (
+        '\t\t{UserAgent: "%s", Purpose: %s, Class: %s, RateTier: %s, '
+        'Required: true, PolicySource: "%s"},\n'
+    ) % (token, purpose_const(purpose), class_const(classe), tier_const(tier), policy_source)
+    bloco = comentario + linha_nova
+    if antes_de is None:
+        marca = ANCORA_REGISTRY
+        idx = texto.index(marca)
+        # Recua até o início da linha que contém a âncora, para inserir ANTES
+        # dela, não no meio da própria struct literal.
+        inicio_linha = texto.rfind("\n", 0, idx) + 1
+        texto = texto[:inicio_linha] + bloco + texto[inicio_linha:]
+    else:
+        marca = 'UserAgent: "%s"' % antes_de
+        idx = texto.index(marca)
+        inicio_linha = texto.rfind("\n", 0, idx) + 1
+        texto = texto[:inicio_linha] + bloco + texto[inicio_linha:]
+    with open(CRAWL_GO, "w", encoding="utf-8") as f:
+        f.write(texto)
+
+
+def purpose_const(purpose):
+    return {
+        "search_discovery": "BotPurposeSearchDiscovery",
+        "user_triggered_fetch": "BotPurposeUserTriggered",
+        "training": "BotPurposeTraining",
+        "ads_validation": "BotPurposeAdsValidation",
+        "seo_tool_crawl": "BotPurposeSEOTool",
+        "product_use_control": "BotPurposeProductUseControl",
+    }.get(purpose, purpose)
+
+
+def class_const(classe):
+    return {
+        "valuable_search_or_user_bot": "BotClassValuableSearchOrUser",
+        "ads_validation_bot": "BotClassAdsValidation",
+        "training_bot": "BotClassTraining",
+        "product_use_control": "BotClassProductUseControl",
+        "seo_tool": "BotClassSEOTool",
+    }.get(classe, classe)
+
+
+def tier_const(tier):
+    return {
+        "unlimited_no_rate_limit": "RateTierUnlimited",
+        "ads_validation_tier_standard": "RateTierAdsValidationStandard",
+        "training_tier_strict": "RateTierTrainingStrict",
+        "training_tier_standard": "RateTierTrainingStandard",
+        "no_http_user_agent": "RateTierNoHTTPUserAgent",
+        "unknown_guard_rate_limit": "RateTierUnknownGuard",
+        "seo_tool_tier_standard": "RateTierSEOToolStandard",
+    }.get(tier, tier)
+
+
+def insere_no_botagents(token, purpose):
+    funcao = PURPOSE_PARA_FUNCAO.get(purpose)
+    if funcao is None:
+        return  # product_use_control não envia UA HTTP; nada a identificar
+    with open(BOTAGENTS, encoding="utf-8") as f:
+        texto = f.read()
+    baixo = token.lower()
+    if re.search(r'\("%s",\s*\[' % re.escape(baixo), texto):
+        return  # já identificado
+    inicio = texto.index("AGENTES = [")
+    fim = texto.index("\n]\n", inicio)
+    corpo = texto[inicio:fim]
+    tokens = [m.group(1) for m in re.finditer(r'\("([a-z0-9._-]+)",\s*\[', corpo)]
+    antes_de = posicao_de_insercao(tokens, baixo)
+    linha = '    ("%s", ["%s"]),\n' % (baixo, baixo)
+    if antes_de is None:
+        # "\n]\n" casa NA MESMA quebra de linha que já fecha a última entrada
+        # existente — inserir em idx colaria a linha nova no fim da anterior,
+        # sem quebra entre as duas. idx+1 pula essa quebra já existente antes
+        # de escrever a linha nova (mesma lógica de insere_no_wj_bot_allow).
+        marca = "\n]\n"
+        idx = texto.index(marca, inicio)
+        texto = texto[:idx + 1] + linha + texto[idx + 1:]
+    else:
+        marca = '("%s", [' % antes_de
+        idx = texto.index(marca, inicio)
+        inicio_linha = texto.rfind("\n", 0, idx) + 1
+        texto = texto[:inicio_linha] + linha + texto[inicio_linha:]
+    # FUNCAO — mesma armadilha de offset do bloco AGENTES acima.
+    marca_funcao = "\n}\n"
+    idx_funcao = texto.index("FUNCAO = {")
+    idx = texto.index(marca_funcao, idx_funcao)
+    texto = texto[:idx + 1] + '    "%s": "%s",\n' % (baixo, funcao) + texto[idx + 1:]
+    with open(BOTAGENTS, "w", encoding="utf-8") as f:
+        f.write(texto)
+
+
+def insere_no_wj_bot_allow(token):
+    baixo = token.lower()
+    for caminho in NGINX_FILES:
+        with open(caminho, encoding="utf-8") as f:
+            texto = f.read()
+        if re.search(r"~\*%s\b" % re.escape(baixo), texto):
+            continue  # já presente
+        marca = "map $http_user_agent $wj_bot_allow {"
+        idx = texto.index(marca)
+        fim_bloco = texto.index("\n}\n", idx)
+        bloco = texto[idx:fim_bloco]
+        tokens = re.findall(r"~\*([a-z0-9._/-]+)\s+1;", bloco)
+        antes_de = None
+        for existente in tokens:
+            if eh_prefixo(baixo, existente.rstrip("/")):
+                antes_de = existente
+                break
+        linha = "    ~*%s              1;\n" % baixo
+        if antes_de is None:
+            texto = texto[:fim_bloco] + "\n" + linha.rstrip("\n") + texto[fim_bloco:]
+        else:
+            marca2 = "~*%s" % antes_de
+            idx2 = texto.index(marca2, idx)
+            inicio_linha = texto.rfind("\n", 0, idx2) + 1
+            texto = texto[:inicio_linha] + linha + texto[inicio_linha:]
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write(texto)
+
+
+def roda(cmd, **kw):
+    print("$ " + " ".join(cmd))
+    r = subprocess.run(cmd, cwd=RAIZ, **kw)
+    return r.returncode
+
+
+def cadeia_de_regeneracao():
+    """Passos comuns a --regenerar e a um cadastro novo: JSON -> robots ->
+    zonas do nginx -> os 4 gates + check-bot-identity-fonte-unica."""
+    passos = [
+        (["./tools/go-modern", "fmt", "./internal/crawl/..."], {}),
+        (["./tools/go-modern", "run", "./cmd/generate-crawl-policy"], {}),
+        (["./tools/go-modern", "run", "./cmd/generate-public-robots"], {}),
+        ([sys.executable, "tools/generate-nginx-rate-tiers", "--escrever"], {}),
+    ]
+    for cmd, kw in passos:
+        if roda(cmd, **kw) != 0:
+            erro("passo falhou: %s — corrija a causa antes de repetir" % " ".join(cmd))
+
+    gates = [
+        ["./tools/go-modern", "test", "-count=1", "./internal/crawl/"],
+        [sys.executable, "tools/check-bot-allowlist-derivada"],
+        ["./tools/go-modern", "test", "-count=1", "./internal/contract/public/", "-run", "NginxBotPolicy|BotValioso|NginxAllowMap|NoNginxConfDenies"],
+        [sys.executable, "tools/check-bot-identity-fonte-unica"],
+        [sys.executable, "tools/check-robots-parser-real"],
+    ]
+    falhou = False
+    for cmd in gates:
+        if roda(cmd) != 0:
+            falhou = True
+    if falhou:
+        erro("um ou mais gates reprovaram — ver saída acima")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--token")
+    p.add_argument("--purpose")
+    p.add_argument("--class", dest="classe")
+    p.add_argument("--tier")
+    p.add_argument("--policy-source")
+    p.add_argument("--corpo-nao-conferivel", metavar="MOTIVO", default=None)
+    p.add_argument("--regenerar", action="store_true",
+                    help="não registra token novo; só reaplica a cadeia (prova de idempotência)")
+    args = p.parse_args()
+
+    if args.regenerar:
+        cadeia_de_regeneracao()
+        print("generate-bot-registry-entry: cadeia reaplicada, nenhuma entrada nova")
+        return 0
+
+    faltando = [n for n in ("token", "purpose", "classe", "tier", "policy_source")
+                if getattr(args, n) is None]
+    if faltando:
+        erro("faltam argumentos obrigatórios: --" + ", --".join(f.replace("classe", "class") for f in faltando))
+
+    if args.policy_source.startswith("sem_documentacao_oficial_do_operador"):
+        erro("este gerador não aceita o prefixo de ausência de doc — isso é decisão "
+             "humana registrada manualmente (precedente: Bytespider), não caminho automático")
+
+    politica = carrega_politica()
+    existente = entrada_existente(politica, args.token)
+    if existente is not None:
+        igual = (
+            existente["purpose"] == args.purpose
+            and existente["class"] == args.classe
+            and existente["rate_tier"] == args.tier
+            and existente["policy_source"] == args.policy_source
+        )
+        if igual:
+            print("generate-bot-registry-entry: %s já registrado com os mesmos campos — no-op" % args.token)
+            return 0
+        erro(
+            "%s já registrado com campos DIFERENTES:\n  atual: %s\n  pedido: purpose=%s class=%s tier=%s policy_source=%s\n"
+            "mudar bot já registrado é decisão humana, não deste gerador"
+            % (args.token, json.dumps(existente, ensure_ascii=False), args.purpose, args.classe, args.tier, args.policy_source)
+        )
+
+    sonda_policy_source(args.policy_source, args.token, args.corpo_nao_conferivel)
+
+    from datetime import date
+    hoje = date.today().isoformat()
+    linhas_comentario = [
+        "\t\t// %s CADASTRADO EM %s por tools/generate-bot-registry-entry.\n" % (args.token, hoje),
+        "\t\t// policy_source sondado no dia (200, token no corpo%s).\n" % (
+            " — %s" % args.corpo_nao_conferivel if args.corpo_nao_conferivel else ""),
+    ]
+    comentario = "".join(linhas_comentario)
+
+    insere_no_registry_go(args.token, args.purpose, args.classe, args.tier, args.policy_source, comentario)
+    insere_no_botagents(args.token, args.purpose)
+    if args.classe == CLASSE_VALIOSA:
+        insere_no_wj_bot_allow(args.token)
+
+    cadeia_de_regeneracao()
+    print("generate-bot-registry-entry: %s registrado" % args.token)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

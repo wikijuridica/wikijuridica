@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""ai-brief — o que esta acontecendo no terminal AGORA, para qualquer agente.
+
+POR QUE
+  Um agente que nao enxerga o terminal age no escuro: nao sabe quem mais esta
+  trabalhando, o que ja esta rodando, se a maquina aguenta mais uma frente, nem
+  que ferramentas tem a disposicao. O resultado e trabalho duplicado, comando
+  pesado concorrente e token gasto para redescobrir o obvio a cada sessao.
+  Este comando responde tudo isso de uma vez, em menos de 2KB — barato de ler,
+  caro de nao ter.
+
+VALE EM QUALQUER SESSAO
+  Nao depende da sessao onde foi criado: le o estado vivo do tmux, dos
+  transcripts e do /proc. Qualquer agente, em qualquer sessao ou projeto, roda
+  `ai-brief` e entende o ambiente.
+
+USO
+  ai-brief            estado completo (denso, sem cor, pronto para o contexto)
+  ai-brief --agents   so a frota de agentes ativos
+  ai-brief --tools    so o catalogo de ferramentas do terminal
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS = HOME / ".claude" / "projects"
+ACTIVE_WINDOW = 120  # segundos sem escrever no transcript => nao esta ativo
+
+
+def sh(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def tmux_state():
+    out = sh("tmux list-sessions -F '#{session_name}\t#{session_windows}\t#{?session_attached,attached,}' 2>/dev/null")
+    sessions = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        name = parts[0]
+        wins = sh(f"tmux list-windows -t '={name}' -F '#{{window_name}}:#{{pane_current_command}}' 2>/dev/null")
+        sessions.append({
+            "name": name,
+            "n": parts[1],
+            "attached": len(parts) > 2 and parts[2] == "attached",
+            "windows": wins.split("\n") if wins else [],
+        })
+    return sessions
+
+
+def agent_label(path):
+    """Qual e a missao deste agente, em poucas palavras.
+
+    O .meta.json so guarda agentType/spawnDepth — nao ha campo de label. A missao
+    real esta na PRIMEIRA mensagem do agente (o prompt). Como o prompt costuma
+    comecar com um bloco grande de contexto compartilhado, o sinal util e a
+    ultima linha delimitada por '===' (onde os workflows escrevem a missao
+    especifica); sem ela, valem as primeiras palavras do prompt.
+    Le so o inicio do arquivo — nunca o transcript inteiro.
+    """
+    try:
+        with path.open("rb") as f:
+            head = f.read(200_000)
+    except OSError:
+        return ""
+    for raw in head.split(b"\n")[:6]:
+        if not raw.strip():
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if d.get("type") != "user":
+            continue
+        msg = d.get("message") or {}
+        content = msg.get("content") if isinstance(msg, dict) else None
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text += c.get("text", "")
+        if not text:
+            continue
+        marks = [ln.strip() for ln in text.split("\n") if ln.strip().startswith("===")]
+        if marks:
+            return marks[-1].strip("= ").strip()[:44]
+        first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+        return first[:44]
+    return ""
+
+
+def active_agents():
+    """Agentes vivos = transcript de subagente escrito nos ultimos ACTIVE_WINDOW s."""
+    now = time.time()
+    rows = []
+    if not PROJECTS.is_dir():
+        return rows
+    for p in PROJECTS.rglob("subagents/**/agent-*.jsonl"):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if now - st.st_mtime > ACTIVE_WINDOW:
+            continue
+        label = agent_label(p)
+        wf = p.parent.name if p.parent.name.startswith("wf_") else ""
+        rows.append({
+            "id": p.name.replace("agent-", "").replace(".jsonl", "")[:17],
+            "label": label or "(sem label)",
+            "wf": wf,
+            "kb": st.st_size // 1024,
+            "idle": int(now - st.st_mtime),
+        })
+    rows.sort(key=lambda r: r["idle"])
+    return rows
+
+
+def resources():
+    mem_total = mem_avail = swap_total = swap_free = 0
+    try:
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":")[0], line.split()[1]
+            if k == "MemTotal":
+                mem_total = int(v)
+            elif k == "MemAvailable":
+                mem_avail = int(v)
+            elif k == "SwapTotal":
+                swap_total = int(v)
+            elif k == "SwapFree":
+                swap_free = int(v)
+    except (OSError, ValueError, IndexError):
+        pass
+    load = open("/proc/loadavg").read().split()[0] if os.path.exists("/proc/loadavg") else "?"
+    cores = os.cpu_count() or 1
+    mem_pct = int((mem_total - mem_avail) * 100 / mem_total) if mem_total else 0
+    swap_pct = int((swap_total - swap_free) * 100 / swap_total) if swap_total else 0
+    return mem_pct, swap_pct, load, cores, (mem_total - mem_avail) // 1024, mem_total // 1024
+
+
+TOOLS = [
+    ("ai-brief", "este comando: estado do terminal (sessoes, agentes, recursos, tokens)"),
+    ("ai-pane run NOME CMD", "roda comando numa janela tmux e devolve saida + exit code REAL"),
+    ("ai-pane read NOME [-n N]", "le o que esta num pane (linhas rejuntadas, sem cauda vazia)"),
+    ("ai-pane list", "todas as janelas: nome, comando, pid, idle/busy"),
+    ("ai-pane new/kill NOME", "cria/encerra janela de trabalho nomeada"),
+    ("ai-pane log NOME [ARQ]", "streaming continuo do pane para arquivo (sem polling)"),
+    ("ai-pane grid N", "cria N janelas de agente ag1..agN"),
+    ("ai-top", "painel de saturacao ao vivo (RAM/swap/load/claude/agentes)"),
+    ("ai-tokens", "consumo de tokens: por dia, por modelo, por agente"),
+    ("ai-status", "linha compacta de saturacao (usada na status-bar do tmux)"),
+]
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "--tools" in args:
+        print("FERRAMENTAS DO TERMINAL (qualquer sessao)")
+        for name, desc in TOOLS:
+            print(f"  {name:26s} {desc}")
+        return
+
+    agents = active_agents()
+
+    if "--agents" in args:
+        print(f"AGENTES ATIVOS ({len(agents)})")
+        for a in agents[:40]:
+            wf = f"{a['wf'][:12]} " if a["wf"] else ""
+            print(f"  {wf}{a['label'][:34]:34s} {a['kb']:>6}KB  ha {a['idle']}s")
+        return
+
+    print(f"AI TERMINAL — estado {time.strftime('%H:%M:%S')}")
+
+    sessions = tmux_state()
+    print(f"\nSESSOES TMUX ({len(sessions)})")
+    for s in sessions:
+        mark = " [voce esta aqui]" if s["attached"] else ""
+        wins = " ".join(s["windows"][:8])
+        print(f"  {s['name'][:30]:30s} {s['n']:>2} jan{mark}")
+        if wins:
+            print(f"    {wins[:150]}")
+
+    print(f"\nAGENTES ATIVOS ({len(agents)}) — escreveram nos ultimos {ACTIVE_WINDOW}s")
+    if not agents:
+        print("  (nenhum — a frota esta ociosa)")
+    for a in agents[:12]:
+        wf = f"{a['wf'][:12]} " if a["wf"] else ""
+        print(f"  {wf}{a['label'][:38]:38s} {a['kb']:>6}KB  ha {a['idle']}s")
+    if len(agents) > 12:
+        print(f"  ... mais {len(agents)-12} (ai-brief --agents)")
+
+    # Estado do repo em forma AGREGADA. `git status` cru custa 86.385 bytes em
+    # /opt/wiki (~21k tokens) porque lista 1.131 arquivos um a um — e o agente so
+    # precisa saber ONDE ha trabalho vivo, nao o nome de cada shard. Medido: o
+    # mesmo sinal cabe em ~150 bytes.
+    repo = sh("git rev-parse --show-toplevel 2>/dev/null")
+    if repo:
+        branch = sh("git rev-parse --abbrev-ref HEAD 2>/dev/null")
+        counts = sh("git status --porcelain 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn")
+        areas = sh("git status --porcelain 2>/dev/null | sed 's|^...||; s|/[^/]*$||' "
+                   "| cut -d/ -f1-2 | sort | uniq -c | sort -rn | head -5")
+        print(f"\nREPO {repo} ({branch})")
+        if counts:
+            resumo = "  ".join(f"{n} {code}" for n, code in
+                               (l.split() for l in counts.splitlines()[:6]) if code)
+            print(f"  {resumo}   (A=staged M=modificado ??=untracked R=renomeado)")
+        for line in areas.splitlines():
+            n, _, area = line.strip().partition(" ")
+            print(f"    {n:>5}  {area.strip()}")
+        print("  detalhe so se precisar: git status --porcelain | grep '^A' | head -20")
+
+    mem_pct, swap_pct, load, cores, used_mb, total_mb = resources()
+    print(f"\nRECURSOS  RAM {mem_pct}% ({used_mb//1024}/{total_mb//1024} GB)  "
+          f"swap {swap_pct}%  load {load}/{cores} cores")
+    if mem_pct >= 85:
+        print("  ATENCAO: RAM no limite — evite lancar nova onda pesada agora.")
+
+    tok = sh("ai-tokens --oneline", timeout=20)
+    if tok:
+        print(f"TOKENS hoje  {tok}")
+
+    # Trabalho pesado em curso: quem mais concorre por CPU neste momento.
+    heavy = sh("ps -eo pcpu=,rss=,comm=,args= --sort=-pcpu 2>/dev/null | head -4")
+    if heavy:
+        print("\nPROCESSOS NO TOPO (cpu%)")
+        for line in heavy.splitlines():
+            f = line.split(None, 3)
+            if len(f) >= 4 and float(f[0] or 0) >= 1.0:
+                print(f"  {f[0]:>5}%  {int(f[1])//1024:>5}MB  {f[3][:66]}")
+
+    print("\nCOMO OPERAR (ai-brief --tools para a lista completa)")
+    print("  ai-pane run NOME 'cmd'   executa e devolve saida + exit code de verdade")
+    print("  ai-pane list             o que cada janela esta fazendo")
+    print("  ai-top                   saturacao ao vivo | ai-tokens  consumo")
+    print("\nREGRA: antes de comando pesado, olhe RAM/load acima. Sem teto de agentes —")
+    print("mas medir antes de lancar evita derrubar o trabalho de quem ja esta rodando.")
+
+
+if __name__ == "__main__":
+    main()

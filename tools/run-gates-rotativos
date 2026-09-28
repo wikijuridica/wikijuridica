@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""run-gates-rotativos — os 356 gates de cmd/check finalmente têm quem os execute.
+
+O QUE ISTO CONSERTA, medido em 2026-09-05: `internal/checks/checks.go` registra
+356 gates. `tools/check-all` executa todos (via `run-check all`), mas NENHUMA
+unit systemd o aciona — nem em `ops/systemd/`, nem em
+`~/.config/systemd/user/` — e o contrato do repositório desaconselha rodá-lo à
+mão, porque `cmd/check` sem argumento já abriu 45 processos e levou o load a 52.
+O `run-qualidade-diaria` invoca 5 desses gates por nome. Os outros 351 existiam,
+mediam coisa real, e só rodavam se alguém lembrasse.
+
+É a mesma doença dos `check-*` órfãos de runner, um degrau acima: lá o gate não
+tinha linha; aqui ele tem um runner que ninguém agenda.
+
+POR QUE FILA COM RETOMADA, E NÃO FATIA FIXA POR DIA. A primeira versão deste
+script cortava a lista em fatias por posição — e a medição derrubou o desenho
+antes de ele nascer: 12 gates estouraram um orçamento de 4 minutos, com
+`p0-pipeline-integration` consumindo o resto sozinho. Os custos são desiguais
+por ordens de grandeza, então QUALQUER corte por posição produz dias que
+estouram e dias que sobram, e um dia que estoura perde a fatia inteira em vez de
+degradar.
+
+A fila resolve sem precisar conhecer o custo de antemão: TUDO roda na ordem de
+QUEM ESTÁ HÁ MAIS TEMPO SEM RODAR, até o orçamento acabar. Os fixos não são
+uma lista que roda inteira -- são uma lista com PRIORIDADE e orçamento
+reservado. Quando não cabem todos, os mais antigos entram e o resumo avisa
+quantos ficaram de fora, porque isso é sinal de orçamento pequeno demais. Gate caro roda com menos frequência, mas roda; gate barato passa
+sempre; e a cobertura é uma propriedade verificável do ledger, não uma promessa
+do desenho. O pior caso — um gate que nunca roda porque não cabe — é visível na
+coluna de idade, e é por isso que o resumo a imprime.
+
+CUSTO: `--lista-nomes` não executa gate nenhum (é leitura da tabela), então
+descobrir o que rodar é grátis.
+
+POR QUE UM BINÁRIO COMPILADO E LOTES, E NÃO `go run` POR GATE (medido em
+2026-09-10). A rodada de 2026-09-07 executou 102 gates em 1201 s e deixou 9
+FIXOS de fora — gate de risco jurídico que tinha de rodar todo dia e não rodou.
+A causa não era gate lento: era o INVÓLUCRO. Medido nesta máquina, com cache
+quente:
+
+    ./tools/go-modern run ./cmd/check --lista-nomes   4,28 s | 4,88 s | 33,3 s (1ª)
+    ./tools/run-go-cmd-cached ./cmd/check ...         4,40 s | 4,65 s | 5,06 s
+    binário já compilado, mesma invocação            0,37 s | 0,65 s | 0,92 s
+
+São ~4 s por invocação que não medem nada: 102 invocações = ~410 s dos 1201 s
+da rodada, 34% do orçamento gasto em relinkar o MESMO binário. Sobre os 87
+fixos, ~370 s dos 720 s reservados a eles — exatamente o buraco por onde os 9
+escaparam.
+
+E há um segundo desperdício, este dentro do processo: `cmd/check` cria um
+`checks.RunContext` por invocação, e é ele que guarda o build público, o corpus
+v2, os índices de manifesto e os relatórios de qualidade. Um gate por processo
+joga esse cache fora a cada gate; um LOTE de gates no mesmo processo o paga uma
+vez. É o mesmo motivo pelo qual `cmd/check all --serial` existe.
+
+Daí o desenho: compila-se `./cmd/check` UMA vez por rodada e executam-se os
+gates em lotes de TAM_LOTE nomes por processo, com `--timings`. O lote é
+pequeno de propósito — o `RunContext` acumula build e corpus em memória, e o
+caminho serial de `cmd/check` não tem `recover()`: um gate que entra em pânico
+mata o processo, e o lote limita o estrago ao próprio lote.
+
+DURAÇÃO POR GATE, QUE ANTES NÃO EXISTIA. `--timings` imprime
+`TIMING check=<nome> status=pass|fail duration_ms=N` em stderr, e o ledger passa
+a gravar `duracoes_s`. Sem isso, "qual gate está caro" só se respondia
+cronometrando à mão — e o aviso do resumo mandava subir o orçamento sem dizer
+para onde o tempo tinha ido.
+
+Uso:
+    tools/run-gates-rotativos                  # a rodada do dia
+    tools/run-gates-rotativos --listar         # o que rodaria, sem executar
+    tools/run-gates-rotativos --orcamento 600  # segundos para a rodada
+    tools/run-gates-rotativos --cobertura      # idade de cada gate, e quem nunca rodou
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+LEDGER = RAIZ / "data/ops/gates_rotativos.jsonl"
+
+# Assunto que não espera a vez na fila: tem PRIORIDADE e orçamento reservado.
+#
+# NÃO É "roda sempre", e a diferença importa: são 87 gates casando este padrão
+# e nem todos cabem numa rodada. Entre os fixos vale a mesma ordem por idade
+# da fila, e o que não couber aparece como AVISO no resumo.
+#
+# `csp` e `isolation` entraram por dano medido, não por palpite: a CSP das
+# páginas é emitida pelo nginx e tem de casar byte a byte com a constante Go —
+# dessincronizou, o navegador bloqueia a folha e NENHUMA página tem estilo, em
+# silêncio; e o isolamento do processo social existe porque um panic dele
+# derrubaria o MCP, o A2A e as 10.141 gêmeas junto, ou seja, o dano não é onde o
+# gate mora. `autoria`/`licenc` cobrem o aceite de relicenciamento, que é o que
+# separa citar de republicar sob a Lei 9.610. O resto da lista é texto jurídico,
+# publicação, indexação, fonte oficial e identidade de saída: erro nessas classes
+# vai ao ar e responde sob a OAB, e esperar a vez seria trocar risco jurídico por
+# CPU.
+SEMPRE = re.compile(
+    r"legal|oab|juridic|citac|fonte|source|publicac|publish|index|sitemap|robots"
+    r"|canonical|crawl|bot|identidade|snapshot|fraude|csp|isolation|autoria|licenc")
+
+# FORA DA FILA: gate de FECHAMENTO, que existe para declarar uma entrega pronta
+# e é caro por construção. Rodá-lo todo dia gasta sem responder pergunta
+# nenhuma — ninguém declara entrega diariamente. Quem o roda é quem fecha a
+# entrega, no momento de fechar.
+FECHAMENTO = re.compile(r"entrega-final|release-final|p0-cycle-close")
+
+ORCAMENTO_PADRAO = 900
+# Teto POR LOTE. Sem ele, um único gate patológico consome a rodada inteira e a
+# fila não anda — foi o que `p0-pipeline-integration` fez na medição de
+# 2026-09-05, comendo 4 minutos sozinho. Com lotes, o teto passa a valer para o
+# processo do lote: `cmd/check --max-duration` reparte o que resta entre os
+# gates seguintes e aborta no primeiro que estourar, então nenhum gate isolado
+# passa deste número e os que ficaram do lote sobem amanhã pela idade.
+TETO_POR_GATE = 240
+# Quantos gates por processo. Grande o bastante para o RunContext (build
+# público, corpus v2, índices de manifesto) ser pago uma vez para muitos gates;
+# pequeno o bastante para caber na memória e para um pânico não levar a rodada
+# junto — o caminho serial de cmd/check não tem recover().
+TAM_LOTE = 12
+# Custo presumido de gate que o ledger ainda não mediu. Medido em 2026-09-10
+# sobre 62 gates: mediana 0,6 s, 36 deles abaixo de 1 s, p90 = 23 s. 10 s fica
+# acima da mediana (não subestima a maioria) e bem abaixo do p90 (não trava a
+# fila com medo de um custo que quase nunca aparece).
+CUSTO_DESCONHECIDO = 10.0
+# O binário da rodada. `.cache/` é regenerável e está no .gitignore: isto é
+# cache de build, não produto.
+BINARIO = RAIZ / ".cache/gates-rotativos/check"
+
+
+def compila_binario() -> pathlib.Path:
+    """Compila ./cmd/check UMA vez por rodada e devolve o caminho do binário.
+
+    Falha aqui é INFRA, e sobe como exceção: rodada que não compila não é rodada
+    verde com zero gates — é rodada que não rodou.
+    """
+    BINARIO.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [str(RAIZ / "tools/go-modern"), "build", "-o", str(BINARIO), str(RAIZ / "cmd/check")],
+        capture_output=True, text=True, cwd=RAIZ, timeout=900)
+    if proc.returncode != 0:
+        raise RuntimeError("compilacao de ./cmd/check falhou: %s"
+                           % (proc.stderr.strip() or proc.stdout.strip())[:400])
+    return BINARIO
+
+
+def lista_de_gates(binario: pathlib.Path) -> list[str]:
+    """Os nomes registrados, lidos do binário da rodada (não executa gate)."""
+    saida = subprocess.run(
+        [str(binario), "--lista-nomes"],
+        capture_output=True, text=True, cwd=RAIZ, timeout=600)
+    nomes = [l.strip() for l in saida.stdout.splitlines() if l.strip() and not l.startswith("-")]
+    return nomes
+
+
+def le_timings(stderr: str, lote: list[str]) -> tuple[dict[str, float], dict[str, str], list[str]]:
+    """Lê o veredito e a duração de cada gate do lote a partir de `--timings`.
+
+    Três estados, e a diferença entre eles é o que impede um gate cego:
+
+      - `status=start` seguido de `status=pass|fail`: o gate rodou e tem duração.
+      - `status=start` SEM fim: o processo morreu dentro dele (pânico, OOM,
+        sinal). É FALHA, nunca "não executou" — senão o gate que quebra o
+        processo todo dia sobe pela idade, quebra de novo e NUNCA aparece como
+        falha, que é a cegueira que este runner existe para acabar.
+      - nem `start`: não chegou a rodar (orçamento acabou antes). Fica fora do
+        ledger para subir amanhã.
+
+    O sink interno do RunContext também imprime linhas TIMING, com `step=` e sem
+    `status=`; é por isso que o discriminador é a presença de `status`.
+    """
+    duracoes: dict[str, float] = {}
+    veredito: dict[str, str] = {}
+    iniciados: list[str] = []
+    do_lote = set(lote)
+    for linha in stderr.splitlines():
+        if not linha.startswith("TIMING check="):
+            continue
+        campos = dict(p.split("=", 1) for p in linha.split() if "=" in p)
+        nome = campos.get("check", "")
+        estado = campos.get("status")
+        if nome not in do_lote or estado is None:
+            continue
+        if estado == "start":
+            iniciados.append(nome)
+            continue
+        veredito[nome] = estado
+        try:
+            duracoes[nome] = int(campos.get("duration_ms", "0")) / 1000.0
+        except ValueError:
+            duracoes[nome] = 0.0
+    mortos = [n for n in iniciados if n not in veredito]
+    return duracoes, veredito, mortos
+
+
+CORTE = re.compile(r"check budget exceeded (?:before|during) ([a-z0-9-]+):")
+
+
+def executa_lote(binario: pathlib.Path, lote: list[str], teto: int):
+    """Roda um lote de gates NUM ÚNICO processo e devolve o que cada um disse.
+
+    `cortados` separa o gate que NÃO chegou a veredito porque o relógio do lote
+    acabou dentro dele. Isso não é reprovação e não pode acender vermelho: o
+    gate não disse nada sobre o conteúdo, e falso vermelho custa a mesma
+    credibilidade que falso verde. Quem trata o corte é o chamador, que sabe se
+    o gate foi cortado por ser lento demais (era o primeiro do lote, com o teto
+    inteiro à disposição) ou porque a rodada simplesmente terminou.
+    """
+    proc = subprocess.run(
+        [str(binario), "--checks", ",".join(lote), "--timings", "--max-duration", "%ds" % teto],
+        capture_output=True, text=True, cwd=RAIZ, timeout=teto + 120)
+    duracoes, veredito, mortos = le_timings(proc.stderr, lote)
+    mensagens: dict[str, str] = {}
+    cortados: list[str] = []
+    for linha in proc.stdout.splitlines():
+        corte = CORTE.search(linha)
+        if corte and corte.group(1) in lote:
+            cortados.append(corte.group(1))
+            continue
+        for nome in lote:
+            if linha.startswith(nome + ": "):
+                mensagens[nome] = linha[len(nome) + 2:]
+    return duracoes, veredito, mortos, mensagens, cortados, proc
+
+
+def agora() -> datetime.datetime:
+    """Relógio da rodada.
+
+    É função própria, e não `datetime.datetime.now()` inline, para a bancada
+    poder exercitar a DECISÃO de orçamento — quem entra, em que ordem, quantos
+    ficam de fora — sem executar gate nenhum e sem dormir. O teste que só
+    recalcula a fórmula por conta própria não vigia nada: continua verde se o
+    bloco do orçamento sumir de `main()`.
+    """
+    return datetime.datetime.now()
+
+
+def historico() -> dict[str, str]:
+    """Última data em que cada gate rodou, lida do ledger."""
+    ultimo: dict[str, str] = {}
+    if not LEDGER.is_file():
+        return ultimo
+    for linha in LEDGER.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        try:
+            r = json.loads(linha)
+        except json.JSONDecodeError:
+            # Linha torta não pode apagar o histórico inteiro: o ledger é
+            # append-only e sobreviver a uma linha ruim é o mínimo.
+            continue
+        data = r.get("data", "")
+        for nome in r.get("gates", []):
+            if data > ultimo.get(nome, ""):
+                ultimo[nome] = data
+    return ultimo
+
+
+def estimativas() -> dict[str, float]:
+    """Última duração MEDIDA de cada gate, lida do ledger.
+
+    É o que fecha o ciclo aberto por `duracoes_s`: medir sem usar a medida
+    deixaria a rodada gastando o orçamento no escuro. Com ela, o empacotador
+    sabe que `canonical-sitemap-consistency` custa ~180 s e não o começa com
+    40 s de relógio na mão — corte não devolve veredito nenhum e o gate roda
+    de novo do zero na rodada seguinte, então tentar sem caber é tempo jogado
+    fora duas vezes. Medido em 2026-09-10: 450 s dos 1200 s da rodada (37%)
+    foram exatamente isso.
+    """
+    custo: dict[str, float] = {}
+    if not LEDGER.is_file():
+        return custo
+    for linha in LEDGER.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        try:
+            r = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        for nome, segundos in (r.get("duracoes_s") or {}).items():
+            try:
+                custo[nome] = float(segundos)
+            except (TypeError, ValueError):
+                continue
+        # Corte é PISO, não medição fechada: o gate foi interrompido antes de
+        # terminar, então o custo real é maior que isso. Entra por `max` para
+        # nunca rebaixar uma duração completa medida depois. A primeira versão
+        # do ledger gravava uma LISTA aqui; ler o formato velho sem quebrar é o
+        # mínimo para um arquivo append-only.
+        cortados = r.get("cortados_por_orcamento") or {}
+        if isinstance(cortados, dict):
+            for nome, segundos in cortados.items():
+                try:
+                    custo[nome] = max(custo.get(nome, 0.0), float(segundos))
+                except (TypeError, ValueError):
+                    continue
+    return custo
+
+
+def ordem_da_fila(nome: str, ultimo: dict[str, str], hoje: datetime.date) -> tuple[int, str]:
+    """O mais antigo primeiro; empate desfeito por sorteio ESTÁVEL NO DIA.
+
+    O EMPATE PELO NOME ERA O MESMO BUG, NA METADE QUE SOBROU (2026-09-10).
+    O comentário abaixo registra que ordenar os fixos por idade consertou a
+    "fila que não anda" — e consertou, para gates de idades diferentes. Mas
+    gate NUNCA executado tem idade 10.000, todos empatados, e o desempate
+    alfabético fazia o fim do alfabeto perder TODO DIA. Com o orçamento
+    estourando em toda rodada, "perder todo dia" é "nunca rodar".
+
+    MEDIDO no próprio ledger, que é onde a cobertura tinha de ser
+    verificável — `data/ops/gates_rotativos.jsonl`, 8 rodadas de 2026-09-05
+    a 2026-09-10, 358 gates registrados:
+
+        gates que rodaram ao menos uma vez   309
+        NUNCA rodaram                         51
+
+    E os 51 são um sufixo alfabético contínuo, de `redesocial-entrega-final`
+    a `zizmor-workflow-security`. Entre eles: `seo`, `seo-oracles`,
+    `technical-seo-google-contract`, `v2-cross-shard-collision`,
+    `v2-public-path-collision`, `text-truncation`, `sem-dado-pessoal-em-git`,
+    `sigilo-sem-texto-claro`, `tool-artifact-provenance` e os onze
+    `social-*`. Não é uma lista qualquer: é rota duplicada, SEO, sigilo e
+    dado pessoal — exatamente o que o §5 do contrato chama de inegociável.
+
+    O SORTEIO É POR DIA, NÃO POR EXECUÇÃO. Dentro da mesma rodada a ordem é
+    a mesma em qualquer replay (a semente é o nome mais a data), então o
+    resultado continua reproduzível e o ledger continua auditável. Entre
+    dias ela muda, e é isso que garante que o sufixo de ontem seja o prefixo
+    de algum amanhã. Ordenar por idade continua dominando: o sorteio só
+    decide EMPATE.
+    """
+    return (-idade(nome, ultimo, hoje), desempate(nome, hoje))
+
+
+def desempate(nome: str, dia: datetime.date) -> str:
+    """Chave de desempate entre gates de MESMA idade: sorteio estável no dia.
+
+    Determinística dentro da rodada (semente = nome + data) e diferente a cada
+    dia, para que nenhum gate fique preso no fim da fila por causa da própria
+    inicial. Ver o docstring de `ordem` para a medição que obrigou isto.
+    """
+    semente = ("%s|%s" % (nome, dia.isoformat())).encode("utf-8")
+    return hashlib.sha256(semente).hexdigest()
+
+
+def idade(nome: str, ultimo: dict[str, str], hoje: datetime.date) -> int:
+    """Dias desde a última execução. Nunca executado => idade máxima."""
+    quando = ultimo.get(nome)
+    if not quando:
+        return 10_000
+    try:
+        return (hoje - datetime.date.fromisoformat(quando)).days
+    except ValueError:
+        return 10_000
+
+
+def main() -> int:
+    # SAIDA LINHA A LINHA. Redirecionada para o log da bancada, a saida do
+    # Python fica em buffer de bloco e so aparece no fim -- e a etapa tem
+    # timeout proprio (1500 s para um orcamento de 1200 s). Se a rodada for
+    # interrompida, um log VAZIO nao diz nem quais gates ja tinham rodado.
+    # Agora cada lote aparece assim que termina.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        # stdout substituido por um dublê sem reconfigure: a rodada continua,
+        # so sem o buffer de linha.
+        pass
+
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--orcamento", type=int, default=ORCAMENTO_PADRAO,
+                   help="segundos para a rodada inteira")
+    p.add_argument("--listar", action="store_true", help="mostra o que rodaria, sem executar")
+    p.add_argument("--cobertura", action="store_true", help="idade de cada gate no ledger")
+    args = p.parse_args()
+
+    # O binário da rodada, compilado UMA vez. Antes, cada gate pagava ~4 s de
+    # `go run` para relinkar exatamente este binário — 34% do orçamento medido
+    # em 2026-09-07 gasto fora de qualquer medição.
+    inicio_build = agora()
+    try:
+        binario = compila_binario()
+        todos = lista_de_gates(binario)
+    except Exception as erro:  # noqa: BLE001 — qualquer falha aqui é infra, não veredito
+        print("run-gates-rotativos: NAO RODOU: nao consegui listar os gates: %s" % erro,
+              file=sys.stderr)
+        return 2
+    build_s = int((agora() - inicio_build).total_seconds())
+    # Lista vazia é infra quebrada, nunca "não há gate": exit 0 aqui seria o
+    # mesmo buraco que este script existe para fechar.
+    if len(todos) < 50:
+        print("run-gates-rotativos: NAO RODOU: --lista-nomes devolveu %d nome(s), "
+              "abaixo do minimo plausivel" % len(todos), file=sys.stderr)
+        return 2
+
+    # Um relogio so: `agora()` e o mesmo ponto que a bancada injeta, entao
+    # idade e duracao nunca discordam entre si.
+    hoje = agora().date()
+    ultimo = historico()
+
+    if args.cobertura:
+        # A VISTA TEM DE CONCORDAR COM A EXECUCAO (2026-09-10). Esta linha era
+        # `sorted(..., reverse=True)` sobre `(idade, nome)`, o que desempata por
+        # nome DESCENDENTE — a ordem oposta a que a fila usava. Quem lesse
+        # `--cobertura` para saber "quem entra amanha" via uma lista que a
+        # rodada nao seguia. Agora as duas leem a mesma chave.
+        ordenados = sorted(todos, key=lambda n: ordem_da_fila(n, ultimo, hoje))
+        idades = [(idade(n, ultimo, hoje), n) for n in ordenados]
+        nunca = [n for i, n in idades if i == 10_000]
+        print("cobertura: %d gate(s) | nunca executados: %d" % (len(todos), len(nunca)))
+        if idades and idades[0][0] != 10_000:
+            print("  idade maxima: %d dia(s) (%s)" % (idades[0][0], idades[0][1]))
+        for i, n in idades[:25]:
+            print("   %-6s %s" % ("nunca" if i == 10_000 else "%dd" % i, n))
+        return 0
+
+    fixos = [n for n in todos if SEMPRE.search(n.lower()) and not FECHAMENTO.search(n.lower())]
+    fila = [n for n in todos if n not in set(fixos) and not FECHAMENTO.search(n.lower())]
+
+    def ordem(n: str) -> tuple[int, str]:
+        return ordem_da_fila(n, ultimo, hoje)
+
+    # O MAIS ANTIGO PRIMEIRO, NAS DUAS LISTAS. É esta ordem que transforma "roda
+    # um pedaço por dia" em cobertura: um gate que ficou de fora ontem sobe hoje,
+    # e sobe de novo amanhã, até rodar.
+    #
+    # ORDENAR OS FIXOS TAMBÉM É OBRIGATÓRIO, e a primeira versão deste script
+    # (6d51e48f) não o fazia: o defeito da "fila que não anda" sobreviveu inteiro
+    # dentro da metade que a mensagem daquele commit declarava resolvida. São 87
+    # fixos e a reserva lhes dá 720 s de um orçamento de 1200 s. Sem ordem por
+    # idade eles entram na ordem de `Names`, então os MESMOS que couberem rodam
+    # todo dia e os demais NUNCA -- e o gate de risco jurídico que calhasse de
+    # nascer no fim do alfabeto ficaria cego para sempre, que é a pior versão
+    # possível deste bug. Em 2026-09-07 sobraram 9, e eram os nove últimos em
+    # ordem alfabética entre os empatados na idade.
+    fixos.sort(key=ordem)
+    fila.sort(key=ordem)
+
+    do_dia = fixos + fila
+    print("run-gates-rotativos: %d gate(s) registrados | %d fixo(s) + %d na fila | orcamento %ds"
+          % (len(todos), len(fixos), len(fila), args.orcamento))
+
+    if args.listar:
+        for n in fixos:
+            print("  fixo   %s" % n)
+        for n in fila[:40]:
+            print("  fila   %-52s idade=%s" % (
+                n, "nunca" if idade(n, ultimo, hoje) == 10_000 else "%dd" % idade(n, ultimo, hoje)))
+        return 0
+
+    # O ORÇAMENTO É REPARTIDO, e sem isso a fila nunca andaria.
+    #
+    # Medido em 2026-09-05: são 87 fixos, e o lote de amostra deu ~20 s por
+    # gate. Só os fixos consomem mais que a rodada inteira — então, num desenho
+    # ingênuo de "fixos primeiro, resto se sobrar", NADA da fila jamais roda e a
+    # rotação não rotaciona. O gate número 88 nunca seria exercitado, que é
+    # exatamente a cegueira que este script existe para acabar.
+    #
+    # A reserva garante progresso: a fila tem uma fatia do tempo que os fixos
+    # não podem comer. Se os fixos não couberem na parte deles, o resumo diz
+    # quantos ficaram de fora — e ISSO é o sinal de que o orçamento está pequeno
+    # demais, não algo para o script esconder.
+    estimado = estimativas()
+    reserva_da_fila = max(60, int(args.orcamento * 0.4))
+    orcamento_fixos = args.orcamento - reserva_da_fila
+    fixos_set = set(fixos)
+
+    executados: list[str] = []
+    duracoes: dict[str, float] = {}
+    cortes: dict[str, float] = {}
+    cortados_na_rodada: set[str] = set()
+    fixos_fora = 0
+    # O build entra no gasto porque o orçamento é de RELÓGIO: a etapa da bancada
+    # tem timeout próprio, e tempo de compilação também é tempo da rodada. O
+    # ledger o grava separado (`build_s`) para ele nunca ser confundido com
+    # custo de gate.
+    gasto = build_s
+    codigo = 0
+    for grupo, limite, eh_fixo in ((fixos, orcamento_fixos, True), (fila, args.orcamento, False)):
+        indice = 0
+        while indice < len(grupo):
+            # Gate já cortado hoje não volta à fila desta rodada: ele custaria o
+            # mesmo corte de novo. Pular é avançar, nunca encerrar o grupo.
+            while indice < len(grupo) and grupo[indice] in cortados_na_rodada:
+                indice += 1
+            if indice >= len(grupo):
+                break
+            restante = limite - gasto
+            if restante <= 5:
+                if eh_fixo:
+                    fixos_fora += len(grupo) - indice
+                break
+            # EMPACOTAR PELO CUSTO MEDIDO, e contra o TETO DO LOTE — não
+            # contra o que resta do grupo. A diferença não é sutil, e a rodada
+            # de 2026-09-10 a mediu: com 400 s restantes, `superseded-absent-
+            # from-sitemap` (180 s) e `canonical-sitemap-consistency` (182 s)
+            # somam 362 e "cabem no restante", mas o processo do lote roda com
+            # `--max-duration 240s` — o segundo é cortado aos 240 s, volta para
+            # a rodada seguinte com menos relógio ainda, e os dois juntos
+            # custaram 240 s por um veredito só. Empacotando contra o teto,
+            # 180+182 > 240 põe cada um no seu lote e os dois entregam veredito.
+            teto = min(TETO_POR_GATE, restante)
+            lote = []
+            previsto = 0.0
+            while indice + len(lote) < len(grupo) and len(lote) < TAM_LOTE:
+                proximo = grupo[indice + len(lote)]
+                if proximo in cortados_na_rodada:
+                    # Já foi cortado hoje: repetir é pagar o mesmo corte duas
+                    # vezes. Ele sobe amanhã pela idade, e agora com o custo
+                    # medido no ledger.
+                    break
+                custo = estimado.get(proximo, CUSTO_DESCONHECIDO)
+                if previsto + custo > teto and lote:
+                    break
+                if not lote and custo > teto:
+                    # Nem o primeiro cabe. Começá-lo é garantir o corte, então
+                    # ele espera a rodada de amanhã, onde a idade o põe na
+                    # frente com a fatia inteira disponível.
+                    if custo > min(TETO_POR_GATE, limite):
+                        # E se nem com a fatia INTEIRA (ou com o teto por lote)
+                        # ele cabe, o problema não é a fila: é o gate. Isso é
+                        # partição a decidir (unit própria, cadência própria),
+                        # não orçamento a subir.
+                        print("  ATENCAO %-52s custo medido %.0fs nao cabe no teto de %ds: "
+                              "partir em unit propria"
+                              % (proximo, custo, min(TETO_POR_GATE, limite)))
+                    lote = []
+                    break
+                lote.append(proximo)
+                previsto += custo
+            if not lote:
+                if eh_fixo:
+                    fixos_fora += len(grupo) - indice
+                break
+            inicio = agora()
+            try:
+                saida = executa_lote(binario, lote, teto)
+            except subprocess.TimeoutExpired:
+                # Processo pendurado além do próprio teto + 120 s. Sem este
+                # tratamento a exceção sobe e a rodada morre SEM gravar o
+                # ledger — perdendo inclusive a prova dos gates que já haviam
+                # rodado, que é o único registro de cobertura que existe.
+                gasto += int((agora() - inicio).total_seconds())
+                codigo = 1
+                print("  FALHA  lote de %d gate(s) pendurado alem de %ds (comeca em %s)"
+                      % (len(lote), teto + 120, lote[0]))
+                indice += len(lote)
+                continue
+            lote_duracoes, veredito, mortos, mensagens, cortados, proc = saida
+            gasto += int((agora() - inicio).total_seconds())
+
+            # O que este lote de fato decidiu, na ordem em que os gates rodaram.
+            # Gate sem veredito e sem `start` não rodou: fica fora do ledger para
+            # subir amanhã pela idade — contá-lo como executado seria exatamente
+            # o "gate que não rodou marcado como gate que passou".
+            decididos = 0
+            cortado_sem_veredito = False
+            for nome in lote:
+                if nome in cortados:
+                    # O relógio do lote acabou dentro dele. Duas leituras, e a
+                    # diferença é medida, não opinião:
+                    #
+                    #  - era o PRIMEIRO do lote com o teto inteiro (240 s) pela
+                    #    frente: o gate sozinho não cabe no teto, e isso é
+                    #    defeito de escala — vermelho, como sempre foi.
+                    #  - veio depois dos outros: quem acabou foi a rodada, não
+                    #    ele. Sem veredito, fica fora do ledger e sobe amanhã
+                    #    pela idade. Acender vermelho aqui seria reprovar
+                    #    conteúdo por causa do relógio.
+                    if nome == lote[0] and teto >= TETO_POR_GATE:
+                        decididos += 1
+                        duracoes[nome] = float(teto)
+                        executados.append(nome)
+                        codigo = 1
+                        print("  FALHA  %-52s %4ds  gate sozinho estoura o teto de %ds"
+                              % (nome, teto, TETO_POR_GATE))
+                    else:
+                        # O gate cortado TEM duração medida: `cmd/check` imprime
+                        # o TIMING antes de abortar. Isso é um PISO do custo
+                        # real (ele foi interrompido, não terminou), e guardá-lo
+                        # é o que impede a rodada de amanhã de repetir a mesma
+                        # aposta perdida.
+                        consumido = lote_duracoes.get(nome, float(teto))
+                        cortes[nome] = round(max(cortes.get(nome, 0.0), consumido), 1)
+                        estimado[nome] = max(estimado.get(nome, CUSTO_DESCONHECIDO), consumido)
+                        cortados_na_rodada.add(nome)
+                        cortado_sem_veredito = True
+                        print("  corte  %-52s    -  orcamento da rodada acabou dentro do gate"
+                              % nome)
+                    break
+                if nome in veredito:
+                    decididos += 1
+                    dur = lote_duracoes.get(nome, 0.0)
+                    duracoes[nome] = round(dur, 1)
+                    executados.append(nome)
+                    if veredito[nome] == "fail":
+                        codigo = 1
+                        print("  FALHA  %-52s %4.0fs  %s"
+                              % (nome, dur, mensagens.get(nome, "")[:120]))
+                    else:
+                        print("  ok     %-52s %4.0fs" % (nome, dur))
+                    continue
+                if nome in mortos:
+                    # Começou e não terminou: o processo morreu dentro dele.
+                    decididos += 1
+                    duracoes[nome] = 0.0
+                    executados.append(nome)
+                    codigo = 1
+                    print("  FALHA  %-52s    -  processo morreu durante o gate (exit=%s) %s"
+                          % (nome, proc.returncode,
+                             (proc.stderr.strip().splitlines() or [""])[-1][:80]))
+                    continue
+                break
+
+            if cortado_sem_veredito:
+                # CORTE NÃO ENCERRA O GRUPO, e a rodada de 2026-09-10 mediu o
+                # preço de achar que sim: com o corte tratado como fim de
+                # grupo, a rodada parou aos 688 s de um orçamento de 1200 s e
+                # 512 s de relógio sobraram sem gate nenhum rodando. O gate
+                # cortado é PULADO (fica sem veredito, sobe amanhã); os
+                # seguintes continuam com o relógio que resta.
+                if eh_fixo:
+                    fixos_fora += 1
+                indice += decididos + 1
+                continue
+
+            if decididos == 0:
+                # Nenhum gate do lote deu veredito: não é gate ruim, é o
+                # processo que não subiu. Avisa uma vez, não marca ninguém como
+                # executado, e segue — o lote inteiro sobe amanhã.
+                codigo = 1
+                print("  FALHA  lote de %d gate(s) sem veredito (exit=%s): %s"
+                      % (len(lote), proc.returncode,
+                         ((proc.stderr or proc.stdout).strip().splitlines() or [""])[-1][:120]))
+                indice += len(lote)
+                continue
+            indice += decididos
+
+    # O LEDGER É O QUE TRANSFORMA "roda um pedaço por dia" EM COBERTURA
+    # VERIFICÁVEL. Sem ele ninguém responde "todos os 356 rodaram nesta
+    # semana?" — e cobertura que não se prova é o mesmo que não ter cobertura.
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "data": hoje.isoformat(),
+            "orcamento_s": args.orcamento,
+            "gasto_s": gasto,
+            "build_s": build_s,
+            "tamanho_do_lote": TAM_LOTE,
+            "exit_code": codigo,
+            "gates_executados": len(executados),
+            "fixos_fora_do_orcamento": fixos_fora,
+            "gates_registrados": len(todos),
+            "gates": sorted(executados),
+            # DURAÇÃO POR GATE: é isto que responde "quem está caro" sem
+            # cronômetro na mão, e é o que substitui o conselho de subir o
+            # orçamento por um alvo nomeado.
+            "duracoes_s": dict(sorted(duracoes.items())),
+            # CORTADO NÃO É REPROVADO nem executado: o relógio acabou dentro
+            # dele. Fica registrado para o gate que é cortado todo dia aparecer
+            # como problema de custo, e não sumir entre os "ficaram para a
+            # proxima rodada".
+            "cortados_por_orcamento": dict(sorted(cortes.items())),
+        }, ensure_ascii=False, sort_keys=True) + "\n")
+
+    faltaram = len(do_dia) - len(executados)
+    print("run-gates-rotativos: %d executado(s) em %ds, %d ficaram para a proxima rodada, exit=%d"
+          % (len(executados), gasto, faltaram, codigo))
+    if cortes:
+        print("run-gates-rotativos: %d gate(s) cortados pelo relogio da rodada (sem veredito): %s"
+              % (len(cortes), ", ".join("%s=%.0fs+" % (n, c) for n, c in sorted(cortes.items()))))
+    if fixos_fora:
+        # NÃO É DETALHE: fixo que não coube é gate de risco jurídico ou de
+        # publicação que ficou sem rodar hoje.
+        #
+        # E o conselho NÃO é "suba o orçamento": o contrato do repositório trata
+        # lentidão como defeito de escala e proíbe corrigir por timeout maior.
+        # Agora que a rodada mede gate a gate, o resumo aponta ONDE o tempo foi
+        # — que é o que se ataca (artefato derivado em vez de varredura, amostra
+        # em vez de acervo inteiro, ou partição do gate em unit própria).
+        caros = sorted(duracoes.items(), key=lambda item: -item[1])[:5]
+        print("run-gates-rotativos: ATENCAO: %d gate(s) FIXO(s) nao couberam no orcamento de %ds "
+              "(reserva da fila: %ds, build: %ds). Os mais caros desta rodada: %s"
+              % (fixos_fora, args.orcamento, reserva_da_fila, build_s,
+                 ", ".join("%s=%.0fs" % (n, d) for n, d in caros) or "sem medicao"))
+    return codigo
+
+
+if __name__ == "__main__":
+    sys.exit(main())

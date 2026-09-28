@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""purge-edge-cache — descarta o cache de borda do Cloudflare depois de publicar.
+
+POR QUE EXISTE: republicar torna o disco correto, mas o visitante continua
+recebendo a versao anterior enquanto a borda guardar a resposta antiga. Em
+2026-08-06 isso aconteceu com a HOME: o arquivo local ja estava certo (22.859
+bytes, 41 links) e o dominio publico ainda entregava a versao velha de 13.359
+bytes — o titular teve que purgar manualmente para o conserto aparecer. Deploy
+que depende de alguem lembrar de um passo manual e deploy pela metade.
+
+Este e o TERCEIRO cache da cadeia, e cada um mordeu uma vez:
+  1. var/on-demand-cache  — respostas geradas pelo Go (limpo por deploy-publico)
+  2. open_file_cache      — descritores do nginx (restart, no deploy-publico)
+  3. cache de borda       — Cloudflare (este)
+
+LOTEAMENTO: confirmado em 2026-08-19 na doc oficial
+(developers.cloudflare.com/cache/how-to/purge-cache/#availability-and-limits,
+seção "Availability and limits"), o "Max operations per request" é 100 para
+Free/Pro/Business (só Enterprise tem 500 na purga single-file; hostname/tag/
+prefixo/purge-everything são 100 nos quatro planos, Enterprise incluído). Este
+comentário dizia "30" até esta correção — não era o número da doc, era um valor
+menor escolhido sem citar fonte; elevado para 100 por leitura da doc, SEM
+medição contra a API real (nenhuma chamada de purga foi feita para validar o
+teto). Mandar mais que o teto numa requisição devolve erro e o deploy segue
+achando que purgou — falha silenciosa. Por isso os alvos vão em lotes de LOTE,
+e qualquer lote que reprovar derruba o resultado inteiro.
+
+TAXA (mesma tabela, seção "Hostname, tag, prefix URL, and purge everything
+limits"): o plano Free tem 5 requisições por minuto, bucket (token bucket) de
+25 — bem abaixo das 800 URLs/s do plano Free na tabela de purga single-file
+("Single-file purge limits"), que é outro grupo de limite. Isso não muda o
+LOTE (que é por-chamada, não por-segundo), mas quem dispara muitos lotes em
+sequência pode esbarrar nas 5 chamadas/minuto do Free — o ideal é um lote só
+por operação de purga, que é o caso normal deste script.
+
+TETO: acima de --teto-por-url a purga total sai mais barata (menos chamadas,
+menos risco de lote perdido) do que enumerar URL a URL. Abaixo dele, purga
+seletiva preserva quente o resto do acervo — purgar 9.622 páginas para corrigir
+20 joga fora o cache de 9.602 que não mudaram.
+
+TAG: além de --url, --tag purga por Cache-Tag (corpo {"tags":[...]} da API,
+ver developers.cloudflare.com/cache/how-to/purge-cache/purge-by-tags/). É o
+mecanismo certo para purgar uma ÁREA inteira do acervo (ex.: as 942 páginas de
+/glossario/) numa chamada só — nginx (ops/nginx/wikijuridica.conf, mapas
+$wj_area_tag/$wj_cache_tag) emite "area-<nome>" em toda resposta de página/hub/
+paginação daquela área, e "wj-acervo" em toda resposta de QUALQUER área (a
+união das 29). Confirmado por medição numa instância de ensaio isolada (nunca
+a de produção): "/", "/sobre/" e "/robots.txt" saem SEM Cache-Tag — não
+carregam a tag global, então purgar "wj-acervo" não os arrasta. --tag e --url
+são independentes: dar os dois manda dois lotes, um por mecanismo (o schema
+OpenAPI de /purge_cache modela "files" e "tags" como variantes de corpo
+mutuamente exclusivas, ver comentário no laço principal abaixo).
+
+CREDENCIAL: `.env.local`, fora do versionamento, resolvida por
+tools/cloudflare_auth.py (escopo "purga"): CLOUDFLARE_ZONE_TOKEN (Bearer de
+escopo de zona, menor privilegio -- Cache Purge esta no escopo dele, medido)
+quando presente; senao CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN (Global API
+Key, cabecalhos X-Auth-Email/X-Auth-Key).
+
+EVIDENCIA HONESTA: grava em data/ops/edge_cache_purge.jsonl a resposta REAL da
+API — sucesso, erro e identificador da operacao. Nenhum campo e escrito como
+verdadeiro sem a chamada correspondente ter sido feita.
+
+Read-only sobre o repositorio (so acrescenta a propria evidencia).
+
+Uso:
+    tools/purge-edge-cache                     # purga tudo
+    tools/purge-edge-cache --url / --url /sobre/
+    tools/purge-edge-cache --tag area-glossario
+    tools/purge-edge-cache --tag wj-acervo     # o acervo inteiro, preservando descritores
+    tools/purge-edge-cache --dry-run
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ENV = os.path.join(ROOT, ".env.local")
+SITE = os.path.join(ROOT, "content/site.json")
+EVIDENCIA = os.path.join(ROOT, "data/ops/edge_cache_purge.jsonl")
+API = "https://api.cloudflare.com/client/v4"
+
+# Limite da API do Cloudflare para "Max operations per request", confirmado na
+# doc oficial em 2026-08-19 (ver LOTEAMENTO acima): 100 para Free/Pro/Business,
+# nos quatro grupos de purga (URL, hostname, tag, prefixo). Vale tanto para
+# --url quanto para --tag.
+LOTE = 100
+
+
+def ler_env():
+    return cloudflare_auth.ambiente(ENV)
+
+
+def cabecalhos(env):
+    """(cabecalhos_ou_None, erro). Delegado a tools/cloudflare_auth.py, escopo
+    "purga": o token de zona cobre Cache Purge (medido), entao ele BASTA
+    SOZINHO -- antes desta migracao (2026-09-03) esta funcao exigia
+    CLOUDFLARE_API_TOKEN presente mesmo com o token de zona no ambiente."""
+    cab, rotulo = cloudflare_auth.cabecalhos("purga", env=env)
+    if cab is None:
+        return None, "sem credencial Cloudflare em .env.local (CLOUDFLARE_ZONE_TOKEN ou CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN)"
+    return cab, ""
+
+
+def chamar(metodo, caminho, headers, corpo=None, timeout=30.0):
+    dados = json.dumps(corpo).encode() if corpo is not None else None
+    pedido = urllib.request.Request(API + caminho, data=dados, headers=headers, method=metodo)
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return json.loads(resposta.read().decode("utf-8")), resposta.status
+    except urllib.error.HTTPError as erro:
+        try:
+            return json.loads(erro.read().decode("utf-8")), erro.code
+        except Exception:
+            return {"success": False, "errors": [{"message": "HTTP %s" % erro.code}]}, erro.code
+    except Exception as erro:
+        return {"success": False, "errors": [{"message": str(erro)[:160]}]}, 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", action="append", default=[],
+                        help="caminho a purgar (repetivel); sem nenhum e sem --tag, purga tudo")
+    parser.add_argument("--tag", action="append", default=[],
+                        help="cache-tag a purgar (repetivel), ex.: --tag area-glossario --tag wj-acervo. "
+                             "Independente de --url: cada mecanismo vai em lote(s) proprio(s), porque o "
+                             "corpo da API modela files e tags como variantes distintas")
+    parser.add_argument("--de-arquivo", default="",
+                        help="arquivo com um caminho por linha; '-' le da entrada padrao")
+    parser.add_argument("--teto-por-url", type=int, default=3000,
+                        help="acima disto, purgar tudo sai mais barato que listar URL a URL")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    with open(SITE, encoding="utf-8") as handle:
+        base = json.load(handle)["base_url"].rstrip("/")
+    dominio = base.split("//", 1)[-1]
+
+    env = ler_env()
+    headers, erro = cabecalhos(env)
+    if erro:
+        print("purge-edge-cache: %s" % erro, file=sys.stderr)
+        return 2
+    modo = "global_api_key" if "X-Auth-Email" in headers else "api_token"
+
+    zonas, _ = chamar("GET", "/zones?name=" + dominio, headers)
+    if not zonas.get("success") or not zonas.get("result"):
+        mensagens = "; ".join(e.get("message", "?") for e in (zonas.get("errors") or []))
+        print("purge-edge-cache: zona %s indisponivel (%s): %s" % (dominio, modo, mensagens or "sem resultado"),
+              file=sys.stderr)
+        return 1
+    zona = zonas["result"][0]["id"]
+
+    caminhos = list(args.url)
+    if args.de_arquivo:
+        origem = sys.stdin if args.de_arquivo == "-" else open(args.de_arquivo, encoding="utf-8")
+        try:
+            caminhos += [linha.strip() for linha in origem if linha.strip()]
+        finally:
+            if origem is not sys.stdin:
+                origem.close()
+
+    # Deduplica preservando a ordem: a mesma rota/tag repetida gastaria cota da
+    # chamada sem efeito nenhum.
+    vistos = set()
+    caminhos = [c for c in caminhos if not (c in vistos or vistos.add(c))]
+    vistos_tag = set()
+    tags = [t for t in args.tag if not (t in vistos_tag or vistos_tag.add(t))]
+
+    # --url e --tag são mecanismos INDEPENDENTES: o schema OpenAPI de
+    # POST /zones/{zone_id}/purge_cache (confirmado em 2026-08-19 lendo
+    # raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json —
+    # a doc HTML pública não expõe o schema, só exemplos) define o corpo como
+    # "anyOf" seis variantes mutuamente exclusivas
+    # (cache-purge_FlexPurgeByTags, _SingleFile, _FlexPurgeByHostnames,
+    # _FlexPurgeByPrefixes, _Everything, _SingleFileWithUrlAndHeaders), cada
+    # uma com APENAS a sua própria chave de topo ("tags" só tem "tags",
+    # "files" só tem "files"). Por isso cada mecanismo vira seu(s) próprio(s)
+    # lote(s) e os dois convivem na mesma execução quando o operador pede os
+    # dois.
+    lotes = []
+    descricao_partes = []
+
+    seletivo = bool(caminhos) and len(caminhos) <= args.teto_por_url
+    if seletivo:
+        alvos = [base + c if c.startswith("/") else c for c in caminhos]
+        fatias = [alvos[i:i + LOTE] for i in range(0, len(alvos), LOTE)]
+        lotes += [{"files": fatia} for fatia in fatias]
+        descricao_partes.append("%d URL(s) em %d lote(s)" % (len(alvos), len(fatias)))
+    elif caminhos:
+        descricao_partes.append("%d URLs excedem o teto de %d" % (len(caminhos), args.teto_por_url))
+
+    if tags:
+        fatias_tag = [tags[i:i + LOTE] for i in range(0, len(tags), LOTE)]
+        lotes += [{"tags": fatia} for fatia in fatias_tag]
+        descricao_partes.append("%d tag(s) em %d lote(s)" % (len(tags), len(fatias_tag)))
+
+    if not lotes:
+        # Nem URL seletiva nem tag: comportamento original — purga tudo. Também
+        # cai aqui quando as URLs pedidas excederam o teto e nenhuma tag foi
+        # dada (a mensagem acima já registra o motivo).
+        lotes = [{"purge_everything": True}]
+        descricao = descricao_partes[0] + "; purgando tudo" if descricao_partes else "tudo"
+    else:
+        descricao = "; ".join(descricao_partes)
+
+    print("zona     : %s (%s)" % (dominio, zona[:10] + "…"))
+    print("modo     : %s" % modo)
+    print("purgando : %s" % descricao)
+
+    if args.dry_run:
+        print("\n--dry-run: nada foi purgado.")
+        return 0
+
+    erros = []
+    sucesso = True
+    status = 0
+    for corpo in lotes:
+        resposta, status = chamar("POST", "/zones/%s/purge_cache" % zona, headers, corpo)
+        if not resposta.get("success"):
+            sucesso = False
+            erros += [e.get("message", "") for e in (resposta.get("errors") or [])]
+    resposta = {"errors": [{"message": m} for m in erros]}
+    registro = {
+        "schema_version": "edge_cache_purge_v1",
+        "purged_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "zone_name": dominio,
+        "auth_mode": modo,
+        "scope": descricao,
+        "http_status": status,
+        "success": sucesso,
+        "errors": [e.get("message", "") for e in (resposta.get("errors") or [])],
+    }
+    os.makedirs(os.path.dirname(EVIDENCIA), exist_ok=True)
+    with open(EVIDENCIA, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if sucesso:
+        print("\nOK: cache de borda descartado (%s). Evidencia em %s"
+              % (descricao, os.path.relpath(EVIDENCIA, ROOT)))
+        purga_total = any("purge_everything" in lote for lote in lotes)
+        if purga_total or len(alvos) >= 1000:
+            # Desde 2026-09-09 o timer do aquecedor passa so as 04:20 e 16:20 UTC:
+            # purga ampla sem reaquecimento deixa o acervo frio por ate 12 h.
+            print("REAQUECA AGORA: tools/warm-edge-cache --rps 12 --concorrencia 4"
+                  + ("" if purga_total else " --de-arquivo <a mesma lista>")
+                  + "  (o timer so passa as 04:20 e 16:20 UTC)")
+        return 0
+    print("\nFALHOU (HTTP %s): %s" % (status, "; ".join(registro["errors"]) or "sem detalhe"),
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

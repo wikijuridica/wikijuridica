@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""check-reorder-nao-toca-publicada — reordenar shard nunca pode envolver
+intent JA PUBLICADO, e isso tem de ser provado ANTES de qualquer --apply.
+
+POR QUE EXISTE (2026-09-08, achado de auditoria da esteira de escrita):
+`tools/generate-v2-shard-slice-reorder` e solido POR DENTRO — CAS antes e
+depois, prova de permutacao exata, flock, ledger em append — mas ele NAO tem
+nocao de "publicado". Ele confia em `expected_intent_ids`, que vem do
+portfolio PINADO (fonte: `expected_intent_ids` do proprio manifesto), nunca
+do `data/editorial/published_manifest.jsonl`. E `tools/check-shard-preservation`
+cobre PERDA de registro, nao ORDEM: uma reordenacao pura (mesmo multiset de
+linhas, ordem diferente) nao dispara a invariante dele. Ou seja, ate este
+gate existir, nada provava que um lote mecanico de reordenacao nao tocava
+byte a byte uma pagina que ja esta no ar.
+
+O QUE ESTE GATE FAZ: le `data/ops/writing_mechanical_reorder_todo.jsonl`
+(schema `v2_writing_mechanical_reorder_v1`, emitido so por
+`ops/relaunch-writing.sh`), extrai `expected_intent_ids` de CADA lote e cruza
+com `unique_intent_id` de `data/editorial/published_manifest.jsonl` (a chave
+CONFIRMADA por leitura de uma linha real do manifesto publicado — nao e
+`intent_id`, que e o nome de campo usado dentro dos SHARDS de
+`data/editorial/v2_pages/*.jsonl`, um espaco de identificador diferente que
+felizmente compartilha os mesmos valores: medido em 2026-09-08, os 10.141
+`unique_intent_id` publicados sao subconjunto exato dos 10.241 `intent_id`
+vivos nos shards). Reprova nomeando cada intent publicado que aparece num
+lote mecanico — decisao que exige autoria/republicacao, nunca reordenacao
+cega.
+
+Registro de manifesto que nao rende `expected_intent_ids: list[str]` bem
+formado, ou cujo `target_rel_path` nao aponta para um shard que EXISTE no
+disco, tambem REPROVA — e o MESMO defeito visto pelo outro lado: um gate que
+nao consegue provar seguranca sobre um lote tem de reprovar esse lote, nunca
+pular em silencio.
+
+Manifesto ausente ou vazio (0 bytes) = PASS, com a mensagem explicita "0
+lotes a conferir" e o mtime do arquivo (quando existe) — para nao fingir que
+conferiu algo que nao leu.
+
+READ-ONLY. Sem `--forcar`, sem flag que relaxe: este gate nao tem escape.
+
+Uso:
+    tools/check-reorder-nao-toca-publicada
+    tools/check-reorder-nao-toca-publicada --json
+    tools/check-reorder-nao-toca-publicada --manifest /caminho --publicados /caminho
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+
+SCHEMA_VERSION_ESPERADA = "v2_writing_mechanical_reorder_v1"
+
+# Espelha _MANIFEST_FIELDS e _TARGET_REL de
+# tools/generate-v2-shard-slice-reorder (linhas 63-67 e 61) — o mesmo
+# contrato de schema que o produtor exige antes de aplicar. Este gate NAO
+# importa o produtor (custaria ~1,5s autenticando 42MB de estoque a cada
+# chamada; um check-* precisa ser barato e stdlib puro).
+CAMPOS_MANIFESTO = {
+    "schema_version", "slug", "target_rel_path", "target_sha256",
+    "expected_n", "expected_intent_ids", "reason_codes",
+    "preserved_record_sha256", "recovery_item_sha256",
+}
+TARGET_REL_RE = re.compile(r"data/editorial/v2_pages/[a-z0-9_.-]+\.jsonl")
+
+
+def _sem_chave_duplicada(par_lista):
+    """object_pairs_hook: reprova (levanta) linha com chave JSON duplicada,
+    mesmo espirito paranoico do decode_json_no_duplicate_keys do produtor."""
+    resultado = {}
+    for chave, valor in par_lista:
+        if chave in resultado:
+            raise ValueError(f"chave duplicada: {chave!r}")
+        resultado[chave] = valor
+    return resultado
+
+
+def carregar_manifesto(caminho: str) -> tuple[list[dict], list[str], str | None]:
+    """Devolve (lotes_validos, motivos_de_reprovacao_por_registro_malformado, mtime_iso)."""
+    if not os.path.isfile(caminho):
+        return [], [], None
+    info = os.stat(caminho)
+    mtime_iso = _dt.datetime.fromtimestamp(info.st_mtime).isoformat()
+    if info.st_size == 0:
+        return [], [], mtime_iso
+    lotes: list[dict] = []
+    malformados: list[str] = []
+    with open(caminho, "rb") as handle:
+        payload = handle.read()
+    linhas = payload.split(b"\n")
+    if payload.endswith(b"\n"):
+        linhas = linhas[:-1]
+    for numero, bruta in enumerate(linhas, 1):
+        if not bruta.strip():
+            continue
+        try:
+            registro = json.loads(bruta, object_pairs_hook=_sem_chave_duplicada)
+        except (json.JSONDecodeError, ValueError) as erro:
+            malformados.append(f"linha {numero}: JSON invalido ({erro})")
+            continue
+        if not isinstance(registro, dict) or set(registro) != CAMPOS_MANIFESTO:
+            malformados.append(f"linha {numero}: schema fora de {sorted(CAMPOS_MANIFESTO)}")
+            continue
+        if registro.get("schema_version") != SCHEMA_VERSION_ESPERADA:
+            malformados.append(
+                f"linha {numero}: schema_version={registro.get('schema_version')!r} "
+                f"!= {SCHEMA_VERSION_ESPERADA!r}")
+            continue
+        lotes.append(registro)
+    return lotes, malformados, mtime_iso
+
+
+def carregar_publicados(caminho: str) -> set[str]:
+    """unique_intent_id de data/editorial/published_manifest.jsonl (streaming,
+    nunca carrega o arquivo inteiro em memoria de uma vez alem das linhas)."""
+    publicados: set[str] = set()
+    if not os.path.isfile(caminho):
+        return publicados
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            uid = registro.get("unique_intent_id")
+            if isinstance(uid, str) and uid:
+                publicados.add(uid)
+    return publicados
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--manifest", default=None,
+                         help="caminho do manifesto mecanico (default: <root>/data/ops/writing_mechanical_reorder_todo.jsonl)")
+    parser.add_argument("--publicados", default=None,
+                         help="caminho do published_manifest (default: <root>/data/editorial/published_manifest.jsonl)")
+    parser.add_argument("--root", default=ROOT,
+                         help="raiz do repo — resolve target_rel_path E os defaults de --manifest/--publicados "
+                              "(default: raiz deste checkout). Passar --root sem --manifest/--publicados "
+                              "explicitos conferia o shard num checkout e o publicado no outro; agora os "
+                              "tres derivam da MESMA raiz por padrao.")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if args.manifest is None:
+        args.manifest = os.path.join(args.root, "data", "ops", "writing_mechanical_reorder_todo.jsonl")
+    if args.publicados is None:
+        args.publicados = os.path.join(args.root, "data", "editorial", "published_manifest.jsonl")
+
+    lotes, malformados, mtime_iso = carregar_manifesto(args.manifest)
+
+    if not lotes and not malformados:
+        motivo = ("manifesto ausente" if not os.path.isfile(args.manifest)
+                   else "manifesto vazio (0 bytes)")
+        print(f"check-reorder-nao-toca-publicada: pass — 0 lotes a conferir ({motivo}: {args.manifest}"
+              + (f", mtime={mtime_iso}" if mtime_iso else "") + ")")
+        if args.json:
+            print(json.dumps({
+                "ok": True, "lotes": 0, "publicados_carregados": None,
+                "manifesto_mtime": mtime_iso, "violacoes": [], "shards_ausentes": [],
+                "malformados": [],
+            }, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    publicados = carregar_publicados(args.publicados)
+
+    violacoes: list[dict] = []
+    shards_ausentes: list[dict] = []
+
+    # CAMPO/ARQUIVO AUSENTE NAO E APROVACAO (mesmo defeito que ja pegou
+    # check-crawl-coverage-stall: "nao sei" virando "esta ok" e a forma mais
+    # cara de gate verde). Ha lote(s) mecanico(s) para conferir mas o
+    # universo publicado veio vazio -- arquivo ausente, truncado, ou so com
+    # linhas invalidas. NAO EXISTE base para provar que nenhum intent
+    # publicado foi tocado; reprova em vez de assumir seguranca por falta
+    # de dado. Janela real: published_manifest.jsonl e reescrito pela
+    # transacao de release, e pode estar momentaneamente vazio/ausente na
+    # mesma noite em que a esteira mecanica roda.
+    if lotes and not publicados:
+        print("check-reorder-nao-toca-publicada: FAIL", file=sys.stderr)
+        print(f"  - universo publicado vazio ou ausente ({args.publicados}) — "
+              "nao e possivel provar seguranca dos lotes mecanicos", file=sys.stderr)
+        if args.json:
+            print(json.dumps({
+                "ok": False, "lotes": len(lotes), "publicados_carregados": 0,
+                "manifesto_mtime": mtime_iso, "violacoes": [],
+                "shards_ausentes": [], "malformados": malformados,
+                "erro": f"universo publicado vazio ou ausente: {args.publicados}",
+            }, ensure_ascii=False, sort_keys=True))
+        return 1
+
+    for registro in lotes:
+        slug = registro.get("slug")
+        target_rel_path = registro.get("target_rel_path")
+        expected_ids = registro.get("expected_intent_ids")
+
+        # target_rel_path fora do padrao ou nao correspondente ao slug: nao da
+        # para confiar no par (slug, shard) que o lote afirma — reprova.
+        caminho_valido = (
+            isinstance(target_rel_path, str)
+            and TARGET_REL_RE.fullmatch(target_rel_path) is not None
+            and target_rel_path == f"data/editorial/v2_pages/{slug}.jsonl"
+        )
+        if not caminho_valido:
+            violacoes.append({
+                "slug": slug, "target_rel_path": target_rel_path,
+                "intents_publicados": [],
+                "motivo": "target_rel_path invalido ou nao corresponde ao slug",
+            })
+            continue
+
+        caminho_absoluto = os.path.join(args.root, target_rel_path)
+        if not os.path.isfile(caminho_absoluto):
+            shards_ausentes.append({"slug": slug, "target_rel_path": target_rel_path})
+            continue
+
+        if not isinstance(expected_ids, list) or not all(isinstance(i, str) for i in expected_ids):
+            violacoes.append({
+                "slug": slug, "target_rel_path": target_rel_path,
+                "intents_publicados": [],
+                "motivo": "expected_intent_ids nao e list[str]",
+            })
+            continue
+
+        tocados_publicados = sorted(set(expected_ids) & publicados)
+        if tocados_publicados:
+            violacoes.append({
+                "slug": slug, "target_rel_path": target_rel_path,
+                "intents_publicados": tocados_publicados,
+                "motivo": "lote mecanico toca intent(s) ja publicado(s)",
+            })
+
+    ok = not violacoes and not shards_ausentes and not malformados
+
+    if args.json:
+        print(json.dumps({
+            "ok": ok, "lotes": len(lotes), "publicados_carregados": len(publicados),
+            "manifesto_mtime": mtime_iso, "violacoes": violacoes,
+            "shards_ausentes": shards_ausentes, "malformados": malformados,
+        }, ensure_ascii=False, sort_keys=True))
+
+    if ok:
+        print(f"check-reorder-nao-toca-publicada: pass — {len(lotes)} lote(s) conferido(s) "
+              f"contra {len(publicados)} intent(s) publicado(s), nenhum tocado")
+        return 0
+
+    print("check-reorder-nao-toca-publicada: FAIL", file=sys.stderr)
+    for malformado in malformados:
+        print(f"  - manifesto malformado: {malformado}", file=sys.stderr)
+    for item in shards_ausentes:
+        print(f"  - shard ausente no disco: slug={item['slug']} target_rel_path={item['target_rel_path']}",
+              file=sys.stderr)
+    for item in violacoes:
+        print(f"  - {item['motivo']}: slug={item['slug']} target_rel_path={item['target_rel_path']} "
+              f"intents_publicados={item['intents_publicados']}", file=sys.stderr)
+    print("\n  Lote mecanico so reordena; se toca intent publicado, a decisao exige autoria",
+          file=sys.stderr)
+    print("  ou republicacao — nunca relaxar este gate para passar.", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

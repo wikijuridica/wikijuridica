@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Submete ao Bing Webmaster, por `SubmitUrlBatch`, as paginas publicadas que o
+Bing ainda nao rastreou — e grava cada submissao num ledger proprio.
+
+O DEFEITO QUE ISTO ATACA (medido 2026-09-09): o Bing tem 4.667 de 10.141
+paginas no indice (`InIndex` em `data/ops/bing_webmaster_daily.jsonl`). O
+IndexNow anuncia o que MUDOU; o que nunca foi rastreado nao muda e portanto
+nunca e anunciado. `SubmitUrlBatch` e o canal que pede rastreio de URL nomeada,
+e a API publica a cota ao vivo (`GetUrlSubmissionQuota`: em 2026-09-09,
+DailyQuota 100 e MonthlyQuota 2.200). A doc oficial fixa o teto de 500 URLs por
+lote e manda consultar a cota antes de submeter.
+
+SELECAO, deterministica e sem sorteio. Entra a pagina publicada que
+  (a) nao tem `url_info` com `LastCrawledDate` nos ultimos 30 dias, ou
+  (b) nunca teve submissao aceita neste ledger;
+e SAI, sem excecao, a que teve submissao ACEITA (HTTP 200) nos ultimos 30 dias.
+Ordem de prioridade:
+  0  `url_info` diz que o Bing nunca a visitou (`LastCrawledDate` nulo)  — mais
+     antiga publicada primeiro (`approved_at`), desempate por sha256(path);
+  1  sem `url_info` ainda (o coletor cobre 200 URLs/dia)                 — idem;
+  2  rastreada ha mais de 30 dias                                        — mais
+     antiga rastreada primeiro;
+  3  rastreada ha menos de 30 dias e nunca submetida — cumpre a letra de (b),
+     mas so entra quando as anteriores esgotam.
+Submissao que FALHOU fica no ledger com `aceita: false` e a URL volta a
+concorrer no dia seguinte: o que nao chegou ao Bing nao conta para os 30 dias.
+
+CODIGOS DE SAIDA: 0 submeteu (ou nada a submeter); 1 o POST falhou ou o ledger
+nao gravou; 2 sem credencial ou a cota nao pode ser lida (API fora). Em
+`--dry-run` a lista e impressa e nada e submetido nem gravado — a cota e lida
+ao vivo quando ha credencial, para a lista ter o tamanho que teria de verdade.
+
+Uso:
+  ./tools/generate-bing-submit-batch --dry-run
+  ./tools/generate-bing-submit-batch --max 100
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+ENV_LOCAL = RAIZ / ".env.local"
+SITE = RAIZ / "content" / "site.json"
+MANIFESTO = RAIZ / "data" / "editorial" / "published_manifest.jsonl"
+SERIE = RAIZ / "data" / "ops" / "bing_webmaster_daily.jsonl"
+LEDGER = RAIZ / "data" / "ops" / "bing_submit_ledger.jsonl"
+
+CHAVE = "WIKI_BING_WEBMASTER_APIKEY"
+BASE = "https://ssl.bing.com/webmaster/api.svc/json"
+# AO SAIR PARA A REDE, O PORTAL E O WikijuridicaBot (CLAUDE.md secao 11, ordem do
+# dono de 2026-09-05). Ate 2026-09-10 esta ferramenta saia como
+# `Python-urllib/3.x` — inclusive no POST que PEDE rastreio, que e' justamente a
+# requisicao em que o operador do outro lado quer saber quem esta pedindo.
+# O proposito e' proprio e nao se toma emprestado de outro: `observacao-de-
+# demanda` descreve LEITURA de metadado, e usa-lo aqui faria o cabecalho mentir
+# sobre o que o programa faz (o mesmo argumento que criou
+# `PropositoEnvioTransacional` em internal/wikijuridicabot/bot.go). Esta saida
+# nao le nada: ela submete URL propria para rastreio.
+# Se o maestro quiser fonte unica em Go, o espelho e' um `Proposito` novo
+# ("submissao-de-url") em internal/wikijuridicabot — a forma abaixo ja e' a que
+# `UserAgentComProposito` produziria.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; submissao-de-url)")
+SCHEMA = "bing_submit_v1"
+# O metodo se chama SubmitUrlBatch; o exemplo JSON da doc oficial escreve o
+# caminho como `SubmitUrlbatch`. Se o primeiro run real devolver 404, a linha
+# do ledger diz isso e a troca e de uma constante.
+ENDPOINT_SUBMISSAO = "SubmitUrlBatch"
+JANELA_DIAS = 30
+MAX_PADRAO = 100
+TETO_LOTE = 500
+# Quantos bytes da resposta do Bing ficam no ledger: o suficiente para ler o
+# erro, sem gravar HTML de pagina de erro inteiro.
+RESPOSTA_MAX = 600
+
+DATA_MS = re.compile(r"/Date\((-?\d+)([+-]\d+)?\)/")
+MOTIVOS = {0: "nunca_rastreada", 1: "sem_url_info", 2: "rastreio_antigo",
+           3: "rastreada_nunca_submetida"}
+
+
+def le_chave():
+    if os.environ.get(CHAVE):
+        return os.environ[CHAVE].strip()
+    try:
+        for linha in ENV_LOCAL.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if linha.startswith("#") or "=" not in linha:
+                continue
+            nome, valor = linha.split("=", 1)
+            if nome.strip() == CHAVE:
+                return valor.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def le_site():
+    return json.loads(SITE.read_text(encoding="utf-8"))["base_url"].rstrip("/") + "/"
+
+
+def data_iso(valor):
+    """Aceita `2026-09-05`, `2026-09-05T..` ou `/Date(ms)/`; devolve date ou None."""
+    if not isinstance(valor, str) or not valor:
+        return None
+    achado = DATA_MS.search(valor)
+    if achado:
+        ms = int(achado.group(1))
+        if ms <= -62135596800000:
+            return None
+        return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).date()
+    try:
+        return dt.date.fromisoformat(valor[:10])
+    except ValueError:
+        return None
+
+
+def le_jsonl(caminho):
+    try:
+        texto = caminho.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    registros = []
+    for linha in texto.splitlines():
+        if not linha.strip():
+            continue
+        try:
+            registros.append(json.loads(linha))
+        except ValueError:
+            continue
+    return registros
+
+
+def carrega_paginas(caminho=None):
+    """Uma pagina por `unique_intent_id`: url -> {path, approved_at}."""
+    caminho = MANIFESTO if caminho is None else caminho
+    por_intencao = {}
+    for r in le_jsonl(caminho):
+        if r.get("page_status", "published") != "published":
+            continue
+        if r.get("index_policy", "index") != "index":
+            continue
+        chave = r.get("unique_intent_id") or r.get("path")
+        if chave and chave not in por_intencao:
+            por_intencao[chave] = r
+    paginas = {}
+    for r in por_intencao.values():
+        url = r.get("canonical_url")
+        if not url:
+            continue
+        paginas[url] = {"path": r.get("path", ""), "approved_at": r.get("approved_at") or ""}
+    return paginas
+
+
+def ultimo_url_info(caminho=None):
+    """Ultima observacao de GetUrlInfo por URL (a de `coletado_em` mais novo)."""
+    caminho = SERIE if caminho is None else caminho
+    ultimo = {}
+    for r in le_jsonl(caminho):
+        if r.get("tipo") != "url_info" or not r.get("Url"):
+            continue
+        atual = ultimo.get(r["Url"])
+        if atual is None or (r.get("coletado_em") or "") >= (atual.get("coletado_em") or ""):
+            ultimo[r["Url"]] = r
+    return ultimo
+
+
+def ultima_submissao_aceita(caminho=None):
+    """url -> date da ultima submissao ACEITA (HTTP 200)."""
+    caminho = LEDGER if caminho is None else caminho
+    aceitas = {}
+    for r in le_jsonl(caminho):
+        if r.get("tipo") != "submissao" or not r.get("aceita") or not r.get("url"):
+            continue
+        dia = data_iso(r.get("submetido_em"))
+        if dia is None:
+            continue
+        if r["url"] not in aceitas or dia > aceitas[r["url"]]:
+            aceitas[r["url"]] = dia
+    return aceitas
+
+
+def classifica(url, pagina, info, aceita_em, hoje, janela=JANELA_DIAS):
+    """Devolve (prioridade, chave_de_ordem, motivo) ou None quando a URL nao
+    concorre hoje."""
+    if aceita_em is not None and (hoje - aceita_em).days < janela:
+        return None
+    desempate = hashlib.sha256(pagina["path"].encode("utf-8")).hexdigest()
+    publicada = pagina.get("approved_at") or "9999-12-31"
+    if info is None:
+        return 1, (publicada, desempate), MOTIVOS[1]
+    rastreada = data_iso(info.get("LastCrawledDate"))
+    if rastreada is None:
+        return 0, (publicada, desempate), MOTIVOS[0]
+    if (hoje - rastreada).days >= janela:
+        return 2, (rastreada.isoformat(), desempate), MOTIVOS[2]
+    if aceita_em is None:
+        return 3, (rastreada.isoformat(), desempate), MOTIVOS[3]
+    return None
+
+
+def seleciona(paginas, infos, aceitas, hoje, maximo, janela=JANELA_DIAS):
+    """Lista ordenada de (url, motivo, chave) ate `maximo`, e a contagem por
+    motivo de tudo que concorria."""
+    candidatas, contagem = [], {}
+    for url, pagina in paginas.items():
+        veredito = classifica(url, pagina, infos.get(url), aceitas.get(url), hoje, janela)
+        if veredito is None:
+            continue
+        prioridade, chave, motivo = veredito
+        contagem[motivo] = contagem.get(motivo, 0) + 1
+        candidatas.append((prioridade, chave, url, motivo))
+    candidatas.sort()
+    return [(url, motivo, chave) for _, chave, url, motivo in candidatas[:max(0, maximo)]], contagem
+
+
+def busca_json(url):
+    requisicao = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+    with urllib.request.urlopen(requisicao, timeout=45) as resposta:
+        return json.loads(resposta.read().decode("utf-8"))
+
+
+def envia_json(url, corpo):
+    """POST JSON; devolve (http_status, corpo_da_resposta). Erro HTTP vira
+    tupla tambem — quem chama decide, e o ledger guarda o que veio."""
+    dados = json.dumps(corpo, ensure_ascii=False).encode("utf-8")
+    requisicao = urllib.request.Request(
+        url, data=dados, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8", "Accept": "application/json",
+                 "User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(requisicao, timeout=60) as resposta:
+            return resposta.status, resposta.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as erro:
+        return erro.code, erro.read().decode("utf-8", errors="replace")
+
+
+def le_cota(chave, site, busca=busca_json):
+    url = f"{BASE}/GetUrlSubmissionQuota?" + urllib.parse.urlencode({"apikey": chave, "siteUrl": site})
+    corpo = busca(url)
+    dados = corpo.get("d", corpo) if isinstance(corpo, dict) else corpo
+    return int(dados.get("DailyQuota", 0)), int(dados.get("MonthlyQuota", 0))
+
+
+def teto_do_lote(maximo, cota_diaria, cota_mensal):
+    return max(0, min(maximo, TETO_LOTE, cota_diaria, cota_mensal))
+
+
+def grava_ledger(linhas, caminho=None):
+    caminho = LEDGER if caminho is None else caminho
+    if not linhas:
+        return
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with open(caminho, "a", encoding="utf-8") as saida:
+        saida.write("\n".join(json.dumps(l, ensure_ascii=False, sort_keys=True) for l in linhas) + "\n")
+        saida.flush()
+        os.fsync(saida.fileno())
+
+
+def main(argv=None, busca=busca_json, envia=envia_json, agora=None):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--max", type=int, default=MAX_PADRAO,
+                        help=f"maximo de URLs por execucao (padrao {MAX_PADRAO}; a cota ao vivo vence)")
+    parser.add_argument("--dry-run", action="store_true", help="lista sem submeter nem gravar")
+    args = parser.parse_args(argv)
+    if args.max < 1:
+        print("--max precisa ser >= 1")
+        return 1
+
+    if agora is None:
+        agora = dt.datetime.now(dt.timezone.utc)
+    hoje = agora.date()
+    site = le_site()
+    chave = le_chave()
+
+    cota_diaria, cota_mensal, cota_texto = None, None, ""
+    if chave:
+        try:
+            cota_diaria, cota_mensal = le_cota(chave, site, busca)
+            cota_texto = f"cota ao vivo: {cota_diaria}/dia, {cota_mensal}/mes"
+        except (urllib.error.URLError, ValueError, OSError, AttributeError) as erro:
+            if not args.dry_run:
+                print(f"cota nao pode ser lida (GetUrlSubmissionQuota): {erro}")
+                return 2
+            cota_texto = f"cota nao lida ({erro}); lista com o teto de --max"
+    elif not args.dry_run:
+        print("sem credencial do Bing Webmaster: nada submetido e nada gravado")
+        print(f"  a chave e lida de {CHAVE}, no ambiente ou em .env.local")
+        return 2
+    else:
+        cota_texto = "sem credencial; lista com o teto de --max"
+
+    teto = args.max if cota_diaria is None else teto_do_lote(args.max, cota_diaria, cota_mensal)
+
+    paginas = carrega_paginas()
+    infos = ultimo_url_info()
+    aceitas = ultima_submissao_aceita()
+    lote, contagem = seleciona(paginas, infos, aceitas, hoje, teto)
+
+    print(f"{len(paginas)} paginas publicadas; url_info para {sum(1 for u in paginas if u in infos)}; "
+          f"{len(aceitas)} com submissao aceita; {cota_texto}")
+    print("concorrem hoje: " + ", ".join(f"{m}={n}" for m, n in sorted(contagem.items())) if contagem
+          else "concorrem hoje: nenhuma")
+    print(f"lote de hoje: {len(lote)} (teto {teto})")
+    for url, motivo, _ in lote:
+        print(f"  {motivo:<26} {url}")
+
+    if args.dry_run:
+        print("\n--dry-run: nada submetido, nada gravado")
+        return 0
+    if not lote:
+        print("\nnada a submeter")
+        return 0
+
+    lote_id = f"{hoje.isoformat()}-{uuid.uuid4().hex[:8]}"
+    url_post = f"{BASE}/{ENDPOINT_SUBMISSAO}?" + urllib.parse.urlencode({"apikey": chave})
+    corpo = {"siteUrl": site, "urlList": [url for url, _, _ in lote]}
+    try:
+        status, resposta = envia(url_post, corpo)
+    except (urllib.error.URLError, OSError) as erro:
+        status, resposta = 0, f"sem resposta: {erro}"
+    aceita = status == 200
+    submetido_em = agora.isoformat()
+    linhas = [{"schema": SCHEMA, "tipo": "submissao", "site": site, "url": url,
+               "motivo": motivo, "lote_id": lote_id, "lote_tamanho": len(lote),
+               "submetido_em": submetido_em, "http_status": status, "aceita": aceita,
+               "resposta": resposta[:RESPOSTA_MAX], "cota_diaria": cota_diaria,
+               "cota_mensal": cota_mensal}
+              for url, motivo, _ in lote]
+    try:
+        grava_ledger(linhas)
+    except OSError as erro:
+        print(f"\nledger nao gravado ({LEDGER}): {erro}")
+        return 1
+
+    print(f"\nlote {lote_id}: HTTP {status} {'aceito' if aceita else 'RECUSADO'}; "
+          f"{len(linhas)} linha(s) em {LEDGER.relative_to(RAIZ) if LEDGER.is_relative_to(RAIZ) else LEDGER}")
+    if not aceita:
+        print(f"  resposta: {resposta[:RESPOSTA_MAX]}")
+    return 0 if aceita else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

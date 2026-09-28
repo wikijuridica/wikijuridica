@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+# tools/check-disk-headroom — READ-ONLY. O gate de espaco em disco que faltava.
+#
+# ★ POR QUE EXISTE (2026-08-29, BUG-147)
+#
+# `ls tools/ | grep -iE 'disk|disco'` nao devolvia nada. `/` estava em 78% no
+# catalogo e em 80% na medicao de hoje. Nenhum gate, nenhuma serie, ninguem
+# avisado.
+#
+# O dano nao e "o disco encheu": e a PUBLICACAO TRANSACIONAL morrendo no meio.
+# internal/publicrelease faz staging -> fingerprint -> promocao -> rollback
+# justamente para o portal nunca ficar hibrido; disco cheio e a unica falha que
+# atinge tambem o rollback, porque ate desfazer precisa escrever.
+#
+# ★ O LIMIAR NAO FOI ESCOLHIDO — FOI DERIVADO. Nada de "85%" ou "90%".
+#
+# (a) CUSTO DE PICO DE UMA PUBLICACAO. Lendo internal/publicrelease, uma
+#     transacao mantem QUATRO arvores do acervo vivas ao mesmo tempo:
+#       1. public/                                        (:5119, publicRoot)
+#       2. .release-staging/public                        (:726, releaseStagingPublicRoot)
+#       3. .release-staging/transactions/<fp>/public      (:730, releaseStagingTransactionPublicRoot)
+#       4. .release-staging/promotion-previews/<sha>/root (:5121, promotionRootsForPlan)
+#     A (1) ja esta em disco, entao a demanda ADICIONAL de pico e 3x o acervo.
+#     Medido em 2026-08-29: `du -sb public` = 449.643.036 B para 10.345 HTML
+#     (`find public -name '*.html' | wc -l`). O gate NAO grava esse numero: ele
+#     mede o acervo a cada execucao, para o limiar acompanhar sozinho o portal
+#     indo de 10 mil para 100 mil paginas. Limiar hardcoded envelhece calado.
+#
+# (b) FATOR 2 SOBRE O PICO. Transacao que aborta deixa o staging para tras, e a
+#     retentativa gera outro fingerprint — logo, outra arvore. Duas tentativas
+#     e o caso comum de um dia ruim, nao o pior caso imaginavel.
+#
+# (c) JANELA DE REACAO, MEDIDA, nao arbitrada. Espaco em disco e alerta de
+#     queima lenta: nao adianta avisar quando ja nao cabe. Quanto tempo esta
+#     casa leva para agir sobre um alerta de infraestrutura? Esta medido em
+#     data/ops/owner_alerts.jsonl (1.494 linhas, 151 pares abertura->resolucao):
+#     mediana 0,02 h — mas essa mediana e das sondas de rede que se resolvem
+#     sozinhas. Nos alertas de queima lenta, os que exigem humano, o tempo
+#     maximo ATE A RESOLUCAO foi 176,37 h (`rede-degradada`), com
+#     `borda-lenta` em 160,05 h e `borda-cache-regra` em 126,34 h.
+#     ceil(176,37 / 24) = 8 dias. Usa-se o MAXIMO e nao o p90 (29,37 h) porque
+#     a falha aqui e irreversivel: publicacao interrompida no meio deixa
+#     artefato hibrido. Nota honesta: ha alertas ABERTOS ha 244 h, que nunca
+#     resolveram e por isso nao entram na conta — a janela de 8 dias e piso
+#     medido, nao teto.
+#
+# (d) SURTO. O que enche disco nesta maquina nao e so goteira: e onda. Medido
+#     na propria serie, entre 2026-08-29T16:03Z e 2026-08-30T21:08Z `/` perdeu
+#     51,5 GiB em 29 h (124,62 -> 73,15 GiB), e nos piores 24 h desse trecho,
+#     47,5 GiB. Nos dois dias completos seguintes o consumo foi 11,29 e 1,07
+#     GiB. Uma tendencia "tipica" (mediana) desses dias e 6,18 GiB/dia — e um
+#     disco com folga so para 8 x 6,18 = 49 GiB nao sobrevive a REPETICAO
+#     daquele surto dentro da janela de reacao. Por isso o piso exige, alem da
+#     tendencia, a pior queda de 24 h vista na janela: se aconteceu esta
+#     semana, pode acontecer nos 8 dias em que ninguem vai agir.
+#
+#   piso_livre = 2 x (3 x acervo)  +  8 dias x tendencia  +  pior_24h
+#                \_____________/     \________________/     \______/
+#                 (a) x (b)               (c)                 (d)
+#
+# ★ A TENDENCIA E POR DIA COMPLETO, E NAO E REGRESSAO. (BUG B8, 2026-09-01)
+#
+# A primeira versao deste gate estimava a tendencia por minimos quadrados sobre
+# TODAS as amostras dos ultimos 7 dias. Com a serie mais nova que 7 dias, a
+# janela era a serie inteira, ancorada no nascimento dela — e o nascimento
+# coincidiu com o surto de 51,5 GiB. Cada amostra nova com o disco PARADO
+# diluia o degrau e derrubava a reta. Medido, com `/` sempre entre 77 e 87 GiB
+# livres:
+#
+#     2026-08-31T21:09Z  n=58  reta 16,85 GiB/dia  piso 137,32 GiB
+#     2026-09-01T05:07Z  n=65  reta 12,62 GiB/dia  piso 103,49 GiB
+#     2026-09-01T12:09Z  n=73  reta  8,83 GiB/dia  piso  73,21 GiB
+#     2026-09-01T19:08Z  n=80  reta  6,88 GiB/dia  piso  57,60 GiB
+#
+# E acrescentando 19 amostras IDENTICAS a ultima (disco imovel por 19 h), a
+# reta ainda cai para 5,83 GiB/dia e o piso para 49,14. Gate que aprova ou
+# reprova conforme a hora nao e gate: ele reprovou 41 vezes em 3 dias e estava
+# verde as 12:09. A regressao deslizante nao resolve — ela da um salto no dia
+# em que o degrau sai da janela.
+#
+# O que se faz agora, e por que cada parte:
+#
+#   - O ritmo e o consumo por DIA UTC COMPLETO: livre_b a meia-noite D menos
+#     livre_b a meia-noite D+1, com o valor da meia-noite INTERPOLADO entre a
+#     ultima amostra antes e a primeira depois. O timer amostra de hora em
+#     hora (`*:07`), entao a fresta normal e de 1 h; aceita-se ate 3 h (dois
+#     disparos perdidos). Fresta maior significa maquina desligada na virada,
+#     e ai o valor da meia-noite seria invencao: a fronteira nao existe e os
+#     dois dias vizinhos NAO contam como completos.
+#   - A tendencia e a MEDIANA dos ultimos 7 dias completos. Mediana porque um
+#     unico dia de surto nao pode ditar a reta — o surto tem termo proprio (d),
+#     que nao se dilui nem se esquece ate sair da janela de 7 dias.
+#   - Sao exigidos >= 2 dias completos. Com um so nao ha mediana: ha um dia.
+#     Abaixo disso o gate imprime INCONCLUSIVO — e INCONCLUSIVO nao e "ok":
+#     a folga estrutural (a)x(b) continua sendo cobrada, e a palavra sai
+#     impressa para ninguem ler o silencio como aprovacao.
+#   - O surto e a pior queda entre duas amostras distantes <= 24 h. Deslizante
+#     e nao por dia calendario, porque o surto medido atravessou a meia-noite
+#     e por dia calendario apareceria como 35 + 16, nunca como 47. A janela
+#     dele comeca 7 dias antes da ultima meia-noite valida e vai ate a ULTIMA
+#     amostra: queda em curso sobe o piso na hora em que e medida (o gate nao
+#     espera o dia fechar para ver 47 GiB sumirem), e queda antiga so sai da
+#     janela na virada do dia. Simulado sobre a serie real: nas 32 h em que a
+#     mediana ainda nao existia, o surto ao vivo ja cobrava 35 -> 47 GiB.
+#   - A TENDENCIA so usa amostras ate a ultima meia-noite, entao entre uma
+#     virada e a seguinte ela e IDENTICA em toda execucao; o SURTO so muda se o
+#     disco cair mais do que a pior queda ja vista — amostra igual a anterior
+#     tem queda zero. Resultado: disco igual, piso igual, e o gate imprime ate
+#     quando o piso esta fixo. O NIVEL e sempre a ultima amostra.
+#
+# ★ /mnt/hdd TAMBEM E GATEADO
+#
+# E o destino do backup (BUG-146). Se ele encher, o backup para de acontecer em
+# silencio — e backup ausente que parece presente e pior que backup nenhum. O
+# piso dele e o TAMANHO ATUAL DO PROPRIO BACKUP, lido de
+# data/ops/backup_wiki.jsonl: como o backup e aditivo e nada nunca e apagado,
+# refazer o espelho do zero exige caber uma segunda copia inteira ao lado da
+# atual. Sem execucao de backup sem problema no ledger, o termo estrutural do
+# HDD e desconhecido: sai INCONCLUSIVO, e tendencia + surto continuam cobrados.
+#
+# ★ READ-ONLY
+#
+# Este gate nao escreve serie nenhuma — quem amostra e tools/generate-disk-
+# -headroom. A unica escrita e o alerta pelo canal tools/notify-owner quando
+# reprova, permitido pela DEC-040 e desligavel com --sem-alerta.
+#
+# EXIT: 0 ok ou INCONCLUSIVO impresso · 1 REPROVA (livre abaixo do piso, ou
+# ponto de montagem sem amostra) · 2 uso, ou NAO RODOU (serie vazia/ausente).
+
+set -u -o pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SERIE="$RAIZ/data/ops/disk_headroom.jsonl"
+LEDGER_BACKUP="$RAIZ/data/ops/backup_wiki.jsonl"
+JANELA_DIAS="8"
+RITMO_DIAS="7"
+ALERTAR="1"
+FORMATO="texto"
+
+uso() {
+	echo "Uso: tools/check-disk-headroom [--janela-dias N] [--ritmo-dias N] [--serie ARQUIVO] [--ledger-backup ARQUIVO] [--sem-alerta] [--json]" >&2
+	exit 2
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--janela-dias)
+		[ $# -ge 2 ] || uso
+		JANELA_DIAS="$2"
+		shift 2
+		;;
+	--ritmo-dias)
+		[ $# -ge 2 ] || uso
+		RITMO_DIAS="$2"
+		shift 2
+		;;
+	# --serie existe para o gate poder ser FALSIFICADO contra uma serie de
+	# teste. Gate que nunca reprovou em nenhuma execucao e gate nao testado:
+	# nao se sabe se ele avisa ou se so sabe passar.
+	--serie)
+		[ $# -ge 2 ] || uso
+		SERIE="$2"
+		shift 2
+		;;
+	# --ledger-backup pelo mesmo motivo: o caminho "backup desconhecido ->
+	# INCONCLUSIVO, sem pular a checagem" so se prova com um ledger vazio.
+	--ledger-backup)
+		[ $# -ge 2 ] || uso
+		LEDGER_BACKUP="$2"
+		shift 2
+		;;
+	--sem-alerta)
+		ALERTAR="0"
+		shift
+		;;
+	--json)
+		FORMATO="json"
+		shift
+		;;
+	-h | --help) uso ;;
+	*)
+		echo "flag desconhecida: $1" >&2
+		uso
+		;;
+	esac
+done
+
+# ACERVO MEDIDO AGORA. Se public/ ainda nao foi gerado, o acervo e 0 e o piso
+# cai para a parte do crescimento — o que esta certo: sem acervo nao ha
+# publicacao para caber. (E o gate CONTINUA cobrando tendencia e surto: ate
+# 2026-09-01 a condicao `if piso_estrutural and livre < piso` pulava a
+# checagem inteira quando o acervo era 0, ao contrario do que esta linha dizia.)
+ACERVO_B=$(nice -n 19 du -sb "$RAIZ/public" 2>/dev/null | awk '{print $1}')
+[ -n "${ACERVO_B:-}" ] || ACERVO_B=0
+
+# O relatorio estruturado sai num arquivo proprio em vez de num descritor
+# extra: `VAR="$(...)" 3>arquivo` NAO propaga o fd 3 para dentro da
+# substituicao de comando, e a primeira versao deste gate morreu exatamente
+# assim (FileNotFoundError: /dev/fd/3).
+REPORT="$(mktemp "${TMPDIR:-/tmp}/check-disk-headroom.XXXXXX.json")"
+limpa() { rm -f "$REPORT"; }
+trap limpa EXIT
+
+SAIDA="$(
+	nice -n 19 python3 - "$SERIE" "$LEDGER_BACKUP" "$ACERVO_B" "$JANELA_DIAS" "$RITMO_DIAS" "$FORMATO" "$REPORT" <<'PYEOF'
+import datetime
+import json
+import sys
+
+serie_path, ledger_backup, acervo_b, janela_dias, ritmo_dias, formato, report_path = sys.argv[1:8]
+acervo_b = int(acervo_b)
+janela_dias = float(janela_dias)
+ritmo_dias = float(ritmo_dias)
+
+GIB = 1073741824.0
+UTC = datetime.timezone.utc
+DIA = datetime.timedelta(days=1)
+
+# CADENCIA DO PRODUTOR: ops/systemd/wikijuridica-disk-headroom.timer dispara em
+# `*:07` com ate 3 min de atraso aleatorio. A meia-noite fica entre as amostras
+# de 23:07 e 00:07 — fresta de 1 h. Toleram-se dois disparos perdidos (3 h);
+# alem disso a maquina esteve desligada na virada e o valor da meia-noite
+# seria inventado. Quem mudar o timer para diario esta desligando a projecao.
+CADENCIA_H = 1.0
+FRESTA_MAX_H = 3.0 * CADENCIA_H
+# Menos de dois dias completos nao tem mediana — tem um dia. E um dia so mede
+# a fase do ciclo (onda de conteudo 04:24, backup 02:20, deploys), nao o ritmo.
+DIAS_COMPLETOS_MINIMO = 2
+# O surto medido (cabecalho, item d) durou 29 h e teve 47,5 GiB nos piores
+# 24 h; a janela de 24 h e a mesma unidade do ritmo diario, para os dois
+# termos serem comparaveis na mensagem.
+SURTO_JANELA_H = 24.0
+
+
+def carrega_jsonl(caminho):
+    """Le JSONL tolerando linha invalida.
+
+    Nao e leniencia gratuita: a PRIMEIRA linha de backup_wiki.jsonl esta
+    corrompida ({"tamanho_kb":,}) porque a rede de seguranca do /mnt/hdd matou
+    o `du` da primeira execucao. O defeito ja foi corrigido na origem, mas a
+    linha ruim continua no historico e nao se apaga dado neste projeto — entao
+    quem le tem de aguentar.
+    """
+    linhas, invalidas = [], 0
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    linhas.append(json.loads(ln))
+                except ValueError:
+                    invalidas += 1
+    except FileNotFoundError:
+        pass
+    return linhas, invalidas
+
+
+amostras, serie_invalidas = carrega_jsonl(serie_path)
+backup_linhas, _ = carrega_jsonl(ledger_backup)
+
+agora = datetime.datetime.now(UTC)
+
+
+def quando(registro):
+    t = registro.get("checked_at")
+    if not t:
+        return None
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=UTC)
+
+
+def iso_z(t):
+    return t.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ")
+
+
+# Tamanho atual do backup, para derivar o piso do /mnt/hdd. Ultima linha SEM
+# problema; se nenhuma, o piso estrutural do HDD vira INCONCLUSIVO e o gate diz
+# isso — nunca pula a checagem em silencio.
+backup_b = None
+for registro in reversed(backup_linhas):
+    if registro.get("problema"):
+        continue
+    kb = registro.get("tamanho_kb")
+    if isinstance(kb, int) and kb > 0:
+        backup_b = kb * 1024
+        break
+
+# Serie por ponto de montagem.
+por_ponto = {}
+for registro in amostras:
+    t = quando(registro)
+    if t is None:
+        continue
+    for alvo in registro.get("alvos", []):
+        if not alvo.get("montado"):
+            continue
+        por_ponto.setdefault(alvo["ponto"], []).append((t, alvo))
+for pontos in por_ponto.values():
+    pontos.sort(key=lambda par: par[0])
+
+
+def meia_noite_de(t):
+    return t.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def valor_na_meia_noite(pontos, mn):
+    """livre_b em `mn`, interpolado entre a ultima amostra antes e a primeira
+    depois. None quando a fresta entre as duas passa de FRESTA_MAX_H, ou
+    quando nao ha amostra de um dos lados."""
+    antes = depois = None
+    for t, a in pontos:
+        if t <= mn:
+            antes = (t, float(a["livre_b"]))
+        else:
+            depois = (t, float(a["livre_b"]))
+            break
+    if antes is None or depois is None:
+        return None
+    (ta, va), (td, vd) = antes, depois
+    fresta_s = (td - ta).total_seconds()
+    if fresta_s / 3600.0 > FRESTA_MAX_H:
+        return None
+    if fresta_s == 0:
+        return va
+    return va + (vd - va) * ((mn - ta).total_seconds() / fresta_s)
+
+
+def mediana(valores):
+    s = sorted(valores)
+    n = len(s)
+    if n % 2:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def ritmo(pontos):
+    """Tendencia (mediana por dia completo, congelada na ultima meia-noite UTC
+    com fronteira valida) e surto (pior queda em 24 h, janela que comeca
+    `ritmo_dias` antes dessa meia-noite e vai ate a ULTIMA amostra).
+
+    Devolve um dict; `inconclusivo` traz o motivo quando nao ha mediana.
+    """
+    ultimo_t = pontos[-1][0]
+    mn_ultima = meia_noite_de(ultimo_t)
+    fronteiras = {}
+    for k in range(int(ritmo_dias), -1, -1):
+        mn = mn_ultima - k * DIA
+        v = valor_na_meia_noite(pontos, mn)
+        if v is not None:
+            fronteiras[mn] = v
+    dias = []
+    for mn in sorted(fronteiras):
+        if mn + DIA in fronteiras:
+            dias.append((mn, fronteiras[mn] - fronteiras[mn + DIA]))
+    saida = {
+        "dias_completos": len(dias),
+        "dias": [(iso_z(mn)[:10], c) for mn, c in dias],
+        "congelado_ate": iso_z(mn_ultima + DIA),
+        "inconclusivo": None,
+        "mediana_b": None,
+        "surto_b": 0.0,
+        "surto_de": None,
+        "surto_ate": None,
+    }
+
+    # SURTO AO VIVO NA ENTRADA, CONGELADO NA SAIDA. A janela comeca ritmo_dias
+    # antes da ultima meia-noite valida (ou do inicio da serie, se ainda nao
+    # houve virada amostrada) e vai ate a ultima amostra: uma queda em curso
+    # sobe o piso na hora em que e medida, e uma queda antiga so sai da janela
+    # na virada do dia. Com o disco parado nada muda — queda entre amostras
+    # iguais e zero — e e isso que o gate promete: piso igual para disco igual.
+    inicio_janela = (max(fronteiras) if fronteiras else pontos[0][0]) - datetime.timedelta(days=ritmo_dias)
+    vivas = [(t, float(a["livre_b"])) for t, a in pontos if t >= inicio_janela]
+    pior, pior_de, pior_ate = 0.0, None, None
+    limite_s = SURTO_JANELA_H * 3600.0
+    for i, (ti, vi) in enumerate(vivas):
+        for tj, vj in vivas[i + 1:]:
+            if (tj - ti).total_seconds() > limite_s:
+                break
+            queda = vi - vj
+            if queda > pior:
+                pior, pior_de, pior_ate = queda, ti, tj
+    saida["surto_b"] = pior
+    saida["surto_de"] = iso_z(pior_de) if pior_de else None
+    saida["surto_ate"] = iso_z(pior_ate) if pior_ate else None
+
+    if len(dias) < DIAS_COMPLETOS_MINIMO:
+        span_h = (ultimo_t - pontos[0][0]).total_seconds() / 3600.0
+        saida["inconclusivo"] = (
+            "%d dia(s) UTC completo(s) na serie (%d amostras em %.1f h); sao necessarios >= %d "
+            "com fronteira de meia-noite amostrada a <= %.0f h para haver mediana e nao um dia so"
+            % (len(dias), len(pontos), span_h, DIAS_COMPLETOS_MINIMO, FRESTA_MAX_H)
+        )
+        return saida
+    saida["mediana_b"] = mediana([c for _, c in dias])
+    return saida
+
+
+relatorio = {
+    "checked_at": agora.isoformat(),
+    "acervo_publico_b": acervo_b,
+    "janela_reacao_dias": janela_dias,
+    "ritmo_dias": ritmo_dias,
+    "ritmo_metodo": "mediana do consumo por dia UTC completo + pior queda em 24 h, congelados na ultima meia-noite",
+    "serie_amostras": len(amostras),
+    "serie_linhas_invalidas": serie_invalidas,
+    "backup_tamanho_b": backup_b,
+    "pontos": [],
+    "problemas": [],
+    "inconclusivos": [],
+    "veredito": None,
+}
+
+if not amostras:
+    # Serie vazia nao e reprovacao nem aprovacao: o gate NAO MEDIU. Sai 2, com
+    # a palavra, para o timer nao registrar "ok" numa maquina sem serie.
+    relatorio["veredito"] = "nao_rodou"
+    relatorio["problemas"].append(
+        "serie %s vazia ou ausente — rode tools/generate-disk-headroom" % serie_path
+    )
+
+for ponto in ("/", "/mnt/hdd"):
+    if relatorio["veredito"] == "nao_rodou":
+        break
+    pontos = por_ponto.get(ponto, [])
+    if not pontos:
+        # Ponto sem amostra montada e DEFEITO, nao ausencia de dado: o produtor
+        # registra `montado: false` quando o HDD sumiu, e HDD sumido e backup
+        # que deixou de existir em silencio (BUG-146).
+        relatorio["problemas"].append("sem amostra montada para %s" % ponto)
+        continue
+    ultimo_t, ultimo = pontos[-1]
+    livre = float(ultimo["livre_b"])
+
+    if ponto == "/":
+        pico_publicacao = 3 * acervo_b
+        piso_estrutural = 2 * pico_publicacao
+        piso_origem = "2 x (3 x acervo de %.2f GiB)" % (acervo_b / GIB)
+    else:
+        pico_publicacao = 0
+        piso_estrutural = backup_b if backup_b else 0
+        if backup_b:
+            piso_origem = "tamanho atual do backup (%.2f GiB), para caber uma reconstrucao inteira ao lado" % (backup_b / GIB)
+        else:
+            piso_origem = "estrutural desconhecido: nenhuma execucao de backup sem problema no ledger"
+            relatorio["inconclusivos"].append(
+                "%s: piso estrutural desconhecido (nenhuma execucao de backup sem problema em %s); "
+                "tendencia e surto continuam cobrados" % (ponto, ledger_backup)
+            )
+
+    r = ritmo(pontos)
+    tendencia_b = max(0.0, r["mediana_b"]) if r["mediana_b"] is not None else 0.0
+    surto_b = max(0.0, r["surto_b"])
+    piso = piso_estrutural + tendencia_b * janela_dias + surto_b
+
+    if r["inconclusivo"]:
+        dias_para_encher = None
+        projecao = "tendencia indisponivel: " + r["inconclusivo"]
+        if surto_b > 0:
+            projecao += "; pior 24 h ja medida %.2f GiB (%s -> %s), cobrada no piso" % (
+                surto_b / GIB, r["surto_de"], r["surto_ate"])
+        relatorio["inconclusivos"].append("%s: %s" % (ponto, projecao))
+    else:
+        dias_lista = ", ".join("%s=%+.2f" % (d, c / GIB) for d, c in r["dias"])
+        if r["mediana_b"] <= 0:
+            dias_para_encher = None
+            projecao = "tendencia estavel ou liberando %.3f GiB/dia (mediana de %d dia(s) completo(s) [%s])" % (
+                abs(r["mediana_b"]) / GIB, r["dias_completos"], dias_lista)
+        else:
+            dias_para_encher = livre / r["mediana_b"]
+            projecao = "tendencia %.3f GiB/dia (mediana de %d dia(s) completo(s) [%s]), enche em %.1f dias" % (
+                r["mediana_b"] / GIB, r["dias_completos"], dias_lista, dias_para_encher)
+        if surto_b > 0:
+            projecao += "; pior 24 h da janela %.2f GiB (%s -> %s)" % (surto_b / GIB, r["surto_de"], r["surto_ate"])
+        else:
+            projecao += "; sem queda em 24 h na janela"
+        projecao += "; piso fixo ate %s, salvo queda de 24 h maior que a pior vista" % r["congelado_ate"]
+
+    entrada = {
+        "ponto": ponto,
+        "livre_b": int(livre),
+        "livre_gib": round(livre / GIB, 2),
+        "pct_usado": ultimo.get("pct_usado"),
+        "amostrado_em": ultimo_t.isoformat(),
+        "pico_publicacao_b": pico_publicacao,
+        "piso_estrutural_b": int(piso_estrutural),
+        "piso_tendencia_b": int(tendencia_b * janela_dias),
+        "piso_surto_b": int(surto_b),
+        "piso_livre_b": int(piso),
+        "piso_livre_gib": round(piso / GIB, 2),
+        "piso_origem": piso_origem,
+        "piso_congelado_ate": r["congelado_ate"],
+        "dias_completos": r["dias_completos"],
+        "consumo_gib_dia": round(r["mediana_b"] / GIB, 4) if r["mediana_b"] is not None else None,
+        "surto_24h_gib": round(surto_b / GIB, 2),
+        "surto_24h_de": r["surto_de"],
+        "surto_24h_ate": r["surto_ate"],
+        "dias_para_encher": round(dias_para_encher, 1) if dias_para_encher is not None else None,
+        "projecao": projecao,
+    }
+    relatorio["pontos"].append(entrada)
+
+    # UMA condicao de reprovacao: livre < piso. "enche antes da janela" nao e
+    # teste independente — como piso = estrutural + janela x tendencia + surto,
+    # livre/tendencia < janela ja implica livre < piso. O "quantos dias faltam"
+    # entra DENTRO da mensagem, porque e ele que aciona alguem: "80% usado" nao
+    # move ninguem, "enche em 6,7 dias" move. E nao ha guarda `piso_estrutural
+    # and`: acervo 0 ou backup desconhecido zeram o termo estrutural, nao a
+    # checagem.
+    if livre < piso:
+        if dias_para_encher is not None and dias_para_encher <= janela_dias:
+            prazo = "no ritmo atual enche em %.1f dias, dentro da janela de reacao" % dias_para_encher
+        elif dias_para_encher is not None:
+            prazo = ("a tendencia sozinha enche em %.1f dias, mas com o pior surto de 24 h da semana "
+                     "(%.2f GiB) repetido na janela faltam %.2f GiB"
+                     % (dias_para_encher, surto_b / GIB, (piso - livre) / GIB))
+        elif r["inconclusivo"]:
+            prazo = "sem projecao: %s" % projecao
+        else:
+            prazo = "sem tendencia de enchimento; faltam %.2f GiB para o estrutural + surto" % ((piso - livre) / GIB)
+        relatorio["problemas"].append(
+            "%s: livre %.2f GiB abaixo do piso %.2f GiB [%s + %.0f dias x %.2f GiB/dia + surto %.2f GiB] — %s"
+            % (ponto, livre / GIB, piso / GIB, piso_origem, janela_dias, tendencia_b / GIB, surto_b / GIB, prazo)
+        )
+
+if relatorio["veredito"] is None:
+    if relatorio["problemas"]:
+        relatorio["veredito"] = "reprova"
+    elif relatorio["inconclusivos"]:
+        relatorio["veredito"] = "inconclusivo"
+    else:
+        relatorio["veredito"] = "ok"
+
+if formato == "json":
+    print(json.dumps(relatorio, ensure_ascii=False, sort_keys=True))
+else:
+    for e in relatorio["pontos"]:
+        print("%-9s livre %.2f GiB (%.2f%% usado) · piso %.2f GiB [estrutural %.2f + tendencia %.2f + surto %.2f]" % (
+            e["ponto"], e["livre_gib"], e["pct_usado"] or 0.0, e["piso_livre_gib"],
+            e["piso_estrutural_b"] / GIB, e["piso_tendencia_b"] / GIB, e["piso_surto_b"] / GIB))
+        print("%-9s estrutural: %s" % ("", e["piso_origem"]))
+        print("%-9s %s" % ("", e["projecao"]))
+    if relatorio["serie_linhas_invalidas"]:
+        print("(serie com %d linha(s) invalida(s), ignoradas)" % relatorio["serie_linhas_invalidas"])
+    for p in relatorio["inconclusivos"]:
+        print("INCONCLUSIVO: %s" % p)
+    for p in relatorio["problemas"]:
+        if relatorio["veredito"] == "nao_rodou":
+            print("NAO RODOU: %s" % p)
+        else:
+            print("REPROVA: %s" % p)
+    if relatorio["veredito"] == "ok":
+        print("check-disk-headroom: ok — piso congelado ate %s" % (
+            relatorio["pontos"][0]["piso_congelado_ate"] if relatorio["pontos"] else "?"))
+
+with open(report_path, "w", encoding="utf-8") as canal:
+    json.dump(relatorio, canal, ensure_ascii=False, sort_keys=True)
+PYEOF
+)" || {
+	echo "check-disk-headroom: avaliacao falhou" >&2
+	exit 2
+}
+
+printf '%s\n' "$SAIDA"
+
+VEREDITO="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+print(d["veredito"])
+' "$REPORT")"
+
+case "$VEREDITO" in
+nao_rodou)
+	# NAO MEDIU. Nem verde nem vermelho: o exit 2 e o que impede o timer de
+	# registrar sucesso numa maquina onde a serie nunca nasceu.
+	exit 2
+	;;
+ok | inconclusivo)
+	# INCONCLUSIVO sai 0 COM A PALAVRA IMPRESSA, nunca "ok": e a convencao dos
+	# gates desta casa (check-efeito-nos-bots). A folga estrutural ja foi
+	# cobrada acima; o que falta e base para projetar, e isso se resolve com
+	# o tempo, nao com alerta de hora em hora.
+	#
+	# E FECHA O ALERTA QUE ELE MESMO ABRIU. Ate 2026-09-03 este gate chamava
+	# notify-owner em cinco pontos e nenhum deles com --resolvido: ele abria a
+	# chave `disco-sem-folga` e nunca a fechava. Medido nesse dia: a chave
+	# estava aberta ha 44 h com o disco de volta ao piso (174,99 GiB livres
+	# contra piso de 14,06), e so nao apareceu como mentira porque ninguem lia
+	# a idade. Alerta que nao fecha sozinho treina o dono a ignorar a fila —
+	# e uma fila ignorada e o mesmo que nao ter alerta.
+	#
+	# `--resolvido` e idempotente no notify-owner: com a chave ja fechada ele
+	# nao entrega nada, entao chamar a cada passada verde nao gera ruido.
+	if [ "$ALERTAR" = "1" ] && [ -x "$RAIZ/tools/notify-owner" ]; then
+		LIVRE_AGORA="$(printf '%s\n' "$SAIDA" | head -1)"
+		"$RAIZ/tools/notify-owner" \
+			--chave "disco-sem-folga" \
+			--resolvido \
+			--titulo "Espaco em disco de volta ao piso" \
+			--mensagem "${LIVRE_AGORA:-folga acima do piso}" \
+			--evidencia "tools/check-disk-headroom" >/dev/null 2>&1 ||
+			echo "check-disk-headroom: AVISO — nao consegui marcar o alerta como resolvido" >&2
+	fi
+	exit 0
+	;;
+esac
+
+PROBLEMAS="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+print(" | ".join(d["problemas"]))
+' "$REPORT")"
+
+if [ "$ALERTAR" = "1" ] && [ -x "$RAIZ/tools/notify-owner" ]; then
+	"$RAIZ/tools/notify-owner" \
+		--chave "disco-sem-folga" \
+		--severidade alta \
+		--titulo "Espaco em disco fora do piso" \
+		--mensagem "$PROBLEMAS" \
+		--evidencia "tools/check-disk-headroom" >/dev/null 2>&1
+	rc_alerta=$?
+	# SEM `|| true`. Silenciar a entrega do alerta e o defeito do BUG-149 em
+	# miniatura: os dois canais registraram "silenciado" e ninguem soube. Alerta
+	# que nao chega e pior que alerta que nao existe, porque cria sensacao de
+	# cobertura. Se o notify-owner falhar, isso sai no stderr do gate — e o
+	# tools/check-gate-pode-reprovar, que apanhou este `|| true`, estava certo.
+	if [ "$rc_alerta" -ne 0 ]; then
+		echo "check-disk-headroom: AVISO — notify-owner saiu $rc_alerta; o alerta NAO foi entregue" >&2
+	fi
+fi
+exit 1

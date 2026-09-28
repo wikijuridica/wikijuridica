@@ -1,0 +1,8 @@
+# Auditoria adversarial C1–C6 (Fable, 2026-09-15) — achados durados
+
+C1 REFUTADA: Go -seco = 4.763 candidatos com overlay (nao 17.069); Python fiel 4.763/2.560; worker omitiu procedimental() (main.go:515) -> variante sem filtro de agravo = 17.065/5.462. Delta real +2.203 (+86%). Rendimento top-500: 500/1.260 iteradas (39,7%); top-30: 30/63.
+C2 NAO REFUTADA: extracao.go:505 descarta nao-ancorado -> 100% e tautologia. 135.263 itens hoje; 1.430 sem urn; 63.554 artigo vazio; 38.397/43.489 linhas sem versao_do_prompt; NormaAtestadaNoTexto so confere numero da norma.
+C3 NAO REFUTADA: 6 slugs existem (WebFetch, CC-BY, ate 20260831); ordem preservada (main.go:145, coleta.go:105/176); cursor nunca teve >4 datasets em 5 commits; cliente.go:190-196 erra explicito acima do limite (nao trunca); ensaio go run reproduziu o erro com fetch completo em 31 s -> JSON upstream malformado; ultima gravacao 2026-09-10 09:52:51 -03.
+C4 NAO REFUTADA: PrivateTmp=yes, BindPaths vazio, ns mnt distintos, dois inodes, sonda ligada (cmd/cerebro/main.go:136; saude.go:171).
+C5 NAO REFUTADA por leitura: roda:271 conta remontadas; :741 exclui shard proprio; :722 exclui self; SliceStable; flag help :185 mente. Precisoes: shard nao existe (disco/HEAD), gerador fora do run-daily-content; "para sempre" exagerado (peso pos-overlay deriva).
+C6 PARCIALMENTE REFUTADA: chaves corrompidas confirmadas (ledger "stj - precedentes" desde 09-11); 12:20 = 0 coletas (journal); mas gate NAO fica cego-verde: le entradas congeladas de 09-10 (diarios REPROVA com "hoje" errado; jurisprudencia/sumulas OK stale); onda 04:24 ainda coleta noticias 1x/dia.

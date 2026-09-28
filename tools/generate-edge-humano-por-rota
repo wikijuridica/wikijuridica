@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""generate-edge-humano-por-rota — as rotas que o tráfego NÃO-BOT-VERIFICADO
+pediu à borda, por dia (frente F3).
+
+O QUE ISTO RESPONDE: das ~10 mil rotas publicadas, quais receberam requisição
+de alguém que a Cloudflare NÃO classificou como bot verificado, quantas, e se
+a rota é uma página publicada. É o ranking de "onde a audiência de fora
+bateu", por dia, medido na borda — a única camada que vê tudo, porque o acervo
+é servido estático e não passa pelo Go.
+
+★ O QUE A BORDA NÃO SEPARA, E ESTE LEDGER NÃO FINGE SEPARAR: `verifiedBotCategory`
+vazia significa "não é um bot que a Cloudflare verificou" — e isso abarca, na
+mesma fatia, a pessoa no navegador, o scraper que se apresenta como Chrome, o
+SemrushBot (não verificado), o PerplexityBot (que a Cloudflare não verifica,
+medido em 2026-09-02) e todo scanner de vulnerabilidade. A borda não tem como
+dizer "humano". Quem diz é o Clarity, que só grava sessão com JavaScript
+executado e interação real — ver docs/MEDICAO_DE_AUDIENCIA.md. Este ledger é o
+DENOMINADOR possível (quem pediu HTML de página real, com 200, por GET, sem ser
+bot verificado nem tráfego próprio); a sessão humana é o numerador, e vive em
+`data/ops/clarity_insights_daily.jsonl`.
+
+`humano_provavel` é, portanto, um nome de contrato com significado ESTREITO:
+`true` = o `path` existe em `content/pages.json` (é página publicada, o tipo
+de URL que uma pessoa lê); `false` = não existe lá — índice de área
+(`/criminal/`, `/glossario/`), paginação (`/jurisprudencia/pagina/2/`), rota
+dinâmica que não é página (`/redesocial/`), URL inventada por scanner, caminho
+supersedido. Medido em 2026-09-08: 11 das 200 do topo são `false`, e TODAS são
+rotas reais do portal (índices e paginação), nenhuma é scanner. NÃO é "é bot"
+nem "é gente": é "a rota é uma página do acervo".
+
+FILTROS (todos no servidor, na própria consulta GraphQL — confirmados contra a
+zona real em 2026-09-09): `verifiedBotCategory: ""`, `edgeResponseStatus: 200`,
+`edgeResponseContentTypeName: "html"`, `clientRequestHTTPMethodName: "GET"`,
+`userAgent_notlike: "wikijuridica%"` (aquecedor, sondas e IndexNow ficam de
+fora). No cliente, sai o scanner que ainda assim recebeu 200 em HTML: path
+começando por `wp-`, `.git` ou `.env`, ou cujo PRIMEIRO SEGMENTO é `xmlrpc`,
+`cgi-bin`, `admin` ou `phpmyadmin`, ou terminando em `.php`. O segmento é
+inteiro de propósito: a forma `^/(…|admin|…)` do contrato casaria
+`/administrativo/…` — 45 páginas publicadas, medido sobre content/pages.json
+em 2026-09-09 (ver `SCANNER_PREFIXO`). O que saiu fica contado em
+`scanners_excluidos`, nunca some.
+
+O NÚMERO: `requests` é o `count` do `httpRequestsAdaptiveGroups` — e o count
+já É a contagem, não amostra a extrapolar: medido em 2026-09-09 sobre três
+dias, Σ count do adaptativo ficou a ≤ 0,3% do total exato do
+`httpRequests1dGroups` (150.508 vs 150.943 em 2026-09-08), enquanto
+count × sampleInterval deu 3,3× o real (ver o cabeçalho de
+tools/generate-cache-baseline, que grava essa conferência todo dia). Por isso
+não há "estimated" aqui; `sample_interval_medio` fica só como informação.
+Medido em 2026-09-08: a home teve 104 requisições, e da 20ª rota em diante o
+count é 1 — o ranking só tem significado na cabeça; a cauda em empate de 1 é
+ordenada pela API de forma arbitrária e o corte em 200 é um corte NESSE
+empate (aqui o desempate é por path, para a saída ser determinística). A
+consulta pede 1.000 grupos para que, depois de tirar scanner, sobrem os 200
+pedidos; `query_truncated` marca o dia em que 1.000 não bastou.
+
+LEDGER APPEND-ONLY em data/ops/edge_humano_por_rota_daily.jsonl, UMA linha por
+dia com a lista `rotas` (top 200) — uma linha por rota faria 73 mil linhas ao
+ano por um ranking cuja unidade de leitura é o dia. Linha idêntica (ignorando
+`gerado_em`) não se regrava; quem consome pega a última por `date`.
+`schema_version: edge_humano_por_rota_v1`.
+
+EXIT CODES: 0 = gravada (ou idêntica à já gravada); 2 = sem credencial, zona
+não resolvida, API fora ou dia além da retenção de 8 dias — esta série só tem
+a borda como fonte, então nada é gravado; 3 = falha de disco.
+
+Uso:
+  ./tools/generate-edge-humano-por-rota                 # ontem (UTC)
+  ./tools/generate-edge-humano-por-rota --dia 2026-09-08
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402
+
+RAIZ = os.environ.get(
+    "WIKI_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SAIDA = os.path.join(RAIZ, "data", "ops", "edge_humano_por_rota_daily.jsonl")
+PAGINAS = os.path.join(RAIZ, "content", "pages.json")
+SITE = os.path.join(RAIZ, "content", "site.json")
+
+SCHEMA = "edge_humano_por_rota_v1"
+TOPO = 200
+LIMITE_CONSULTA = 1000
+RETENCAO_DIAS = 8
+
+# `wp-`, `.git` e `.env` são PREFIXOS (wp-login.php, wp-admin/, .git/config,
+# .env.bak). `admin`, `phpmyadmin`, `xmlrpc` e `cgi-bin` são SEGMENTOS
+# inteiros — seguidos de `/`, `.` ou fim. A forma literal do contrato
+# (`^/(…|admin|…)`) casaria `/administrativo/…`, e o teste de falso positivo
+# sobre o acervo real mediu 45 páginas publicadas da área de Direito
+# Administrativo que sairiam do ranking como "scanner".
+SCANNER_PREFIXO = re.compile(
+    r"^/(wp-|\.git|\.env|(?:xmlrpc|cgi-bin|admin|phpmyadmin)(?:[/.]|$))", re.I)
+SCANNER_EXTENSAO = re.compile(r"\.php$", re.I)
+
+CONSULTA = """
+query($zone: String!, $since: Time!, $until: Time!, $limite: Int!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $limite,
+        filter: {datetime_geq: $since, datetime_leq: $until,
+                 userAgent_notlike: "wikijuridica%",
+                 verifiedBotCategory: "", edgeResponseStatus: 200,
+                 edgeResponseContentTypeName: "html",
+                 clientRequestHTTPMethodName: "GET"},
+        orderBy: [count_DESC]) {
+      count
+      avg { sampleInterval }
+      dimensions { clientRequestPath }
+    }
+  } }
+}
+"""
+
+# Pontos de injeção dos testes (sem rede).
+GRAPHQL = cloudflare_auth.graphql
+RESOLVER_ZONA = None
+
+
+def dominio_do_site():
+    with open(SITE, encoding="utf-8") as fh:
+        return json.load(fh)["base_url"].split("://", 1)[-1].rstrip("/")
+
+
+def resolver_zona(env):
+    explicita = (env or {}).get("CLOUDFLARE_ZONE_ID")
+    if explicita:
+        return explicita, None
+    return cloudflare_auth.zona_id(dominio_do_site(), env=env)
+
+
+RESOLVER_ZONA = resolver_zona
+
+
+def caminhos_publicados(caminho=None):
+    """Conjunto de `path` de content/pages.json — a régua de `humano_provavel`."""
+    with open(caminho or PAGINAS, encoding="utf-8") as fh:
+        paginas = json.load(fh)
+    return {p.get("path") for p in paginas if isinstance(p, dict) and p.get("path")}
+
+
+def e_scanner(path):
+    return bool(SCANNER_PREFIXO.search(path or "") or SCANNER_EXTENSAO.search(path or ""))
+
+
+def janela_do_dia(dia):
+    return f"{dia.isoformat()}T00:00:00Z", f"{dia.isoformat()}T23:59:59Z"
+
+
+def grupos_de(dados):
+    zonas = ((dados or {}).get("viewer") or {}).get("zones") or []
+    return (zonas[0] if zonas else {}).get("httpRequestsAdaptiveGroups") or []
+
+
+def classifica(grupos, publicados, topo=TOPO, limite=LIMITE_CONSULTA):
+    """Dos grupos (path, count, sampleInterval): tira scanner, ordena por
+    count desc (empate por path, para a saída ser determinística), corta no
+    topo e marca `humano_provavel` pela presença em pages.json."""
+    scanners = {"grupos": 0, "requests": 0}
+    rotas = []
+    for g in grupos:
+        path = (g.get("dimensions") or {}).get("clientRequestPath") or ""
+        n = g.get("count", 0)
+        if e_scanner(path):
+            scanners["grupos"] += 1
+            scanners["requests"] += n
+            continue
+        intervalo = (g.get("avg") or {}).get("sampleInterval") or 1
+        rotas.append({
+            "path": path,
+            "requests": n,
+            "sample_interval_medio": round(intervalo, 3),
+            "humano_provavel": path in publicados,
+        })
+    rotas.sort(key=lambda r: (-r["requests"], r["path"]))
+    return {
+        "rotas": rotas[:topo],
+        "rotas_total_grupos": len(rotas),
+        "requests_total": sum(r["requests"] for r in rotas),
+        "requests_no_topo": sum(r["requests"] for r in rotas[:topo]),
+        "rotas_publicadas_no_topo": sum(1 for r in rotas[:topo] if r["humano_provavel"]),
+        "scanners_excluidos": scanners,
+        "query_truncated": len(grupos) >= limite,
+    }
+
+
+def monta_linha(dia, classificado):
+    desde, ate = janela_do_dia(dia)
+    linha = {
+        "schema_version": SCHEMA,
+        "date": dia.isoformat(),
+        "window_start": desde,
+        "window_end": ate,
+        "topo": TOPO,
+        "filtro": ('verifiedBotCategory:"" edgeResponseStatus:200 '
+                   'edgeResponseContentTypeName:"html" clientRequestHTTPMethodName:"GET" '
+                   'userAgent_notlike:"wikijuridica%" ; scanner excluido no cliente'),
+        "humano_provavel_significa": "path existe em content/pages.json; nao e prova de pessoa",
+        "fonte_de_sessao_humana": "data/ops/clarity_insights_daily.jsonl",
+    }
+    linha.update(classificado)
+    return linha
+
+
+def ler_jsonl(caminho):
+    registros = []
+    if not os.path.isfile(caminho):
+        return registros
+    with open(caminho, encoding="utf-8") as fh:
+        for bruto in fh:
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registros.append(json.loads(bruto))
+            except json.JSONDecodeError:
+                continue
+    return registros
+
+
+def assinatura(linha):
+    return json.dumps({k: v for k, v in linha.items() if k != "gerado_em"},
+                      sort_keys=True, ensure_ascii=False)
+
+
+def grava(linha, caminho=None):
+    caminho = caminho or SAIDA
+    nova = assinatura(linha)
+    for existente in ler_jsonl(caminho):
+        if assinatura(existente) == nova:
+            return False
+    linha = dict(linha)
+    linha["gerado_em"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    with open(caminho, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return True
+
+
+def resumo(linha):
+    cabeca = ", ".join("%s=%d" % (r["path"], r["requests"]) for r in linha["rotas"][:5])
+    return ("%s | rotas=%d (topo %d, %d publicadas) | requests=%d | scanners=%d/%d | %s"
+            % (linha["date"], linha["rotas_total_grupos"], len(linha["rotas"]),
+               linha["rotas_publicadas_no_topo"], linha["requests_total"],
+               linha["scanners_excluidos"]["grupos"], linha["scanners_excluidos"]["requests"],
+               cabeca))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="rotas pedidas por trafego nao-bot-verificado, por dia")
+    parser.add_argument("--dia", help="YYYY-MM-DD em UTC (padrão: ontem)")
+    args = parser.parse_args(argv)
+
+    hoje = dt.datetime.now(dt.timezone.utc).date()
+    try:
+        dia = dt.date.fromisoformat(args.dia) if args.dia else hoje - dt.timedelta(days=1)
+    except ValueError:
+        print(f"--dia invalido: {args.dia!r} (esperado YYYY-MM-DD)", file=sys.stderr)
+        return 2
+    if (hoje - dia).days > RETENCAO_DIAS:
+        print(f"{dia} esta alem da retencao de {RETENCAO_DIAS} dias do dataset: nada a medir",
+              file=sys.stderr)
+        return 2
+
+    env = cloudflare_auth.ambiente()
+    cab, rotulo = cloudflare_auth.cabecalhos("leitura", env=env)
+    if cab is None:
+        print("sem credencial Cloudflare (CLOUDFLARE_ZONE_TOKEN ou Global Key em .env.local): "
+              "esta serie so tem a borda como fonte, nada gravado", file=sys.stderr)
+        return 2
+    zona, erro = RESOLVER_ZONA(env)
+    if erro or not zona:
+        print(f"zona nao resolvida: {erro}", file=sys.stderr)
+        return 2
+
+    try:
+        publicados = caminhos_publicados()
+    except (OSError, ValueError) as erro:
+        print(f"falha lendo {PAGINAS}: {erro}", file=sys.stderr)
+        return 3
+
+    desde, ate = janela_do_dia(dia)
+    dados, erro = GRAPHQL(CONSULTA, {"zone": zona, "since": desde, "until": ate,
+                                     "limite": LIMITE_CONSULTA})
+    if erro:
+        print(f"GraphQL indisponivel: {erro}", file=sys.stderr)
+        return 2
+
+    linha = monta_linha(dia, classifica(grupos_de(dados), publicados))
+    try:
+        gravou = grava(linha)
+    except OSError as erro:
+        print(f"falha gravando {SAIDA}: {erro}", file=sys.stderr)
+        return 3
+    print(("  gravada   " if gravou else "  identica  ") + resumo(linha))
+    print(f"\nledger: {os.path.relpath(SAIDA, RAIZ)}  credencial: {rotulo}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

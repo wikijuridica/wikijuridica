@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""check-source-stamp-expiry — vigia a bomba-relógio de 30 dias do carimbo
+de proveniência das official_sources do estoque canônico v2.
+
+Motivação (2026-08-04): internal/v2ingest/official_source_verification.go
+(OfficialSourceVerified) e internal/v2ingest/validation_as_of.go
+(OfficialSourceVerificationMaxAgeDays=30) exigem que toda official_source
+tenha verified_at com no máximo 30 dias em relação a "agora" para passar o
+gate de ingestão. Sem uma esteira contínua de reverificação, o estoque
+inteiro (9.7k páginas hoje, rumo a centenas de milhares) vence sozinho: as
+páginas hoje válidas param de passar o gate ~30 dias depois de carimbadas,
+travando a fábrica inteira de uma vez.
+
+Este check é READ-ONLY: lê data/editorial/v2_pages/*.jsonl e conta, por
+fonte, quantos dias faltam para o vencimento (ou se já venceu / nunca foi
+carimbada). NÃO faz rede, NÃO escreve nada — quem resolve o passivo é
+cmd/generate-v2-official-source-verify (via tools/generate-v2-official-
+source-verify), que este check apenas empurra a rodar a tempo.
+
+Exit 1 quando pelo menos uma fonte de página ATIVA (não-tombstone) já venceu
+ou nunca foi carimbada — o passivo do problema 1 é sempre reprovação, não
+aviso. Janelas de 7/15/30 dias são só telemetria (não reprovam sozinhas):
+servem para o operador agendar a esteira antes que o "já venceu" apareça.
+
+Uso:
+    ./tools/check-source-stamp-expiry
+    ./tools/check-source-stamp-expiry --root /opt/wiki --json
+    ./tools/check-source-stamp-expiry --as-of 2026-08-04
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import sys
+
+MAX_AGE_DAYS = 30  # espelha v2ingest.OfficialSourceVerificationMaxAgeDays
+PAGES_REL = "data/editorial/v2_pages"
+WINDOWS = (7, 15, 30)
+
+
+def find_project_root(start: str) -> str:
+    current = os.path.abspath(start)
+    while True:
+        if os.path.isfile(os.path.join(current, "go.mod")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            raise SystemExit(f"go.mod não encontrado a partir de {start}")
+        current = parent
+
+
+def parse_verified_at(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d",):
+        try:
+            return datetime.datetime.strptime(value, fmt).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            pass
+    try:
+        # RFC3339 (aceita "Z" e offset explícito).
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def normalize_day(value: datetime.datetime) -> datetime.datetime:
+    value = value.astimezone(datetime.timezone.utc)
+    return datetime.datetime(value.year, value.month, value.day, tzinfo=datetime.timezone.utc)
+
+
+def classify(verified_at_raw: str, as_of: datetime.datetime):
+    """Devolve (status, days_remaining) para uma official_source.
+
+    status in {"missing", "invalid", "future", "expired", "valid"}.
+    days_remaining é None para missing/invalid; pode ser negativo (já
+    venceu há N dias) para expired.
+    """
+    parsed = parse_verified_at(verified_at_raw)
+    if parsed is None:
+        if (verified_at_raw or "").strip():
+            return "invalid", None
+        return "missing", None
+    verification_day = normalize_day(parsed)
+    today = normalize_day(as_of)
+    if verification_day > today:
+        return "future", None
+    expires_on = verification_day + datetime.timedelta(days=MAX_AGE_DAYS)
+    days_remaining = (expires_on - today).days
+    if days_remaining < 0:
+        return "expired", days_remaining
+    return "valid", days_remaining
+
+
+def scan(root: str, as_of: datetime.datetime):
+    pages_dir = os.path.join(root, PAGES_REL)
+    files = sorted(glob.glob(os.path.join(pages_dir, "*.jsonl")))
+    counts = collections.Counter()
+    window_counts = {window: 0 for window in WINDOWS}
+    expired_examples = []
+    missing_examples = []
+    pages_scanned = 0
+    pages_with_problem = 0
+
+    for path in files:
+        with open(path, encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise SystemExit(f"{path}:{line_number}: JSON inválido: {error}")
+                if record.get("skipped"):
+                    continue
+                pages_scanned += 1
+                sources = record.get("official_sources") or []
+                page_problem = False
+                for index, source in enumerate(sources):
+                    status, days_remaining = classify(source.get("verified_at", ""), as_of)
+                    counts[status] += 1
+                    if status in ("missing", "invalid", "expired", "future"):
+                        page_problem = True
+                    if status == "expired" and len(expired_examples) < 20:
+                        expired_examples.append({
+                            "shard": os.path.basename(path), "line": line_number,
+                            "intent_id": record.get("intent_id"), "source_index": index,
+                            "url": source.get("url"), "days_overdue": -days_remaining,
+                        })
+                    if status == "missing" and len(missing_examples) < 5:
+                        missing_examples.append({
+                            "shard": os.path.basename(path), "line": line_number,
+                            "intent_id": record.get("intent_id"), "source_index": index,
+                            "url": source.get("url"),
+                        })
+                    if status == "valid":
+                        for window in WINDOWS:
+                            if days_remaining <= window:
+                                window_counts[window] += 1
+                if page_problem:
+                    pages_with_problem += 1
+
+    return {
+        "pages_scanned": pages_scanned,
+        "pages_with_stamp_problem": pages_with_problem,
+        "sources_valid": counts["valid"],
+        "sources_missing": counts["missing"],
+        "sources_invalid": counts["invalid"],
+        "sources_future": counts["future"],
+        "sources_expired": counts["expired"],
+        "expiring_within_days": {str(window): window_counts[window] for window in WINDOWS},
+        "expired_examples": expired_examples,
+        "missing_examples": missing_examples,
+    }
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--root", default=".", help="raiz do worktree (default: cwd, sobe até achar go.mod)")
+    parser.add_argument("--as-of", default="", help="data de referência YYYY-MM-DD (default: hoje UTC)")
+    parser.add_argument("--json", action="store_true", help="saída só em JSON (sem texto)")
+    args = parser.parse_args(argv)
+
+    root = find_project_root(args.root)
+    as_of = datetime.datetime.now(datetime.timezone.utc)
+    if args.as_of:
+        as_of = datetime.datetime.strptime(args.as_of, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+
+    report = scan(root, as_of)
+    report["as_of"] = as_of.date().isoformat()
+    report["max_age_days"] = MAX_AGE_DAYS
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(f"check-source-stamp-expiry: as_of={report['as_of']} max_age_days={MAX_AGE_DAYS}")
+        print(f"  páginas ativas escaneadas: {report['pages_scanned']}")
+        print(f"  páginas com pelo menos 1 fonte com problema de carimbo: {report['pages_with_stamp_problem']}")
+        print(f"  fontes válidas: {report['sources_valid']}")
+        print(f"  fontes sem carimbo (missing): {report['sources_missing']}")
+        print(f"  fontes com carimbo inválido (invalid): {report['sources_invalid']}")
+        print(f"  fontes com carimbo no futuro (future): {report['sources_future']}")
+        print(f"  fontes JÁ VENCIDAS (expired): {report['sources_expired']}")
+        for window in WINDOWS:
+            print(f"  fontes válidas hoje que vencem em <= {window} dias: {report['expiring_within_days'][str(window)]}")
+        if report["expired_examples"]:
+            print("  exemplos vencidas (até 20):")
+            for example in report["expired_examples"]:
+                print(f"    {example['shard']}:{example['line']} {example['intent_id']} "
+                      f"idx={example['source_index']} overdue={example['days_overdue']}d url={example['url']}")
+        if report["missing_examples"]:
+            print("  exemplos sem carimbo (até 5):")
+            for example in report["missing_examples"]:
+                print(f"    {example['shard']}:{example['line']} {example['intent_id']} "
+                      f"idx={example['source_index']} url={example['url']}")
+
+    problem_total = report["sources_missing"] + report["sources_invalid"] + report["sources_expired"] + report["sources_future"]
+    if problem_total > 0:
+        if not args.json:
+            print(f"check-source-stamp-expiry: REPROVADO — {problem_total} fonte(s) já reprovam o gate "
+                  f"(rode tools/generate-v2-official-source-verify --apply para resolver as verificáveis)",
+                  file=sys.stderr)
+        return 1
+    if not args.json:
+        print("check-source-stamp-expiry: OK — nenhuma fonte vencida/ausente/inválida hoje")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

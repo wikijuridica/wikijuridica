@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""check-gate-pode-reprovar — READ-ONLY.
+
+Reprova quando um `tools/check-*` não tem NENHUM caminho de saída diferente de
+zero, ou quando ele engole o status real do gate que invoca.
+
+POR QUE ESTE GATE EXISTE, e o que ele corrige de fato:
+
+  "Gate que sai 0 relatando fracasso é defeito de primeira ordem — pior que gate
+  ausente, porque produz confiança falsa."
+
+  Só que a MEDIÇÃO QUE ORIGINOU ESSA TAREFA ERA UM FALSO POSITIVO, e este
+  arquivo nasce dessa correção. O plano de superfície de bots (T8.7, 2026-08-26)
+  afirmava: "Cinco `check-*` não têm nenhum caminho de saída diferente de zero —
+  e dois deles, que guardam COLISÃO DE ROTA PÚBLICA, não têm NENHUM `exit` ou
+  `return`". O instrumento era `grep -L 'exit\\|sys.exit\\|return 1' tools/check-*`.
+
+  REFUTADO POR EXECUÇÃO, em 2026-08-26:
+
+    tools/run-check nome-que-nao-existe-fase8                 -> exit 1
+    tools/check-v2-public-path-collision --flag-inexistente   -> exit 2
+    tools/check-v2-cross-shard-collision --flag-inexistente   -> exit 2
+    run-heavy-throttled run-check <inexistente> --timings     -> exit 1
+
+  Os dois guardas de colisão de rota pública terminam em
+  `exec "$ROOT/tools/run-check" <nome> "$@"`. `exec` SUBSTITUI o processo: o
+  status do binário É o status do script. E `tools/run-check` fecha com
+  `"$BIN" "${CHECK_ARGS[@]}"` como último comando sob `set -e`. A cadeia inteira
+  propaga. O grep não via `exec` e concluiu ao contrário.
+
+  E a varredura precisa, sobre os 280+ scripts, achou ZERO gates incapazes de
+  reprovar. Os três últimos candidatos —
+  check-authorial-mass-global-similarity-audit, check-codex2-source-candidate-pack
+  e check-codex2-source-frontier — também fecham em
+  `exec ./tools/run-heavy-throttled ... run-check ...`, e a cadeia com
+  run-heavy-throttled foi medida devolvendo exit 1 (com `--timings`; sem ele,
+  exit 2 pelo envelope, que também é diferente de zero).
+
+  Este gate é o que impede a próxima regressão de verdade, e ao mesmo tempo
+  impede que a MESMA falsa acusação volte: ele reconhece delegação por `exec`,
+  em vez de exigir a palavra `exit`.
+
+O QUE ELE REPROVA:
+
+  1. script sem nenhum caminho de saída != 0 — nem `exit N`, nem `exit $var`,
+     nem `sys.exit`, nem `exec`, nem `return N`, nem comando final que propague
+     sob `set -e`.
+  2. script que ENGOLE o status: chamada ao runner com `|| true` / `|| :`, ou
+     canalizada para `head`/`tail`/`cat` sem `set -o pipefail` nem
+     `${PIPESTATUS[0]}`. É o defeito de `cmd | tail` que já custou um veredito
+     errado neste repositório.
+
+O QUE ELE NÃO FAZ, e a honestidade importa: ele NÃO prova que cada gate reprova
+o defeito que promete guardar — isso é do teste de cada gate. Ele prova que o
+CANAL de reprovação existe. Confundir as duas coisas seria o mesmo erro que ele
+corrige.
+
+PROVA DE QUE ELE REPROVA:
+
+    mkdir -p /tmp/fx/tools
+    printf '#!/bin/sh\\necho tudo certo\\n' > /tmp/fx/tools/check-mentiroso
+    tools/check-gate-pode-reprovar --root /tmp/fx; echo $?
+
+Saída esperada: o achado e exit 1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+
+# Comandos finais que NÃO propagam nada útil: um script que fecha em `echo`
+# sempre sai 0, por mais que tenha impresso "FALHOU" na linha de cima.
+COMANDOS_INERTES = ("echo", "printf", ":", "true", "cat", "exit 0", "return 0", "fi", "done", "esac", "}")
+
+# O runner que os gates deste repositório invocam. Engolir o status DELE é o
+# defeito concreto que a regra 2 persegue.
+RUNNERS = ("run-check", "run-heavy-throttled", "go-modern", "check-")
+
+TEM_EXIT_NZ = re.compile(r"""\bexit\s+["']?(\$|[1-9])""")
+TEM_RETURN_NZ = re.compile(r"""\breturn\s+[1-9]""")
+TEM_EXEC = re.compile(r"""(^|\s|;)exec\s+\S""", re.MULTILINE)
+TEM_SYSEXIT = re.compile(r"""sys\.exit\s*\(|raise\s+SystemExit""")
+TEM_SET_E = re.compile(r"""set\s+-[a-zA-Z]*e""")
+TEM_PIPEFAIL = re.compile(r"""set\s+-o\s+pipefail|set\s+-[a-zA-Z]*o\s+pipefail|pipefail""")
+TEM_PIPESTATUS = re.compile(r"""PIPESTATUS""")
+
+
+def codigo_vivo(texto: str) -> list[tuple[int, str]]:
+    """Linhas que executam: sem comentário, sem vazio, sem heredoc de ajuda."""
+    linhas: list[tuple[int, str]] = []
+    dentro_de_heredoc = False
+    for numero, bruta in enumerate(texto.split("\n"), start=1):
+        nua = bruta.strip()
+        if dentro_de_heredoc:
+            if nua in ("EOF", "'EOF'", "EOF'"):
+                dentro_de_heredoc = False
+            continue
+        if re.search(r"<<-?'?EOF'?\s*$", nua):
+            dentro_de_heredoc = True
+            continue
+        if not nua or nua.startswith("#"):
+            continue
+        linhas.append((numero, nua))
+    return linhas
+
+
+def pode_reprovar(texto: str) -> tuple[bool, str]:
+    if TEM_EXIT_NZ.search(texto):
+        return True, "exit com status != 0"
+    if TEM_SYSEXIT.search(texto):
+        return True, "sys.exit / SystemExit"
+    if TEM_EXEC.search(texto):
+        # `exec` substitui o processo: o status do comando É o do script.
+        return True, "delega por exec (o status do comando substitui o do script)"
+    if TEM_RETURN_NZ.search(texto):
+        return True, "return com status != 0"
+    vivas = codigo_vivo(texto)
+    if not vivas:
+        return False, "nenhuma linha executável"
+    if not TEM_SET_E.search(texto):
+        return False, "sem set -e e sem saída explícita: todo comando pode falhar em silêncio"
+    _, ultima = vivas[-1]
+    for inerte in COMANDOS_INERTES:
+        if ultima == inerte or ultima.startswith(inerte + " "):
+            return False, f"último comando é inerte ({inerte}): o script sai 0 sempre"
+    return True, "último comando propaga sob set -e"
+
+
+def engole_status(texto: str) -> list[tuple[int, str]]:
+    achados: list[tuple[int, str]] = []
+    tem_pipefail = bool(TEM_PIPEFAIL.search(texto))
+    tem_pipestatus = bool(TEM_PIPESTATUS.search(texto))
+    for numero, linha in codigo_vivo(texto):
+        if not any(runner in linha for runner in RUNNERS):
+            continue
+        if re.search(r"\|\|\s*(true|:)\s*$", linha):
+            achados.append((numero, f"chamada ao runner silenciada por '|| true': {linha[:110]}"))
+            continue
+        # `$( ... | head )` é captura de TEXTO, não do status do gate: o `|`
+        # ali vive dentro de uma substituição de comando e não decide o exit
+        # do script. Só o pipe de PRIMEIRO nível engole veredito.
+        sem_substituicao = re.sub(r"\$\([^)]*\)", "", linha)
+        if re.search(r"\|\s*(head|tail)\b", sem_substituicao) and not (tem_pipefail or tem_pipestatus):
+            achados.append((numero, f"veredito canalizado para head/tail sem pipefail/PIPESTATUS: {linha[:110]}"))
+    return achados
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="reprova tools/check-* que nao pode reprovar, ou que engole o status do runner"
+    )
+    parser.add_argument("--root", default=None,
+                        help="raiz do repositorio; aponte para uma fixture para provar que este gate reprova")
+    parser.add_argument("--verbose", action="store_true", help="lista o veredito de cada script")
+    args = parser.parse_args()
+
+    raiz = args.root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pasta = os.path.join(os.path.abspath(raiz), "tools")
+    if not os.path.isdir(pasta):
+        print(f"check-gate-pode-reprovar: {pasta} nao existe", file=sys.stderr)
+        return 2
+
+    mudos: list[str] = []
+    engolem: list[str] = []
+    total = 0
+    for nome in sorted(os.listdir(pasta)):
+        if not nome.startswith("check-"):
+            continue
+        caminho = os.path.join(pasta, nome)
+        if not os.path.isfile(caminho):
+            continue
+        total += 1
+        try:
+            texto = open(caminho, encoding="utf-8", errors="replace").read()
+        except OSError as erro:
+            mudos.append(f"{caminho}: ilegivel ({erro})")
+            continue
+        ok, motivo = pode_reprovar(texto)
+        if args.verbose:
+            print(f"{'OK  ' if ok else 'MUDO'} {nome}: {motivo}")
+        if not ok:
+            mudos.append(f"{caminho}: {motivo}")
+        for numero, achado in engole_status(texto):
+            engolem.append(f"{caminho}:{numero}: {achado}")
+
+    print(f"check-gate-pode-reprovar: scripts={total} mudos={len(mudos)} engolem_status={len(engolem)}")
+    if not mudos and not engolem:
+        print("OK: todo tools/check-* tem caminho de saida != 0 e nenhum engole o status do runner.")
+        return 0
+    for achado in mudos:
+        print(f"FALHA: gate que NAO PODE REPROVAR -> {achado}", file=sys.stderr)
+    for achado in engolem:
+        print(f"FALHA: gate que ENGOLE o status -> {achado}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

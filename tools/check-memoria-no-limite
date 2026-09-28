@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Reprova quando o indice de memoria do projeto se aproxima do corte que nao avisa.
+
+O CORTE, MEDIDO NO BINARIO QUE EXECUTA (nao na documentacao)
+------------------------------------------------------------
+A documentacao da Anthropic fala em "200 linhas OU 25 KB, o que vier primeiro",
+e 25 KB e' ambiguo: 25.000 ou 25.600? Medido em 2026-09-16 lendo o bundle do
+proprio CLI em uso (`~/.local/share/claude/versions/2.1.268`, o mesmo exe dos
+processos vivos), a resposta e' literal:
+
+    var tc="MEMORY.md", ..., iL=200, F1=25000, IXt=4*F1, ...;
+    function M2e(e){let n=e.trim();
+      return {trimmed:n, lineCount: rn(n,"\\n")+1, byteCount: n.length}}
+    function ynt(e,n="index"){let{trimmed:r,lineCount:o,byteCount:d}=M2e(e),
+      p=o>iL, _=d>F1; ...}
+
+Tres consequencias que mudam a medicao, todas ja erradas na primeira versao
+desta guarda (que usava 25*1024 = 25.600 bytes UTF-8):
+
+1. O teto de tamanho e' **25.000**, nao 25.600. 600 a menos.
+2. A unidade NAO e' byte UTF-8: `byteCount` e' `n.length` do JavaScript, ou
+   seja **unidade de codigo UTF-16** (= code point, salvo emoji/astral, que
+   contam 2). Em PT-BR acentuado a diferenca e' de ~3,4%: o indice deste
+   projeto tinha 23.973 bytes UTF-8 e 23.191 unidades. Medir byte mede outra
+   grandeza.
+3. O corte se aplica ao conteudo **trimado**, e o predicado e' `>` estrito:
+   200 linhas exatas ainda carregam inteiras; 201 cortam. `lineCount` e'
+   numero de `\\n` do texto trimado + 1.
+
+O QUE ACONTECE NO CORTE
+-----------------------
+Nao e' silencio absoluto, e a diferenca importa: `ynt` corta o excedente e
+acrescenta ao conteudo carregado
+
+    > WARNING: MEMORY.md is N lines (limit: 200). Only part of it was loaded:
+      X of Y lines were cut off, starting at line Z ("<primeira linha cortada>").
+
+O modelo da sessao ve esse aviso; **log, gate e humano nao veem nada** — nenhum
+arquivo muda, nenhum exit code acusa. E a mensagem do proprio CLI ao escrever
+memoria diz o resto: "everything past the limit is silently dropped each time
+the index is loaded — entries at the end are already invisible to readers".
+
+A REGUA, PRE-REGISTRADA (escrita antes de medir o indice desta sessao)
+----------------------------------------------------------------------
+- REPROVA (exit 1): >= 190 linhas OU >= 23.750 unidades. O alarme antigo era
+  24.576 bytes UTF-8; na densidade medida deste indice (1,0337 byte/unidade)
+  isso equivalia a ~23.777 unidades. 23.750 e' portanto **mais apertado** que o
+  alarme que substitui — trocar a unidade nao afrouxou nada. Sao 95% do teto:
+  ~1.250 unidades e 10 linhas de folga, o custo de ~10 memorias novas.
+- AVISO (exit 0, impresso): >= 160 linhas OU >= 20.000 unidades. Nao e' numero
+  inventado: e' o `UEs=0.8` do proprio CLI, que ao escrever memoria ja diz
+  "approaching the read limit". A meta que ele manda perseguir e' `P_r=0.7` —
+  140 linhas e 17.500 unidades.
+
+O INDICE TAMBEM MENTE POR PONTEIRO, NAO SO POR TAMANHO
+-------------------------------------------------------
+Compactar mexendo em ponteiro cria dois defeitos que o tamanho nao apanha:
+- **ponteiro quebrado**: linha `- [titulo](arquivo.md)` cujo arquivo nao existe.
+  A licao fica inalcancavel e o indice afirma o que nao ha.
+- **memoria orfa**: arquivo `.md` no diretorio que nao esta no indice **nem** e'
+  citado por nome em `.claude/rules/*.md`. Memoria que nada carrega e' memoria
+  que nao existe. Citada numa rule com `paths:`, ela carrega on-demand quando o
+  arquivo casado e' tocado — por isso a rule que absorve uma memoria tem de
+  nomear o arquivo de origem.
+- **`[[link]]` por deriva de nome**: `[[x]]` sem destino MAS com quase-homonimo
+  no diretorio e' erro de digitacao, e reprova. `[[x]]` sem nada parecido e'
+  referencia futura, que o proprio manual da memoria autoriza ("a `[[name]]`
+  that doesn't match an existing memory yet is fine") — sai como AVISO.
+  Wikilink dentro de crase ou bloco de codigo NAO conta: `[[ $x =~ $re ]]` do
+  bash e' sintaxe, nao ponteiro.
+
+READ-ONLY: nao escreve nada. Sai 0 se ha folga, 1 se passou do alarme ou ha
+defeito de ponteiro, 2 se nao conseguiu medir (o que nunca e' sucesso).
+"""
+
+from __future__ import annotations
+
+import difflib
+import os
+import re
+import sys
+from pathlib import Path
+
+TETO_LINHAS_OFICIAL = 200  # iL do bundle
+TETO_CHARS_OFICIAL = 25000  # F1 do bundle, em unidades UTF-16
+ALARME_LINHAS = 190
+ALARME_CHARS = 23750
+AVISO_LINHAS = 160  # UEs = 0.8 do proprio CLI
+AVISO_CHARS = 20000
+META_LINHAS = 140  # P_r = 0.7 do proprio CLI
+META_CHARS = 17500
+
+SEMELHANCA_DE_DERIVA = 0.86
+
+RE_PONTEIRO = re.compile(r"^- \[([^\]]*)\]\(([^)]+)\)", re.M)
+RE_WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
+RE_CERCA = re.compile(r"^\s*```")
+RE_CRASE = re.compile(r"`[^`\n]*`")
+RE_NOME = re.compile(r"^name:\s*(.+)$", re.M)
+
+
+def caminho_do_indice(projeto: Path) -> Path | None:
+    """Deriva o caminho, nunca hardcoded.
+
+    O diretorio de memoria do Claude Code e ~/.claude/projects/<slug>/memory/,
+    onde <slug> e o caminho do projeto com "/" virando "-".
+    """
+    slug = str(projeto).replace("/", "-")
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    indice = base / "projects" / slug / "memory" / "MEMORY.md"
+    return indice if indice.is_file() else None
+
+
+def raiz_do_projeto() -> Path:
+    return Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path(__file__).resolve().parent.parent)
+
+
+def unidades_utf16(texto: str) -> int:
+    """`String.prototype.length` do JavaScript: astral conta 2."""
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in texto)
+
+
+def sem_codigo(texto: str) -> str:
+    """Apaga bloco cercado e trecho entre crases, preservando as linhas.
+
+    Sem isso, `[[ $x =~ $re ]]` do bash vira ponteiro quebrado — falso positivo
+    medido no proprio diretorio de memoria deste projeto.
+    """
+    linhas, dentro = [], False
+    for linha in texto.splitlines():
+        if RE_CERCA.match(linha):
+            dentro = not dentro
+            linhas.append("")
+            continue
+        linhas.append("" if dentro else RE_CRASE.sub("", linha))
+    return "\n".join(linhas)
+
+
+def memorias_do_diretorio(memdir: Path) -> dict[str, Path]:
+    return {
+        p.name: p
+        for p in sorted(memdir.glob("*.md"))
+        if p.name != "MEMORY.md" and not p.name.startswith(".")
+    }
+
+
+def slugs_conhecidos(memorias: dict[str, Path]) -> set[str]:
+    slugs = set()
+    for nome, caminho in memorias.items():
+        slugs.add(nome[:-3])
+        achou = RE_NOME.search(caminho.read_text(encoding="utf-8", errors="replace")[:2000])
+        if achou:
+            slugs.add(achou.group(1).strip().strip("\"'"))
+    return slugs
+
+
+def citadas_em_rules(raiz: Path, memorias: dict[str, Path]) -> dict[str, str]:
+    """Memoria absorvida por rule: nome do arquivo citado em .claude/rules/*.md."""
+    citadas: dict[str, str] = {}
+    diretorio = raiz / ".claude" / "rules"
+    if not diretorio.is_dir():
+        return citadas
+    for rule in sorted(diretorio.glob("*.md")):
+        texto = rule.read_text(encoding="utf-8", errors="replace")
+        for nome in memorias:
+            if nome in texto:
+                citadas.setdefault(nome, rule.name)
+    return citadas
+
+
+def main() -> int:
+    raiz = raiz_do_projeto()
+    indice = caminho_do_indice(raiz)
+    if indice is None:
+        print(
+            "NAO MEDIDO: indice de memoria nao encontrado. Esperado em "
+            "~/.claude/projects/<slug-do-projeto>/memory/MEMORY.md",
+            file=sys.stderr,
+        )
+        return 2
+
+    bruto = indice.read_bytes()
+    texto = bruto.decode("utf-8", errors="replace")
+    trimado = texto.strip()
+    linhas = trimado.count("\n") + 1
+    chars = unidades_utf16(trimado)
+    bytes_utf8 = len(bruto)
+
+    memdir = indice.parent
+    memorias = memorias_do_diretorio(memdir)
+    ponteiros = RE_PONTEIRO.findall(texto)
+    alvos = [destino for _, destino in ponteiros]
+    quebrados = sorted({d for d in alvos if d not in memorias})
+    duplicados = sorted({d for d in alvos if alvos.count(d) > 1})
+
+    absorvidas = citadas_em_rules(raiz, memorias)
+    orfas = sorted(set(memorias) - set(alvos) - set(absorvidas))
+
+    slugs = slugs_conhecidos(memorias)
+    deriva: list[str] = []
+    futuros: list[str] = []
+    for nome, caminho in sorted(memorias.items()):
+        corpo = sem_codigo(caminho.read_text(encoding="utf-8", errors="replace"))
+        for alvo in RE_WIKILINK.findall(corpo):
+            alvo = alvo.strip()
+            if alvo in slugs:
+                continue
+            parecidos = difflib.get_close_matches(alvo, slugs, n=1, cutoff=SEMELHANCA_DE_DERIVA)
+            if parecidos:
+                deriva.append(f"{nome}: [[{alvo}]] -> quis dizer {parecidos[0]}?")
+            else:
+                futuros.append(f"{nome}: [[{alvo}]]")
+
+    pct_c = 100 * chars / TETO_CHARS_OFICIAL
+    pct_l = 100 * linhas / TETO_LINHAS_OFICIAL
+    print(
+        f"memoria: {linhas} linhas ({pct_l:.0f}% de {TETO_LINHAS_OFICIAL}), "
+        f"{chars} unidades UTF-16 ({pct_c:.0f}% de {TETO_CHARS_OFICIAL}), "
+        f"{len(ponteiros)} ponteiros"
+    )
+    print(f"  {indice}")
+    print(
+        f"  {bytes_utf8} bytes UTF-8 no disco (informativo: o corte do CLI NAO e' em byte)"
+    )
+    print(
+        f"  memorias no diretorio: {len(memorias)} | no indice: {len(set(alvos))} | "
+        f"absorvidas por rule: {len(absorvidas)} | orfas: {len(orfas)}"
+    )
+    print(f"  ponteiros quebrados: {len(quebrados)} | [[links]] por deriva de nome: {len(deriva)}")
+
+    estourou = []
+    if chars >= ALARME_CHARS:
+        estourou.append(f"unidades {chars} >= alarme {ALARME_CHARS} (corte {TETO_CHARS_OFICIAL})")
+    if linhas >= ALARME_LINHAS:
+        estourou.append(f"linhas {linhas} >= alarme {ALARME_LINHAS} (corte {TETO_LINHAS_OFICIAL})")
+    for d in quebrados:
+        estourou.append(f"ponteiro quebrado: o indice cita {d}, que nao existe no diretorio")
+    for d in duplicados:
+        estourou.append(f"ponteiro duplicado: {d} aparece mais de uma vez no indice")
+    for o in orfas:
+        estourou.append(f"memoria orfa: {o} nao esta no indice nem e citada em .claude/rules/")
+    for d in deriva:
+        estourou.append(f"[[link]] por deriva de nome: {d}")
+
+    if estourou:
+        for e in estourou:
+            print(f"[REPROVA] {e}", file=sys.stderr)
+        print(
+            "\nO corte NAO aparece em log nem em exit code: o que passar dele deixa de\n"
+            "carregar em toda sessao seguinte. Nao apague memoria -- encurte o hook\n"
+            "cortando so em fronteira de clausula, e mova o que e especifico de um\n"
+            "arquivo para .claude/rules/ com `paths:`, que custa ZERO no indice\n"
+            "permanente e carrega quando o arquivo casado e tocado. A rule que absorve\n"
+            "uma memoria tem de citar o nome do arquivo dela, senao a memoria fica orfa.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if futuros:
+        print(f"  [nota] {len(futuros)} [[link]] sem destino, sem quase-homonimo = referencia futura:")
+        for f in futuros:
+            print(f"         {f}")
+
+    avisos = []
+    if linhas >= AVISO_LINHAS:
+        avisos.append(f"{linhas} linhas >= {AVISO_LINHAS} (80% de {TETO_LINHAS_OFICIAL})")
+    if chars >= AVISO_CHARS:
+        avisos.append(f"{chars} unidades >= {AVISO_CHARS} (80% de {TETO_CHARS_OFICIAL})")
+    if avisos:
+        print("  [AVISO] o proprio CLI ja considera este indice 'approaching the read limit':")
+        for a in avisos:
+            print(f"          {a}")
+        print(f"          meta declarada por ele (70%): {META_LINHAS} linhas e {META_CHARS} unidades")
+
+    folga_c = ALARME_CHARS - chars
+    folga_l = ALARME_LINHAS - linhas
+    print(
+        f"  folga ate o alarme: {folga_c} unidades, {folga_l} linhas "
+        f"(~{max(min(folga_c // 140, folga_l), 0)} memorias)"
+    )
+    print(
+        f"  folga ate o corte:  {TETO_CHARS_OFICIAL - chars} unidades, "
+        f"{TETO_LINHAS_OFICIAL - linhas} linhas"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        print("NAO MEDIDO: o instrumento caiu. Defeito do medidor, nao veredito.", file=sys.stderr)
+        sys.exit(2)

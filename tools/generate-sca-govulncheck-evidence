@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# generate-sca-govulncheck-evidence -- roda o govulncheck DE VERDADE e grava a
+# evidencia versionada da execucao em data/ops/sca_govulncheck_evidence.jsonl.
+#
+# Por que existe (medido em 2026-08-26). O gate `sca-govulncheck` memoiza o
+# proprio veredito, mas o memo mora em ~/.cache/opt-wiki-check-sca-memo -- fora
+# do git, fora do backup, sujeito a GC e invisivel para qualquer auditoria. Na
+# pratica, a unica prova de que o scanner rodou era a mensagem de um commit, e
+# esta sessao mediu mensagem de commit mentir. Medicao do dia: o memo vivo mais
+# recente do sca-govulncheck era de 2026-08-12, ou seja, catorze dias sem
+# nenhuma execucao viva registrada em lugar nenhum -- inclusive DEPOIS dos bumps
+# de x/mod, x/image e toolchain feitos na primeira onda da Fase 9, cujo "esta
+# limpo" nunca teve prova persistida.
+#
+# Divisao de papeis do repositorio: `check-*` e read-only e NAO escreve dado; e
+# `generate-*` que escreve. Por isso a evidencia nasce aqui, e o gate
+# `sca-govulncheck-evidence` apenas a le e reprova quando ela esta ausente,
+# velha, ou descrevendo um go.mod/toolchain/escopo que nao e o atual.
+#
+# ANTI-FRAUDE: cada linha deste ledger corresponde a UMA execucao real do
+# govulncheck neste host. Nao existe caminho que escreva linha sem rodar a
+# ferramenta -- se o scanner falhar, o script sai != 0 e NAO grava nada.
+set -euo pipefail
+ROOT="$(
+	unset CDPATH
+	cd -- "$(dirname -- "$0")/.." && pwd
+)"
+PATH="$ROOT/tools:$PATH"
+export PATH
+cd "$ROOT"
+export GOCACHE="${GOCACHE:-$HOME/.cache/go-build}"
+
+EVIDENCE_PATH="data/ops/sca_govulncheck_evidence.jsonl"
+
+# O escopo TEM de ser o mesmo de scaGovulncheckPackages() em
+# internal/checks/checks.go. `./...` nao expande neste repositorio: o nginx cria
+# var/nginx/{body,fastcgi,proxy,scgi} com dono `nobody` e modo 0700 e o
+# caminhador de pacotes aborta o padrao inteiro. O gate de evidencia compara
+# este escopo com o do codigo e reprova se divergirem.
+SCAN_SCOPE=("./internal/..." "./cmd/...")
+
+VERSION_OUTPUT="$(go-modern tool -modfile=tools/sca/go.mod govulncheck -version)"
+
+REPORT="$(mktemp -t wiki-govulncheck-XXXXXX.json)"
+trap 'rm -f "$REPORT"' EXIT
+
+STARTED_MS="$(date -u +%s%3N)"
+set +e
+go-modern tool -modfile=tools/sca/go.mod govulncheck -format json "${SCAN_SCOPE[@]}" >"$REPORT" 2>/tmp/wiki-govulncheck-stderr.$$
+SCAN_EXIT=$?
+set -e
+FINISHED_MS="$(date -u +%s%3N)"
+SCAN_STDERR="$(cat /tmp/wiki-govulncheck-stderr.$$ 2>/dev/null || true)"
+rm -f "/tmp/wiki-govulncheck-stderr.$$"
+
+if [[ ! -s "$REPORT" ]]; then
+	printf 'generate-sca-govulncheck-evidence: govulncheck nao produziu relatorio (exit=%d)\n%s\n' "$SCAN_EXIT" "$SCAN_STDERR" >&2
+	exit 1
+fi
+
+mkdir -p data/ops
+nice -n 19 python3 - "$REPORT" "$EVIDENCE_PATH" "$SCAN_EXIT" "$STARTED_MS" "$FINISHED_MS" "$VERSION_OUTPUT" "${SCAN_SCOPE[@]}" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timezone
+
+report_path, evidence_path, scan_exit, started_ms, finished_ms, version_output = sys.argv[1:7]
+scan_scope = list(sys.argv[7:])
+
+raw = open(report_path, encoding="utf-8").read()
+decoder = json.JSONDecoder()
+objects = []
+index = 0
+while index < len(raw):
+    while index < len(raw) and raw[index] in " \n\r\t":
+        index += 1
+    if index >= len(raw):
+        break
+    obj, index = decoder.raw_decode(raw, index)
+    objects.append(obj)
+
+osv_by_id = {o["osv"]["id"]: o["osv"] for o in objects if "osv" in o}
+findings = [o["finding"] for o in objects if "finding" in o]
+
+# govulncheck distingue duas coisas que NAO podem ser somadas: vulnerabilidade
+# ALCANCAVEL (o trace chega numa funcao do nosso codigo) e vulnerabilidade
+# apenas presente no grafo de modulos. So a primeira e achado de execucao.
+def chamada(finding):
+    trace = finding.get("trace") or []
+    return bool(trace and trace[0].get("function"))
+
+def resumo(finding):
+    osv_id = finding.get("osv")
+    osv = osv_by_id.get(osv_id, {})
+    fixed = finding.get("fixed_version")
+    ranges_sem_correcao = True
+    for affected in osv.get("affected", []) or []:
+        for r in affected.get("ranges", []) or []:
+            for event in r.get("events", []) or []:
+                if "fixed" in event:
+                    ranges_sem_correcao = False
+    return {
+        "osv": osv_id,
+        "module": (finding.get("trace") or [{}])[-1].get("module", ""),
+        "found_version": finding.get("trace", [{}])[-1].get("version", "") if finding.get("trace") else "",
+        "fixed_version": fixed or "",
+        "reachable_call": chamada(finding),
+        "upstream_has_no_fix": ranges_sem_correcao,
+        "aliases": osv.get("aliases", []),
+    }
+
+alcancaveis = [resumo(f) for f in findings if chamada(f)]
+so_no_grafo = [resumo(f) for f in findings if not chamada(f)]
+
+def sha256_arquivo(caminho):
+    h = hashlib.sha256()
+    with open(caminho, "rb") as handle:
+        for bloco in iter(lambda: handle.read(1 << 16), b""):
+            h.update(bloco)
+    return h.hexdigest()
+
+go_mod = open("go.mod", encoding="utf-8").read()
+diretiva_go = re.search(r"(?m)^go\s+(\S+)$", go_mod)
+toolchain = re.search(r"(?m)^toolchain\s+(\S+)$", go_mod)
+
+scanner = re.search(r"Scanner:\s*govulncheck@(\S+)", version_output)
+db_url = re.search(r"DB:\s*(\S+)", version_output)
+db_updated = re.search(r"DB updated:\s*(.+)", version_output)
+go_do_scanner = re.search(r"(?m)^Go:\s*(\S+)$", version_output)
+
+agora = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+veredito = "pass" if not alcancaveis else "fail"
+
+registro = {
+    "evidence_id": "sca-govulncheck-" + agora,
+    # record_status segue o padrao dos demais ledgers de SCA: artefato de
+    # engenharia, nunca conteudo publicavel.
+    "record_status": "sca_govulncheck_evidence_blocked_no_publication",
+    "tool_check": "sca-govulncheck",
+    "tool_module_path": "golang.org/x/vuln/cmd/govulncheck",
+    "tool_version": scanner.group(1) if scanner else "",
+    "tool_go_version": go_do_scanner.group(1) if go_do_scanner else "",
+    "isolated_tool_module": "tools/sca/go.mod",
+    "vuln_db": db_url.group(1) if db_url else "",
+    "vuln_db_updated": db_updated.group(1).strip() if db_updated else "",
+    "scan_scope": scan_scope,
+    "scan_exit_code": int(scan_exit),
+    "go_directive": diretiva_go.group(1) if diretiva_go else "",
+    "toolchain": toolchain.group(1) if toolchain else "",
+    "go_mod_sha256": sha256_arquivo("go.mod"),
+    "go_sum_sha256": sha256_arquivo("go.sum"),
+    "verdict": veredito,
+    "reachable_findings": alcancaveis,
+    "reachable_findings_count": len(alcancaveis),
+    "module_graph_only_findings": so_no_grafo,
+    "module_graph_only_findings_count": len(so_no_grafo),
+    "osv_entries_considered": len(osv_by_id),
+    "duration_ms": int(finished_ms) - int(started_ms),
+    "executed_live": True,
+    "publication_allowed": False,
+    "render_allowed": False,
+    "sitemap_allowed": False,
+    "approval": False,
+    "public_path": "",
+    "index_policy": "noindex",
+    "checked_at": agora,
+}
+
+with open(evidence_path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+print(
+    "generate-sca-govulncheck-evidence: verdict={} alcancaveis={} so_no_grafo={} escopo={} tool={} db={}".format(
+        veredito,
+        len(alcancaveis),
+        len(so_no_grafo),
+        " ".join(scan_scope),
+        registro["tool_version"],
+        registro["vuln_db_updated"],
+    )
+)
+PY

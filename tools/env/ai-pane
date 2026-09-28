@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# ai-pane — protocolo estavel para um AGENTE DE IA operar panes tmux.
+#
+# PROBLEMA QUE RESOLVE
+#   Um agente que pilota o tmux direto esbarra em enderecamento instavel: indices
+#   de pane mudam quando qualquer pane nasce/morre, `capture-pane` sem -J devolve
+#   linhas quebradas no meio (e o agente le comando cortado como se fosse erro), e
+#   acompanhar output continuo vira polling caro. Aqui cada unidade de trabalho e
+#   uma JANELA NOMEADA — endereco estavel `sessao:=nome` que nunca se desloca.
+#
+# COMANDOS
+#   ai-pane list                      panes ativos: nome, comando, pid, ocioso?
+#   ai-pane new NOME [CMD...]         cria janela NOME (opcionalmente ja rodando CMD)
+#   ai-pane run NOME CMD...           roda CMD na janela e devolve saida + exit code
+#   ai-pane send NOME CMD...          envia CMD (assincrono; nao espera terminar)
+#   ai-pane read NOME [-n LINHAS]     le o pane (texto limpo, linhas rejuntadas)
+#   ai-pane last NOME                 le so a saida do ULTIMO comando
+#   ai-pane status NOME               'idle' (shell no prompt) ou 'busy: <cmd>'
+#   ai-pane log NOME [ARQUIVO]        streaming continuo do pane para arquivo
+#   ai-pane unlog NOME                encerra o streaming
+#   ai-pane grid N [CMD]              cria N janelas ag1..agN (frota de agentes)
+#   ai-pane kill NOME                 encerra a janela NOME
+#   ai-pane killall-agents            encerra so as janelas ag* (nunca claude/shell/mon)
+#
+# NOTAS
+#   - Sessao alvo: $AI_PANE_SESSION, ou a sessao do $TMUX atual, ou a primeira viva.
+#   - `read` usa capture-pane -p -J: -J rejunta linha logica quebrada pelo wrap,
+#     que e a causa classica de agente ler comando pela metade.
+#   - `log` usa pipe-pane: o tmux escreve o output no arquivo conforme sai. O agente
+#     le o arquivo (tail -n / diff de tamanho) em vez de repetir capture caro.
+#   - `send` e ASSINCRONO: quem envia e le em seguida corre o risco classico de ler
+#     o pane ANTES de o shell executar (medido: `read` logo apos `send` devolve so o
+#     eco do comando). Para isso existe `run`, que e sincrono: redireciona a saida
+#     para arquivo, grava o exit code num sentinela e so retorna quando o comando
+#     terminou — o agente recebe saida limpa e status real, sem adivinhar.
+#   - A sincronizacao interna do `run` NAO e espera ociosa de agente: e o bloqueio
+#     determinista de UM comando, com --timeout obrigatorio por default. Observar
+#     frota (status/log/list) continua sem polling.
+set -uo pipefail
+
+die() { printf 'ai-pane: %s\n' "$*" >&2; exit 1; }
+command -v tmux >/dev/null 2>&1 || die 'tmux nao encontrado'
+
+# --- sessao alvo ---------------------------------------------------------------
+resolve_session() {
+  if [ -n "${AI_PANE_SESSION:-}" ]; then printf '%s' "$AI_PANE_SESSION"; return 0; fi
+  if [ -n "${TMUX:-}" ]; then tmux display-message -p '#{session_name}' 2>/dev/null && return 0; fi
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | head -1
+}
+SESSION="$(resolve_session)"
+[ -n "$SESSION" ] || die 'nenhuma sessao tmux viva (crie com start-ai-terminal-claude.sh)'
+T="=$SESSION"
+
+win() { printf '%s:=%s' "$T" "$1"; }
+win_exists() { tmux list-windows -t "$T" -F '#{window_name}' 2>/dev/null | grep -Fxq "$1"; }
+require_win() { win_exists "$1" || die "janela '$1' nao existe (ai-pane list)"; }
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "nome invalido: $1"; }
+
+cmd="${1:-list}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  list|ls)
+    printf '%-20s %-14s %-8s %-6s %s\n' NOME COMANDO PID LINHAS ESTADO
+    tmux list-windows -t "$T" -F '#{window_name}	#{pane_current_command}	#{pane_pid}	#{history_size}' 2>/dev/null |
+      while IFS=$'\t' read -r name pcmd pid hist; do
+        case "$pcmd" in bash|zsh|sh|fish) state=idle ;; *) state="busy" ;; esac
+        printf '%-20s %-14s %-8s %-6s %s\n' "$name" "$pcmd" "$pid" "$hist" "$state"
+      done
+    ;;
+
+  new)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane new NOME [CMD...]'
+    valid_name "$name"; shift
+    if win_exists "$name"; then
+      printf 'ai-pane: janela %s ja existe (reutilizando)\n' "$name" >&2
+    else
+      tmux new-window -d -t "$T" -n "$name" -c "${AI_PANE_WORKDIR:-$PWD}" || die "falha ao criar $name"
+      tmux select-pane -t "$(win "$name")" -T "$name" 2>/dev/null || true
+    fi
+    if [ "$#" -gt 0 ]; then
+      tmux send-keys -t "$(win "$name")" "$*" C-m
+    fi
+    printf '%s\n' "$name"
+    ;;
+
+  send)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane send NOME CMD...'
+    shift; require_win "$name"
+    [ "$#" -gt 0 ] || die 'nada para enviar'
+    tmux send-keys -t "$(win "$name")" "$*" C-m
+    ;;
+
+  run)
+    # Execucao SINCRONA: a saida vai para arquivo (nao depende de capture-pane nem
+    # do tamanho do scrollback) e o exit code chega intacto ao chamador.
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane run NOME [--timeout N] CMD...'
+    shift
+    timeout_s=600
+    case "${1:-}" in
+      --timeout) shift; timeout_s="${1:-600}"; shift ;;
+      --timeout=*) timeout_s="${1#--timeout=}"; shift ;;
+    esac
+    [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "timeout invalido: $timeout_s"
+    [ "$#" -gt 0 ] || die 'nada para executar'
+    win_exists "$name" || {
+      tmux new-window -d -t "$T" -n "$name" -c "${AI_PANE_WORKDIR:-$PWD}" || die "falha ao criar $name"
+      tmux select-pane -t "$(win "$name")" -T "$name" 2>/dev/null || true
+    }
+    runbase="/tmp/ai-pane-$(id -u)/run"
+    mkdir -p "$runbase"
+    token="$$-$(date +%s%N)"
+    out="$runbase/$token.out"
+    rcf="$runbase/$token.rc"
+    : >"$out"
+    # SUBSHELL, nao grupo: com `{ ...; }` um comando que chama `exit` encerra o
+    # shell do pane, a janela fecha, o sentinela nunca e escrito e o run fica
+    # pendurado ate o timeout (medido em 2026-07-28). Com `( ... )` o exit morre no
+    # subshell, o rc chega intacto e o pane sobrevive para o proximo comando.
+    tmux send-keys -t "$(win "$name")" \
+      "( $* ) >$(printf '%q' "$out") 2>&1; printf '%s' \$? >$(printf '%q' "$rcf")" C-m
+    # Anuncia onde a saida vive ANTES de comecar a esperar.
+    # Sem isto, um comando longo era irrecuperavel: o Bash tool do harness corta o
+    # chamador em foreground bem antes do timeout default de 600s daqui; quando o
+    # chamador morre, este laco morre junto e os `exit 124`/`exit 125` — os unicos
+    # pontos que imprimiam o caminho — nunca chegam a executar. O token e
+    # `$$-$(date +%s%N)`, impossivel de adivinhar depois. Resultado medido: dois
+    # arquivos .full de 368 KB e 590 KB largados em /tmp sem dono. Com o path no
+    # stderr desde o inicio, o run continua rodando no pane e a saida se recupera
+    # com um `cat`. Custo: ~90 bytes de stderr por invocacao.
+    printf 'ai-pane: run em andamento — saida=%s rc=%s\n' "$out" "$rcf" >&2
+    deadline=$(( $(date +%s) + timeout_s ))
+    while [ ! -s "$rcf" ]; do
+      # Guarda contra espera eterna: se a janela sumiu (pane morto, kill-window),
+      # nenhum sentinela vira — falhe agora com diagnostico em vez de pendurar.
+      if ! win_exists "$name"; then
+        cat "$out" 2>/dev/null
+        printf 'ai-pane: janela %s desapareceu antes de concluir (pane morto?)\n' "$name" >&2
+        rm -f "$out" "$rcf" 2>/dev/null || true
+        exit 125
+      fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        cat "$out" 2>/dev/null
+        printf 'ai-pane: TIMEOUT apos %ss — comando segue rodando na janela %s\n' "$timeout_s" "$name" >&2
+        exit 124
+      fi
+      command sleep 0.1
+    done
+    rc="$(cat "$rcf" 2>/dev/null || echo 1)"
+    # Mesmo teto do `read`: um build verboso pode gerar megabytes e o chamador e um
+    # agente com janela de contexto finita. Quando trunca, diz onde esta o resto —
+    # o arquivo completo fica no disco ate o proximo ai-gc.
+    max_bytes="${AI_PANE_MAX_BYTES:-200000}"
+    out_size=$(stat -c %s "$out" 2>/dev/null || echo 0)
+    if [ "$out_size" -gt "$max_bytes" ]; then
+      keep="$runbase/$token.full"
+      mv -f "$out" "$keep" 2>/dev/null
+      head -c "$max_bytes" "$keep" 2>/dev/null
+      printf '\n[ai-pane: saida de %s bytes truncada em %s. Completa em: %s]\n' "$out_size" "$max_bytes" "$keep" >&2
+      rm -f "$rcf" 2>/dev/null || true
+      exit "${rc:-1}"
+    fi
+    cat "$out" 2>/dev/null
+    rm -f "$out" "$rcf" 2>/dev/null || true
+    exit "${rc:-1}"
+    ;;
+
+  read|cat)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane read NOME [-n LINHAS]'
+    shift; require_win "$name"
+    lines=200
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -n) shift; lines="${1:-200}" ;;
+        -n*) lines="${1#-n}" ;;
+        --all) lines=0 ;;
+      esac
+      shift
+    done
+    # -J rejunta a linha logica quebrada pelo wrap (senao o agente le comando pela
+    # metade). O awk final descarta a cauda de linhas vazias que o capture-pane
+    # sempre devolve (o pane abaixo do cursor) — ruido puro no contexto do agente.
+    #
+    # TETO DURO de saida. Com history-limit 50000, `--all` num pane que rodou um
+    # build pode devolver ~1.9 MB (~475k tokens) — sozinho estoura uma janela de
+    # 200k e custa caro ate numa de 1M. Um comando de leitura JAMAIS pode ser a
+    # coisa que derruba a sessao de quem o chamou. Para historico longo de verdade
+    # existe `ai-pane log` (pipe-pane para arquivo), que nao passa pelo contexto.
+    max_bytes="${AI_PANE_MAX_BYTES:-200000}"
+    export AI_PANE_LAST_NAME="$name"
+    if [ "$lines" -eq 0 ]; then
+      tmux capture-pane -p -J -S - -t "$(win "$name")"
+    else
+      tmux capture-pane -p -J -S "-${lines}" -t "$(win "$name")"
+    fi | awk '{ buf[NR]=$0 } END { last=0; for (i=1;i<=NR;i++) if (buf[i] ~ /[^[:space:]]/) last=i; for (i=1;i<=last;i++) print buf[i] }' \
+       | awk -v max="$max_bytes" '
+           { total += length($0) + 1
+             if (total > max) { cut++; next }
+             print }
+           END { if (cut) printf "\n[ai-pane: %d linhas finais omitidas — saida truncada em %d bytes. Use `ai-pane log %s` para acompanhar sem passar pelo contexto, ou -n MENOR.]\n", cut, max, ENVIRON["AI_PANE_LAST_NAME"] }'
+    ;;
+
+  last)
+    # Saida do ultimo comando: do fim, sobe ate a linha anterior ao ultimo prompt.
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane last NOME'
+    require_win "$name"
+    tmux capture-pane -p -J -S -2000 -t "$(win "$name")" |
+      awk '{ buf[NR]=$0 } END {
+        start=1
+        for (i=NR-1; i>=1; i--) if (buf[i] ~ /\$ $|\$ [^ ]/ && buf[i] !~ /^ /) { start=i; break }
+        for (i=start; i<=NR; i++) print buf[i]
+      }'
+    ;;
+
+  status)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane status NOME'
+    require_win "$name"
+    pcmd="$(tmux display-message -p -t "$(win "$name")" '#{pane_current_command}')"
+    case "$pcmd" in
+      bash|zsh|sh|fish) printf 'idle\n' ;;
+      *) printf 'busy: %s\n' "$pcmd" ;;
+    esac
+    ;;
+
+  log)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane log NOME [ARQUIVO]'
+    require_win "$name"
+    out="${2:-/tmp/ai-pane-$(id -u)/${SESSION}-${name}.log}"
+    mkdir -p "$(dirname "$out")"
+    tmux pipe-pane -o -t "$(win "$name")" "cat >> $(printf '%q' "$out")"
+    printf '%s\n' "$out"
+    ;;
+
+  unlog)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane unlog NOME'
+    require_win "$name"
+    tmux pipe-pane -t "$(win "$name")"
+    ;;
+
+  grid)
+    n="${1:-4}"; shift 2>/dev/null || true
+    [[ "$n" =~ ^[0-9]+$ ]] || die 'uso: ai-pane grid N [CMD]'
+    for i in $(seq 1 "$n"); do
+      name="ag$i"
+      win_exists "$name" || tmux new-window -d -t "$T" -n "$name" -c "${AI_PANE_WORKDIR:-$PWD}"
+      tmux select-pane -t "$(win "$name")" -T "$name" 2>/dev/null || true
+      [ "$#" -gt 0 ] && tmux send-keys -t "$(win "$name")" "$*" C-m
+    done
+    printf 'criadas/reutilizadas %s janelas: ag1..ag%s\n' "$n" "$n"
+    ;;
+
+  kill)
+    name="${1:-}"; [ -n "$name" ] || die 'uso: ai-pane kill NOME'
+    case "$name" in
+      claude|shell|mon) die "recusado: '$name' e janela estrutural da sessao" ;;
+    esac
+    require_win "$name"
+    tmux kill-window -t "$(win "$name")"
+    ;;
+
+  killall-agents)
+    # So janelas ag<numero>. Nunca toca em claude/shell/mon nem em nome arbitrario.
+    tmux list-windows -t "$T" -F '#{window_name}' 2>/dev/null | grep -E '^ag[0-9]+$' |
+      while IFS= read -r w; do tmux kill-window -t "$(win "$w")" && printf 'kill %s\n' "$w"; done
+    ;;
+
+  help|-h|--help)
+    grep -E '^#( |$)' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+
+  *)
+    die "comando desconhecido: $cmd (ai-pane help)"
+    ;;
+esac

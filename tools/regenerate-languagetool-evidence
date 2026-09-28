@@ -1,0 +1,122 @@
+#!/bin/bash
+# Regenera data/ops/languagetool_quality_evidence.jsonl em FATIAS, porque uma
+# passada inteira nao cabe no envelope.
+#
+# POR QUE ESTA FERRAMENTA EXISTE (medido em 2026-08-30)
+#
+# O corpus tem 7.959 registros e o gerador faz ~2,2 registros/s com
+# --concurrency 12 contra o LanguageTool local: ~61 minutos. O teto duro do
+# envelope pesado e 1800 s, e o proprio wrapper diz o que fazer quando nao cabe
+# -- "shard/cache/optimize instead of increasing the timeout". Esta ferramenta e
+# o shard.
+#
+# Cada fatia resolve ate --max-live-checks misses ao vivo, popula o cache
+# persistente e grava a evidencia COMPLETA com budget fail-closed para o
+# restante; a fatia seguinte aproveita o cache e avanca. O laco para quando o
+# gate fica verde ou quando uma fatia nao progride mais.
+#
+# ARMADILHAS QUE ESTA FERRAMENTA JA EMBUTE, cada uma custou uma passada:
+#   - WIKI_HEAVY_TIMEOUT_SECONDS sozinho NAO vale: vence o menor entre ele e
+#     WIKI_HEAVY_BUDGET_MS, e o default do segundo e 120 s.
+#   - --timeout do gerador tem default de 2 s por requisicao, e o LanguageTool
+#     leva ~1 s ja aquecido e mais na primeira chamada. Com 2 s o gerador conclui
+#     service_required_unavailable com o servico respondendo HTTP 200.
+#   - sem --require-service o gerador NAO falha quando o servico esta fora: ele
+#     grava uma amostra de 200 registros por cima da evidencia boa (BUG-227, hoje
+#     barrado pela guarda de reducao de cobertura).
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+
+ENDPOINT="${LT_ENDPOINT:-http://127.0.0.1:8082/v2/check}"
+FATIAS="${LT_FATIAS:-6}"
+CHECKS_POR_FATIA="${LT_CHECKS_POR_FATIA:-2500}"
+# CONCORRENCIA 4, NAO 12, e a diferenca foi medida contando as requisicoes que o
+# proprio servidor loga:
+#
+#   concorrencia 12 -> ~0,4 req/s   (em campo, com load 15 em 8 nucleos)
+#   concorrencia  4 -> ~1,9 req/s   (121 requisicoes em 65 s)
+#
+# Quase CINCO VEZES mais rapido com menos paralelismo. O LanguageTool e
+# CPU-bound: 12 requisicoes simultaneas em 8 nucleos disputam entre si e com a
+# JVM, e o throughput desaba. Com 1,9 req/s uma fatia de 2.500 checks leva ~22
+# min e CABE no teto de 1795 s; com 12 nao cabia, e cada fatia morria pela
+# metade. E o "optimize" que o envelope manda fazer em vez de esticar o relogio.
+CONCORRENCIA="${LT_CONCORRENCIA:-4}"
+
+# IDENTIDADE DA SONDA (CLAUDE.md secao 11). Ate 2026-09-10 esta chamada saia como
+# `curl/8.x`. O destino e um SERVICO LOCAL nosso, nao o portal — por isso vai o
+# User-Agent da sonda interna e NAO vai o `X-Warming-Request`: aquele cabecalho
+# existe para tirar a requisicao da metrica de audiencia do portal, e aqui nao ha
+# metrica de audiencia a proteger. Identificar continua valendo: e o que separa,
+# no log do servico, a nossa sonda de um cliente qualquer da maquina.
+UA_SONDA="wikijuridica-superficie-probe/1.0"
+REGISTROS="${LT_REGISTROS:-7959}"
+
+if ! curl -sf -o /dev/null --max-time 10 -A "$UA_SONDA" "${ENDPOINT%/v2/check}/v2/languages"; then
+	echo "regenerate-languagetool-evidence: servico ausente em $ENDPOINT" >&2
+	echo "  suba com: CP=\$(find .toolchains/m2 -name '*.jar' | tr '\\n' ':')" >&2
+	echo "            java -cp \"\$CP\" org.languagetool.server.HTTPServer --port 8082" >&2
+	exit 2
+fi
+
+antes="$(grep -c . data/ops/languagetool_quality_evidence.jsonl 2>/dev/null || echo 0)"
+echo "regenerate-languagetool-evidence: evidencia atual=$antes registros; ate $FATIAS fatias de $CHECKS_POR_FATIA checks"
+
+fatia=0
+esperas=0
+while [ "$fatia" -lt "$FATIAS" ]; do
+	fatia=$((fatia + 1))
+	inicio="$(date +%s)"
+	# TRES relogios governam este comando, e vence o menor de todos:
+	# WIKI_HEAVY_TIMEOUT_SECONDS e WIKI_HEAVY_BUDGET_MS no envelope, e
+	# WIKI_GO_CMD_TIMEOUT_SECONDS no run-go-cmd-cached. Declarar so os dois
+	# primeiros deixa o terceiro no default e o comando morre antes.
+	WIKI_HEAVY_TIMEOUT_SECONDS=1795 WIKI_HEAVY_BUDGET_MS=1795000 \
+		WIKI_GO_CMD_TIMEOUT_SECONDS=1790 \
+		./tools/run-generate-supervised ./cmd/generate-languagetool-quality \
+		--require-service --endpoint "$ENDPOINT" --timeout 45s \
+		--max-records "$REGISTROS" --max-live-checks "$CHECKS_POR_FATIA" \
+		--concurrency "$CONCORRENCIA" 2>&1 | grep -vE "repo_awareness|artifact_claim"
+	saida=${PIPESTATUS[0]}
+	agora="$(grep -c . data/ops/languagetool_quality_evidence.jsonl 2>/dev/null || echo 0)"
+	echo "fatia $fatia: exit=$saida duracao=$(($(date +%s) - inicio))s registros=$agora"
+
+	# exit 75 e CORRIDA, nao defeito: o envelope recusou porque outro comando
+	# segurava o lock do mesmo escopo. Medido em 2026-08-30: duas fatias inteiras
+	# se perderam assim em 4 s cada, contra um processo orfao de uma tentativa
+	# anterior -- a cota foi consumida sem nenhum check ter rodado. Corrida se
+	# espera e se repete; ela nao gasta fatia.
+	# exit 124 com duracao proxima de 300 s e CONTENCAO, nao timeout de trabalho:
+	# LOCK_WAIT_SECONDS do run-go-cmd-cached e 300 (tools/run-go-cmd-cached:354),
+	# entao a fatia esperou o lock de build de outra frente e desistiu sem rodar
+	# um unico check. Medido em 2026-08-30: "fatia 1: exit=124 duracao=303s".
+	# Gastar uma fatia nisso e o mesmo desperdicio do exit 75.
+	duracao=$(($(date +%s) - inicio))
+	if [ "$saida" -eq 124 ] && [ "$duracao" -lt 400 ]; then
+		saida=75
+		echo "  exit 124 em ${duracao}s: contencao do lock de build, nao trabalho perdido"
+	fi
+	if [ "$saida" -eq 75 ]; then
+		esperas=$((esperas + 1))
+		if [ "$esperas" -gt 10 ]; then
+			echo "regenerate-languagetool-evidence: lock ocupado em 10 tentativas seguidas; veja quem segura com ps e NAO mate processo de outra sessao" >&2
+			exit 75
+		fi
+		echo "  lock ocupado (exit 75, corrida): aguardando 60 s sem gastar fatia (tentativa $esperas de 10)"
+		# `< /dev/zero` faria o read girar CPU lendo NUL por 60 s; o process
+		# substitution vazio bloqueia de verdade, com CPU zero.
+		read -rt 60 -u 9 _ 9<> <(:) 2>/dev/null || true
+		fatia=$((fatia - 1))
+		continue
+	fi
+	esperas=0
+
+	if ./tools/go-modern run ./cmd/check languagetool-quality >/dev/null 2>&1; then
+		echo "regenerate-languagetool-evidence: gate VERDE apos $fatia fatia(s)"
+		exit 0
+	fi
+done
+
+echo "regenerate-languagetool-evidence: $FATIAS fatias sem fechar o gate; rode de novo para continuar do cache" >&2
+exit 1

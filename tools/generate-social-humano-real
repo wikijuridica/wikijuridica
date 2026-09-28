@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""generate-social-humano-real — a série de humano da REDE SOCIAL, medida na origem.
+
+Escreve `data/ops/social_humano_daily.jsonl` a partir do ledger de origem
+`data/ops/access/nginx-YYYY-MM-DD.jsonl` (`origin_access_nginx_v1`), agregando
+por dia as dimensões que o GA4 mede no acervo: sessões, rota e origem de
+referência.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTE PRODUTOR EXISTE
+
+As rotas públicas de `/redesocial/` subiram em 2026-09-05 servidas pelo processo
+Go de 127.0.0.1:8091, e a CSP das duas variantes é `script-src 'none'`
+(`internal/socialheaders`). Isso é uma decisão de segurança correta — a rede
+social publica texto de terceiro, e a CSP é a defesa que continua valendo quando
+a sanitização falha —, mas tem uma consequência exata: **não há GA4 nem Clarity
+ali**. O instrumento que mede humano no acervo não alcança a rede social, e o
+piso dela seria estruturalmente zero para sempre.
+
+Desativar a medição é proibido pelo contrato do projeto. Então a medição muda de
+superfície: em vez do navegador, o LOG DE ORIGEM. A rede social tem uma vantagem
+estrutural sobre o acervo para isso — não existe `public/` para ela, toda
+requisição atravessa o nginx e o Go, e o `proxy_cache_bypass $cookie_wjsession`
+garante que o visitante com sessão sempre chega à origem.
+
+O QUE ESTA SÉRIE NÃO É, dito no próprio registro (campo `piso`)
+
+Ela é um PISO, nunca um número único, e o registro publica `piso: true`,
+`teto: null` e o motivo da ausência de teto. Duas forças puxam para lados
+opostos e nenhuma delas é corrigível na origem:
+
+  * PARA BAIXO — a rota anônima sai com `s-maxage=3600` (cmd/social/rotas.go).
+    Visitante servido pela borda da Cloudflare não toca a origem e não aparece
+    aqui. Toda visita medida é visita que existiu; a recíproca é falsa.
+  * PARA CIMA — automação que se anuncia com User-Agent de navegador real e não
+    carrega marca conhecida passa pelo filtro. É o resíduo declarado em
+    `metodo.residuo`, e é a razão de o número nunca ser apresentado como
+    "pessoas".
+
+POR QUE NÃO SE USA `edge_traffic_daily.jsonl`. Ele se autodenuncia no próprio
+campo `uniques_filter: "none_includes_self_traffic"` — inclui bot e inclui o
+aquecimento da própria borda, medido em 93% do tráfego de borda. E
+`crawl_coverage_daily`, `edge_bot_agents_daily` e `edge_bot_status_daily` vêm do
+GraphQL da Cloudflare com `sampled_dataset: true`: amostra não é contagem.
+
+────────────────────────────────────────────────────────────────────────────
+AS DEFINIÇÕES, que também vão escritas no registro
+
+DIA — partição UTC, porque o ledger-fonte já é particionado em UTC. O campo
+`fuso` diz isso em toda linha.
+
+VISITANTE — par (bloco de rede, User-Agent). O bloco é o IPv4 exato ou o /64 do
+IPv6. O /64 não é arredondamento: o celular que gerou as três primeiras
+requisições de `/redesocial/` trocou o sufixo da interface entre 03:52 e 07:28
+(`2001:db8:c05c:2e00:5a3…` e `2001:db8:c05c:2e00:5a3…`) mantendo o mesmo
+prefixo. Com IP exato, um visitante viraria dois e o número deixaria de ser
+piso — inflar é o erro que esta série não pode cometer.
+
+  A chave de visitante existe SÓ EM MEMÓRIA e NUNCA é gravada. O registro é
+  agregado: contagens, nada de identificador. Não há HMAC porque não há campo
+  por visitante a publicar — e `data/ops/access/` já guarda `remote_addr` em
+  claro em arquivo versionado, o que a história do git preserva para sempre;
+  esta série não acrescenta uma segunda cópia disso.
+
+SESSÃO — sequência de requisições do mesmo visitante em que o intervalo entre
+duas consecutivas é menor ou igual a 1.800 s (30 min, a mesma janela de
+inatividade do GA4). A sessão fecha por inatividade OU na virada do dia UTC:
+visitante ativo às 23:50 e às 00:05 conta uma sessão em cada linha, porque o
+agregado é diário e uma sessão que atravessasse a partição seria contada duas
+vezes ou nenhuma.
+
+HUMANO — o discriminador é deliberadamente simples, porque a conferência
+independente exigida pelo contrato (R3) tem de ser reproduzível com `jq`/`awk`
+por quem não leu este arquivo. Uma requisição conta como humana quando, e só
+quando, sobrevive a todas as exclusões de `motivo_de_exclusao()`.
+
+IDEMPOTÊNCIA — o registro NÃO carrega instante de geração, de propósito: ele é
+função pura do ledger de origem, e um carimbo de relógio faria duas execuções
+idênticas produzirem arquivos diferentes, destruindo a única prova barata de que
+o agregador não inventa. Rodar duas vezes com a mesma fonte devolve o mesmo
+sha256. Dias fora da janela pedida são preservados BYTE A BYTE (texto cru, sem
+re-serializar), e a linha do dia recalculado substitui a anterior em vez de se
+somar a ela — a armadilha do `edge_bot_agents_daily`, que é append-only com
+restatements e cuja soma crua produz número inventado.
+
+Uso:
+    tools/generate-social-humano-real                    # hoje e ontem
+    tools/generate-social-humano-real --dias 7
+    tools/generate-social-humano-real --dia 2026-09-05 --json
+"""
+
+import argparse
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import statistics
+import sys
+from importlib.machinery import SourceFileLoader
+from urllib.parse import urlsplit
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FONTE_DIR = os.path.join(RAIZ, "data", "ops", "access")
+DESTINO = os.path.join(RAIZ, "data", "ops", "social_humano_daily.jsonl")
+
+SCHEMA = "social_humano_daily_v1"
+# O critério é versionado no NOME, pelo mesmo motivo do `schema_version` dos
+# ledgers: mudou o critério, muda a versão, e a série antiga continua legível
+# em vez de virar uma comparação silenciosa entre coisas diferentes.
+CRITERIO = "humano_de_origem_social_v1"
+METODO_VERSAO = "sessao_inatividade_1800s_visitante_rede_ua_v1"
+
+# Escopo: as superfícies da rede social, e só elas.
+PREFIXOS_NO_ESCOPO = ("/redesocial/", "/api/v1/redesocial/")
+# Fora do numerador editorial: a folha de estilo (um ano de `immutable`, então
+# quem a pede é cache frio, não leitor) e o sitemap (é superfície de máquina).
+PREFIXOS_NAO_EDITORIAIS = ("/redesocial/assets/", "/redesocial/sitemap")
+
+JANELA_DE_SESSAO_S = 1800
+
+# O DIA EM QUE A SUPERFÍCIE PASSOU A EXISTIR, e por que ele é uma trava.
+#
+# O ingress de `/redesocial/` entrou no ar em 2026-09-05 00:11:11 -0300 (commit
+# 27c394ca, "o ingress no ar — socket do systemd, servico na 8091 e as duas
+# locations"), que em UTC é o mesmo dia. Rodar este produtor sobre 02, 03 e 04
+# de setembro devolve `bruto=0` — e esse zero NÃO é medição da superfície, é
+# ausência dela. Gravado na série, ele vira três dias de linha reta que qualquer
+# leitor interpreta como "ninguém entrou", quando a verdade é "não havia onde
+# entrar". Dia anterior a esta data sai do escopo com motivo nomeado, em vez de
+# virar um zero indistinguível do zero verdadeiro que um dia vai aparecer.
+DIA_DE_NASCIMENTO_DA_SUPERFICIE = "2026-09-05"
+TOP_PAGINAS_LIMITE = 25
+ROTAS_LIMITE = 50
+
+_botagents = SourceFileLoader("botagents", os.path.join(RAIZ, "tools/botagents.py")).load_module()
+
+# Marcas que um cliente automatizado escreve no próprio User-Agent. A lista é
+# curta de propósito: ela só precisa pegar o que se declara, porque o que NÃO se
+# declara já é o resíduo assumido em `metodo.residuo`. Casar demais aqui derruba
+# humano; casar de menos infla a série. Medido contra o ledger real —
+# `AionBot/1.0` viaja dentro de um User-Agent que começa com `Mozilla/5.0`, e
+# sem esta varredura ele seria contado como pessoa.
+MARCAS_DE_AUTOMACAO = re.compile(
+    r"bot|crawler|spider|scraper|scrapy|headless|preview|probe|monitor|fetcher|archiver",
+    re.IGNORECASE,
+)
+
+# Hosts de referência, agrupados pela função que exercem. A ordem de teste é
+# IA -> busca -> social, porque `gemini.google.com` é sufixo de `google.com` e
+# cairia em "busca" se a busca viesse antes.
+HOSTS_DE_IA = ("chatgpt.com", "chat.openai.com", "perplexity.ai", "claude.ai",
+               "gemini.google.com", "copilot.microsoft.com", "you.com")
+HOSTS_DE_BUSCA = ("google.", "bing.com", "duckduckgo.com", "search.yahoo.com",
+                  "yandex.", "ecosia.org", "search.brave.com", "startpage.com")
+HOSTS_SOCIAIS = ("facebook.com", "instagram.com", "linkedin.com", "lnkd.in",
+                 "t.co", "twitter.com", "x.com", "reddit.com", "threads.net",
+                 "whatsapp.com", "telegram.org", "youtube.com")
+HOST_DA_CASA = "wikijuridica.com.br"
+
+
+def no_escopo(caminho):
+    """A requisição pertence à rede social?"""
+    limpo = (caminho or "").split("?", 1)[0]
+    return any(limpo.startswith(p) for p in PREFIXOS_NO_ESCOPO)
+
+
+def bloco_de_rede(ip):
+    """IPv4 exato, /64 do IPv6, ou o pseudônimo diário — a unidade de visitante.
+
+    O PSEUDÔNIMO É A UNIDADE, e não um endereço ilegível. Desde 2026-09-05 o
+    produtor do ledger (schema origin_access_nginx_v2) grava, para a superfície
+    social, um HMAC diário no lugar do `remote_addr` — o IP em claro passou a
+    viver fora do git, sob o prazo de seis meses que o Marco Civil art. 15 exige.
+
+    Sem esta linha o pseudônimo cairia no ValueError abaixo e viraria
+    "ip_ilegivel" para TODO visitante: eles colapsariam por User-Agent, e dois
+    visitantes distintos com o mesmo navegador contariam como um só. O número
+    deixaria de ser piso — passaria a subcontar — e a série mentiria PARA BAIXO
+    em silêncio, que é o defeito difícil de perceber.
+
+    E o agrupamento continua exato: o pseudônimo já é derivado do /64 no IPv6,
+    então a unidade é a mesma de antes, apenas irreversível fora daqui.
+    """
+    bruto = (ip or "").strip()
+    if bruto.startswith("pseudo-"):
+        return bruto
+    try:
+        endereco = ipaddress.ip_address(bruto)
+    except ValueError:
+        return "ip_ilegivel"
+    if endereco.version == 6:
+        return str(ipaddress.ip_network(str(endereco) + "/64", strict=False).network_address)
+    return str(endereco)
+
+
+def chave_de_visitante(ip, user_agent):
+    """Agrupador EFÊMERO. Nunca é gravado — ver o cabeçalho, seção VISITANTE."""
+    return "%s|%s" % (bloco_de_rede(ip), (user_agent or "").strip())
+
+
+def motivo_de_exclusao(registro):
+    """Diz POR QUE esta requisição não conta como humana, ou None se ela conta.
+
+    A ordem é a da confiabilidade da prova: o que o nginx MARCOU vem antes do
+    que se deduz da string do User-Agent.
+    """
+    caminho = (registro.get("path") or "").split("?", 1)[0]
+    if any(caminho.startswith(p) for p in PREFIXOS_NAO_EDITORIAIS):
+        return "rota_nao_editorial"
+
+    # `motivo_de_desconto` é a fonte única do desconto de tráfego próprio
+    # (tools/botagents.py) e recebe os valores COMO O LOG OS ESCREVE. Aqui a
+    # fonte é o ledger JSONL, onde `warming`/`bot_simulation` já são booleanos:
+    # passar `False` direto faria `str(False)` = "False" cair fora do conjunto
+    # ("", "-", "0") e DESCARTAR TODAS as linhas. A conversão abaixo não é
+    # enfeite, é a diferença entre a série existir e ser sempre zero.
+    marcado = _botagents.motivo_de_desconto(
+        bot_sim="true" if registro.get("bot_simulation") else "-",
+        warm="true" if registro.get("warming") else "-",
+        ip=registro.get("remote_addr"),
+        user_agent=registro.get("user_agent"),
+    )
+    if marcado:
+        # O produtor do ledger de origem já descarta estes três casos antes de
+        # gravar. A checagem aqui não é redundância: é defesa contra o produtor
+        # mudar de critério sem que esta série perceba — e o dia em que ele
+        # mudar, o motivo aparece contado no registro em vez de sumir.
+        return marcado
+
+    if registro.get("agent_key"):
+        return "bot_catalogado"
+    if str(registro.get("bot_allow") or "").strip() == "1":
+        # `$wj_bot_allow` só vale 1 para bot valioso de busca/usuário
+        # (ops/nginx/standalone/nginx.conf:396). Sem `agent_key` isso seria
+        # incoerência do log; descontar é o lado seguro.
+        return "bot_valioso_marcado_no_nginx"
+
+    metodo = (registro.get("method") or "").upper()
+    if metodo not in ("GET", "POST"):
+        # HEAD não renderiza nada para ninguém; OPTIONS tampouco.
+        return "metodo_nao_humano"
+
+    ua = (registro.get("user_agent") or "").strip()
+    if not ua or ua == "-":
+        return "ua_ausente"
+    if not ua.startswith("Mozilla/"):
+        # `undici`, `node`, `python-httpx`, `Go-http-client`, `Bun/1.1.45`,
+        # `claude-code/2.1.260`: cliente que não finge ser navegador é
+        # automação por construção. Um humano de User-Agent exótico só ABAIXA o
+        # piso, e abaixar o piso é permitido; inflá-lo não é.
+        return "ua_nao_navegador"
+    if MARCAS_DE_AUTOMACAO.search(ua):
+        return "ua_declara_automacao"
+    return None
+
+
+_SEGMENTO_DE_PAGINA = re.compile(r"^\d+$")
+
+
+def rota_normalizada(caminho):
+    """O TEMPLATE da rota, para que a cardinalidade não cresça com o acervo.
+
+    Sem isto, `por_rota` ganharia uma chave por dúvida publicada e a linha do
+    dia cresceria sem limite. O caminho exato continua disponível, truncado, em
+    `top_paginas`.
+    """
+    limpo = (caminho or "").split("?", 1)[0]
+    partes = [p for p in limpo.split("/") if p]
+    # ["redesocial", "duvida", "<slug>", ...]
+    if len(partes) >= 3 and partes[0] == "redesocial" and partes[1] == "duvida":
+        cauda = partes[3:]
+        alvo = ["/redesocial/duvida/{slug}"]
+        if cauda[:1] == ["pagina"]:
+            alvo.append("pagina")
+            alvo.append("{n}" if len(cauda) > 1 and _SEGMENTO_DE_PAGINA.match(cauda[1]) else "?")
+            cauda = cauda[2:]
+        if cauda[:1] in (["index.md"], ["feed.xml"]):
+            return "/".join(alvo) + "/" + cauda[0]
+        return "/".join(alvo) + "/"
+    if len(partes) >= 4 and partes[0] == "redesocial" and partes[1] == "tema":
+        cauda = partes[4:]
+        base = "/redesocial/tema/{area}/{slug}"
+        if cauda[:1] in (["index.md"], ["feed.xml"]):
+            return base + "/" + cauda[0]
+        return base + "/"
+    if len(partes) >= 3 and partes[0] == "redesocial" and partes[1] == "conta":
+        return "/redesocial/conta/{tela}/"
+    if len(partes) >= 3 and partes[0] == "redesocial" and partes[1] == "sitemap":
+        return "/redesocial/sitemap/{shard}"
+    if len(partes) >= 4 and partes[:3] == ["api", "v1", "redesocial"]:
+        return "/api/v1/redesocial/%s" % partes[3]
+    # Rota fixa (as doze da superfície, mais as gêmeas Markdown e os feeds):
+    # o caminho JÁ é o template, e devolvê-lo inteiro é o que mantém
+    # `/redesocial/` distinto de `/redesocial/index.md` no relatório.
+    return limpo
+
+
+def host_do_referer(referer):
+    """Só o HOST, nunca a URL inteira.
+
+    O termo de busca já vazou por `Referer` neste projeto uma vez; gravar a URL
+    completa de uma origem externa é a mesma classe de vazamento, num arquivo
+    que a história do git guarda para sempre.
+    """
+    if not referer or referer in ("-",):
+        return None
+    try:
+        host = urlsplit(referer).hostname
+    except ValueError:
+        return None
+    return (host or "").lower() or None
+
+
+def origem_de(referer):
+    """(classe, host) da origem de referência."""
+    host = host_do_referer(referer)
+    if host is None:
+        return "direto", None
+    if host == HOST_DA_CASA or host.endswith("." + HOST_DA_CASA):
+        return "interno", host
+    if any(host == m or host.endswith("." + m) or host.startswith(m) for m in HOSTS_DE_IA):
+        return "ia", host
+    if any(m in host for m in HOSTS_DE_BUSCA):
+        return "busca", host
+    if any(host == m or host.endswith("." + m) for m in HOSTS_SOCIAIS):
+        return "social", host
+    return "referencia_externa", host
+
+
+def instante(ts):
+    """`2026-09-05T07:28:15Z` -> datetime UTC. None se ilegível."""
+    try:
+        return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def sessoes_de(eventos):
+    """Corta a fila de eventos de UM visitante em sessões pela janela de inatividade.
+
+    `eventos` é uma lista de dicionários com `quando` (datetime) já ordenada.
+    """
+    abertas = []
+    for evento in eventos:
+        if abertas and (evento["quando"] - abertas[-1][-1]["quando"]).total_seconds() <= JANELA_DE_SESSAO_S:
+            abertas[-1].append(evento)
+        else:
+            abertas.append([evento])
+    return abertas
+
+
+def sha256_do_arquivo(caminho):
+    digestor = hashlib.sha256()
+    with open(caminho, "rb") as handle:
+        for pedaco in iter(lambda: handle.read(1 << 20), b""):
+            digestor.update(pedaco)
+    return digestor.hexdigest()
+
+
+def topo(contagem, limite):
+    """As `limite` chaves mais frequentes, com desempate estável pelo nome."""
+    return [{"chave": k, "requisicoes": v}
+            for k, v in sorted(contagem.items(), key=lambda par: (-par[1], par[0]))[:limite]]
+
+
+def agrega(dia, registros, fonte):
+    """A linha do dia. `registros` são os do ledger de origem daquele dia."""
+    bruto = 0
+    por_motivo = {}
+    bots_por_agente = {}
+    humanos = []
+    ilegiveis = 0
+
+    for registro in registros:
+        if not no_escopo(registro.get("path")):
+            continue
+        bruto += 1
+        if registro.get("agent_key"):
+            chave = registro["agent_key"]
+            bots_por_agente[chave] = bots_por_agente.get(chave, 0) + 1
+        motivo = motivo_de_exclusao(registro)
+        if motivo:
+            por_motivo[motivo] = por_motivo.get(motivo, 0) + 1
+            continue
+        quando = instante(registro.get("ts"))
+        if quando is None:
+            ilegiveis += 1
+            por_motivo["ts_ilegivel"] = por_motivo.get("ts_ilegivel", 0) + 1
+            continue
+        humanos.append({
+            "quando": quando,
+            "visitante": chave_de_visitante(registro.get("remote_addr"),
+                                            registro.get("user_agent")),
+            "path": (registro.get("path") or "").split("?", 1)[0],
+            "rota": rota_normalizada(registro.get("path")),
+            "status": int(registro.get("status") or 0),
+            "origem": origem_de(registro.get("referer")),
+        })
+
+    humanos.sort(key=lambda e: (e["quando"], e["path"]))
+    por_visitante = {}
+    for evento in humanos:
+        por_visitante.setdefault(evento["visitante"], []).append(evento)
+
+    todas_as_sessoes = []
+    for visitante in sorted(por_visitante):
+        todas_as_sessoes.extend(sessoes_de(por_visitante[visitante]))
+
+    por_rota = {}
+    por_pagina = {}
+    por_status = {}
+    por_origem_requisicao = {}
+    hosts_de_referencia = {}
+    for evento in humanos:
+        por_rota[evento["rota"]] = por_rota.get(evento["rota"], 0) + 1
+        por_pagina[evento["path"]] = por_pagina.get(evento["path"], 0) + 1
+        marca = str(evento["status"])
+        por_status[marca] = por_status.get(marca, 0) + 1
+        classe, host = evento["origem"]
+        por_origem_requisicao[classe] = por_origem_requisicao.get(classe, 0) + 1
+        if host:
+            hosts_de_referencia[host] = hosts_de_referencia.get(host, 0) + 1
+
+    por_origem_sessao = {}
+    por_rota_de_entrada = {}
+    duracoes = []
+    for sessao in todas_as_sessoes:
+        # A origem é atributo da SESSÃO e vem da PRIMEIRA requisição dela — é
+        # assim que o GA4 atribui fonte no acervo, e é o que impede a segunda
+        # página de uma visita direta virar "interno".
+        classe, _ = sessao[0]["origem"]
+        por_origem_sessao[classe] = por_origem_sessao.get(classe, 0) + 1
+        entrada = sessao[0]["rota"]
+        por_rota_de_entrada[entrada] = por_rota_de_entrada.get(entrada, 0) + 1
+        duracoes.append(int((sessao[-1]["quando"] - sessao[0]["quando"]).total_seconds()))
+
+    descontadas = sum(por_motivo.values())
+    par = _botagents.denominador(bruto, descontadas, criterio=CRITERIO)
+
+    linha = {
+        "schema_version": SCHEMA,
+        "registro": "dia",
+        "dia": dia,
+        "fuso": "UTC",
+        "criterio": CRITERIO,
+        "metodo_versao": METODO_VERSAO,
+        # A limitação viaja NA LINHA, não só no cabeçalho: linha isolada tem de
+        # se defender sozinha, que é o que `uniques_filter` faz — bem — no
+        # `edge_traffic_daily.jsonl`.
+        "piso": True,
+        "teto": None,
+        "teto_motivo": ("a rota anônima sai com s-maxage=3600 e a borda serve HIT sem tocar "
+                        "a origem: visita servida pelo cache não aparece aqui, então não há "
+                        "limite superior mensurável nesta superfície"),
+        "sessao_definicao": "inatividade_%ds_ou_virada_do_dia_utc" % JANELA_DE_SESSAO_S,
+        "visitante_definicao": "bloco_de_rede_ipv4_exato_ou_ipv6_64_mais_user_agent",
+        "identificador_publicado": False,
+        "escopo_prefixos": list(PREFIXOS_NO_ESCOPO),
+        "escopo_fora": list(PREFIXOS_NAO_EDITORIAIS),
+        "fonte": fonte,
+        "denominador": par,
+        "descontadas_por_motivo": dict(sorted(por_motivo.items())),
+        "bots_por_agente": dict(sorted(bots_por_agente.items())),
+        "requisicoes_humanas_piso": par["liquido"],
+        "sessoes_piso": len(todas_as_sessoes),
+        "visitantes_distintos_piso": len(por_visitante),
+        "duracao_sessao_mediana_s": int(statistics.median(duracoes)) if duracoes else 0,
+        "duracao_sessao_maxima_s": max(duracoes) if duracoes else 0,
+        "requisicoes_por_sessao": (round(len(humanos) / len(todas_as_sessoes), 2)
+                                   if todas_as_sessoes else 0.0),
+        "por_rota": dict(sorted(por_rota.items(), key=lambda p: (-p[1], p[0]))[:ROTAS_LIMITE]),
+        "por_rota_limite": ROTAS_LIMITE,
+        "por_rota_distintas": len(por_rota),
+        "top_paginas": topo(por_pagina, TOP_PAGINAS_LIMITE),
+        "top_paginas_limite": TOP_PAGINAS_LIMITE,
+        "top_paginas_distintas": len(por_pagina),
+        "por_status": dict(sorted(por_status.items())),
+        "por_origem_sessao": dict(sorted(por_origem_sessao.items())),
+        "por_origem_requisicao": dict(sorted(por_origem_requisicao.items())),
+        "sessoes_por_rota_de_entrada": dict(sorted(por_rota_de_entrada.items(),
+                                                   key=lambda p: (-p[1], p[0]))[:ROTAS_LIMITE]),
+        "hosts_de_referencia": dict(sorted(hosts_de_referencia.items(),
+                                           key=lambda p: (-p[1], p[0]))[:ROTAS_LIMITE]),
+    }
+    if ilegiveis:
+        linha["ts_ilegiveis"] = ilegiveis
+    return linha
+
+
+def cabecalho():
+    """A primeira linha do arquivo: o método por extenso, em texto legível.
+
+    JSONL não tem comentário, e um método que só existisse no docstring deste
+    script seria um contrato que o consumidor do dado nunca lê.
+    """
+    return {
+        "schema_version": SCHEMA,
+        "registro": "cabecalho",
+        "criterio": CRITERIO,
+        "metodo_versao": METODO_VERSAO,
+        "produtor": "tools/generate-social-humano-real",
+        # v1 OU v2: o produtor subiu de schema em 2026-09-05 de forma ADITIVA, e
+        # os dias anteriores a essa data continuam em v1 no disco. Declarar só um
+        # dos dois faria a linha mentir sobre metade da série.
+        "fonte_de_dado": "data/ops/access/nginx-YYYY-MM-DD.jsonl (origin_access_nginx_v1 ate 2026-09-04, v2 a partir de 2026-09-05)",
+        "piso": True,
+        "teto": None,
+        "metodo": {
+            "por_que_origem": ("a CSP de /redesocial/ é script-src 'none' nas duas variantes "
+                               "(internal/socialheaders), então não há GA4 nem Clarity: a medição "
+                               "de humano só pode vir do log de origem, e toda requisição da rede "
+                               "social atravessa o nginx e o Go porque não existe public/ para ela"),
+            "dia": "partição UTC, herdada do ledger de origem",
+            "visitante": ("par (bloco de rede, user_agent); o bloco é o IPv4 exato ou o /64 do "
+                          "IPv6, porque o sufixo de interface do IPv6 rotaciona dentro da janela "
+                          "de sessão e inflaria a contagem de visitantes"),
+            "sessao": ("sequência de requisições do mesmo visitante com intervalo <= %d s entre "
+                       "consecutivas; fecha por inatividade ou na virada do dia UTC" % JANELA_DE_SESSAO_S),
+            "humano": ("requisição GET ou POST, fora de /redesocial/assets/ e /redesocial/sitemap, "
+                       "sem marca de aquecimento nem de simulação de bot, de IP público, com "
+                       "agent_key nulo e bot_allow != 1, cujo user_agent começa com 'Mozilla/' e "
+                       "não contém marca de automação"),
+            "origem_da_sessao": "classe do referer da PRIMEIRA requisição da sessão, só pelo host",
+            "privacidade": ("nenhum identificador por visitante é publicado; a chave de "
+                            "agrupamento existe só em memória e o referer entra apenas como host"),
+            "residuo": ("automação com user_agent de navegador real e sem marca conhecida passa "
+                        "pelo filtro e infla o piso; é o único viés conhecido para cima"),
+            "idempotencia": ("o registro não carrega instante de geração: é função pura do ledger "
+                             "de origem, e duas execuções sobre a mesma fonte produzem o mesmo "
+                             "sha256"),
+            "nao_usa": ("edge_traffic_daily (uniques_filter=none_includes_self_traffic), "
+                        "crawl_coverage_daily, edge_bot_agents_daily e edge_bot_status_daily "
+                        "(sampled_dataset=true)"),
+        },
+    }
+
+
+def serializa(objeto):
+    return json.dumps(objeto, ensure_ascii=False, sort_keys=True)
+
+
+def linhas_existentes():
+    """(por_dia, cruas_ilegiveis) do destino, preservando o texto original.
+
+    Dia que não foi recalculado é reescrito BYTE A BYTE: re-serializar poderia
+    mudar bytes de uma linha que ninguém pediu para mexer.
+    """
+    por_dia = {}
+    ilegiveis = []
+    if not os.path.exists(DESTINO):
+        return por_dia, ilegiveis
+    with open(DESTINO, encoding="utf-8") as handle:
+        for bruta in handle:
+            texto = bruta.rstrip("\n")
+            if not texto.strip():
+                continue
+            try:
+                objeto = json.loads(texto)
+            except ValueError:
+                ilegiveis.append(texto)
+                continue
+            if objeto.get("registro") == "cabecalho":
+                continue
+            dia = objeto.get("dia")
+            if not dia:
+                ilegiveis.append(texto)
+                continue
+            por_dia[dia] = texto
+    return por_dia, ilegiveis
+
+
+def le_fonte(dia):
+    """(registros, descritor da fonte) do dia, ou (None, None) se não houver arquivo."""
+    caminho = os.path.join(FONTE_DIR, "nginx-%s.jsonl" % dia)
+    if not os.path.exists(caminho):
+        return None, None
+    registros = []
+    linhas = 0
+    ilegiveis = 0
+    with open(caminho, encoding="utf-8") as handle:
+        for bruta in handle:
+            if not bruta.strip():
+                continue
+            linhas += 1
+            try:
+                registros.append(json.loads(bruta))
+            except ValueError:
+                ilegiveis += 1
+    fonte = {
+        "arquivo": os.path.relpath(caminho, RAIZ),
+        "sha256": sha256_do_arquivo(caminho),
+        "linhas": linhas,
+    }
+    if ilegiveis:
+        fonte["linhas_ilegiveis"] = ilegiveis
+    return registros, fonte
+
+
+def escreve(novas):
+    """Reescrita atômica do destino inteiro, preservando o que não foi recalculado."""
+    por_dia, ilegiveis = linhas_existentes()
+    for dia, linha in novas.items():
+        por_dia[dia] = serializa(linha)
+    os.makedirs(os.path.dirname(DESTINO), exist_ok=True)
+    temporario = DESTINO + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as handle:
+        handle.write(serializa(cabecalho()) + "\n")
+        for dia in sorted(por_dia):
+            handle.write(por_dia[dia] + "\n")
+        # Linha que este produtor não consegue interpretar não se apaga: ela
+        # volta ao arquivo, no fim, e o operador é avisado por stderr.
+        for texto in ilegiveis:
+            handle.write(texto + "\n")
+    os.replace(temporario, DESTINO)
+    return len(ilegiveis)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dias", type=int, default=2, help="quantos dias retroativos (padrão 2)")
+    ap.add_argument("--dia", help="um dia específico, YYYY-MM-DD (ignora --dias)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    hoje = datetime.datetime.now(datetime.timezone.utc).date()
+    if args.dia:
+        try:
+            alvos = [datetime.date.fromisoformat(args.dia).isoformat()]
+        except ValueError:
+            print("generate-social-humano-real: --dia inválido: %s" % args.dia, file=sys.stderr)
+            return 2
+    else:
+        alvos = [(hoje - datetime.timedelta(days=n)).isoformat() for n in range(max(1, args.dias))]
+
+    novas = {}
+    ausentes = []
+    antes_da_superficie = []
+    for dia in sorted(alvos):
+        if dia < DIA_DE_NASCIMENTO_DA_SUPERFICIE:
+            antes_da_superficie.append(dia)
+            continue
+        registros, fonte = le_fonte(dia)
+        if registros is None:
+            ausentes.append(dia)
+            continue
+        novas[dia] = agrega(dia, registros, fonte)
+
+    if not novas:
+        print("generate-social-humano-real: nenhum dia a agregar — sem ledger de origem "
+              "para %s (produtor: tools/generate-origin-access-ledger)%s"
+              % (", ".join(ausentes) or "nenhum dia pedido",
+                 ("; %s é anterior a %s, quando a superfície entrou no ar"
+                  % (", ".join(antes_da_superficie), DIA_DE_NASCIMENTO_DA_SUPERFICIE))
+                 if antes_da_superficie else ""),
+              file=sys.stderr)
+        return 2
+
+    preservadas = escreve(novas)
+    if preservadas:
+        print("generate-social-humano-real: %d linha(s) ilegível(is) do destino foram "
+              "preservadas no fim do arquivo" % preservadas, file=sys.stderr)
+
+    resultado = {"schema_version": SCHEMA, "destino": os.path.relpath(DESTINO, RAIZ),
+                 "dias": {d: novas[d] for d in sorted(novas)},
+                 "sem_ledger_de_origem": ausentes,
+                 "anteriores_a_superficie": antes_da_superficie,
+                 "dia_de_nascimento_da_superficie": DIA_DE_NASCIMENTO_DA_SUPERFICIE}
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print("generate-social-humano-real -> %s" % os.path.relpath(DESTINO, RAIZ))
+    for dia in sorted(novas):
+        linha = novas[dia]
+        print("  %s  %s" % (dia, _botagents.denominador_em_uma_linha(
+            linha["denominador"], rotulo="requisicoes /redesocial")))
+        print("     PISO humano: %d requisição(ões) · %d sessão(ões) · %d visitante(s) "
+              "distinto(s) — sem teto (borda serve HIT sem tocar a origem)"
+              % (linha["requisicoes_humanas_piso"], linha["sessoes_piso"],
+                 linha["visitantes_distintos_piso"]))
+        if linha["por_origem_sessao"]:
+            print("     origem das sessões: %s" % linha["por_origem_sessao"])
+        if linha["por_rota"]:
+            print("     rotas: %s" % linha["por_rota"])
+        if linha["descontadas_por_motivo"]:
+            print("     descontadas: %s" % linha["descontadas_por_motivo"])
+    for dia in ausentes:
+        print("  %s  sem ledger de origem" % dia)
+    for dia in antes_da_superficie:
+        print("  %s  anterior a %s: a superfície ainda não existia, e zero aqui seria "
+              "linha reta falsa" % (dia, DIA_DE_NASCIMENTO_DA_SUPERFICIE))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

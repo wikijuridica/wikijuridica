@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+'use strict'
+// generate-writing-prompt-dump — materializa os PROMPTS exatos que o
+// transcript derivado (scripts/workflows/writing-mass-todo.js ou um slice)
+// entregaria a cada redator, SEM chamar agente LLM.
+//
+// POR QUE EXISTE (2026-07-30, sessão Cowork): em ambiente sem o harness
+// Workflow() (ex.: Cowork desktop), o despacho é feito por Agent tool externo.
+// Reimplementar o buildPrompt fora do transcript criaria drift de contrato;
+// este dumper carrega o transcript REAL com dubles (mesma técnica provada de
+// tools/check-writing-mass-dispatch) e captura o prompt/model por lote no
+// momento do agent() — byte-idêntico ao que o harness enviaria.
+//
+// USO: tools/generate-writing-prompt-dump <transcript.js> <outdir>
+//   Escreve <outdir>/<slug>.prompt.txt e <outdir>/manifest.json
+//   ({slug, model, n, chars} por lote). Raiz do repo via WIKI_ROOT
+//   (default /opt/wiki; no sandbox Cowork use o path do mount).
+// Saída é DERIVADA e efêmera (staging); nunca entra em release.
+
+const fs = require('node:fs')
+const path = require('node:path')
+const vm = require('node:vm')
+
+const transcriptPath = process.argv[2]
+const outDir = process.argv[3]
+if (!transcriptPath || !outDir) {
+  console.error('uso: generate-writing-prompt-dump <transcript.js> <outdir>')
+  process.exit(2)
+}
+const rawSource = fs.readFileSync(transcriptPath, 'utf8')
+// Mesmo tratamento do check-writing-mass-dispatch: o harness avalia o
+// transcript como corpo com export/meta; fora dele, o export vira const.
+const source = rawSource.replace(/^export const meta/m, 'const meta')
+if (source === rawSource) {
+  console.error('transcript sem "export const meta" — formato inesperado')
+  process.exit(2)
+}
+fs.mkdirSync(outDir, { recursive: true })
+
+const captured = []
+// Mesma fábrica do check-writing-mass-dispatch: corpo async com hooks como
+// parâmetros (o harness real injeta agent/parallel/... assim). agent() captura
+// o prompt em vez de executar; parallel() invoca thunks lazy sequencialmente.
+// Assinatura real do harness: agent(prompt, opts) com opts.label = "write:<slug>".
+// A claim devolvida precisa ser VÁLIDA para o transcript (senão o circuit
+// breaker corta o despacho e só os primeiros lotes têm prompt capturado) —
+// mesmo formato sintético do check-writing-mass-dispatch (makeClaim).
+const batchAnchor = source.match(/const batches = (\[.*?\])\n/s)
+if (!batchAnchor) {
+  console.error('transcript sem ancora "const batches" — formato inesperado')
+  process.exit(2)
+}
+const queueBatches = JSON.parse(batchAnchor[1])
+const batchBySlug = new Map(queueBatches.map((b) => [b.slug, b]))
+// 2026-07-31 — CAUSA-RAIZ DO "105 de 109" SILENCIOSO. O dumper entregava
+// log() = no-op ao transcript, entao TODA a diagnostica do despacho
+// ("DROPADO <slug>: fila stale", "CIRCUIT BREAKER", contagem da fila) era
+// engolida e um dump PARCIAL saia com exit 0 e mensagem de sucesso. Quem
+// consumia o outdir despachava 105 lotes achando que era a fila inteira e os 4
+// lotes restantes sumiam sem rastro. Agora o transcript fala em stderr e o
+// dumper e fail-closed: captura < fila = erro, com os slugs faltantes nomeados
+// no manifesto e no stderr.
+const transcriptLog = (message) => {
+  process.stderr.write(`[transcript] ${String(message)}\n`)
+}
+const HEX_OK = 'f'.repeat(64)
+const synthIntentIds = (n) =>
+  Array.from({ length: n }, (_, i) => `syn-intent-${i}`)
+const agent = async (prompt, opts) => {
+  const label = opts && opts.label ? String(opts.label) : ''
+  const slug = label.replace(/^write:/, '') || `lote-${captured.length}`
+  const model = (opts && opts.model) || 'sonnet'
+  captured.push({ slug, model, chars: String(prompt).length })
+  fs.writeFileSync(path.join(outDir, `${slug}.prompt.txt`), String(prompt))
+  const batch = batchBySlug.get(slug)
+  if (!batch) return null
+  const claim = {
+    slug: batch.slug,
+    file: `data/editorial/v2_pages/${batch.slug}.jsonl`,
+    written: batch.n, expected: batch.n,
+    intent_ids: batch.take > 0 ? synthIntentIds(batch.n) : batch.intent_ids,
+    target_sha256: batch.target_sha256,
+    audited_sha256: HEX_OK, audit_ok: true,
+    word_count_min: 700, word_count_max: 1300, notes: 'prompt-dump duble',
+  }
+  if (batch.writing_recovery) {
+    claim.raw_recovery_preimage_evidence = {
+      path: `data/editorial/v2_raw_recovery_preimages/${batch.target_sha256}.raw`,
+      sha256: batch.target_sha256,
+    }
+  }
+  return claim
+}
+const parallel = async (thunks) => {
+  const results = []
+  for (const t of thunks) {
+    try { results.push(await (typeof t === 'function' ? t() : t)) }
+    catch (error) { results.push(null) }
+  }
+  return results
+}
+const factory = new Function(
+  'agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'budget',
+  'args', 'process', 'require', 'TextEncoder',
+  '"use strict"; return (async () => {\n' + source + '\n})()',
+)
+
+;(async () => {
+  try {
+    await factory(
+      agent, parallel, undefined, () => {}, transcriptLog, undefined, undefined,
+      '{}', undefined, undefined, undefined,
+    )
+  } catch (error) {
+    // O transcript pode lançar depois do despacho (verificação de claims
+    // sobre dubles). O que importa é o que foi capturado até aqui.
+    console.error(`transcript terminou com: ${String(error).slice(0, 200)}`)
+  }
+  const capturedSlugs = new Set(captured.map((item) => item.slug))
+  const missing = queueBatches
+    .map((b) => b.slug)
+    .filter((slug) => !capturedSlugs.has(slug))
+  fs.writeFileSync(
+    path.join(outDir, 'manifest.json'),
+    JSON.stringify({
+      total: captured.length,
+      queue_total: queueBatches.length,
+      complete: missing.length === 0,
+      missing,
+      lotes: captured,
+    }, null, 1))
+  console.log(
+    `prompts capturados: ${captured.length}/${queueBatches.length} -> ${outDir}`)
+  if (captured.length === 0) process.exit(1)
+  // Dump parcial NUNCA sai com sucesso: quem despacha a partir do outdir tem de
+  // saber, no exit code, que a fila nao foi materializada inteira.
+  if (missing.length > 0) {
+    console.error(
+      `DUMP INCOMPLETO: ${missing.length} lote(s) da fila sem prompt capturado ` +
+      `(o transcript dropou/nao despachou) — ${missing.join(', ')}`)
+    process.exit(3)
+  }
+})()

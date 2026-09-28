@@ -1,0 +1,694 @@
+#!/usr/bin/env python3
+"""check-bot-telemetry-honesty — nenhum numero do projeto pode misturar
+trafego forjado com trafego real.
+
+POR QUE EXISTE (docs/plans/2026-08-11-recuperacao-crawl.md, C4/FASE 3):
+`generate-bot-traffic-origin` somava, ate 2026-08-11, TODA linha com UA de bot
+em "requests" — autentica ou forjada — e so repartia entre verified/unverified,
+nunca descartava. Um scanner unico (35.196.168.160, Google Cloud, trocando de
+User-Agent a cada requisicao) fez o projeto acreditar que "GPTBot e ClaudeBot
+vem e desistem", quando os dois eram, no periodo medido, 100% forjados.
+
+O QUE ESTE CHECK REPROVA:
+  1. Linha v3 (schema_version origin_bot_traffic_daily_v3) cujos campos nao
+     fecham a conta: requests != authentic + forged + unverifiable, ou
+     requests_is_metric != false, ou verification_method fora do enum
+     conhecido. Linha v2 (legado, anterior a esta correcao) e ACEITA sem
+     reprovar — e para isso mesmo que o schema_version avancou, em vez de
+     reescrever a serie: o leitor antigo nao quebra e o defeito antigo nao
+     e mascarado, so deixa de se repetir.
+  2. A linha MAIS RECENTE de cada serie (origem e borda) ainda no formato
+     ANTIGO. Isso prova que o PRODUTOR corrigido esta rodando de fato — nao
+     so que as linhas velhas continuam limpas. Serie que nunca mais recebe
+     escrita nova ficaria "tecnicamente sem linha ruim" para sempre, e o
+     defeito reapareceria em silencio.
+  3. Qualquer arquivo em data/ops/bot_ip_ranges/ com mtime > 7 dias. Faixa
+     velha classifica bot autentico como forjado ou nao-verificavel por
+     engano assim que o operador trocar de bloco de IP.
+  4. Linha da borda com numero FISICAMENTE IMPOSSIVEL, em qualquer schema —
+     inclusive v1. Criterio e teto medido em tools/edgetelemetry.py.
+
+     POR QUE ESTE ITEM EXISTE (auditoria de 2026-08-12): este check rodava e
+     devolvia OK com uma linha de 1.000.000.000.000 (um trilhao) de
+     requisicoes do YandexBot num unico dia, sobre um acervo de 9.835 URLs. Os
+     itens 1-3 olhavam so FORMATO — schema_version e presenca de campo — e a
+     linha v1 era pulada por um `continue` antes de qualquer verificacao. Um
+     gate chamado "honestidade de telemetria" que nao ve um trilhao e falso
+     verde, e no repositorio falso verde nao vale como prova.
+
+     A verificacao vale para o LEGADO de proposito: a regra de correcao so
+     para frente impede reescrever a serie antiga, entao a linha v1 impossivel
+     continua no arquivo e continua legivel por qualquer consumidor. Aceitar o
+     formato antigo (itens 1-2) e coisa diferente de aceitar numero impossivel.
+
+READ-ONLY. Exit 1 em qualquer reprovacao. Nunca escreve a quarentena — quem
+escreve e tools/generate-edge-telemetry-quarantine (check le, generate grava).
+
+Uso:
+    tools/check-bot-telemetry-honesty
+    tools/check-bot-telemetry-honesty --json
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import edgetelemetry  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ORIGEM = os.path.join(ROOT, "data/ops/origin_bot_traffic_daily.jsonl")
+BORDA = os.path.join(ROOT, "data/ops/edge_bot_agents_daily.jsonl")
+FAIXAS = os.path.join(ROOT, "data/ops/bot_ip_ranges")
+
+ORIGEM_SCHEMA_LEGADO = "origin_bot_traffic_daily_v2"
+ORIGEM_SCHEMA_NOVO = "origin_bot_traffic_daily_v3"
+# Borda: v1, v2 e v3 sao LEGADO aceito sem reprovar; v4 e o corrente exigido.
+#
+# O v2 gravava `authenticity: "unverifiable_at_edge"` sobre a premissa — falsa —
+# de que o plano Free negava `verifiedBotCategory`. Ele funciona, e desde
+# 2026-08-12 o produtor conta somente bot que a Cloudflare autenticou. As linhas
+# v2 continuam no ledger (append-only, nada e apagado) e passam a valer SOB
+# RESSALVA: a contagem delas soma a sonda de auditoria deste repositorio, que a
+# borda nao distingue porque o cabecalho X-Bot-Simulation so chega ao nginx. A
+# ressalva esta enumerada em data/ops/bot_identity_caveat.jsonl.
+#
+# O v3 (2026-08-12 a 2026-09-02) JA tinha identidade verificada pela
+# Cloudflare — nao e um defeito de identidade como v1/v2, e por isso NAO entra
+# em bot_identity_caveat.jsonl nem no contador `legacy_unverified_identity`.
+# Ele vira legado em 2026-09-02 porque o v4 acrescenta uma SEGUNDA forma de
+# verificacao (faixa de IP oficial) que o v3 nao tinha — um bot 100%
+# verificavel so por IP (o caso medido do PerplexityBot) ficava com
+# requests_sampled=0 sob o v3, sem que isso fosse "sonda propria" nem
+# "trafego forjado": era so a Cloudflare nao verificando aquele operador.
+BORDA_SCHEMAS_LEGADO = {"edge_bot_agents_daily_v1", "edge_bot_agents_daily_v2",
+                        "edge_bot_agents_daily_v3"}
+BORDA_SCHEMA_NOVO = "edge_bot_agents_daily_v4"
+
+# Vocabulario aceito em `authenticity` por schema. No v3 a contagem tem que
+# declarar QUAL verificacao a sustenta; "unverifiable_at_edge" (a afirmacao
+# errada do v2) deixa de ser aceito em linha nova, senao o produtor poderia
+# regredir para a contagem por User-Agent sem que nada reprovasse.
+AUTENTICIDADE_V2 = {"unverifiable_at_edge"}
+AUTENTICIDADE_V3 = {"cloudflare_verified_bot_category", "unverified_at_edge"}
+# v4 (2026-09-02): ganha as duas pernas de verificacao. A palavra para "nada
+# verificou" VOLTA a ser "unverifiable_at_edge" (a do v2) — deliberadamente
+# diferente da grafia "unverified_at_edge" do v3, para que nenhum consumidor
+# confunda os dois vocabularios por semelhanca de string.
+AUTENTICIDADE_V4 = {"cloudflare_verified_bot_category", "ip_range_at_edge",
+                    "cloudflare_and_ip_range", "unverifiable_at_edge"}
+
+METODOS_VALIDOS = {"ip_range", "rdns_fcrdns", "none"}
+
+MAX_DIAS_FAIXA = 7
+
+
+def ler_jsonl(caminho):
+    """Devolve (numero, registro, bruto).
+
+    O texto BRUTO acompanha o registro porque a quarentena identifica linha por
+    sha256 do conteudo, nunca por numero: o ledger e append-only e um timer
+    escreve a cada 30 minutos, entao numero de linha aponta para outro registro
+    em poucas horas.
+    """
+    linhas = []
+    if not os.path.isfile(caminho):
+        return linhas
+    with open(caminho, encoding="utf-8") as handle:
+        for numero, bruto in enumerate(handle, start=1):
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                linhas.append((numero, json.loads(bruto), bruto))
+            except json.JSONDecodeError as erro:
+                linhas.append((numero, {"_erro_json": str(erro)}, bruto))
+    return linhas
+
+
+def checar_origem():
+    problemas = []
+    linhas = ler_jsonl(ORIGEM)
+    if not linhas:
+        return problemas, {"lines": 0}
+    ultima_versao = None
+    for numero, registro, _bruto in linhas:
+        if "_erro_json" in registro:
+            problemas.append("origin_bot_telemetry_invalid_json line=%d %s"
+                              % (numero, registro["_erro_json"]))
+            continue
+        versao = registro.get("schema_version")
+        ultima_versao = versao
+        if versao == ORIGEM_SCHEMA_LEGADO:
+            # Legado, aceito por desenho: o produtor foi corrigido, a serie
+            # antiga nao e reescrita (regra do repositorio: correcao so para
+            # frente). Sem verificacao de metrica aqui de proposito.
+            continue
+        if versao != ORIGEM_SCHEMA_NOVO:
+            problemas.append("origin_bot_telemetry_unknown_schema line=%d schema=%r"
+                              % (numero, versao))
+            continue
+        # A partir daqui: linha v3, tem que fechar a conta.
+        requisicoes = registro.get("requests")
+        autentico = registro.get("requests_authentic")
+        forjado = registro.get("requests_forged")
+        nao_verificavel = registro.get("requests_unverifiable")
+        if registro.get("requests_is_metric") is not False:
+            problemas.append(
+                "origin_bot_telemetry_requests_marked_as_metric line=%d agent=%s "
+                "requests_is_metric=%r (deveria ser false: 'requests' mistura "
+                "forjado com autentico)"
+                % (numero, registro.get("agent_key"), registro.get("requests_is_metric")))
+        if None in (requisicoes, autentico, forjado, nao_verificavel):
+            problemas.append(
+                "origin_bot_telemetry_v3_field_missing line=%d agent=%s"
+                % (numero, registro.get("agent_key")))
+        elif requisicoes != autentico + forjado + nao_verificavel:
+            problemas.append(
+                "origin_bot_telemetry_v3_sum_mismatch line=%d agent=%s "
+                "requests=%d authentic=%d forged=%d unverifiable=%d"
+                % (numero, registro.get("agent_key"), requisicoes, autentico,
+                   forjado, nao_verificavel))
+        metodo = registro.get("verification_method")
+        if metodo not in METODOS_VALIDOS:
+            problemas.append(
+                "origin_bot_telemetry_verification_method_invalid line=%d agent=%s metodo=%r"
+                % (numero, registro.get("agent_key"), metodo))
+        # A distincao que este check protege: SEM metodo so pode virar
+        # unverifiable, nunca forged (forjar exige ter testado e falhado).
+        if metodo == "none" and forjado not in (0, None):
+            problemas.append(
+                "origin_bot_telemetry_forged_without_method line=%d agent=%s "
+                "forged=%s sem verification_method — agente sem metodo disponivel "
+                "nao pode ser classificado como forjado" % (numero, registro.get("agent_key"), forjado))
+        # O marcador de "coletor rodou, zero bots na janela" (2026-08-19, ver
+        # generate-bot-traffic-origin) e uma linha v3 como qualquer outra e ja
+        # passou pelas checagens acima — mas ele carrega uma promessa A MAIS:
+        # dizer "zero" tem que corresponder a REALMENTE zero em todo campo, e
+        # tem que vir com o motivo. Sem este bloco, alguem poderia gravar
+        # record_type=zero_observation com trafego real por baixo (ou o inverso:
+        # esconder um dia inteiro de trafego real atras de um "zero" alegado) e
+        # nenhuma checagem pegaria — o proprio marcador virava o mascaramento
+        # que ele existe para impedir.
+        if registro.get("agent_key") == "_zero_observation" or registro.get("record_type") == "zero_observation":
+            if registro.get("record_type") != "zero_observation" or registro.get("agent_key") != "_zero_observation":
+                problemas.append(
+                    "origin_bot_telemetry_zero_marker_malformed line=%d — agent_key e "
+                    "record_type do marcador de observacao zero tem que vir juntos "
+                    "(agent_key=%r record_type=%r)"
+                    % (numero, registro.get("agent_key"), registro.get("record_type")))
+            if requisicoes != 0 or autentico != 0 or forjado != 0 or nao_verificavel != 0:
+                problemas.append(
+                    "origin_bot_telemetry_zero_marker_not_zero line=%d — marcador de zero "
+                    "observacoes com contagem != 0 (requests=%r authentic=%r forged=%r "
+                    "unverifiable=%r) — ou e zero de verdade, ou nao e este record_type"
+                    % (numero, requisicoes, autentico, forjado, nao_verificavel))
+            if not registro.get("reason"):
+                problemas.append(
+                    "origin_bot_telemetry_zero_marker_no_reason line=%d — marcador de zero "
+                    "observacoes sem campo 'reason': silencio explicado vira silencio ambiguo "
+                    "de novo se o motivo nao estiver gravado" % numero)
+            if registro.get("summable") is not False:
+                problemas.append(
+                    "origin_bot_telemetry_zero_marker_summable line=%d — marcador de zero "
+                    "observacoes com summable=%r (tem que ser false: ele nao e um "
+                    "incremento de trafego, e um heartbeat do coletor)"
+                    % (numero, registro.get("summable")))
+    if ultima_versao is not None and ultima_versao != ORIGEM_SCHEMA_NOVO:
+        problemas.append(
+            "origin_bot_telemetry_producer_stale ultima_linha_schema=%r esperado=%r "
+            "— o produtor corrigido (v3) ainda nao gravou nenhuma linha nova; "
+            "rode tools/generate-bot-traffic-origin com trafego de bot na janela"
+            % (ultima_versao, ORIGEM_SCHEMA_NOVO))
+    return problemas, {"lines": len(linhas), "last_schema": ultima_versao}
+
+
+def checar_borda():
+    problemas = []
+    linhas = ler_jsonl(BORDA)
+    if not linhas:
+        return problemas, {"lines": 0}
+    acervo = edgetelemetry.acervo_urls(ROOT)
+    quarentena = edgetelemetry.carregar_quarentena(ROOT)
+    neutralizadas = 0
+    implausiveis = 0
+    legado_sob_ressalva = 0
+    legado_v3_verificado = 0
+    ultima_versao = None
+    for numero, registro, bruto in linhas:
+        if "_erro_json" in registro:
+            problemas.append("edge_bot_telemetry_invalid_json line=%d %s"
+                              % (numero, registro["_erro_json"]))
+            continue
+        versao = registro.get("schema_version")
+        ultima_versao = versao
+
+        # MAGNITUDE ANTES DE TUDO. Este bloco fica acima do `continue` do
+        # legado de proposito: numero impossivel reprova em QUALQUER schema.
+        # Enquanto a verificacao morava depois, a linha v1 do trilhao passava
+        # sem ser olhada, e o check saia 0.
+        motivos = edgetelemetry.avaliar_linha(registro, acervo)
+        if motivos:
+            implausiveis += 1
+            chave = edgetelemetry.sha_linha(bruto)
+            if chave in quarentena:
+                # Ja revisada e registrada como impossivel: nao entra em
+                # nenhuma conta e nao reprova de novo. A linha continua no
+                # ledger (append-only, nada e apagado) — o que mudou e que
+                # existe registro assinado do porque ela nao vale.
+                neutralizadas += 1
+            else:
+                problemas.append(
+                    "edge_bot_telemetry_implausivel line=%d date=%s agent=%s "
+                    "schema=%s sha256=%s :: %s"
+                    % (numero, registro.get("date"), registro.get("agent_key"),
+                       versao, chave[:16], " | ".join(motivos)))
+
+        if versao in BORDA_SCHEMAS_LEGADO:
+            # Legado, aceito por desenho — ver o racional em checar_origem.
+            # Aceitar o FORMATO antigo nunca significou aceitar numero
+            # impossivel: a magnitude ja foi verificada acima. O v2 exigia o
+            # campo `authenticity` com o valor unico daquela epoca; a exigencia
+            # continua valendo para ele, porque afrouxa-la deixaria passar linha
+            # v2 malformada escrita por qualquer produtor futuro.
+            if versao == "edge_bot_agents_daily_v2":
+                valor = registro.get("authenticity")
+                if valor is None:
+                    problemas.append(
+                        "edge_bot_telemetry_authenticity_missing line=%d agent=%s schema=v2"
+                        % (numero, registro.get("agent_key")))
+                elif valor not in AUTENTICIDADE_V2:
+                    problemas.append(
+                        "edge_bot_telemetry_authenticity_invalid line=%d agent=%s schema=v2 valor=%r"
+                        % (numero, registro.get("agent_key"), valor))
+                legado_sob_ressalva += 1
+            elif versao == "edge_bot_agents_daily_v3":
+                # v3 JA tinha identidade verificada pela Cloudflare — nao e o
+                # mesmo defeito do v1/v2 (nao entra em legado_sob_ressalva, que
+                # o relatorio rotula "SOB RESSALVA" e a linha 66 do produtor
+                # documenta como afirmacao FALSA de identidade). O v3 so nao
+                # tinha a SEGUNDA perna de verificacao (faixa de IP) que o v4
+                # acrescentou; a exigencia de vocabulario da epoca continua
+                # valendo, para que uma linha v3 malformada nao passe batido.
+                valor = registro.get("authenticity")
+                if valor is None:
+                    problemas.append(
+                        "edge_bot_telemetry_authenticity_missing line=%d agent=%s schema=v3"
+                        % (numero, registro.get("agent_key")))
+                elif valor not in AUTENTICIDADE_V3:
+                    problemas.append(
+                        "edge_bot_telemetry_authenticity_invalid line=%d agent=%s schema=v3 valor=%r"
+                        % (numero, registro.get("agent_key"), valor))
+                legado_v3_verificado += 1
+            continue
+        if versao != BORDA_SCHEMA_NOVO:
+            problemas.append("edge_bot_telemetry_unknown_schema line=%d schema=%r"
+                              % (numero, versao))
+            continue
+        # v4: a contagem tem que declarar a verificacao que a sustenta (agora
+        # com duas pernas possiveis — Cloudflare e faixa de IP), e o volume
+        # nao-verificado tem que continuar registrado. A COERENCIA numerica
+        # (requests_sampled = cloudflare_verified + ip_range, e
+        # ip_range_at_edge exigindo requests_sampled_ip_range>0) e
+        # responsabilidade de edgetelemetry.avaliar_linha, chamado ACIMA —
+        # duplicar aqui teria dois lugares para esquecer de atualizar juntos.
+        valor = registro.get("authenticity")
+        if valor is None:
+            problemas.append(
+                "edge_bot_telemetry_authenticity_missing line=%d agent=%s — sem o campo que "
+                "declara qual verificacao de identidade sustenta a contagem"
+                % (numero, registro.get("agent_key")))
+        elif valor not in AUTENTICIDADE_V4:
+            problemas.append(
+                "edge_bot_telemetry_authenticity_invalid line=%d agent=%s valor=%r "
+                "(esperado um de %s)"
+                % (numero, registro.get("agent_key"), valor, sorted(AUTENTICIDADE_V4)))
+        elif valor in ("cloudflare_verified_bot_category", "cloudflare_and_ip_range") \
+                and not registro.get("verified_bot_categories"):
+            problemas.append(
+                "edge_bot_telemetry_verified_category_missing line=%d agent=%s — declara "
+                "identidade verificada pela Cloudflare sem dizer QUAL categoria"
+                % (numero, registro.get("agent_key")))
+        if "requests_sampled_unverified_ua" not in registro:
+            problemas.append(
+                "edge_bot_telemetry_discard_unrecorded line=%d agent=%s — v4 tem que gravar "
+                "quanto foi descartado por falta de verificacao; descarte silencioso e a "
+                "origem da proxima medicao enganosa"
+                % (numero, registro.get("agent_key")))
+    if ultima_versao is not None and ultima_versao != BORDA_SCHEMA_NOVO:
+        problemas.append(
+            "edge_bot_telemetry_producer_stale ultima_linha_schema=%r esperado=%r "
+            "— o produtor corrigido (v4, Cloudflare + faixa de IP) ainda nao "
+            "gravou linha nova" % (ultima_versao, BORDA_SCHEMA_NOVO))
+    return problemas, {
+        "lines": len(linhas),
+        "last_schema": ultima_versao,
+        "public_urls": acervo,
+        "daily_ceiling": edgetelemetry.teto_requisicoes_dia(acervo),
+        "implausible": implausiveis,
+        "quarantined": neutralizadas,
+        # Linhas medidas por STRING de User-Agent, sem verificacao de
+        # identidade NENHUMA. Nao reprovam (correcao so para frente), mas a
+        # contagem aparece para que ninguem some v2 com v3/v4 achando que
+        # mede a mesma coisa.
+        "legacy_unverified_identity": legado_sob_ressalva,
+        # Linhas v3: identidade JA verificada pela Cloudflare, so sem a
+        # segunda perna (faixa de IP) que o v4 acrescentou. Contador proprio
+        # para nao lumped com o de cima, que descreveria identidade v3 como
+        # "sem verificacao" — afirmacao falsa.
+        "legacy_v3_verified_identity": legado_v3_verificado,
+    }
+
+
+def checar_faixas():
+    problemas = []
+    relatorio = []
+    if not os.path.isdir(FAIXAS):
+        problemas.append("bot_ip_ranges_dir_missing %s" % os.path.relpath(FAIXAS, ROOT))
+        return problemas, relatorio
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    arquivos = sorted(nome for nome in os.listdir(FAIXAS) if nome.endswith(".json"))
+    if not arquivos:
+        problemas.append("bot_ip_ranges_empty %s" % os.path.relpath(FAIXAS, ROOT))
+        return problemas, relatorio
+    for nome in arquivos:
+        caminho = os.path.join(FAIXAS, nome)
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(caminho), datetime.timezone.utc)
+        idade_dias = (agora - mtime).total_seconds() / 86400.0
+        relatorio.append({"file": nome, "age_days": round(idade_dias, 2)})
+        if idade_dias > MAX_DIAS_FAIXA:
+            problemas.append(
+                "bot_ip_range_stale file=%s age_days=%.1f max=%d — rode "
+                "tools/generate-bot-ip-ranges (timer: wikijuridica-bot-ipranges.timer)"
+                % (nome, idade_dias, MAX_DIAS_FAIXA))
+    return problemas, relatorio
+
+
+# ---------------------------------------------------------------------------
+# A QUARTA PERNA: a sonda do proprio repositorio nao pode virar metrica de bot.
+#
+# POR QUE ELA PRECISOU EXISTIR. O plano desta frente escreveu, em prosa, que o
+# gate "passa a reprovar quando o log registrar UA de bot real sem marcacao" —
+# e a tarefa nunca foi criada. O proprio plano deixou a sentenca ao lado:
+# "Regra que so existe em prosa nao e controle; e esperanca."
+#
+# O QUE FOI MEDIDO EM 2026-08-26, antes desta perna existir:
+#   44.343 linhas no access log do dia
+#   20.401 com User-Agent de bot conhecido
+#   20.149 delas marcadas bot_simulation=true ou warming=true (sonda propria)
+#      252 nao marcadas — e NENHUMA delas e Googlebot
+# Ou seja: a instrumentacao estava honesta e o produtor ja excluia simulacao
+# (`simulations_excluded`, `requests_is_metric`). O que faltava era a guarda:
+# se amanha o produtor parar de excluir, ou o campo sumir do schema, nada
+# reprovava — e 20 mil sondas proprias virariam "rastreio do Googlebot".
+#
+# A ARMADILHA DE CHAVE, que mordeu na hora de escrever isto: o campo NAO se
+# chama `bot_sim`. Chama-se `bot_simulation`. O plano procurou pelo nome errado
+# e concluiu que "o log ja tem o campo" sem confirmar qual. E a mesma familia de
+# erro que este repositorio catalogou ao procurar `intent_id` num manifesto cuja
+# chave e `unique_intent_id`.
+#
+# O QUE ESTA PERNA NAO PODE FAZER, e declara em vez de fingir: o access log NAO
+# tem endereco de origem, entao nao ha como provar que uma linha nao marcada
+# veio de fora. UA forjado por terceiro existe no mundo e nao e fraude nossa.
+# O que se verifica aqui e o que e verificavel: que a marcacao continua sendo
+# emitida, e que nenhuma metrica publicada conta mais requisicoes do que ha
+# linhas nao marcadas.
+CAMPOS_DE_MARCACAO = ("bot_simulation", "warming")
+
+# AS MARCAS SAEM DO REGISTRY, NUNCA DE UMA LISTA A PARTE.
+#
+# A primeira versao desta perna trazia 13 marcas escritas a mao. O ledger de
+# producao tem 29 agent_key, e a critica adversarial mostrou o preco: forjou
+# 99.999 requisicoes sob `chatgpt-user` -- que estava fora da lista -- e o gate
+# deu verde. Uma allowlist paralela a de producao e um segundo lugar para
+# esquecer, e aqui esquecer significa deixar de confrontar justamente o agente
+# novo, que e o que ninguem lembrou de acrescentar.
+#
+# content/crawl_policy.json e a mesma fonte que governa o rate limit no nginx e
+# o robots.txt: bot que existe para o portal existe la. O casamento e por
+# user_agent em minusculas, que e como o produtor normaliza `agent_key`
+# (OAI-SearchBot -> oai-searchbot).
+REGISTRY = os.path.join(ROOT, "content/crawl_policy.json")
+
+# Fallback declarado: se o registry sumir ou ficar ilegivel, estas sao as marcas
+# minimas -- e a ausencia vira ressalva, nunca silencio.
+MARCAS_MINIMAS = (
+    "googlebot", "gptbot", "claudebot", "perplexitybot", "bingbot",
+    "oai-searchbot", "ccbot", "bytespider", "amazonbot", "applebot",
+    "meta-externalagent", "duckduckbot", "yandexbot",
+)
+
+
+def marcas_de_bot():
+    """Marcas conhecidas, derivadas do registry de producao."""
+    try:
+        with open(REGISTRY, encoding="utf-8") as handle:
+            politica = json.load(handle)
+    except (OSError, ValueError):
+        return set(MARCAS_MINIMAS), False
+    marcas = set()
+    for entrada in politica.get("bot_registry") or []:
+        agente = str(entrada.get("user_agent", "")).strip().lower()
+        # "*" e o curinga do robots, nao um bot: incluir faria toda linha casar.
+        if agente and agente != "*":
+            marcas.add(agente)
+    if not marcas:
+        return set(MARCAS_MINIMAS), False
+    return marcas | set(MARCAS_MINIMAS), True
+
+
+MARCAS_DE_BOT, MARCAS_DO_REGISTRY = marcas_de_bot()
+
+
+def _access_log_do_dia(dia):
+    """Le o access log de um dia. Devolve (linhas, por_marca_nao_marcada, tem_campos)."""
+    caminho = os.path.join(ROOT, "data/ops/access", "access-%s.jsonl" % dia)
+    if not os.path.exists(caminho):
+        return 0, {}, None
+    total = 0
+    nao_marcada = {}
+    campos_vistos = set()
+    for _numero, registro, _bruto in ler_jsonl(caminho):
+        total += 1
+        campos_vistos.update(registro.keys())
+        if registro.get("bot_simulation") is True or registro.get("warming") is True:
+            continue
+        ua = str(registro.get("user_agent", "")).lower()
+        for marca in MARCAS_DE_BOT:
+            if marca in ua:
+                nao_marcada[marca] = nao_marcada.get(marca, 0) + 1
+                break
+    faltando = [c for c in CAMPOS_DE_MARCACAO if c not in campos_vistos]
+    return total, nao_marcada, faltando
+
+
+def checar_sonda_propria():
+    """A sonda do repositorio nao pode ser contada como rastreio de bot."""
+    problemas = []
+    resumo = {}
+
+    ledger = ORIGEM
+    if not os.path.exists(ledger):
+        return problemas, {"skipped": "sem origin_bot_traffic_daily.jsonl"}
+
+    # TODOS OS DIAS QUE TEM ACCESS LOG, nunca so o mais recente.
+    #
+    # A primeira versao desta perna usava `dias[-1]`, e a critica adversarial a
+    # derrubou em sandbox: bastava UMA linha datada no futuro -- erro de digitacao,
+    # relogio torto ou ma-fe -- para o gate escolher um dia sem access log,
+    # devolver "skipped" e dar verde sobre 50.000 requisicoes forjadas no dia
+    # real. Um gate cuja unica leitura pode ser desviada por um campo do proprio
+    # artefato auditado nao e controle; e teatro.
+    #
+    # A leitura agora e por INTERSECAO: confronta-se todo dia que tenha as duas
+    # pontas (linha no ledger E access log em disco). Dia sem log entra na
+    # ressalva pelo nome, em vez de encerrar a verificacao.
+    #
+    # ler_jsonl devolve (numero, registro, bruto) -- desempacotar, nunca supor
+    # que a linha e o proprio dicionario. E a armadilha de forma que este
+    # repositorio cataloga: ler o artefato pela chave, posicao ou camada que
+    # alguem SUPOS, em vez da que ele tem.
+    linhas = [registro for _numero, registro, _bruto in ler_jsonl(ledger)]
+    dias = sorted({str(r.get("date", "")) for r in linhas if r.get("date")})
+    if not dias:
+        return problemas, {"skipped": "ledger sem campo date"}
+
+    por_dia = {}
+    for registro in linhas:
+        por_dia.setdefault(str(registro.get("date", "")), []).append(registro)
+
+    conferidos, sem_log = [], []
+    total_log = total_nao_marcada = 0
+    agentes_confrontados = agentes_sem_referencia = 0
+    excedentes = []
+    nao_confrontaveis = set()
+
+    for dia in dias:
+        linhas_log, nao_marcada, faltando = _access_log_do_dia(dia)
+        if faltando is None:
+            sem_log.append(dia)
+            continue
+        conferidos.append(dia)
+        total_log += linhas_log
+        total_nao_marcada += sum(nao_marcada.values())
+
+        if faltando:
+            problemas.append(
+                "access-%s.jsonl nao registra %s: sem a marcacao, toda sonda propria "
+                "passa a contar como rastreio real de bot" % (dia, " nem ".join(faltando)))
+
+        por_agente = {}
+        sem_declaracao = []
+        for registro in por_dia.get(dia, []):
+            chave = str(registro.get("agent_key", "")).lower()
+            if not chave:
+                continue
+            if registro.get("requests_is_metric") is True:
+                por_agente[chave] = por_agente.get(chave, 0) + int(registro.get("requests") or 0)
+            if "simulations_excluded" not in registro:
+                sem_declaracao.append(chave)
+
+        if sem_declaracao:
+            problemas.append(
+                "%d linha(s) de %s sem o campo simulations_excluded: a exclusao da sonda "
+                "propria deixou de ser declarada (agentes: %s)"
+                % (len(sem_declaracao), dia, ", ".join(sorted(set(sem_declaracao))[:5])))
+
+        for chave, contadas in sorted(por_agente.items()):
+            if not contadas:
+                continue
+            disponiveis = nao_marcada.get(chave)
+            if disponiveis is None:
+                # AGENTE QUE NAO SE CONSEGUE CONFRONTAR NAO E AGENTE CONFERIDO.
+                #
+                # O ledger de producao tem 29 agent_key e MARCAS_DE_BOT conhece
+                # 13: chatgpt-user, claude-user, perplexity-user, google-extended
+                # e googleother, entre outros, ficavam fora. A versao anterior
+                # apenas seguia adiante -- e somava o agente ao total de
+                # "confrontados", de modo que o relatorio AFIRMAVA um confronto
+                # que nao houve. A critica adversarial forjou 99.999 requisicoes
+                # sob chatgpt-user e o gate deu verde dizendo "1 agente
+                # confrontado".
+                #
+                # Nao reprovar continua certo (afirmar sem base e o defeito que
+                # este arquivo combate). Nao DECLARAR e que era o furo.
+                agentes_sem_referencia += 1
+                nao_confrontaveis.add(chave)
+                continue
+            agentes_confrontados += 1
+            if contadas > disponiveis:
+                excedentes.append("%s em %s conta %d requisicao(oes) como metrica, mas o log "
+                                  "tem so %d linha(s) nao marcada(s)"
+                                  % (chave, dia, contadas, disponiveis))
+
+    if excedentes:
+        problemas.append("metrica publicada acima do trafego nao marcado: %s"
+                         % "; ".join(excedentes))
+
+    resumo["days_checked"] = len(conferidos)
+    resumo["date"] = ", ".join(conferidos[-3:]) if conferidos else "nenhum"
+    resumo["access_lines"] = total_log
+    resumo["unmarked_bot_lines"] = total_nao_marcada
+    resumo["agents_checked"] = agentes_confrontados
+    resumo["agents_unmatched"] = agentes_sem_referencia
+    resumo["excess"] = len(excedentes)
+    if sem_log:
+        resumo["days_without_log"] = sem_log
+    if nao_confrontaveis:
+        resumo["unmatched_keys"] = sorted(nao_confrontaveis)
+
+    # NENHUM AGENTE CONFRONTADO NAO E "TUDO CERTO". Em 2026-08-26 as linhas do
+    # dia trazem requests_is_metric=False -- o produtor so promove a metrica o
+    # que conseguiu AUTENTICAR. O confronto entao nao roda, e dizer
+    # "0 problema(s)" sem dizer isso seria o verde sobre mundo errado que este
+    # arquivo inteiro existe para evitar.
+    if not agentes_confrontados:
+        resumo["nothing_to_confront"] = (
+            "nenhum agente confrontado em %d dia(s): ou nada foi publicado como metrica "
+            "de bot, ou os agentes publicados estao fora de MARCAS_DE_BOT"
+            % len(conferidos))
+    return problemas, resumo
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    problemas_origem, resumo_origem = checar_origem()
+    problemas_borda, resumo_borda = checar_borda()
+    problemas_faixas, resumo_faixas = checar_faixas()
+    problemas_sonda, resumo_sonda = checar_sonda_propria()
+
+    todos = problemas_origem + problemas_borda + problemas_faixas + problemas_sonda
+
+    print("check-bot-telemetry-honesty")
+    print("  origem  (%d linha(s), ultimo schema=%s): %d problema(s)"
+          % (resumo_origem.get("lines", 0), resumo_origem.get("last_schema"), len(problemas_origem)))
+    teto = resumo_borda.get("daily_ceiling")
+    print("  borda   (%d linha(s), acervo=%s URLs, teto=%s req/bot/dia): %d problema(s)"
+          % (resumo_borda.get("lines", 0), resumo_borda.get("public_urls", 0),
+             teto if teto is not None else "indisponivel", len(problemas_borda)))
+    print("          magnitude impossivel: %d linha(s), das quais %d ja em quarentena"
+          % (resumo_borda.get("implausible", 0), resumo_borda.get("quarantined", 0)))
+    print("          identidade por User-Agent (v2, SOB RESSALVA, nao reprova): %d linha(s)"
+          % resumo_borda.get("legacy_unverified_identity", 0))
+    print("          identidade verificada, schema anterior (v3, sem faixa de IP): %d linha(s)"
+          % resumo_borda.get("legacy_v3_verified_identity", 0))
+    if teto is None and resumo_borda.get("lines", 0) > 0:
+        # A guarda por `lines > 0` existe porque serie VAZIA sai cedo de
+        # checar_borda sem calcular teto nenhum: sem ela, o arquivo vazio
+        # imprimiria "acervo publico ilegivel", que seria uma afirmacao falsa
+        # sobre o que o codigo fez — nao ha acervo ilegivel ali, ha serie sem
+        # linha. Aviso que descreve verificacao que nao aconteceu e o mesmo
+        # defeito que este check existe para combater.
+        #
+        # Com linhas presentes e teto ausente a mensagem e verdadeira: os
+        # tetos de volume nao puderam ser afirmados, e so o teste de fator
+        # (que nao depende do acervo) rodou.
+        print("          AVISO: acervo publico ilegivel — so o fator de "
+              "extrapolacao foi verificado, nao o volume por URL.")
+    print("  faixas  (%d arquivo(s)): %d problema(s)"
+          % (len(resumo_faixas), len(problemas_faixas)))
+    if resumo_sonda.get("skipped"):
+        print("  sonda   (%s)" % resumo_sonda["skipped"])
+    else:
+        print("  sonda   (%d dia(s) conferido(s), %d linha(s) no access log, %d de bot NAO "
+              "marcada(s), %d agente(s) confrontado(s)): %d problema(s)"
+              % (resumo_sonda.get("days_checked", 0), resumo_sonda.get("access_lines", 0),
+                 resumo_sonda.get("unmarked_bot_lines", 0),
+                 resumo_sonda.get("agents_checked", 0), len(problemas_sonda)))
+        if resumo_sonda.get("unmatched_keys"):
+            print("          RESSALVA: %d agente(s) publicado(s) SEM referencia no access log, "
+                  "nao confrontado(s): %s"
+                  % (resumo_sonda.get("agents_unmatched", 0),
+                     ", ".join(resumo_sonda["unmatched_keys"][:6])))
+        if resumo_sonda.get("days_without_log"):
+            dias = resumo_sonda["days_without_log"]
+            print("          RESSALVA: %d dia(s) do ledger sem access log em disco, nao "
+                  "conferido(s): %s" % (len(dias), ", ".join(dias[:4])))
+        if resumo_sonda.get("nothing_to_confront"):
+            print("          RESSALVA: %s" % resumo_sonda["nothing_to_confront"])
+
+    if args.json:
+        print(json.dumps({
+            "origin": {"summary": resumo_origem, "issues": problemas_origem},
+            "edge": {"summary": resumo_borda, "issues": problemas_borda},
+            "ranges": {"files": resumo_faixas, "issues": problemas_faixas},
+        }, ensure_ascii=False, indent=2))
+
+    if todos:
+        print("\nREPROVADO: telemetria de bot com trafego forjado somado como metrica,\n"
+              "ou serie parada no formato antigo, ou faixa de IP velha.", file=sys.stderr)
+        for problema in todos:
+            print("  " + problema, file=sys.stderr)
+        return 1
+
+    print("\ncheck-bot-telemetry-honesty: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

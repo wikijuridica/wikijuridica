@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""deploy-binario-go — sobe um binário Go novo (cmd/server) na ORDEM que a
+produção exige, do build à borda.
+
+O PRODUTO DESTA FERRAMENTA É A ORDEM. Cada passo existe porque a inversão dele
+já quebrou produção, e o roteiro estava só na cabeça de quem opera: em
+2026-09-05 a troca de um binário foi feita à mão e custou uma hora, com cinco
+tentativas seguidas servindo o conteúdo ANTIGO. Enquanto a ordem morar na
+memória de alguém, ela se perde na próxima sessão.
+
+    1 build para nome temporário   — compilar por cima do binário em execução
+                                     devolve ETXTBSY ("Text file busy"); já
+                                     abortou um deploy em 2026-08-06.
+    2 validação ISOLADA            — o binário candidato sobe em porta própria
+                                     E com WIKI_CACHE_DIR/WIKI_ACCESS_LOG_DIR
+                                     próprios. PORTA DIFERENTE NÃO ISOLA DISCO:
+                                     em 2026-08-19 uma segunda instância no
+                                     mesmo var/on-demand-cache destruiu o índice
+                                     de busca em produção — a busca respondia
+                                     200 com "Nenhum resultado" e nenhum health
+                                     check via. O log de acesso próprio é
+                                     anti-fraude: sonda de validação com
+                                     warming=false entraria no ledger que decide
+                                     SEO como visita autêntica.
+    3 troca ATÔMICA (os.replace)   — rename troca o inode; o processo vivo segue
+                                     com o antigo até o restart. `cp` por cima é
+                                     não-atômico e reencontra o ETXTBSY.
+    4 socket ANTES do serviço      — binário → socket → serviço. Socket
+                                     `Type=notify` reativado com binário que
+                                     ignora LISTEN_FDS faz bind próprio, toma
+                                     EADDRINUSE e entra em laço de 5 s com a
+                                     porta em LISTEN: 504 para o visitante. Como
+                                     o passo 3 já trocou o arquivo, aqui o
+                                     socket NÃO se para — ele fica em LISTEN
+                                     enfileirando (FlushPending=no) e o restart
+                                     do serviço vira latência, não erro. Foram
+                                     1.435 respostas 502 em 26–28/08/2026 até
+                                     essa fila existir.
+    5 readiness PROVADA            — no Go (127.0.0.1:8089) e PELO NGINX
+                                     (127.0.0.1:8088). Houve 13 min em que o Go
+                                     respondia e o proxy não; sondar só o Go
+                                     teria declarado sucesso.
+    6 invalidar o cache de ORIGEM  — a zona `wj_dyn` do nginx guarda a última
+                                     resposta boa das rotas dinâmicas com
+                                     s-maxage=604800. SETE DIAS. Sem esta etapa
+                                     a render nova não existe para quem lê pela
+                                     origem.
+    7 aquecer a origem             — com requisição real, marcada como
+                                     aquecimento, ANTES de mexer na borda.
+    8 purgar a BORDA               — das MESMAS rotas.
+
+★ A ORDEM 6 → 7 → 8 É O PRODUTO. Purgar a borda antes de invalidar e aquecer a
+  origem faz o Tiered Cache repopular com o conteúdo VELHO — medido em
+  2026-09-05: `age: 0`, `cf-cache-status: HIT`, campos=0, cinco tentativas
+  seguidas. Depois de inverter para a ordem certa: campos=3 na primeira
+  tentativa. Quem trocar 7 e 8 de lugar reintroduz exatamente esse defeito, e é
+  por isso que `internal/deployordem` reprova a inversão num teste.
+
+AS ROTAS DERIVAM DO ACERVO, nunca de lista fixa: descritores de máquina,
+`/api/v1/lote` por área, `/{área}/llms-full.txt` e as gêmeas Markdown de todas
+as URLs públicas — o MESMO conjunto que `tools/warm-origin-cache` aquece, lido
+do módulo dele para que não existam dois catálogos divergindo em silêncio.
+
+O QUE ELA NÃO FAZ, DE PROPÓSITO: não republica conteúdo (isso é
+`tools/deploy-publico`), não recarrega o nginx (nenhuma config muda aqui; e
+`nginx -t` como root re-atribui var/nginx/ a nobody e derruba o canal de
+máquina inteiro), não purga a borda por `purge_everything` sem o operador pedir,
+e não reimplementa a invalidação de origem nem a purga de borda — chama as
+ferramentas que já existem.
+
+Uso:
+    tools/deploy-binario-go --seco                 # o plano inteiro, sem tocar em nada
+    tools/deploy-binario-go --seco --json
+    tools/deploy-binario-go                        # o deploy de verdade
+    tools/deploy-binario-go --sem-build            # bin/wikijuridica-server.next já pronto
+    tools/deploy-binario-go --rota /sobre/index.md --rota /openapi.json
+"""
+
+import argparse
+import atexit
+import datetime
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from importlib.machinery import SourceFileLoader
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+
+BINARIO_VIVO = "bin/wikijuridica-server"
+BINARIO_NOVO = "bin/wikijuridica-server.next"
+BINARIO_ANTERIOR = "bin/wikijuridica-server.anterior"
+
+SERVICO = "wikijuridica-server"
+LOCAL_GO = "http://127.0.0.1:8089"
+ORIGEM_NGINX = "http://127.0.0.1:8088"
+HOST_PUBLICO = "wikijuridica.com.br"
+
+# A PORTA DA VALIDAÇÃO ISOLADA é a mesma que tools/check-server-binary-smoke usa
+# (PORTA=127.0.0.1:18099 no cabeçalho dele). O smoke a declara por conta própria;
+# repeti-la aqui documenta o acoplamento e mantém a variável de ambiente coerente
+# com o que o processo candidato vai escutar.
+PORTA_ISOLADA = "127.0.0.1:18099"
+
+# Identidade de sonda interna do portal. É a mesma string que `tools/deploy-publico`
+# usa no laço de prontidão e que `internal/wikijuridicabot.AplicaSondaInterna`
+# escreve do lado Go. `X-Warming-Request: true` é o que mantém a sonda FORA da
+# contagem de audiência — e nunca sai para host externo: tudo aqui é loopback.
+UA_SONDA = "wikijuridica-superficie-probe/1.0"
+CABECALHO_AQUECIMENTO = "X-Warming-Request"
+
+LEDGER = RAIZ / "data" / "ops" / "deploy_binario_go.jsonl"
+
+# A INVALIDAÇÃO DE ORIGEM DEIXOU DE SER EM LOTES (2026-09-16), e o motivo é a
+# ferramenta ter trocado palpite por varredura. `tools/purge-origin-cache` não
+# monta mais 36 chaves por rota — 34 delas não existiam (medido: nenhuma chave
+# viva da zona tem `https` nem `:8088`) e a fórmula não alcançava as variantes
+# de `Vary: Accept-Encoding`, que são 1,8 objeto por rota no acervo. Agora ela
+# lê a linha `KEY:` de cada objeto da zona e remove TODOS os da rota.
+#
+# A varredura é por CHAMADA, não por rota, então lote virou custo: medido em
+# 2026-09-16 sobre as 11.268 rotas dinâmicas, 25.022 objetos na zona, modo seco:
+#     400 rotas por argv .......  7,20 s  -> 29 chamadas = ~209 s
+#   4.000 rotas por argv .......  9,97 s  ->  3 chamadas =  ~30 s
+#   11.268 rotas por --de-arquivo  5,66 s ->  1 chamada  =   5,7 s
+# Os três são MODO SECO (varredura + índice, sem `os.remove`): medem a seleção,
+# que é a parte que o lote multiplicava. A remoção real acrescenta um unlink e
+# um stat por objeto — 22.409 objetos na lista inteira, medidos em seco.
+# A lista vai em ARQUIVO também porque um argv de 11 mil `--rota` imprimia 562 KB
+# de plano; o arquivo é temporário, fica no diretório do deploy e some com ele.
+
+# A ORDEM CANÔNICA, em um lugar só. `main` recusa rodar se `PASSOS` divergir
+# dela, e `internal/deployordem` confere as duas contra a terceira cópia — a que
+# vive no Go, fora do alcance de quem editar este arquivo.
+ORDEM_CANONICA = (
+    "1-build-para-nome-temporario",
+    "2-validacao-isolada",
+    "3-troca-atomica",
+    "4-socket-antes-do-servico",
+    "5-readiness",
+    "6-invalidar-origem",
+    "7-aquecer-origem",
+    "8-purgar-borda",
+)
+
+
+class Falha(Exception):
+    """Aborta o deploy no passo em que a evidência apareceu, não depois."""
+
+
+class Passo:
+    def __init__(self, ident, titulo, motivo, executar):
+        self.ident = ident
+        self.titulo = titulo
+        self.motivo = motivo
+        self.executar = executar
+
+
+class Contexto:
+    def __init__(self, args):
+        self.args = args
+        self.seco = args.seco
+        self.carimbo = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.trabalho = RAIZ / "var" / "deploy-binario" / self.carimbo
+        self.rotas = []
+        self.rotas_restritas = bool(args.rota)
+        self.registros = []
+
+    def anota(self, passo, estado, detalhe):
+        self.registros.append({
+            "passo": passo.ident,
+            "titulo": passo.titulo,
+            "estado": estado,
+            "detalhe": detalhe,
+        })
+        marca = {"ok": "OK", "pulado": "--", "seco": "(seco)", "aviso": "!!"}.get(estado, estado)
+        print("  %-6s %s" % (marca, detalhe))
+
+
+_warm = None
+
+
+def modulo_warm():
+    """Carrega tools/warm-origin-cache como módulo.
+
+    O catálogo de rotas dinâmicas é DELE — descritores, lote por área,
+    llms-full e as gêmeas do acervo. Reescrever a derivação aqui criaria dois
+    catálogos que divergem no dia em que alguém acrescentar uma rota a um só.
+    """
+    global _warm
+    if _warm is None:
+        _warm = SourceFileLoader(
+            "warm_origin_cache", str(RAIZ / "tools" / "warm-origin-cache")).load_module()
+    return _warm
+
+
+def rotas_dinamicas(args):
+    """As rotas que este deploy invalida, aquece e purga — derivadas do acervo."""
+    if args.rota:
+        return list(dict.fromkeys(args.rota))
+    warm = modulo_warm()
+    rotas = (list(warm.DESCRITORES)
+             + warm.rotas_de_lote()
+             + warm.rotas_de_texto_integral()
+             + warm.gemeas())
+    return list(dict.fromkeys(rotas))
+
+
+def roda(comando, ctx, ambiente=None, timeout=1800):
+    """Executa e devolve (codigo, saida). Em --seco, não executa nada.
+
+    A linha impressa é ENCURTADA quando o comando carrega um lote de rotas: um
+    único lote de invalidação leva 400 `--rota`, e imprimi-lo inteiro produzia
+    562 KB de saída no primeiro ensaio — plano que ninguém lê não documenta
+    ordem nenhuma. O comando executado continua íntegro.
+    """
+    linha = " ".join(comando)
+    if len(linha) > 220:
+        linha = "%s … (+%d argumentos)" % (" ".join(comando[:5]), len(comando) - 5)
+    print("     $ %s" % linha)
+    if ctx.seco:
+        return 0, "(seco)"
+    try:
+        proc = subprocess.run(comando, cwd=str(RAIZ), env=ambiente, timeout=timeout,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except subprocess.TimeoutExpired:
+        # Estouro de tempo vira Falha com o comando de retomada, e não traceback:
+        # depois do passo 3 o binário já está trocado, e quem opera precisa saber
+        # exatamente onde a cadeia parou para continuar do ponto certo.
+        raise Falha("o comando estourou %ds e foi interrompido: %s. Nada além do que os passos "
+                    "anteriores já fizeram foi alterado; retome deste passo." % (timeout, linha))
+    for linha in proc.stdout.splitlines():
+        print("       %s" % linha)
+    return proc.returncode, proc.stdout
+
+
+def sonda(url, host=None, timeout=3):
+    """Um GET assinado como sonda interna. Nunca sai do loopback."""
+    cabecalhos = {"User-Agent": UA_SONDA, CABECALHO_AQUECIMENTO: "true"}
+    if host:
+        cabecalhos["Host"] = host
+    pedido = urllib.request.Request(url, headers=cabecalhos)
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            resposta.read()
+            return resposta.status
+    except urllib.error.HTTPError as erro:
+        return erro.code
+    except Exception:
+        return 0
+
+
+def espera_responder(url, host, segundos):
+    """Prova de prontidão: espera o status 200 chegar, não o relógio passar."""
+    limite = time.monotonic() + segundos
+    ultimo = 0
+    while time.monotonic() < limite:
+        ultimo = sonda(url, host=host)
+        if ultimo == 200:
+            return True, ultimo
+        time.sleep(0.5)
+    return False, ultimo
+
+
+# ─────────────────────────── os oito passos ────────────────────────────────
+
+
+def passo_1_build_para_nome_temporario(ctx, passo):
+    """Compila em bin/wikijuridica-server.next — NUNCA por cima do que roda.
+
+    Sobrescrever o arquivo de um processo em execução devolve ETXTBSY. O nome
+    temporário é o que torna o passo 3 um rename, e o rename é o que torna a
+    troca atômica.
+    """
+    if ctx.args.sem_build:
+        if not (RAIZ / BINARIO_NOVO).exists():
+            raise Falha("--sem-build exige %s pronto, e ele não existe" % BINARIO_NOVO)
+        ctx.anota(passo, "pulado", "build pulado (--sem-build); usando %s" % BINARIO_NOVO)
+        return
+    codigo, _ = roda(["nice", "-n", "10", "./tools/go-modern", "build",
+                      "-o", BINARIO_NOVO, "./cmd/server"], ctx)
+    if codigo != 0:
+        raise Falha("o build reprovou (exit %d). NADA foi tocado em produção." % codigo)
+    ctx.anota(passo, "seco" if ctx.seco else "ok", "compilado em %s" % BINARIO_NOVO)
+
+
+def passo_2_validacao_isolada(ctx, passo):
+    """Sobe o candidato ISOLADO, antes de encostar no que está no ar.
+
+    WIKI_CACHE_DIR é OBRIGATÓRIO e não é detalhe: porta diferente não isola
+    disco, e uma segunda instância no mesmo var/on-demand-cache já destruiu o
+    índice de busca em produção (2026-08-19). WIKI_ACCESS_LOG_DIR e
+    WIKI_INSTANCE mandam as requisições desta validação para fora do ledger que
+    decide SEO — elas chegam ao servidor com warming=false e seriam
+    indistinguíveis de visita de público.
+
+    A bateria é a de tools/check-server-binary-smoke (rotas, teto de 50 KB,
+    ausência de JavaScript não autorizado, headers, política de cache, 404,
+    robots): read-only, não escreve em bin/, não reinicia serviço, não recarrega
+    nginx.
+    """
+    if not (RAIZ / BINARIO_NOVO).exists() and not ctx.seco:
+        raise Falha("%s não existe — o passo 1 não produziu binário" % BINARIO_NOVO)
+    isolado = ctx.trabalho / "isolado"
+    ambiente = dict(os.environ)
+    ambiente["WIKI_HTTP_ADDR"] = PORTA_ISOLADA
+    ambiente["WIKI_CACHE_DIR"] = str(isolado / "on-demand-cache")
+    ambiente["WIKI_ACCESS_LOG_DIR"] = str(isolado / "access-log")
+    ambiente["WIKI_INSTANCE"] = "deploy-binario-%s" % ctx.carimbo
+    ambiente["WIKI_SMOKE_STAGE"] = str(isolado / "stage")
+    print("     porta %s · cache %s · ledger %s · instância %s"
+          % (PORTA_ISOLADA, ambiente["WIKI_CACHE_DIR"],
+             ambiente["WIKI_ACCESS_LOG_DIR"], ambiente["WIKI_INSTANCE"]))
+    if not ctx.seco:
+        isolado.mkdir(parents=True, exist_ok=True)
+    codigo, _ = roda(["tools/check-server-binary-smoke", BINARIO_NOVO], ctx,
+                     ambiente=ambiente, timeout=900)
+    if codigo != 0:
+        raise Falha("o binário candidato REPROVOU na validação isolada (exit %d). "
+                    "Produção segue com o binário anterior; nada foi trocado." % codigo)
+    ctx.anota(passo, "seco" if ctx.seco else "ok",
+              "candidato aprovado isolado em %s com cache e ledger próprios" % PORTA_ISOLADA)
+
+
+def passo_3_troca_atomica(ctx, passo):
+    """Rename para o caminho final, preservando o binário anterior.
+
+    `os.replace` é rename(2): troca o inode num único passo, o processo vivo
+    segue com o antigo até o restart e não há instante em que o caminho aponte
+    para meio arquivo. `cp` por cima seria não-atômico e devolveria ETXTBSY.
+    """
+    vivo = RAIZ / BINARIO_VIVO
+    if ctx.seco:
+        ctx.anota(passo, "seco", "renomearia %s -> %s (anterior em %s)"
+                  % (BINARIO_NOVO, BINARIO_VIVO, BINARIO_ANTERIOR))
+        return
+    if vivo.exists():
+        shutil.copy2(vivo, RAIZ / BINARIO_ANTERIOR)
+    os.replace(RAIZ / BINARIO_NOVO, vivo)
+    ctx.anota(passo, "ok", "binário trocado por rename (anterior preservado em %s)"
+              % BINARIO_ANTERIOR)
+
+
+def passo_4_socket_antes_do_servico(ctx, passo):
+    """binário → socket → serviço, nessa ordem, e o socket NÃO se para.
+
+    O 127.0.0.1:8089 pertence a wikijuridica-server.socket desde 2026-09-01; o
+    serviço só herda o descritor (Requires=). Com o binário já trocado no passo
+    3, parar o socket seria o único jeito de reintroduzir a janela de
+    ECONNREFUSED que ele existe para fechar: mantido em LISTEN, o kernel
+    enfileira as conexões durante o restart (FlushPending=no) e a queda vira
+    latência.
+
+    A inversão que este passo proíbe: subir o socket com um binário que ignora
+    LISTEN_FDS. Ele faz bind próprio, toma EADDRINUSE e entra em laço de 5 s com
+    a porta em LISTEN — 504 para quem estiver na página.
+    """
+    if ctx.seco:
+        ctx.anota(passo, "seco", "garantiria %s.socket ativo e então reiniciaria %s.service"
+                  % (SERVICO, SERVICO))
+        return
+    ativo = subprocess.run(["systemctl", "is-active", "--quiet", "%s.socket" % SERVICO],
+                           cwd=str(RAIZ)).returncode == 0
+    if not ativo:
+        codigo, _ = roda(["sudo", "-n", "systemctl", "start", "%s.socket" % SERVICO], ctx)
+        if codigo != 0:
+            raise Falha("o socket não subiu. O binário JÁ está trocado; conclua você mesmo:\n"
+                        "     sudo systemctl start %s.socket\n"
+                        "     sudo systemctl restart %s.service" % (SERVICO, SERVICO))
+    codigo, _ = roda(["sudo", "-n", "systemctl", "restart", "%s.service" % SERVICO], ctx)
+    if codigo != 0:
+        raise Falha("o serviço não reiniciou. O binário JÁ está trocado; conclua você mesmo:\n"
+                    "     sudo systemctl restart %s.service\n"
+                    "   e veja: journalctl -u %s -n 40" % (SERVICO, SERVICO))
+    ctx.anota(passo, "ok", "socket em LISTEN e %s.service reiniciado" % SERVICO)
+
+
+def passo_5_readiness(ctx, passo):
+    """Esperar responder DE VERDADE, e pelos dois caminhos.
+
+    O Go pode estar de pé e o nginx não: houve 13 min em que o proxy devolvia
+    erro com o processo saudável. Sondar só 127.0.0.1:8089 declararia sucesso.
+    As duas sondas vão assinadas como sonda interna, com X-Warming-Request, para
+    não entrarem na contagem de audiência.
+    """
+    if ctx.seco:
+        ctx.anota(passo, "seco", "esperaria 200 em %s/healthz e em %s/healthz (pelo nginx)"
+                  % (LOCAL_GO, ORIGEM_NGINX))
+        return
+    pronto, status = espera_responder(LOCAL_GO + "/healthz", None, 120)
+    if not pronto:
+        raise Falha("o servidor não respondeu em 120 s (último status %s). Provável reprovação "
+                    "do publishedmanifest.Validate no boot: journalctl -u %s -n 40"
+                    % (status, SERVICO))
+    pronto_nginx, status_nginx = espera_responder(ORIGEM_NGINX + "/healthz", HOST_PUBLICO, 60)
+    if not pronto_nginx:
+        raise Falha("o Go responde mas o nginx não repassa (último status %s). Nada foi purgado; "
+                    "a borda segue servindo o que já servia." % status_nginx)
+    ctx.anota(passo, "ok", "200 no Go (%s) e pelo nginx (%s)" % (LOCAL_GO, ORIGEM_NGINX))
+
+
+def passo_6_invalidar_origem(ctx, passo):
+    """Invalida a zona wj_dyn nas rotas dinâmicas, por tools/purge-origin-cache.
+
+    O Cache-Control dessas rotas é s-maxage=604800: sem esta etapa, a render
+    nova fica SETE DIAS defasada para quem lê pela origem — e a borda, quando
+    purgada, repopula justamente dela. É por isso que este passo vem ANTES do
+    aquecimento e da purga de borda.
+
+    A invalidação é local (stat + unlink) e só remove o que existe, então ela é
+    SEMPRE completa sobre o conjunto derivado: purgar uma amostra deixaria o
+    resto do acervo defasado por uma semana, que é o defeito de origem.
+    """
+    # A lista fica em var/ (ignorado pelo git), não em data/ops: se o deploy cair
+    # entre escrever e apagar, um arquivo solto dentro de diretório VERSIONADO
+    # entraria no `git add` de quem commitasse o ledger ao lado.
+    lista = RAIZ / "var" / "deploy-binario" / "invalidacao-origem-em-curso.txt"
+    lista.parent.mkdir(parents=True, exist_ok=True)
+    lista.write_text("\n".join(ctx.rotas) + "\n", encoding="utf-8")
+    try:
+        comando = ["tools/purge-origin-cache", "--de-arquivo", str(lista)]
+        if ctx.seco:
+            # `roda` já não executa nada em modo seco; o `--seco` vai junto por
+            # defesa em profundidade — se algum dia este comando escapar do
+            # ensaio, ele ainda assim não removeria objeto nenhum do cache.
+            comando.append("--seco")
+        codigo, _ = roda(comando, ctx, timeout=600)
+    finally:
+        lista.unlink(missing_ok=True)
+    if codigo != 0:
+        raise Falha("a invalidação de origem reprovou (exit %d). A borda NÃO foi purgada — "
+                    "repopular agora traria o conteúdo velho. Exit 2 da ferramenta significa "
+                    "objeto que resistiu na zona (`restantes`) ou varredura inconsistente; "
+                    "confira com `tools/purge-origin-cache --de-arquivo <lista> --json`."
+                    % codigo)
+    ctx.anota(passo, "seco" if ctx.seco else "ok",
+              "%d rota(s) dinâmica(s) invalidadas na zona wj_dyn" % len(ctx.rotas))
+
+
+def passo_7_aquecer_origem(ctx, passo):
+    """Aquece a origem com requisição REAL, antes de encostar na borda.
+
+    ★ ESTE PASSO VEM ANTES DA PURGA DE BORDA, e essa é a lição de 2026-09-05:
+      com a borda purgada primeiro, o Tiered Cache repopula do que estiver na
+      origem — e o que estava lá era o objeto velho. Medido: age 0, HIT,
+      campos=0, cinco vezes seguidas; com a ordem certa, campos=3 de primeira.
+
+    O aquecimento usa as variantes de Accept-Encoding que o bot realmente pede
+    (`gzip, br` e a ausência do cabeçalho), medidas em tools/warm-origin-cache —
+    o nginx guarda um objeto por variante, e aquecer só a que ninguém pede é
+    encher o cache para o próprio instrumento.
+
+    Falha aqui ABORTA antes do passo 8: purgar a borda sem prova de que a origem
+    serve o conteúdo novo é o tiro no escuro que esta ferramenta existe para
+    impedir.
+    """
+    if ctx.seco:
+        alvo = ("%d rota(s) restrita(s), por warm-origin-cache.pedir" % len(ctx.rotas)) \
+            if ctx.rotas_restritas else "todo o conjunto dinâmico, por tools/warm-origin-cache"
+        ctx.anota(passo, "seco", "aqueceria %s em %s (UA interno do aquecedor + %s: true; "
+                                 "a sonda de prontidão do passo 5 usa %s)"
+                  % (alvo, ORIGEM_NGINX, CABECALHO_AQUECIMENTO, UA_SONDA))
+        return
+    if ctx.rotas_restritas:
+        warm = modulo_warm()
+        falhas = []
+        for rota in ctx.rotas:
+            for variante in warm.VARIANTES_ACCEPT_ENCODING:
+                codigo, _tamanho = warm.pedir(rota, accept_encoding=variante)
+                if codigo != 200:
+                    falhas.append((rota, variante, codigo))
+        if falhas:
+            raise Falha("aquecimento incompleto (%d resposta(s) fora de 200: %s). A borda NÃO "
+                        "foi purgada." % (len(falhas), falhas[:5]))
+        ctx.anota(passo, "ok", "%d rota(s) x %d variante(s) aquecidas na origem"
+                  % (len(ctx.rotas), len(warm.VARIANTES_ACCEPT_ENCODING)))
+        return
+    codigo, _ = roda(["tools/warm-origin-cache", "--rps", "80", "--concorrencia", "8"],
+                     ctx, timeout=1800)
+    if codigo != 0:
+        raise Falha("o aquecimento de origem reprovou (exit %d). A borda NÃO foi purgada: "
+                    "purgá-la com a origem fria repopularia o Tiered Cache sem garantia de "
+                    "conteúdo novo. Rode tools/warm-origin-cache e só então "
+                    "tools/purge-edge-cache." % codigo)
+    ctx.anota(passo, "ok", "origem quente (tools/warm-origin-cache sobre o conjunto derivado)")
+
+
+def passo_8_purgar_borda(ctx, passo):
+    """Purga a borda das MESMAS rotas, por tools/purge-edge-cache.
+
+    O TETO VAI EXPLÍCITO. `purge-edge-cache` degrada em silêncio para
+    `purge_everything` quando a lista passa de --teto-por-url (3000 por padrão),
+    e purgar tudo jogaria fora o cache das ~10 mil páginas HTML que este deploy
+    não mudou — o acervo inteiro voltaria frio para o crawler. Com o teto acima
+    do tamanho da lista, a purga é seletiva em lotes de 100 (o "Max operations
+    per request" da API), que é o grupo de limite single-file, não o de 5
+    chamadas/minuto.
+
+    A lista vai por --de-arquivo: 10 mil caminhos em argv seriam ilegíveis e a
+    ferramenta já lê arquivo.
+    """
+    arquivo = ctx.trabalho / "rotas-borda.txt"
+    teto = max(3000, len(ctx.rotas) + 1)
+    if not ctx.seco:
+        arquivo.parent.mkdir(parents=True, exist_ok=True)
+        arquivo.write_text("\n".join(ctx.rotas) + "\n", encoding="utf-8")
+    else:
+        print("     escreveria %d rota(s) em %s" % (len(ctx.rotas), arquivo))
+    comando = ["tools/purge-edge-cache", "--de-arquivo", str(arquivo),
+               "--teto-por-url", str(teto)]
+    if ctx.seco:
+        comando.append("--dry-run")
+        print("     $ %s" % " ".join(comando))
+        ctx.anota(passo, "seco", "purgaria %d rota(s) na borda, seletivas (teto %d)"
+                  % (len(ctx.rotas), teto))
+        return
+    codigo, _ = roda(comando, ctx, timeout=900)
+    if codigo != 0:
+        raise Falha("a purga de borda reprovou (exit %d). A origem JÁ está correta e quente; "
+                    "repita: tools/purge-edge-cache --de-arquivo %s --teto-por-url %d"
+                    % (codigo, arquivo, teto))
+    ctx.anota(passo, "ok", "%d rota(s) purgadas na borda (seletiva, teto %d)"
+              % (len(ctx.rotas), teto))
+
+
+PASSOS = (
+    Passo(
+        "1-build-para-nome-temporario",
+        "compila cmd/server em bin/wikijuridica-server.next",
+        "compilar por cima do binário em execução devolve ETXTBSY",
+        passo_1_build_para_nome_temporario,
+    ),
+    Passo(
+        "2-validacao-isolada",
+        "sobe o candidato em porta, cache e ledger próprios",
+        "porta diferente não isola disco: cache compartilhado já destruiu o índice de busca",
+        passo_2_validacao_isolada,
+    ),
+    Passo(
+        "3-troca-atomica",
+        "rename do candidato para bin/wikijuridica-server",
+        "cp por cima é não-atômico e reencontra o ETXTBSY",
+        passo_3_troca_atomica,
+    ),
+    Passo(
+        "4-socket-antes-do-servico",
+        "socket em LISTEN e restart do serviço",
+        "socket Type=notify com binário sem LISTEN_FDS entra em laço de EADDRINUSE e 504",
+        passo_4_socket_antes_do_servico,
+    ),
+    Passo(
+        "5-readiness",
+        "espera 200 no Go e pelo nginx",
+        "presumir prontidão já declarou sucesso com o proxy fora do ar",
+        passo_5_readiness,
+    ),
+    Passo(
+        "6-invalidar-origem",
+        "invalida a zona wj_dyn nas rotas dinâmicas",
+        "s-maxage=604800: sem isto a render nova fica sete dias defasada",
+        passo_6_invalidar_origem,
+    ),
+    Passo(
+        "7-aquecer-origem",
+        "aquece a origem com requisição real assinada",
+        "a borda repopula da origem: fria, ela repopula com o conteúdo velho",
+        passo_7_aquecer_origem,
+    ),
+    Passo(
+        "8-purgar-borda",
+        "purga a borda das mesmas rotas, seletiva",
+        "purgar antes de aquecer devolve HIT com conteúdo antigo — medido cinco vezes",
+        passo_8_purgar_borda,
+    ),
+)
+
+
+def confere_ordem():
+    """Recusa rodar se PASSOS divergir da ordem canônica.
+
+    Defesa em profundidade: a guarda que vale é `internal/deployordem`, que
+    compara as duas listas deste arquivo com a terceira cópia, no Go. Aqui a
+    conferência serve para que uma inversão jamais chegue a EXECUTAR.
+    """
+    declarada = tuple(p.ident for p in PASSOS)
+    if declarada != ORDEM_CANONICA:
+        raise Falha("a ordem dos passos foi alterada: %s. A ordem do contrato é %s — "
+                    "purgar a borda antes de invalidar e aquecer a origem repopula o Tiered "
+                    "Cache com o conteúdo VELHO."
+                    % (" -> ".join(declarada), " -> ".join(ORDEM_CANONICA)))
+
+
+
+def _remove_lock_de_deploy(caminho):
+    """Remove o lock sem deixar a falha da remocao derrubar o deploy.
+
+    O lock existe para CALAR o vigia; nao conseguir apaga-lo mantem o vigia
+    calado ate os 30 min de carencia que ele mesmo aplica, o que e degradacao
+    aceitavel. Derrubar um deploy bem-sucedido por causa disso, nao.
+    """
+    try:
+        os.remove(caminho)
+    except FileNotFoundError:
+        pass
+    except OSError as erro:
+        print("deploy-binario-go: nao removi %s: %s (o vigia o ignora apos 30 min)"
+              % (caminho, erro), file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--seco", action="store_true",
+                    help="mostra o plano inteiro sem compilar, trocar, reiniciar ou purgar")
+    ap.add_argument("--sem-build", action="store_true",
+                    help="usa bin/wikijuridica-server.next já compilado")
+    ap.add_argument("--rota", action="append", default=[],
+                    help="restringe as rotas de origem/borda (repetível); sem isto, derivam do acervo")
+    ap.add_argument("--json", action="store_true", help="resumo em JSON no fim")
+    args = ap.parse_args()
+
+    os.chdir(RAIZ)
+    try:
+        confere_ordem()
+    except Falha as erro:
+        print("deploy-binario-go ABORTADO: %s" % erro, file=sys.stderr)
+        return 2
+
+    # O LOCK DE DEPLOY, e ele faltava aqui — assimetria medida em 2026-09-05.
+    #
+    # Tres instrumentos LEEM data/ops/.deploy-em-curso.lock para calar durante um
+    # deploy — tools/check-portal-health, tools/check-http-smoke e
+    # internal/checks/http_smoke_redesocial.go — e ate hoje um SO o escrevia:
+    # tools/deploy-publico. Consequencia: todo deploy de binario que caisse na
+    # janela de um timer de vigia mandava alarme ao dono dizendo que o portal
+    # caiu, quando o que houve foi a troca que este proprio script conduz.
+    # Alarme falso e pior que alarme nenhum: ensina o operador a ignorar o
+    # alarme verdadeiro.
+    #
+    # O trap equivalente e o try/finally la embaixo; o vigia ignora o lock
+    # depois de 30 min, para que um deploy interrompido nao desligue a
+    # vigilancia para sempre.
+    lock_de_deploy = os.path.join(RAIZ, "data", "ops", ".deploy-em-curso.lock")
+    if not args.seco:
+        os.makedirs(os.path.dirname(lock_de_deploy), exist_ok=True)
+        with open(lock_de_deploy, "w"):
+            pass
+        # atexit e nao try/finally: o main tem cinco pontos de retorno e pode
+        # sair por excecao. O equivalente em deploy-publico e o `trap ... EXIT
+        # INT TERM`, e a cobertura tem de ser a mesma -- lock que sobrevive a um
+        # caminho de saida desliga o vigia ate os 30 min de carencia.
+        atexit.register(_remove_lock_de_deploy, lock_de_deploy)
+
+    ctx = Contexto(args)
+    ctx.rotas = rotas_dinamicas(args)
+    if not ctx.rotas:
+        print("deploy-binario-go ABORTADO: nenhuma rota dinâmica derivada do acervo. "
+              "Sem elas os passos 6-8 não têm alvo e o deploy deixaria origem e borda "
+              "servindo a render anterior.", file=sys.stderr)
+        return 2
+
+    print("deploy-binario-go %s%s" % (ctx.carimbo, "  [SECO — nada será alterado]" if ctx.seco else ""))
+    print("rotas dinâmicas derivadas do acervo: %d%s"
+          % (len(ctx.rotas), " (restritas por --rota)" if ctx.rotas_restritas else ""))
+    for amostra in ctx.rotas[:3]:
+        print("  ex.: %s" % amostra)
+
+    inicio = time.monotonic()
+    for passo in PASSOS:
+        print("\n%s — %s" % (passo.ident, passo.titulo))
+        print("  porquê: %s" % passo.motivo)
+        try:
+            passo.executar(ctx, passo)
+        except Falha as erro:
+            print("\nABORTADO no passo %s: %s" % (passo.ident, erro), file=sys.stderr)
+            registra(ctx, "abortado", passo.ident, time.monotonic() - inicio)
+            return 1
+    duracao = time.monotonic() - inicio
+    registra(ctx, "concluido", "", duracao)
+
+    # A FRASE FINAL NÃO PODE MENTIR NO ENSAIO. Em modo seco nada foi invalidado,
+    # aquecido nem purgado; anunciar o contrário é o tipo de saída que faz alguém
+    # acreditar num deploy que não aconteceu.
+    if ctx.seco:
+        print("\nplano conferido em %.1fs — NADA foi alterado. Em execução real seriam %d rota(s) "
+              "invalidadas na origem, aquecidas e então purgadas na borda, nesta ordem."
+              % (duracao, len(ctx.rotas)))
+    else:
+        print("\nconcluído em %.1fs — %d rota(s) invalidadas na origem, aquecidas e purgadas na borda"
+              % (duracao, len(ctx.rotas)))
+    if args.json:
+        print(json.dumps({
+            "schema_version": "deploy_binario_go_v1",
+            "seco": ctx.seco,
+            "carimbo": ctx.carimbo,
+            "rotas": len(ctx.rotas),
+            "ordem": list(ORDEM_CANONICA),
+            "passos": ctx.registros,
+            "duracao_s": round(duracao, 1),
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
+def registra(ctx, desfecho, passo_que_abortou, duracao):
+    """Evidência do que ESTA execução fez. Em --seco não se grava nada: ledger
+    de deploy que registra ensaio como deploy é dado falso."""
+    if ctx.seco:
+        return
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "schema_version": "deploy_binario_go_v1",
+            "executado_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "desfecho": desfecho,
+            "passo_que_abortou": passo_que_abortou,
+            "ordem": list(ORDEM_CANONICA),
+            "rotas": len(ctx.rotas),
+            "rotas_restritas": ctx.rotas_restritas,
+            "passos": ctx.registros,
+            "duracao_s": round(duracao, 1),
+        }, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""apply-dynamic-redirect-rules — poe no ar a regra de barra final que o repositorio declara.
+
+ESCREVE na zona Cloudflare. Idempotente: le antes, compara, e nao faz nada se ja
+estiver igual. Mesma disciplina de tools/apply-cache-rules -- estado anterior
+inteiro no ledger ANTES do PUT.
+
+POR QUE ESTA FERRAMENTA PRECISA EXISTIR. Ate 2026-09-04 nenhuma ferramenta
+escrevia nem LIA os redirects: `grep -rln dynamic-redirect-rules.json tools/`
+devolvia vazio. A regra estava versionada e a fase viva na zona tinha ZERO
+regras -- declarada e nunca aplicada, um contrato que ninguem cumpre e ninguem
+percebe.
+
+A GUARDA QUE ESTA FERRAMENTA TEM E A DE CACHE NAO PRECISA. Redirect de barra
+final atinge TODA a superficie publica, e a expressao versionada tinha um
+defeito que so apareceu quando alguem foi olhar: ela nao excluia `.css` nem
+`.js`, entao aplica-la mandaria /assets/wj-<hash>.css para 301 e as 10.141
+paginas ficariam sem estilo -- com a location do nginx perfeitamente correta e
+o sintoma apontando para o lugar errado. Por isso o apply NAO escreve sem antes
+rodar a verificacao estrutural de check-edge-redirect-drift contra o public/
+real. Se a regra quebraria algum arquivo servido, a ferramenta recusa e explica
+qual.
+
+DECISAO DE APLICAR, medida em 2026-09-04 no access.log do nginx (100.186
+requisicoes): 8.476 delas (8,46%) sao redirect de barra final que hoje viaja ate
+a origem e volta; e ZERO paths respondem 200 sem barra, isto e, a regra nao tira
+nada do ar. Ganho medido, risco medido nulo, guarda continua no gate diario.
+
+Uso:
+    tools/apply-dynamic-redirect-rules --dry-run     # mostra o que faria
+    tools/apply-dynamic-redirect-rules               # aplica
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CANONICO = os.path.join(RAIZ, "ops/cloudflare/dynamic-redirect-rules.json")
+LEDGER = os.path.join(RAIZ, "data/ops/edge_rule_apply.jsonl")
+ENV = os.path.join(RAIZ, ".env.local")
+DOMINIO = "wikijuridica.com.br"
+FASE = "http_request_dynamic_redirect"
+API = "https://api.cloudflare.com/client/v4"
+GATE = os.path.join(RAIZ, "tools", "check-edge-redirect-drift")
+
+
+def carrega_gate():
+    """Importa o gate para reusar a verificacao estrutural. Reimplementa-la aqui
+    criaria duas versoes da mesma regra, e a que decide a escrita seria a que
+    ninguem testa."""
+    spec = importlib.util.spec_from_loader(
+        "check_edge_redirect_drift",
+        importlib.machinery.SourceFileLoader("check_edge_redirect_drift", GATE),
+    )
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+def recusa_por_arquivo_quebrado(regras):
+    """[] quando e seguro aplicar; senao, a lista de motivos."""
+    gate = carrega_gate()
+    servidos = gate.arquivos_servidos_pelo_nome()
+    if not servidos:
+        return [
+            "public/ esta vazio ou ausente: sem os arquivos servidos nao da para "
+            "afirmar que a regra nao quebra nenhum, e aplicar as cegas uma regra "
+            "que atinge toda a superficie publica nao e opcao"
+        ]
+    motivos = []
+    for regra in regras:
+        if not regra.get("enabled", True):
+            continue
+        expressao = regra.get("expression") or ""
+        quebrados = [p for p in servidos if gate.seria_redirecionado(p, expressao)]
+        if quebrados:
+            motivos.append(
+                f"a regra redirecionaria {len(quebrados)} arquivo(s) que o nginx serve pelo nome. "
+                f"Amostra: {', '.join(sorted(quebrados)[:5])}"
+            )
+    return motivos
+
+
+def _credenciais(env, precisa_escrever=False):
+    """Global API Key nos DOIS sentidos, e isto foi medido, nao suposto.
+
+    O token de zona cobre GET de zona e de settings, mas NAO a fase de
+    rulesets: com ele a leitura deste entrypoint devolve 403 Forbidden --
+    exatamente o que `check-edge-waf-drift` ja registra para firewall e
+    bot_management. Pedir "leitura" aqui devolveria o zone-token e o 403
+    apareceria como se fosse indisponibilidade da API, mandando investigar a
+    credencial errada. O escopo "firewall" e o nome que este repositorio da a
+    "sempre Global API Key".
+    """
+    escopo = "escrita" if precisa_escrever else "firewall"
+    cab, rotulo = cloudflare_auth.cabecalhos(escopo, env=env)
+    if cab is not None:
+        return cab, rotulo
+    return cloudflare_auth.cabecalhos("leitura", env=env)
+
+
+def chamar(url, cabecalhos, metodo="GET", corpo=None):
+    dados = json.dumps(corpo).encode("utf-8") if corpo is not None else None
+    req = urllib.request.Request(url, data=dados, method=metodo, headers=cabecalhos)
+    with urllib.request.urlopen(req, timeout=45) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def normaliza(regra):
+    return {
+        "action": regra.get("action"),
+        "expression": " ".join((regra.get("expression") or "").split()),
+        "enabled": regra.get("enabled", True),
+        "action_parameters": regra.get("action_parameters") or {},
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    with open(CANONICO, encoding="utf-8") as f:
+        regras_novas = json.load(f).get("rules") or []
+    if not regras_novas:
+        print(f"{CANONICO} nao declara regra nenhuma — nada a aplicar", file=sys.stderr)
+        return 2
+
+    # A GUARDA VEM ANTES DA CREDENCIAL, de proposito: uma regra que quebraria o
+    # acervo nao deve nem chegar perto de uma chave de escrita.
+    motivos = recusa_por_arquivo_quebrado(regras_novas)
+    if motivos:
+        print("RECUSADO — a regra declarada quebraria arquivo servido:", file=sys.stderr)
+        for motivo in motivos:
+            print(f"  {motivo}", file=sys.stderr)
+        print("Corrija ops/cloudflare/dynamic-redirect-rules.json antes de aplicar.", file=sys.stderr)
+        return 1
+
+    env = cloudflare_auth.ambiente(ENV)
+    # A zona e RESOLVIDA pelo dominio, nao lida de uma variavel com default
+    # fixo: um id defasado no ambiente devolve 403 na leitura, que e
+    # indistinguivel de falta de escopo e manda investigar a credencial errada.
+    # `zona_id` cacheia em memoria e cobra so uma chamada.
+    zona, erro_zona = cloudflare_auth.zona_id(DOMINIO, env=env)
+    if erro_zona:
+        zona = env.get("CLOUDFLARE_ZONE_ID")
+        if not zona:
+            print(f"nao resolvi a zona de {DOMINIO}: {erro_zona}", file=sys.stderr)
+            return 2
+    leitura, rotulo_leitura = _credenciais(env, precisa_escrever=False)
+    escrita, rotulo_escrita = _credenciais(env, precisa_escrever=True)
+    if leitura is None:
+        print("sem credencial Cloudflare em .env.local", file=sys.stderr)
+        return 2
+
+    url = f"{API}/zones/{zona}/rulesets/phases/{FASE}/entrypoint"
+    try:
+        antes = chamar(url, leitura)["result"]
+    except urllib.error.HTTPError as e:
+        print(f"nao consegui LER o ruleset ({e.code} {e.reason}) — nao escrevo as cegas",
+              file=sys.stderr)
+        return 1
+
+    regras_antes = antes.get("rules") or []
+    print(f"zona      : {zona}")
+    print(f"credencial: leitura={rotulo_leitura} escrita={rotulo_escrita}")
+    print(f"ruleset   : {antes.get('name')} (version {antes.get('version')})")
+    print(f"no ar     : {len(regras_antes)} regra(s) | versionado: {len(regras_novas)} regra(s)")
+    print("guarda    : nenhum arquivo servido seria redirecionado")
+
+    if [normaliza(r) for r in regras_antes] == [normaliza(r) for r in regras_novas]:
+        print("ja esta identico ao versionado — nada a fazer (idempotente)")
+        return 0
+
+    for r in regras_novas:
+        print(f"  vai aplicar: {(r.get('description') or '')[:110]}")
+        destino = ((r.get("action_parameters") or {}).get("from_value") or {})
+        print(f"    status_code           = {destino.get('status_code')}")
+        print(f"    preserve_query_string = {destino.get('preserve_query_string')}")
+
+    if args.dry_run:
+        print("\n--dry-run: nada escrito na zona")
+        return 0
+
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "schema_version": "edge_rule_apply_v1",
+            "aplicado_em": datetime.now(timezone.utc).isoformat(),
+            "zona": zona,
+            "fase": FASE,
+            "version_antes": antes.get("version"),
+            "regras_antes": regras_antes,
+            "regras_depois_pretendidas": regras_novas,
+            "origem": os.path.relpath(CANONICO, RAIZ),
+        }, ensure_ascii=False) + "\n")
+
+    try:
+        depois = chamar(url, escrita, "PUT", {"rules": regras_novas})["result"]
+    except urllib.error.HTTPError as e:
+        detalhe = ""
+        try:
+            detalhe = e.read().decode("utf-8")[:600]
+        except (urllib.error.URLError, OSError, UnicodeDecodeError) as leitura_falhou:
+            detalhe = f"(corpo do erro ilegivel: {leitura_falhou})"
+        print(f"PUT falhou: {e.code} {e.reason}\n{detalhe}", file=sys.stderr)
+        print("O estado anterior esta gravado no ledger, nada foi perdido.", file=sys.stderr)
+        return 1
+
+    print(f"\nAPLICADO. version {antes.get('version')} -> {depois.get('version')} | "
+          f"{len(depois.get('rules') or [])} regra(s) no ar")
+    print(f"estado anterior preservado em {os.path.relpath(LEDGER, RAIZ)}")
+    print("\nConfira com: tools/check-edge-redirect-drift")
+    print("E SONDE de verdade: a folha de estilo tem de continuar 200, e um path")
+    print("sem barra tem de voltar 301 SEM tocar a origem.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

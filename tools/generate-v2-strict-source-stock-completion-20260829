@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""generate-v2-strict-source-stock-completion-20260829 — a fonte exata que a página strict devia carregar e não carrega.
+
+O DEFEITO, medido em 2026-08-29. `tools/reconcile_v2_strict_source_stock.py
+--check` acusa 16 ocorrências de `exact_source_url_missing` em 9 das 40
+intenções strict: a página cita 2 fontes oficiais, e o catálogo exato projeta
+3 a 5 para aquela intenção. Não é excesso da projeção — é atraso da página.
+`data/editorial/portfolio_v2/seguros.jsonl` fixou esses `source_hints` em
+b475677f (2026-07-14), e as páginas nasceram em seguida com o conjunto antigo
+(seg-auto-rcf-v-o-que-cobre entrou em `v2_pages/seguros-05.jsonl` com duas
+fontes). O mesmo trio de hints está pinado no contrato Go
+(`minimumStrictSourceHintsByIntent`, internal/contract/source), então encolher
+o portfólio para caber na página seria regredir o contrato: quem alcança o
+outro é a página.
+
+POR QUE NINGUÉM VIU. `load_projection` valida o catálogo INTEIRO antes de
+comparar o estoque, e desde 2026-07-30 uma única entrada com URL de resolvedor
+(`decreto-35851-1954`) abortava a carga — o reconciliador morria antes de
+chegar à comparação. Corrigida aquela entrada, os 32 defeitos reais
+apareceram: 16 de identidade (que o próprio `--write` normaliza) e estes 16 de
+ausência, que ele RECUSA — e recusa com razão: acrescentar URL sem
+proveniência observada seria inventar evidência.
+
+O QUE ESTE GERADOR FAZ. Para cada par (intenção strict, URL ausente) apontado
+pelo `--check`:
+
+  - copia a identidade `{name, url, anchor_claim}` da PROJEÇÃO
+    (`reconcile_v2_strict_source_stock.load_projection`), nunca do catálogo
+    cru: quando dois hints da mesma intenção compartilham URL, a projeção
+    consolida os anchor_claim com o separador literal " | ", e copiar o claim
+    de um hint só gravaria identidade que o gate reprova no instante seguinte;
+  - REQUISITA a URL (GET) e grava o código HTTP real e a data real da
+    requisição. Só 200/203/206 são graváveis (internal/v2ingest/validate.go,
+    officialSourceHTTPStatusAllowed). URL que não responde fica sem gravar e
+    a página fica incompleta — reportada, nunca completada com status suposto;
+  - acrescenta ao fim de `official_sources`, sem tocar nas fontes existentes
+    nem na ordem delas, e nunca cria URL duplicada.
+
+`verified_at` significa aqui o que significa nas 21 mil fontes já aceitas: a
+data em que a URL foi requisitada e respondeu com o código registrado. É
+verificação de disponibilidade da referência, não auditoria do conteúdo — o
+corpo da resposta não é lido, copiado nem parafraseado.
+
+CONTRATO DE ESCRITA: lease de época canônica, lock exclusivo, CAS pelo sha256
+do shard lido, escrita atômica com fsync, intenções sob supersessão puladas,
+idempotente (rodar de novo com tudo completo não escreve nada). NÃO commita e
+NÃO republica. Evidência apendada em
+data/source-audit/v2_strict_source_stock_completion.jsonl.
+
+Uso:
+    tools/generate-v2-strict-source-stock-completion-20260829 --dry-run
+    tools/generate-v2-strict-source-stock-completion-20260829
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import glob
+import json
+import os
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools import generate_v2_review_queue as queue
+from tools import reconcile_v2_strict_source_stock as reconciler
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.v2-strict-source-stock-completion.lock"
+SUPERSEDED = ROOT / "data/editorial/v2_superseded"
+EVIDENCIA = ROOT / "data/source-audit/v2_strict_source_stock_completion.jsonl"
+MAX_SHARD_BYTES = 64 << 20
+
+# UA já precedente em tools/generate-catalog-url-repair. Medido em 2026-08-29:
+# o Planalto fecha a conexão sem resposta para o UA descritivo puro
+# (RemoteDisconnected) e responde 200 em 0,33 s para este. Não é disfarce de
+# navegador de usuário: o nome do projeto e o propósito metadata-only estão
+# no próprio campo.
+UA = "Mozilla/5.0 WikiJuridicaV2SourceProvenance/1.0 metadata-only no-content-copy"
+STATUS_GRAVAVEL = (200, 203, 206)
+
+
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    os.fchmod(fd, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def intents_em_supersessao() -> set:
+    alvo = set()
+    for caminho in sorted(SUPERSEDED.glob("*.jsonl")):
+        for linha in caminho.read_text(encoding="utf-8").splitlines():
+            if linha.strip():
+                intent = json.loads(linha).get("intent_id")
+                if intent:
+                    alvo.add(intent)
+    return alvo
+
+
+def sondar_uma_vez(url: str, timeout: float) -> tuple[int | None, str | None]:
+    """(http_status, motivo). Uma requisição real; o corpo não é guardado."""
+    pedido = urllib.request.Request(
+        url, headers={"User-Agent": UA, "Accept": "*/*"})
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            resposta.read(1 << 20)
+            return int(resposta.status), None
+    except urllib.error.HTTPError as erro:
+        return int(erro.code), f"http {erro.code}"
+    except Exception as erro:  # rede: URLError, timeout, TLS, protocolo
+        return None, f"{type(erro).__name__}: {erro}"
+
+
+def sondar(url: str, timeout: float, tentativas: int,
+           pausa: float) -> tuple[int | None, str | None, list]:
+    """Sonda com repetição LIMITADA e registra tudo que foi observado.
+
+    Por que repetir: medido em 2026-08-29, www.in.gov.br devolve 404 e 200
+    alternadamente para a MESMA URL em requisições consecutivas (2 de 3 deram
+    200) — nós de borda do órgão fora de sincronia. Uma sonda única gravaria
+    "esta fonte oficial sumiu" a partir de um acidente de roteamento.
+
+    Por que LIMITADA e registrada: repetir até obter a resposta desejada seria
+    fabricar evidência. O teto é fechado, a série inteira das tentativas vai
+    para o ledger, e o status gravado é o que foi de fato observado.
+    """
+    observado = []
+    for tentativa in range(1, max(1, tentativas) + 1):
+        status, motivo = sondar_uma_vez(url, timeout)
+        observado.append(status if status is not None else motivo)
+        if status in STATUS_GRAVAVEL:
+            return status, None, observado
+        if tentativa < tentativas:
+            time.sleep(pausa)
+    return status, motivo, observado
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--pausa", type=float, default=0.6,
+                        help="segundos entre requisições (educação com o órgão)")
+    parser.add_argument("--timeout", type=float, default=40.0)
+    parser.add_argument("--tentativas", type=int, default=3,
+                        help="teto de sondagens por URL (borda de orgao "
+                             "publico alterna 404/200 na mesma URL)")
+    args = parser.parse_args()
+
+    resultado = reconciler.check_stock(ROOT)
+    ausentes = [d for d in resultado["defects"]
+                if d["kind"] == "exact_source_url_missing"]
+    print(f"defeitos totais no estoque strict: {len(resultado['defects'])} | "
+          f"URL ausente: {len(ausentes)}")
+    if not ausentes:
+        print("nada a completar.")
+        return 0
+
+    projecao = reconciler.load_projection(ROOT)
+    bloqueados = intents_em_supersessao()
+    por_arquivo: dict[str, list[dict]] = {}
+    pulados = []
+    for defeito in ausentes:
+        if defeito["intent_id"] in bloqueados:
+            pulados.append({**defeito, "motivo": "intent sob supersessao"})
+            continue
+        arquivo = defeito["location"].split(":")[0]
+        por_arquivo.setdefault(arquivo, []).append(defeito)
+
+    # Uma sondagem por URL distinta, reaproveitada entre intenções.
+    cache: dict[str, tuple] = {}
+    hoje = datetime.date.today().isoformat()
+    for defeito in [d for lista in por_arquivo.values() for d in lista]:
+        url = defeito["url"]
+        if url in cache:
+            continue
+        cache[url] = sondar(url, args.timeout, args.tentativas, args.pausa)
+        status, motivo, observado = cache[url]
+        print(f"  sonda {status if status is not None else 'ERRO'} {url}"
+              + (f" (tentativas: {observado})" if len(observado) > 1 else "")
+              + (f" ({motivo})" if status is None else ""))
+        time.sleep(args.pausa)
+
+    evidencia = []
+    escritos = 0
+    arquivos_tocados = 0
+    recusados = []
+    fd = exclusive_lock(LOCK)
+    try:
+        with canonical_stock_write_lease(ROOT):
+            for arquivo in sorted(por_arquivo):
+                caminho = ROOT / arquivo
+                snapshot = queue.read_regular_file_snapshot(
+                    caminho, max_bytes=MAX_SHARD_BYTES)
+                linhas = [linha for linha in
+                          snapshot.payload.decode("utf-8").split("\n") if linha]
+                registros = [json.loads(linha) for linha in linhas]
+                por_intent: dict[str, tuple[int, dict]] = {}
+                for indice, registro in enumerate(registros):
+                    intent = registro.get("intent_id")
+                    if intent:
+                        por_intent.setdefault(intent, (indice, registro))
+                # O shard NÃO tem serialização única: medido em 2026-08-29, a
+                # linha usa separadores espaçados no topo e compactos dentro de
+                # official_sources — ela foi montada por ferramentas
+                # diferentes. Re-serializar tudo reescreveria centenas de
+                # linhas que este gerador não tem por que tocar, então a linha
+                # não modificada sai do arquivo EXATAMENTE como entrou.
+                alterados: set = set()
+                mudou = False
+                for defeito in por_arquivo[arquivo]:
+                    intent = defeito["intent_id"]
+                    url = defeito["url"]
+                    status, motivo, observado = cache[url]
+                    posicao = por_intent.get(intent)
+                    registro = posicao[1] if posicao else None
+                    linha_evidencia = {
+                        "intent_id": intent, "file": arquivo, "url": url,
+                        "http_status": status, "verified_at": hoje,
+                        "sondagens": observado, "escrito": False,
+                    }
+                    if registro is None:
+                        linha_evidencia["motivo"] = "intent ausente do shard"
+                        recusados.append(linha_evidencia)
+                        evidencia.append(linha_evidencia)
+                        continue
+                    if status not in STATUS_GRAVAVEL:
+                        linha_evidencia["motivo"] = (
+                            motivo or f"status {status} nao gravavel")
+                        recusados.append(linha_evidencia)
+                        evidencia.append(linha_evidencia)
+                        continue
+                    identidade = None
+                    for esperada in projecao.sources_by_intent[intent]:
+                        if esperada["url"] == url:
+                            identidade = dict(esperada)
+                            break
+                    if identidade is None:
+                        linha_evidencia["motivo"] = "url fora da projecao"
+                        recusados.append(linha_evidencia)
+                        evidencia.append(linha_evidencia)
+                        continue
+                    fontes = registro.get("official_sources")
+                    if not isinstance(fontes, list):
+                        linha_evidencia["motivo"] = "pagina sem official_sources"
+                        recusados.append(linha_evidencia)
+                        evidencia.append(linha_evidencia)
+                        continue
+                    if any(isinstance(f, dict) and f.get("url") == url
+                           for f in fontes):
+                        linha_evidencia["motivo"] = "url ja presente"
+                        evidencia.append(linha_evidencia)
+                        continue
+                    identidade["verified_at"] = hoje
+                    identidade["http_status"] = status
+                    fontes.append(identidade)
+                    registro["official_sources"] = fontes
+                    alterados.add(posicao[0])
+                    linha_evidencia["escrito"] = True
+                    linha_evidencia["name"] = identidade["name"]
+                    evidencia.append(linha_evidencia)
+                    escritos += 1
+                    mudou = True
+                    print(f"  + {intent}: {url}")
+                if mudou:
+                    arquivos_tocados += 1
+                    if not args.dry_run:
+                        saida = [
+                            json.dumps(registros[indice], ensure_ascii=False,
+                                       separators=(",", ":"))
+                            if indice in alterados else linha
+                            for indice, linha in enumerate(linhas)
+                        ]
+                        payload = ("\n".join(saida) + "\n").encode("utf-8")
+                        queue.atomic_replace_cas(
+                            caminho, payload, snapshot.digest)
+    except StockEpochBusy as erro:
+        print(f"estoque canonico ocupado por outra frente: {erro}",
+              file=sys.stderr)
+        return 75
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    evidencia.extend(pulados)
+    print(f"\nfontes acrescentadas: {escritos} em {arquivos_tocados} shard(s) | "
+          f"recusadas: {len(recusados)} | puladas por supersessao: {len(pulados)}")
+    for recusa in recusados:
+        print(f"  RECUSADA {recusa['intent_id']} {recusa['url']}: "
+              f"{recusa.get('motivo')}")
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+        return 0
+    if evidencia:
+        anterior = EVIDENCIA.read_bytes() if EVIDENCIA.exists() else b""
+        if anterior and not anterior.endswith(b"\n"):
+            anterior += b"\n"
+        atomic_write(EVIDENCIA, anterior + ("\n".join(
+            json.dumps(r, ensure_ascii=False) for r in evidencia) + "\n"
+        ).encode("utf-8"))
+        print(f"Evidencia: {os.path.relpath(EVIDENCIA, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

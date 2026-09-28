@@ -1,0 +1,1631 @@
+#!/usr/bin/python3 -I
+"""Cooperative fail-closed guard for finalized v2 ref transactions.
+
+This checker is intentionally tree-ish based.  The reference-transaction hook
+invokes it for the candidate commit, so ``git commit --no-verify`` cannot turn
+an accidental unreviewed finalized shard into repository history while the
+checkout keeps its canonical hooksPath.  Its identity and receipt are public
+integrity binds, not authority: a caller that disables hooks or forges the
+environment can bypass them.  The official consumer therefore invokes this
+checker inside its already authenticated closure immediately before update-ref.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import unicodedata
+from typing import Any
+
+
+INSTALL_ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = INSTALL_ROOT
+GIT = "/usr/bin/git"
+OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+FINALIZED = re.compile(
+    r"data/editorial/v2_pages/[a-z0-9_]+(?:-[a-z0-9_]+)+\.jsonl")
+PORTFOLIO = re.compile(
+    r"data/editorial/portfolio_v2/[a-z0-9_]+(?:-[a-z0-9_]+)*\.jsonl")
+# Rota de remoção sancionada: recibo emitido por
+# internal/v2pageshardquarantine (nome, destino e mode espelhados de
+# quarantine.go). O recibo `.spec.json` do plano não casa este padrão de
+# propósito: só o recibo terminal é autoridade de remoção.
+QUARANTINE_RECEIPT = re.compile(
+    r"data/ops/v2_page_shard_quarantine_[a-z0-9_]+\.json")
+QUARANTINE_SHARD = re.compile(
+    r"data/editorial/v2_pages_quarantine/[a-z0-9]+(?:-[a-z0-9]+)*/"
+    r"[0-9a-f]{16}-[a-z0-9_]+(?:-[a-z0-9_]+)+\.jsonl")
+QUARANTINE_OPERATION = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+QUARANTINE_CLOSED_FLAGS = (
+    "public", "publication_allowed", "render_allowed", "sitemap_allowed",
+    "indexable", "approval",
+)
+QUARANTINE_SOURCE_MODES = frozenset({0o600, 0o644})
+MAX_QUARANTINE_RECEIPTS = 4096
+CANONICAL_INTENT_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+# Espelho fiel dos anchors de produção de
+# internal/v2supersessionintegrity/integrity.go (defaultTrustedArchiveSHA256).
+# O gate Go compilado do parent já reprova o commit inteiro quando um archive
+# nesses paths diverge do anchor (enforceDefaultArchiveAnchors) e quando um
+# archive novo aparece sem digest externo confiável (validateTombstone).
+# Este espelho portanto nunca cria autoridade nova: apenas consome, no produto
+# finalizado, a MESMA evidência já commitada no parent para pinar byte a byte
+# shards canônicos de supersessão.
+ANCHORED_SUPERSESSION_ARCHIVES = {
+    "data/editorial/v2_superseded/"
+    "duplicate-intent-consolidation-2026-07-11.jsonl":
+        "f673f8ed5f006e2adef772814c9aa9c24e4933e11511f45ad2925f0e3f6330d6",
+    "data/editorial/v2_superseded/"
+    "duplicate-intent-consolidation-2026-07-15.jsonl":
+        "a0ec0dccfd1e058f2652ccbcdb554421bc709826f5827cbb4787f3e97e1c78ba",
+    "data/editorial/v2_superseded/"
+    "duplicate-intent-consolidation-aereo-2026-07-21.jsonl":
+        "9d5a0b14347c7513604a991bb91d276cde16424d808a7c54f215ecfd63f34ba8",
+}
+WORKFLOW_IDENTITY = (
+    "Portal Jurídico Workflow <workflow-integrator@portal-juridico.invalid>")
+MAX_GIT_BYTES = 128 * 1024 * 1024
+MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_RECORDS = 2_000_000
+# Teto de conteúdo por `git cat-file --batch`. Mantém cada lote muito abaixo de
+# MAX_GIT_BYTES conforme o estoque cresce de centenas para milhares de shards —
+# sem isso, um lote único viraria "saída Git excedeu limite" em escala.
+MAX_BATCH_BYTES = 32 * 1024 * 1024
+# Cache de blob por OID (endereçado por conteúdo: mesmo OID, mesmos bytes).
+# Torna a comparação old/new O(delta) em vez de reler a árvore inteira duas
+# vezes. Zerado ao estourar o teto para não crescer sem limite.
+MAX_BLOB_CACHE_BYTES = 256 * 1024 * 1024
+BLOB_CACHE: dict[str, bytes] = {}
+BLOB_CACHE_BYTES = 0
+CLOSED_PUBLIC_REQUIRED_FALSE_FLAGS = (
+    "public", "publication_allowed", "publication_candidate",
+    "render_allowed", "sitemap_allowed", "indexable", "approval",
+)
+CLOSED_PUBLIC_OPTIONAL_FALSE_FLAGS = (
+    "publicly_indexable", "manifest_allowed",
+)
+SEMANTIC_FIXED_CLOSURE = frozenset({
+    "data/editorial/v2_writing_semantic_contract.json",
+    "data/ops/v2_semantic_forward_candidates_receipt.json",
+    "data/ops/v2_supersession_independent_reviews_20260716.jsonl",
+    "data/editorial/v2_semantic_superseded/"
+    "writing-semantic-recuts-20260715.jsonl",
+})
+# Derived closure (plano 2026-07-22 Fase 1; RCA D4.8 §4.1/§4.4): every fixed
+# anchor is accepted in EITHER form — inside the commit delta when this
+# generation changed it, or carried byte-identical across old→new when a
+# later generation legitimately keeps it unchanged (evidence bytes frozen by
+# the contract requirements and checked_at=2026-07-15; first generation
+# landed in aff5fd7e).  The former SEMANTIC_DELTA_REQUIRED_ANCHORS subset
+# check forced contract+receipt into an impossible delta after consumption.
+# Transition window: the committer executes THIS guard from the HEAD copy, so
+# commits whose contract/receipt stay out of the delta only pass after this
+# file lands at HEAD; until then every semantic-recut transaction must keep
+# contract+receipt staged (both forms remain accepted by this code forever).
+# Per-anchor authentication is unchanged: an anchor outside the delta must be
+# the exact same regular blob on both sides, and the compiled
+# check-v2-writing-semantic-contract gate still reconstructs the evidence.
+SEMANTIC_BOOTSTRAP_RUNTIME_MODES = {
+    ".githooks/pre-commit": "100755",
+    "tools/commit-verified-v2-workflow-results": "100755",
+    "tools/test_commit_verified_v2_workflow_results.py": "100644",
+    "tools/check-v2-finalized-commit": "100755",
+    "tools/check-go-index-compile-closure": "100755",
+    "tools/check-go-compile-closure": "100755",
+    "tools/lgpd_current_legal_facts.py": "100644",
+    "tools/audit_v2_pages.py": "100755",
+    "tools/v2_stock_epoch.py": "100644",
+    "tools/finalize-v2-review": "100755",
+    "tools/test_audit_v2_pages_portfolio_membership.py": "100644",
+    "tools/generate_v2_review_queue.py": "100644",
+    "tools/v2_portfolio_intent_migrations.py": "100644",
+    "tools/verify-v2-workflow-results": "100755",
+    "scripts/workflows/writing-review.js": "100644",
+    "cmd/check-v2-private-distinctness/main.go": "100644",
+    "cmd/check-v2-private-distinctness/main_test.go": "100644",
+    "internal/v2pagedistinctness/batch.go": "100644",
+    "internal/v2pagedistinctness/compare.go": "100644",
+    "internal/v2pagedistinctness/compare_test.go": "100644",
+    "internal/v2pagedistinctness/immutable_query.go": "100644",
+    "internal/v2pagedistinctness/immutable_query_test.go": "100644",
+    "internal/v2pagedistinctness/global_partition.go": "100644",
+    "internal/v2pagedistinctness/global_partition_scratch.go": "100644",
+    "internal/v2pagedistinctness/global_partition_scratch_linux.go": "100644",
+    "internal/v2pagedistinctness/global_partition_scratch_other.go": "100644",
+    "internal/v2pagedistinctness/global_partition_test.go": "100644",
+    "internal/v2pagedistinctness/global_profile_adjudication.go": "100644",
+    "internal/v2pagedistinctness/global_profile_sidecar.go": "100644",
+    "internal/v2pagedistinctness/global_profile_sidecar_test.go": "100644",
+    "internal/v2pagedistinctness/partition_census.go": "100644",
+    "internal/v2pagedistinctness/partition_census_test.go": "100644",
+    "internal/v2pagedistinctness/partition_stream.go": "100644",
+    "internal/v2pagedistinctness/partition_stream_test.go": "100644",
+    "internal/v2pagedistinctness/posting.go": "100644",
+    "internal/v2pagedistinctness/posting_test.go": "100644",
+    "internal/v2pagedistinctness/profile.go": "100644",
+    "internal/v2pagedistinctness/querycursor.go": "100644",
+    "internal/v2pagedistinctness/querycursor_test.go": "100644",
+    "internal/v2pagedistinctness/store.go": "100644",
+    "internal/v2pagedistinctness/store_test.go": "100644",
+    "internal/v2pagedistinctness/termdirectory.go": "100644",
+    "internal/v2pagedistinctness/types.go": "100644",
+    "data/source-registry/v2_source_provenance_live_evidence_sets/exact-dc3379dc25bc63ff7d044d0112491f7a6c63b195c0c94236042fe32dcf104cfa.jsonl": "100644",
+    "internal/v2pagedistinctness/update_lock_other.go": "100644",
+    "internal/v2pagedistinctness/batch_test.go": "100644",
+    "internal/v2pagedistinctness/epoch.go": "100644",
+    "internal/v2pagedistinctness/epoch_linux.go": "100644",
+    "internal/v2pagedistinctness/epoch_linux_test.go": "100644",
+    "internal/v2pagedistinctness/epoch_other.go": "100644",
+    "internal/v2pagedistinctness/identity_linux.go": "100644",
+    "internal/v2pagedistinctness/identity_other.go": "100644",
+    "internal/v2pagedistinctness/immutable_query_test.go": "100644",
+    "internal/v2pagedistinctness/profile_jsonl_test.go": "100644",
+    "internal/v2pagedistinctness/profile_test.go": "100644",
+    "internal/v2pagedistinctness/update_lock_linux.go": "100644",
+    "internal/v2pagedistinctness/update_lock_linux_test.go": "100644",
+    "internal/v2supersessionintegrity/integrity.go": "100644",
+    "internal/v2supersessionintegrity/receipt.go": "100644",
+    "internal/v2supersessionintegrity/independent_review_forward_test.go":
+        "100644",
+    "internal/v2supersessionintegrity/repository.go": "100644",
+    "internal/v2supersessionintegrity/repository_quarantine_test.go": "100644",
+    "internal/v2supersessionintegrity/git_index_test.go": "100644",
+    "internal/v2supersessionintegrity/committed_forward.go": "100644",
+    "internal/v2supersessionintegrity/exact_duplicate_normalization.go": "100644",
+    "internal/v2supersessionintegrity/exact_duplicate_normalization_test.go": "100644",
+    "internal/v2supersessionintegrity/exact_relocation.go": "100644",
+    "internal/v2supersessionintegrity/forward_evidence.go": "100644",
+    "internal/v2supersessionintegrity/forward_evidence_test.go": "100644",
+    "internal/v2supersessionintegrity/git_committed_forward.go": "100644",
+    "internal/v2supersessionintegrity/git_index.go": "100644",
+    "internal/v2supersessionintegrity/independent_review_forward.go": "100644",
+    "internal/v2supersessionintegrity/integrity_test.go": "100644",
+    "internal/v2supersessionintegrity/receipt_test.go": "100644",
+    "internal/v2supersessionintegrity/recovery.go": "100644",
+    "internal/v2supersessionintegrity/recovery_test.go": "100644",
+}
+SEMANTIC_DUPLICATE_NORMALIZATIONS = {
+    "data/editorial/v2_pages/glossario2-d01.jsonl": (
+        "de44fe1fea21672e33b4b9d460e17f986b9537c0",
+        "863895cce3a75272abde946f6cbfca6c9c4cf018",
+        "4ab0e88c310c3f6240ba1f9ebd2097f08c1955ff8029dc8401c333b53adecb65",
+        "23dfc34bf542ba4aedd28eeed906b803049ba9893ed2095d813c8a42ec01ae10", 13),
+    "data/editorial/v2_pages/glossario2-d02.jsonl": (
+        "ebd6b1ca4b1968c02a4f170d972a313e37e51c4b",
+        "82d746d74b66dd3124684f9dee0f87b3d4b21cd3",
+        "38eb75a4785ea1324e9b4011b9dce06b9d55c70a6f162e0db3fba09b05bb2e05",
+        "10d0d8cd7cc44e63394d2fc3bfb7ae8e6c626aa5e1d3b29410455cd2de70229a", 13),
+}
+SEMANTIC_CANONICAL_ID_NORMALIZATIONS = {}
+SEMANTIC_EXACT_FORWARD_NORMALIZATIONS = {
+    "data/editorial/v2_pages/codex-autonomos-seguros-r26.jsonl": (
+        "cff59dcbc84a225dac07d68203d5c06c8c3d1496",
+        "4b4258941bae31659c985afb4bc22d41d563c906",
+        "88e98940310eb87cabf1a78cc18ce4e517a8ac8defe44d1364de4a619523b6a7",
+        "ab8afeb97a5bc8bdf471af9b309399921082e07f14924bbfbd3cc04fddc318aa",
+        2, 2),
+    "data/editorial/portfolio_v2/seguros.jsonl": (
+        "fa58cab69bc8d96f7a3bbd0753dad4e00491d501",
+        "a5a15e25e0b0b6b633b3d715af364ec8499c9294",
+        "f3101f8d83e9eaa52c1c21842407eb4eac2431d4d94bf999d4f280dd075e6215",
+        "57797cc9d516c1102ec063fc9d8455da08e45a57e1f7cbd0b8ac2f8f60eeb32a",
+        239, 242),
+}
+
+
+class GuardError(RuntimeError):
+    pass
+
+
+def git(arguments: list[str], *, input_payload: bytes | None = None) -> bytes:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    completed = subprocess.run(
+        [GIT, "--no-replace-objects", "-c", "core.fsmonitor=false",
+         "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
+         "-c", f"safe.directory={ROOT}",
+         *arguments],
+        cwd=ROOT, env=environment, input=input_payload,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+        check=False,
+    )
+    if (len(completed.stdout) > MAX_GIT_BYTES or
+            len(completed.stderr) > MAX_GIT_BYTES):
+        raise GuardError("saída Git excedeu limite")
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.decode(
+            "utf-8", errors="replace").split())[:800]
+        raise GuardError(f"git {' '.join(arguments[:3])} falhou: {detail}")
+    return completed.stdout
+
+
+def decode_object(raw: bytes, label: str) -> dict[str, Any]:
+    def reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise GuardError(f"chave JSON duplicada em {label}: {key}")
+            result[key] = value
+        return result
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicate)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuardError(f"JSON inválido em {label}") from error
+    if not isinstance(value, dict):
+        raise GuardError(f"registro não é objeto em {label}")
+    return value
+
+
+def decode_unique_intent(raw: bytes, label: str) -> str:
+    try:
+        pairs = json.loads(raw, object_pairs_hook=tuple)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuardError(f"JSON inválido em {label}") from error
+    if (not isinstance(pairs, tuple) or
+            any(not isinstance(pair, tuple) or len(pair) != 2 or
+                not isinstance(pair[0], str) for pair in pairs)):
+        raise GuardError(f"registro não é objeto em {label}")
+    intents = [value for key, value in pairs if key == "intent_id"]
+    if (len(intents) != 1 or not isinstance(intents[0], str) or
+            not intents[0] or intents[0].strip() != intents[0]):
+        raise GuardError(f"intent_id inválido em {label}")
+    return intents[0]
+
+
+def jsonl_records(payload: bytes, label: str) -> list[dict[str, Any]]:
+    if (not payload or not payload.endswith(b"\n") or b"\r" in payload or
+            b"\0" in payload):
+        raise GuardError(f"JSONL inválido em {label}")
+    lines = payload.splitlines()
+    if not lines or any(not line for line in lines):
+        raise GuardError(f"linha vazia em {label}")
+    return [decode_object(raw, f"{label}:{line_number}")
+            for line_number, raw in enumerate(lines, 1)]
+
+
+def canonical_intent_fold(value: str) -> str:
+    return "".join(
+        character for character in unicodedata.normalize("NFKD", value)
+        if unicodedata.combining(character) == 0)
+
+
+def folded_intent_locations(
+    locations: dict[str, list[tuple[str, int]]], canonical: str,
+) -> list[tuple[str, str, int]]:
+    return sorted(
+        (intent, path, line_number)
+        for intent, entries in locations.items()
+        if canonical_intent_fold(intent) == canonical
+        for path, line_number in entries
+    )
+
+
+def assert_public_state_closed(record: dict[str, Any], label: str) -> None:
+    for flag in CLOSED_PUBLIC_REQUIRED_FALSE_FLAGS:
+        # Historical internal v2 rows predate the explicit booleans. Absence is
+        # closed (the zero value consumed by render/release); only a present,
+        # non-false value may open state. Requiring a retroactive field rewrite
+        # here made every otherwise unrelated v2 transaction impossible.
+        if flag in record and record[flag] is not False:
+            raise GuardError(f"flag pública aberta em {label}: {flag}")
+    for flag in CLOSED_PUBLIC_OPTIONAL_FALSE_FLAGS:
+        if flag in record and record[flag] is not False:
+            raise GuardError(f"flag pública opcional aberta em {label}: {flag}")
+    if "index_policy" in record and record["index_policy"] != "noindex":
+        raise GuardError(f"index_policy aberto em {label}")
+    if "public_path" in record and record["public_path"] != "":
+        raise GuardError(f"public_path aberto em {label}")
+
+
+# A product issue is deliberately content-addressed by its stable logical
+# location, not by a human diagnostic string.  This lets a candidate prove
+# that it did not add or move a pre-existing defect while still allowing an
+# unrelated, safe V2 repair to land.  A changed page is never grandfathered:
+# every issue in a touched shard must be fixed in that same transaction.
+ProductIssue = tuple[str, str, int, str]
+
+
+def public_state_product_issues(
+    record: dict[str, Any], path: str, line_number: int, intent: str,
+) -> set[ProductIssue]:
+    issues: set[ProductIssue] = set()
+    for flag in CLOSED_PUBLIC_REQUIRED_FALSE_FLAGS + \
+            CLOSED_PUBLIC_OPTIONAL_FALSE_FLAGS:
+        if flag in record and record[flag] is not False:
+            issues.add(("public-state", path, line_number,
+                        f"{intent}:{flag}"))
+    if "index_policy" in record and record["index_policy"] != "noindex":
+        issues.add(("public-state", path, line_number,
+                    f"{intent}:index_policy"))
+    if "public_path" in record and record["public_path"] != "":
+        issues.add(("public-state", path, line_number,
+                    f"{intent}:public_path"))
+    return issues
+
+
+def canonical_repair_transition(
+    old_payload: bytes, new_payload: bytes, path: str,
+) -> tuple[str, str, int]:
+    old_records = jsonl_records(old_payload, path + "@old")
+    new_records = jsonl_records(new_payload, path + "@new")
+    old_lines = old_payload.splitlines(keepends=True)
+    new_lines = new_payload.splitlines(keepends=True)
+    if len(old_lines) != len(new_lines) or len(old_records) != len(new_records):
+        raise GuardError("canonical-id-repair alterou quantidade de linhas")
+    changed = [index for index, pair in enumerate(zip(old_lines, new_lines))
+               if pair[0] != pair[1]]
+    if len(changed) != 1:
+        raise GuardError(
+            "canonical-id-repair exige exatamente uma linha alterada")
+    index = changed[0]
+    old_record = old_records[index]
+    new_record = new_records[index]
+    old_intent = old_record.get("intent_id")
+    new_intent = new_record.get("intent_id")
+    if (not isinstance(old_intent, str) or not isinstance(new_intent, str) or
+            not old_intent or not new_intent or
+            old_intent.strip() != old_intent or
+            new_intent.strip() != new_intent):
+        raise GuardError("intent_id inválido no canonical-id-repair")
+    if (CANONICAL_INTENT_ID.fullmatch(old_intent) is not None or
+            new_intent != canonical_intent_fold(old_intent) or
+            CANONICAL_INTENT_ID.fullmatch(new_intent) is None or
+            old_intent == new_intent):
+        raise GuardError("accent-fold canonical-id-repair diverge do NFKD exato")
+    old_token = (
+        b'"intent_id":' +
+        json.dumps(old_intent, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"))
+    new_token = (
+        b'"intent_id":' +
+        json.dumps(new_intent, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"))
+    if (old_lines[index].count(old_token) != 1 or
+            new_lines[index].count(new_token) != 1 or
+            new_lines[index] != old_lines[index].replace(
+                old_token, new_token, 1)):
+        raise GuardError("bytes extras no canonical-id-repair")
+    restored = dict(new_record)
+    restored["intent_id"] = old_intent
+    if restored != old_record:
+        raise GuardError("campo extra mudou no canonical-id-repair")
+    for line_number, (old_item, new_item) in enumerate(
+            zip(old_records, new_records), 1):
+        assert_public_state_closed(old_item, f"{path}:{line_number}:old")
+        assert_public_state_closed(new_item, f"{path}:{line_number}:new")
+    return old_intent, new_intent, index + 1
+
+
+def canonical_tree_entries(
+    commit: str,
+    directory: str,
+    pattern: re.Pattern[str],
+    label: str,
+) -> dict[str, tuple[str, str, int]]:
+    """Inventory one directory completely, keeping mode/OID/size per entry.
+
+    ``-l`` custa nada aqui e elimina um fork ``ls-tree`` POR PATH mais adiante:
+    a mesma listagem que autentica o inventário passa a alimentar a leitura de
+    blobs em lote.  Entry escondida por filtro continua sendo falha dura.
+    """
+    output = git([
+        "ls-tree", "-r", "-l", "-z", commit, "--", directory,
+    ])
+    entries: dict[str, tuple[str, str, int]] = {}
+    for raw in output.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_path = raw.split(b"\t", 1)
+            fields = metadata.decode("ascii").split()
+            path = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise GuardError(f"inventário {label} possui entry inválida") from error
+        if len(fields) != 4:
+            raise GuardError(f"inventário {label} possui entry inválida")
+        mode, kind, oid, raw_size = fields
+        if (pattern.fullmatch(path) is None or kind != "blob" or
+                mode != "100644" or OID.fullmatch(oid) is None):
+            raise GuardError(
+                f"inventário {label} possui path/mode não canônico: {path}")
+        if not raw_size.isdigit():
+            raise GuardError(f"inventário {label} possui tamanho inválido: {path}")
+        size = int(raw_size)
+        if size > MAX_FILE_BYTES:
+            raise GuardError(f"blob excede limite: {path}")
+        if path in entries:
+            raise GuardError(f"inventário {label} possui path duplicado")
+        entries[path] = (mode, oid, size)
+    return entries
+
+
+def finalized_tree_entries(commit: str) -> dict[str, tuple[str, str, int]]:
+    return canonical_tree_entries(
+        commit, "data/editorial/v2_pages", FINALIZED, "v2")
+
+
+def portfolio_tree_entries(commit: str) -> dict[str, tuple[str, str, int]]:
+    return canonical_tree_entries(
+        commit, "data/editorial/portfolio_v2", PORTFOLIO, "portfolio_v2")
+
+
+def finalized_tree_files(commit: str) -> list[str]:
+    return sorted(finalized_tree_entries(commit))
+
+
+def read_blob_batch(oids: list[str]) -> dict[str, bytes]:
+    """Decode one ``git cat-file --batch`` stream com framing estrito.
+
+    Objeto ausente vem como ``<oid> missing`` (2 campos) e cai no mesmo erro
+    duro de objeto inesperado: o lote é fail-closed como a leitura unitária.
+    """
+    for oid in oids:
+        if OID.fullmatch(oid) is None:
+            raise GuardError("OID de blob inválido no lote")
+    payload = git(["cat-file", "--batch"],
+                  input_payload=("\n".join(oids) + "\n").encode("ascii"))
+    result: dict[str, bytes] = {}
+    offset = 0
+    for oid in oids:
+        newline = payload.find(b"\n", offset)
+        if newline < 0:
+            raise GuardError("lote cat-file truncou o cabeçalho")
+        try:
+            header = payload[offset:newline].decode("ascii", errors="strict")
+        except UnicodeDecodeError as error:
+            raise GuardError("cabeçalho cat-file não é ASCII") from error
+        fields = header.split(" ")
+        if len(fields) != 3 or fields[0] != oid or fields[1] != "blob":
+            raise GuardError(
+                f"lote cat-file devolveu objeto inesperado: {header}")
+        if not fields[2].isdigit():
+            raise GuardError("lote cat-file devolveu tamanho inválido")
+        size = int(fields[2])
+        if size > MAX_FILE_BYTES:
+            raise GuardError(f"blob excede limite: {oid}")
+        start = newline + 1
+        end = start + size
+        if payload[end:end + 1] != b"\n":
+            raise GuardError("lote cat-file truncou o conteúdo")
+        result[oid] = payload[start:end]
+        offset = end + 1
+    if offset != len(payload):
+        raise GuardError("lote cat-file devolveu bytes extras")
+    return result
+
+
+def blobs_for_entries(
+    entries: dict[str, tuple[str, str, int]],
+    paths: list[str],
+    label: str,
+) -> dict[str, bytes]:
+    """Ler todos os blobs pedidos em lote, não um fork por path.
+
+    Blob Git é endereçado por CONTEÚDO: ler por OID é byte-a-byte idêntico a
+    ``git show <commit>:<path>`` para a entry que carrega aquele OID.  649
+    shards x 2 árvores significavam ~2.600 forks por invocação --product-only
+    (>30 s só em criação de processo).  O cache por OID ainda torna a segunda
+    árvore O(delta): shard não tocado tem o MESMO OID nas duas pontas, então é
+    lido uma única vez.  Nada do gate é afrouxado — a cobertura full-tree
+    permanece idêntica.
+    """
+    global BLOB_CACHE_BYTES
+    wanted: dict[str, int] = {}
+    for path in paths:
+        entry = entries.get(path)
+        if entry is None:
+            raise GuardError(f"entry ausente/ambígua: {path}")
+        _mode, oid, size = entry
+        if oid not in BLOB_CACHE:
+            wanted[oid] = size
+    chunk: list[str] = []
+    chunk_bytes = 0
+    pending: list[list[str]] = []
+    for oid, size in wanted.items():
+        if chunk and chunk_bytes + size > MAX_BATCH_BYTES:
+            pending.append(chunk)
+            chunk = []
+            chunk_bytes = 0
+        chunk.append(oid)
+        chunk_bytes += size
+    if chunk:
+        pending.append(chunk)
+    for batch in pending:
+        for oid, payload in read_blob_batch(batch).items():
+            if BLOB_CACHE_BYTES > MAX_BLOB_CACHE_BYTES:
+                BLOB_CACHE.clear()
+                BLOB_CACHE_BYTES = 0
+            BLOB_CACHE[oid] = payload
+            BLOB_CACHE_BYTES += len(payload)
+    result: dict[str, bytes] = {}
+    for path in paths:
+        _mode, oid, size = entries[path]
+        payload = BLOB_CACHE.get(oid)
+        if payload is None or len(payload) != size:
+            raise GuardError(f"lote {label} não devolveu o blob de {path}")
+        result[path] = payload
+    return result
+
+
+def blob(commit: str, path: str) -> bytes:
+    payload = git(["show", f"{commit}:{path}"])
+    if len(payload) > MAX_FILE_BYTES:
+        raise GuardError(f"blob excede limite: {path}")
+    return payload
+
+
+def blob_by_oid(oid: str) -> bytes:
+    """Read a pinned pre-image blob directly from the object store.
+
+    A landed normalization keeps only the candidate blob in both trees; the
+    authenticated old blob stays reachable through the ancestor commit that
+    consumed the transition and is addressed here by its exact OID.
+    """
+    if not OID.fullmatch(oid):
+        raise GuardError("OID de pre-imagem inválido")
+    payload = git(["cat-file", "blob", oid])
+    if len(payload) > MAX_FILE_BYTES:
+        raise GuardError(f"blob excede limite: {oid}")
+    return payload
+
+
+def _finalized_delta(old: str, new: str, diff_filter: str) -> list[str]:
+    raw = git(["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z",
+               f"--diff-filter={diff_filter}", old, new, "--", "data/editorial/v2_pages"])
+    try:
+        paths = [part.decode("utf-8", errors="strict")
+                 for part in raw.split(b"\0") if part]
+    except UnicodeDecodeError as error:
+        raise GuardError("delta contém path não UTF-8") from error
+    noncanonical = [path for path in paths if not FINALIZED.fullmatch(path)]
+    if noncanonical:
+        raise GuardError("delta v2 finalizado tem path não canônico: " +
+                         ",".join(noncanonical[:8]))
+    return sorted(set(paths))
+
+
+def changed_finalized(old: str, new: str) -> list[str]:
+    """Shards finalizados ADICIONADOS ou ALTERADOS pelo commit candidato.
+
+    O filtro ACM é o que separa esta rota da de remoção. Sem ele, um shard
+    REMOVIDO entrava nesta lista e ia parar no lookup da árvore NOVA, onde por
+    definição não existe — e o gate morria com "entry ausente/ambígua", como se
+    o commit estivesse corrompido. Uma quarentena legítima (move do shard para
+    data/editorial/v2_pages_quarantine sob recibo) reprovava QUALQUER commit
+    cujo pathspec tocasse v2_pages, inclusive commits que não tinham nada a ver
+    com ela. A remoção continua auditada, agora pela rota própria abaixo.
+    """
+    if set(old) == {"0"}:
+        paths = finalized_tree_files(new)
+        noncanonical = [path for path in paths if not FINALIZED.fullmatch(path)]
+        if noncanonical:
+            raise GuardError("delta v2 finalizado tem path não canônico: " +
+                             ",".join(noncanonical[:8]))
+        return sorted(set(paths))
+    return _finalized_delta(old, new, "ACM")
+
+
+def removed_finalized(old: str, new: str) -> list[str]:
+    """Shards finalizados REMOVIDOS pelo commit candidato.
+
+    Remover shard do estoque canônico só é legítimo pela quarentena sancionada
+    (internal/v2pageshardquarantine move por renameat2 e grava recibo em
+    data/ops/). Exigir o recibo mantém a porta fechada para remoção casual, sem
+    penalizar a operação correta.
+    """
+    if set(old) == {"0"}:
+        return []
+    return _finalized_delta(old, new, "D")
+
+
+def matching_tree_entries(
+    commit: str,
+    directory: str,
+    pattern: re.Pattern[str],
+    label: str,
+) -> dict[str, tuple[str, str, int]]:
+    """Inventariar apenas as entries canônicas de um diretório heterogêneo.
+
+    ``canonical_tree_entries`` exige que TODO path do diretório case com o
+    padrão — correto para ``v2_pages``/``portfolio_v2``, impossível para
+    ``data/ops``, que hospeda dezenas de artefatos de famílias diferentes.
+    Aqui o path que não casa é ignorado; o que casa continua fail-closed em
+    tipo, mode, OID e tamanho.
+    """
+    output = git(["ls-tree", "-r", "-l", "-z", commit, "--", directory])
+    entries: dict[str, tuple[str, str, int]] = {}
+    for raw in output.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_path = raw.split(b"\t", 1)
+            fields = metadata.decode("ascii").split()
+            path = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise GuardError(f"inventário {label} possui entry inválida") from error
+        if len(fields) != 4:
+            raise GuardError(f"inventário {label} possui entry inválida")
+        mode, kind, oid, raw_size = fields
+        if pattern.fullmatch(path) is None:
+            continue
+        if kind != "blob" or mode != "100644" or OID.fullmatch(oid) is None:
+            raise GuardError(
+                f"inventário {label} possui path/mode não canônico: {path}")
+        if not raw_size.isdigit():
+            raise GuardError(f"inventário {label} possui tamanho inválido: {path}")
+        size = int(raw_size)
+        if size > MAX_FILE_BYTES:
+            raise GuardError(f"blob excede limite: {path}")
+        if path in entries:
+            raise GuardError(f"inventário {label} possui path duplicado")
+        entries[path] = (mode, oid, size)
+    return entries
+
+
+def quarantine_receipt_index(
+    new: str, wanted: set[str],
+) -> dict[str, list[tuple[str, str, int]]]:
+    """Ler os recibos de quarentena DA ÁRVORE CANDIDATA, nunca da worktree.
+
+    A worktree é mutável e não faz parte do commit: aceitar um recibo solto
+    ali (inclusive untracked) reabriria a remoção casual que este gate existe
+    para fechar.  Cada shard do recibo é validado contra a regra do gerador
+    sancionado (``internal/v2pageshardquarantine``): destino
+    ``data/editorial/v2_pages_quarantine/<operation_id>/<sha256[:16]>-<nome>``,
+    mode de origem 0600/0644 (quarantine.go:1082) e estado público fechado no
+    recibo inteiro.
+
+    O rigor por entrada só recai sobre os shards que ESTE commit remove
+    (``wanted``): uma entrada de outro lote não autoriza nada aqui, e
+    reprovar por causa dela transformaria um recibo alheio em bloqueio de
+    commits sem relação — a mesma classe de dano do bug que este fix corrige.
+    O cabeçalho do recibo continua fail-closed por inteiro: é ele que declara
+    a quarentena bloqueada e sem estado público aberto.
+    """
+    entries = matching_tree_entries(
+        new, "data/ops", QUARANTINE_RECEIPT, "recibo de quarentena")
+    paths = sorted(entries)
+    if len(paths) > MAX_QUARANTINE_RECEIPTS:
+        raise GuardError("inventário de recibos de quarentena excede limite")
+    payloads = blobs_for_entries(entries, paths, "quarantine-receipt")
+    index: dict[str, list[tuple[str, str, int]]] = {}
+    for path in paths:
+        try:
+            record = json.loads(payloads[path].decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise GuardError(
+                f"recibo de quarentena não é JSON UTF-8: {path}") from error
+        if not isinstance(record, dict):
+            raise GuardError(f"recibo de quarentena não é objeto: {path}")
+        schema = record.get("schema_version")
+        if not isinstance(schema, int) or isinstance(schema, bool) or schema < 3:
+            raise GuardError(
+                f"recibo de quarentena com schema não suportado: {path}")
+        operation = record.get("operation_id")
+        if (not isinstance(operation, str) or
+                QUARANTINE_OPERATION.fullmatch(operation) is None):
+            raise GuardError(
+                f"recibo de quarentena sem operation_id canônico: {path}")
+        if (record.get("status") != "blocked_quarantined" or
+                record.get("index_policy") != "noindex"):
+            raise GuardError(
+                f"recibo de quarentena não declara estado bloqueado: {path}")
+        for flag in QUARANTINE_CLOSED_FLAGS:
+            if record.get(flag) is not False:
+                raise GuardError(
+                    f"recibo de quarentena com estado público aberto: {path}:{flag}")
+        shards = record.get("shards")
+        if not isinstance(shards, list) or not shards:
+            raise GuardError(f"recibo de quarentena sem shards: {path}")
+        for position, shard in enumerate(shards, 1):
+            location = f"{path}:{position}"
+            if not isinstance(shard, dict):
+                raise GuardError(f"shard de recibo inválido: {location}")
+            source = shard.get("source_path")
+            if not isinstance(source, str) or source not in wanted:
+                continue
+            destination = shard.get("quarantine_path")
+            digest = shard.get("sha256")
+            size = shard.get("bytes")
+            mode = shard.get("mode")
+            if FINALIZED.fullmatch(source) is None:
+                raise GuardError(f"source_path não canônico no recibo: {location}")
+            if (not isinstance(destination, str) or
+                    QUARANTINE_SHARD.fullmatch(destination) is None):
+                raise GuardError(
+                    f"quarantine_path não canônico no recibo: {location}")
+            if not isinstance(digest, str) or HEX64.fullmatch(digest) is None:
+                raise GuardError(f"sha256 inválido no recibo: {location}")
+            if (not isinstance(size, int) or isinstance(size, bool) or
+                    size < 1 or size > MAX_FILE_BYTES):
+                raise GuardError(f"bytes inválido no recibo: {location}")
+            # Espelho exato da regra do gerador (quarantine.go:1082): o shard
+            # de origem pode estar 0600 (lease privado do gerador datado) ou
+            # 0644. O mode do BLOB na árvore candidata continua preso em
+            # 100644 por matching_tree_entries.
+            if mode not in QUARANTINE_SOURCE_MODES:
+                raise GuardError(f"mode não canônico no recibo: {location}")
+            expected = (
+                f"data/editorial/v2_pages_quarantine/{operation}/"
+                f"{digest[:16]}-{source.rsplit('/', 1)[1]}")
+            if destination != expected:
+                raise GuardError(
+                    f"destino fora da regra do gerador de quarentena: {location}")
+            index.setdefault(source, []).append((destination, digest, size))
+    return index
+
+
+def assert_removals_are_quarantined(new: str, removed: list[str]) -> None:
+    """Remoção de shard finalizado só passa provando a quarentena sancionada.
+
+    A prova tem três pernas, todas lidas de objetos Git imutáveis da árvore
+    candidata: (1) existe recibo cujo ``source_path`` é o shard removido;
+    (2) o ``quarantine_path`` desse recibo existe como blob 100644 na mesma
+    árvore; (3) os bytes desse blob batem, em sha256 e tamanho, com o que o
+    recibo declara.  ``git rm`` casual falha na perna (1); recibo forjado sem
+    mover o conteúdo falha na (2); conteúdo trocado depois do recibo falha na
+    (3).  Nenhuma delas consulta a worktree.
+    """
+    if not removed:
+        return
+    index = quarantine_receipt_index(new, set(removed))
+    shard_entries = matching_tree_entries(
+        new, "data/editorial/v2_pages_quarantine", QUARANTINE_SHARD,
+        "quarentena v2")
+    wanted: set[str] = set()
+    for path in removed:
+        for destination, _digest, _size in index.get(path, ()):
+            if destination in shard_entries:
+                wanted.add(destination)
+    payloads = blobs_for_entries(
+        shard_entries, sorted(wanted), "v2-quarantine")
+    sem_recibo: list[str] = []
+    sem_conteudo: list[str] = []
+    for path in removed:
+        claims = index.get(path, [])
+        if not claims:
+            sem_recibo.append(path)
+            continue
+        proven = False
+        for destination, digest, size in claims:
+            entry = shard_entries.get(destination)
+            payload = payloads.get(destination)
+            if entry is None or payload is None:
+                continue
+            if entry[2] != size or len(payload) != size:
+                continue
+            if hashlib.sha256(payload).hexdigest() != digest:
+                continue
+            proven = True
+            break
+        if not proven:
+            sem_conteudo.append(path)
+    if sem_recibo:
+        raise GuardError(
+            "remoção de shard finalizado sem recibo de quarentena: " +
+            ",".join(sem_recibo[:8]))
+    if sem_conteudo:
+        raise GuardError(
+            "quarentena não confere com o recibo do shard removido: " +
+            ",".join(sem_conteudo[:8]))
+
+
+def changed_paths(old: str, new: str) -> list[str]:
+    raw = git(["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z",
+               old, new])
+    try:
+        paths = [part.decode("utf-8", errors="strict")
+                 for part in raw.split(b"\0") if part]
+    except UnicodeDecodeError as error:
+        raise GuardError("delta possui path não UTF-8") from error
+    if len(paths) != len(set(paths)):
+        raise GuardError("delta possui path duplicado")
+    return sorted(paths)
+
+
+def commit_identity(commit: str) -> tuple[str, str]:
+    raw = git(["show", "-s", "--format=%an <%ae>%n%cn <%ce>", commit])
+    try:
+        lines = raw.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as error:
+        raise GuardError("identidade do commit não é UTF-8") from error
+    if len(lines) != 2:
+        raise GuardError("commit não possui author/committer canônicos")
+    return lines[0], lines[1]
+
+
+def tree_entry(commit: str, path: str) -> tuple[str, str]:
+    raw = git(["ls-tree", "-z", commit, "--", path])
+    if not raw.endswith(b"\0") or raw.count(b"\0") != 1:
+        raise GuardError(f"entry ausente/ambígua: {path}")
+    try:
+        header, observed = raw[:-1].split(b"\t", 1)
+        mode, kind, oid = header.decode("ascii").split(" ")
+        observed_path = observed.decode("utf-8", errors="strict")
+    except (ValueError, UnicodeDecodeError) as error:
+        raise GuardError(f"entry inválida: {path}") from error
+    if (observed_path != path or kind != "blob" or
+            mode not in {"100644", "100755"} or not OID.fullmatch(oid)):
+        raise GuardError(f"entry não é blob regular 100644/100755: {path}")
+    return mode, oid
+
+
+def worktree_matches(commit: str, path: str, expected_blob: bytes) -> None:
+    target = ROOT / path
+    try:
+        before = os.lstat(target)
+    except OSError as error:
+        raise GuardError(f"shard alterado não existe na worktree: {path}") from error
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+            stat.S_IMODE(before.st_mode) != 0o644 or before.st_size > MAX_FILE_BYTES):
+        raise GuardError(f"shard alterado precisa ser regular único mode 0644: {path}")
+    descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise GuardError(f"shard truncou durante leitura: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise GuardError(f"shard cresceu durante leitura: {path}")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+         before.st_ctime_ns) !=
+            (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+             opened.st_ctime_ns) or
+            (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+             opened.st_ctime_ns) !=
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+             after.st_ctime_ns)):
+        raise GuardError(f"shard mudou durante autenticação: {path}")
+    if b"".join(chunks) != expected_blob:
+        raise GuardError(f"worktree diverge do blob candidato: {path}")
+
+
+def membership_hint(path: str, intent: str, count: int = 0) -> str:
+    """Mensagem ACIONAVEL para a recusa de pertinencia ao portfolio.
+
+    POR QUE ESTA FUNCAO EXISTE (custo medido em 2026-08-20).
+
+    A mensagem anterior era "intent fora/ambiguo no portfolio candidato:
+    <path>:<intent>" e nao dizia nem qual dos dois casos era, nem o que fazer.
+    Um agente com o indice INTEGRO -- 280 paginas, 280 intencoes, 1:1
+    verificado sobre o proprio git write-tree -- tentou o mesmo commit QUATRO
+    vezes antes de ler o codigo e descobrir a regra, que esta documentada
+    apenas num comentario tres funcoes acima: a autoridade de pertinencia e o
+    portfolio do commit PAI, nunca o do candidato.
+
+    A regra e boa (ninguem fabrica a demanda e o conteudo no mesmo movimento
+    atomico) e nao muda aqui. O que muda e a mensagem: gate que reprova sem
+    dizer o que corrigir faz o agente tentar de novo as cegas, e cada tentativa
+    custa um build completo. Nenhuma verificacao foi afrouxada -- so passou a
+    explicar.
+    """
+    if count > 1:
+        causa = (f"a intencao aparece {count} vezes no portfolio; "
+                 "deve aparecer exatamente uma")
+    else:
+        causa = ("a intencao NAO esta no portfolio do commit PAI "
+                 "(data/editorial/portfolio_v2/)")
+    return (
+        f"intent fora/ambiguo no portfolio candidato: {path}:{intent} -- {causa}. "
+        "A autoridade de pertinencia e o commit PAI, nunca o candidato: "
+        "portfolio e pagina NAO entram na mesma transacao, por desenho "
+        "(ninguem fabrica a demanda e o conteudo no mesmo movimento atomico). "
+        "COMO CORRIGIR, em dois commits nesta ordem: "
+        "1) git commit -F <msg> -- data/editorial/portfolio_v2 ; "
+        "2) git commit -F <msg> -- data/editorial/v2_pages . "
+        "Confira antes com: ./tools/check-v2-portfolio-pairing"
+    )
+
+
+def portfolio_membership(commit: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    records = 0
+    portfolio_entries = portfolio_tree_entries(commit)
+    portfolio_paths = sorted(portfolio_entries)
+    portfolio_payloads = blobs_for_entries(
+        portfolio_entries, portfolio_paths, "portfolio_v2")
+    for path in portfolio_paths:
+        payload = portfolio_payloads[path]
+        if payload and not payload.endswith(b"\n"):
+            raise GuardError(f"portfolio sem LF terminal: {path}")
+        for line_number, raw in enumerate(payload.splitlines(), 1):
+            if not raw:
+                raise GuardError(f"linha vazia em {path}:{line_number}")
+            record = decode_object(raw, f"{path}:{line_number}")
+            intent = record.get("intent_id")
+            if (not isinstance(intent, str) or
+                    CANONICAL_INTENT_ID.fullmatch(intent) is None):
+                raise GuardError(f"intent_id inválido em {path}:{line_number}")
+            counts[intent] = counts.get(intent, 0) + 1
+            if counts[intent] != 1:
+                raise GuardError(
+                    f"intent_id duplicado no portfolio: {intent}")
+            records += 1
+            if records > MAX_RECORDS:
+                raise GuardError("portfolio excede limite de registros")
+    if not counts:
+        raise GuardError("portfolio_v2 candidato está vazio")
+    return counts
+
+
+def receipt_digest(old: str, new: str, entries: list[tuple[str, str, str]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"v2-finalized-reference-receipt-v1\0")
+    digest.update(old.encode("ascii") + b"\0" + new.encode("ascii") + b"\0")
+    for path, mode, oid in sorted(entries):
+        digest.update(path.encode("utf-8") + b"\0" + mode.encode("ascii") +
+                      b"\0" + oid.encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def semantic_recut_receipt_digest(
+    old: str, new: str, entries: list[tuple[str, str, str]],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"v2-semantic-recut-commit-receipt-v1\0")
+    digest.update(old.encode("ascii") + b"\0" + new.encode("ascii") + b"\0")
+    for path, mode, oid in sorted(entries):
+        digest.update(path.encode("utf-8") + b"\0" + mode.encode("ascii") +
+                      b"\0" + oid.encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def semantic_normalization_payloads(
+    old: str, new: str, path: str, old_oid: str, new_oid: str,
+) -> tuple[bytes, bytes]:
+    """Resolve the authenticated old/new payloads of one pinned transition.
+
+    Pending generation: the parent tree still carries the old blob and the
+    candidate applies the new blob.  Landed generation: both trees already
+    carry the exact new blob (transition consumed by an ancestor commit) and
+    the authenticated pre-image is read directly by its pinned OID.
+    """
+    old_entry, new_entry = tree_entry(old, path), tree_entry(new, path)
+    if old_entry == ("100644", new_oid):
+        if new_entry != old_entry:
+            raise GuardError(
+                "normalização pousada divergiu no candidate OID: " + path)
+        return blob_by_oid(old_oid), blob(new, path)
+    if old_entry != ("100644", old_oid) or new_entry != ("100644", new_oid):
+        raise GuardError(
+            "normalização perdeu parent/candidate OID: " + path)
+    return blob(old, path), blob(new, path)
+
+
+def check_semantic_duplicate_normalizations(old: str, new: str) -> None:
+    member = b',"page_type":"verbete"'
+    for path, authority in SEMANTIC_DUPLICATE_NORMALIZATIONS.items():
+        old_oid, new_oid, old_sha, new_sha, rows = authority
+        old_payload, new_payload = semantic_normalization_payloads(
+            old, new, path, old_oid, new_oid)
+        if (hashlib.sha256(old_payload).hexdigest() != old_sha or
+                hashlib.sha256(new_payload).hexdigest() != new_sha or
+                not old_payload.endswith(b"\n") or
+                not new_payload.endswith(b"\n")):
+            raise GuardError("duplicate normalization perdeu SHA/LF")
+        old_lines, new_lines = old_payload.splitlines(), new_payload.splitlines()
+        if len(old_lines) != rows or len(new_lines) != rows:
+            raise GuardError("duplicate normalization perdeu 13 linhas")
+        for line_number, (old_line, new_line) in enumerate(
+                zip(old_lines, new_lines), 1):
+            try:
+                pairs = json.loads(
+                    old_line, object_pairs_hook=lambda value: ("object", value))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise GuardError("duplicate normalization parent JSON inválido") from error
+            if (not isinstance(pairs, tuple) or len(pairs) != 2 or
+                    pairs[0] != "object" or not isinstance(pairs[1], list)):
+                raise GuardError("duplicate normalization parent não é objeto")
+            keys = [pair[0] for pair in pairs[1]
+                    if isinstance(pair, tuple) and len(pair) == 2]
+            page_types = [pair[1] for pair in pairs[1]
+                          if isinstance(pair, tuple) and len(pair) == 2 and
+                          pair[0] == "page_type"]
+            if (len(keys) != len(pairs[1]) or
+                    page_types != ["verbete", "verbete"] or
+                    any(keys.count(key) != (2 if key == "page_type" else 1)
+                        for key in set(keys)) or
+                    old_line.count(member) != 2 or
+                    new_line != old_line.replace(member, b"", 1)):
+                raise GuardError(
+                    f"duplicate normalization alterou bytes extras: {path}:{line_number}")
+            record = decode_object(new_line, f"{path}:{line_number}")
+            for flag in ("publication_candidate", "public", "indexable",
+                         "publication_allowed", "render_allowed",
+                         "sitemap_allowed", "approval"):
+                if record.get(flag) is not False:
+                    raise GuardError(
+                        f"duplicate normalization abriu flag: {path}:{line_number}:{flag}")
+            if (record.get("page_type") != "verbete" or
+                    record.get("index_policy") != "noindex" or
+                    record.get("public_path") != ""):
+                raise GuardError("duplicate normalization abriu estado público")
+
+
+def check_semantic_canonical_id_normalizations(old: str, new: str) -> None:
+    old_token = '"intent_id":"seguro-marítimo-avaria-carga-protesto"'.encode()
+    new_token = b'"intent_id":"seguro-maritimo-avaria-carga-protesto"'
+    for path, authority in SEMANTIC_CANONICAL_ID_NORMALIZATIONS.items():
+        old_oid, new_oid, old_sha, new_sha, rows = authority
+        old_payload, new_payload = semantic_normalization_payloads(
+            old, new, path, old_oid, new_oid)
+        if (hashlib.sha256(old_payload).hexdigest() != old_sha or
+                hashlib.sha256(new_payload).hexdigest() != new_sha):
+            raise GuardError("canonical normalization perdeu SHA")
+        old_lines, new_lines = old_payload.splitlines(keepends=True), new_payload.splitlines(keepends=True)
+        if (len(old_lines) != rows or len(new_lines) != rows or
+                old_lines[0].count(old_token) != 1 or
+                new_lines[0] != old_lines[0].replace(old_token, new_token, 1) or
+                new_lines[1:] != old_lines[1:]):
+            raise GuardError("canonical normalization alterou bytes fora do fold")
+        for line, raw in enumerate(new_payload.splitlines(), 1):
+            record = decode_object(raw, f"{path}:{line}")
+            for flag in CLOSED_PUBLIC_REQUIRED_FALSE_FLAGS:
+                if record.get(flag) is not False:
+                    raise GuardError("canonical normalization abriu flag pública")
+            if record.get("index_policy") != "noindex" or record.get("public_path") != "":
+                raise GuardError("canonical normalization abriu estado público")
+
+
+def check_semantic_exact_forward_normalizations(old: str, new: str) -> None:
+    """Bind exceptional forward edits to the wrapper's exact byte authority."""
+    for path, authority in SEMANTIC_EXACT_FORWARD_NORMALIZATIONS.items():
+        (old_oid, new_oid, old_sha, new_sha,
+         old_rows, new_rows) = authority
+        old_payload, new_payload = semantic_normalization_payloads(
+            old, new, path, old_oid, new_oid)
+        if (hashlib.sha256(old_payload).hexdigest() != old_sha or
+                hashlib.sha256(new_payload).hexdigest() != new_sha or
+                len(old_payload.splitlines()) != old_rows or
+                len(new_payload.splitlines()) != new_rows):
+            raise GuardError(
+                "normalização forward perdeu bytes/quantidade fixa: " + path)
+
+
+def check_semantic_recut(old: str, new: str, finalized: list[str]) -> None:
+    paths = changed_paths(old, new)
+    for path in sorted(SEMANTIC_FIXED_CLOSURE.difference(paths)):
+        # Anchor carried unchanged by a later generation (any of the four):
+        # it must remain the exact same regular blob on both sides of the
+        # commit.  An anchor that changed can only arrive inside the delta.
+        anchor_entry = tree_entry(new, path)
+        if (anchor_entry[0] != "100644" or
+                tree_entry(old, path) != anchor_entry):
+            raise GuardError(
+                "âncora fixa semantic-recut divergiu fora do delta: " + path)
+    for family, label in (
+            (SEMANTIC_DUPLICATE_NORMALIZATIONS,
+             "semantic-recut omitiu duplicate normalization fixa"),
+            (SEMANTIC_CANONICAL_ID_NORMALIZATIONS,
+             "semantic-recut omitiu canonical normalization fixa"),
+            (SEMANTIC_EXACT_FORWARD_NORMALIZATIONS,
+             "semantic-recut omitiu normalização forward fixa")):
+        for path, authority in family.items():
+            if tree_entry(old, path) == ("100644", authority[1]):
+                # Landed transition (consumed by an ancestor commit): it must
+                # not rejoin this delta.  Its bytes are still revalidated
+                # against the pinned authority by the check below.
+                if path in paths:
+                    raise GuardError(
+                        "normalização já pousada não aceita novo delta: " +
+                        path)
+                continue
+            if path not in paths:
+                raise GuardError(label + ": " + path)
+    if any(path not in SEMANTIC_FIXED_CLOSURE and
+           path not in SEMANTIC_BOOTSTRAP_RUNTIME_MODES and
+           FINALIZED.fullmatch(path) is None and PORTFOLIO.fullmatch(path) is None
+           for path in paths):
+        raise GuardError("semantic-recut incluiu path fora da closure privada")
+    if not finalized or not any(PORTFOLIO.fullmatch(path) for path in paths):
+        raise GuardError("semantic-recut exige páginas e portfolio candidato")
+    for path, expected_mode in SEMANTIC_BOOTSTRAP_RUNTIME_MODES.items():
+        new_entry = tree_entry(new, path)
+        if new_entry[0] != expected_mode:
+            raise GuardError("semantic-recut runtime perdeu modo fixo: " + path)
+        if path not in paths and tree_entry(old, path) != new_entry:
+            raise GuardError(
+                "semantic-recut runtime mudou fora do delta autenticado: " + path)
+    entries: list[tuple[str, str, str]] = []
+    for path in paths:
+        mode, object_id = tree_entry(new, path)
+        expected_mode = SEMANTIC_BOOTSTRAP_RUNTIME_MODES.get(path, "100644")
+        if mode != expected_mode:
+            raise GuardError("semantic-recut path perdeu modo fixo: " + path)
+        entries.append((path, mode, object_id))
+    expected = semantic_recut_receipt_digest(old, new, entries)
+    if os.environ.get("WIKI_V2_AUTHENTICATED_SEMANTIC_RECUT_SHA256") != expected:
+        raise GuardError("receipt privado semantic-recut ausente/divergente")
+    check_semantic_duplicate_normalizations(old, new)
+    check_semantic_canonical_id_normalizations(old, new)
+    check_semantic_exact_forward_normalizations(old, new)
+
+    members = portfolio_membership(new)
+    for path in finalized:
+        for line_number, record in enumerate(jsonl_records(blob(new, path), path), 1):
+            intent = record.get("intent_id")
+            if not isinstance(intent, str) or members.get(intent) != 1:
+                raise GuardError(membership_hint(
+                    path, str(intent), members.get(intent, 0) if isinstance(intent, str) else 0))
+            for flag in ("publication_allowed", "render_allowed", "sitemap_allowed"):
+                if flag in record and record[flag] is not False:
+                    raise GuardError(f"flag pública aberta em {path}:{line_number}:{flag}")
+            for flag in CLOSED_PUBLIC_REQUIRED_FALSE_FLAGS + \
+                    CLOSED_PUBLIC_OPTIONAL_FALSE_FLAGS:
+                if flag in record and record[flag] is not False:
+                    raise GuardError(f"flag pública aberta em {path}:{line_number}:{flag}")
+            if (("index_policy" in record and record["index_policy"] != "noindex") or
+                    record.get("public_path", "") != ""):
+                raise GuardError(f"index/path público aberto em {path}:{line_number}")
+
+
+def intent_locations(commit: str) -> dict[str, list[tuple[str, int]]]:
+    locations: dict[str, list[tuple[str, int]]] = {}
+    records = 0
+    for path in finalized_tree_files(commit):
+        payload = blob(commit, path)
+        if (not payload or not payload.endswith(b"\n") or
+                b"\r" in payload or b"\0" in payload):
+            raise GuardError(f"JSONL inválido em {path}")
+        lines = payload.splitlines()
+        if not lines or any(not line for line in lines):
+            raise GuardError(f"linha vazia em {path}")
+        for line_number, raw in enumerate(lines, 1):
+            intent = decode_unique_intent(raw, f"{path}:{line_number}")
+            locations.setdefault(intent, []).append((path, line_number))
+            records += 1
+            if records > MAX_RECORDS:
+                raise GuardError("estoque v2 excede limite de registros")
+    return locations
+
+
+def canonical_repair_receipt_digest(
+    old: str, new: str, path: str,
+    old_mode: str, old_oid: str, new_mode: str, new_oid: str,
+    old_intent: str, new_intent: str, line_number: int,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"v2-canonical-id-repair-receipt-v1\0")
+    for value in (
+            old, new, path, old_mode, old_oid, new_mode, new_oid,
+            old_intent, new_intent, str(line_number)):
+        digest.update(value.encode("utf-8") + b"\0")
+    return digest.hexdigest()
+
+
+def authenticated_recovery(new: str) -> bool:
+    recovery_oid = os.environ.get("WIKI_V2_AUTHENTICATED_RECOVERY_OID")
+    if recovery_oid is None:
+        return False
+    if recovery_oid != new:
+        raise GuardError("recovery perdeu bind do commit candidato")
+    if git(["rev-parse", "--verify", "HEAD^{commit}"]) != (
+            new + "\n").encode("ascii"):
+        raise GuardError("recovery só aceita o commit candidato no HEAD atual")
+    return True
+
+
+def check_canonical_id_repair(
+    old: str, new: str, changed: list[str], *, recovery: bool = False,
+) -> None:
+    if len(changed) != 1:
+        raise GuardError(
+            "canonical-id-repair exige exatamente um shard alterado")
+    path = changed[0]
+    old_mode, old_oid = tree_entry(old, path)
+    new_mode, new_oid = tree_entry(new, path)
+    if old_mode != "100644" or new_mode != "100644":
+        raise GuardError("canonical-id-repair não aceita add/delete/mode change")
+    old_payload = blob(old, path)
+    new_payload = blob(new, path)
+    if not recovery:
+        worktree_matches(new, path, new_payload)
+    old_intent, new_intent, line_number = canonical_repair_transition(
+        old_payload, new_payload, path)
+    old_locations = intent_locations(old)
+    if old_locations.get(old_intent) != [(path, line_number)]:
+        raise GuardError("intent antigo não é globalmente único")
+    if old_locations.get(new_intent):
+        raise GuardError("intent canônico novo já existia no parent")
+    if folded_intent_locations(old_locations, new_intent) != [(
+            old_intent, path, line_number)]:
+        raise GuardError("intent_id possui alias NFKD global no parent")
+    new_locations = intent_locations(new)
+    if new_locations.get(new_intent) != [(path, line_number)] or \
+            new_locations.get(old_intent):
+        raise GuardError("candidate tree não materializou transição única")
+    if folded_intent_locations(new_locations, new_intent) != [(
+            new_intent, path, line_number)]:
+        raise GuardError("candidate tree manteve alias NFKD global")
+    expected = canonical_repair_receipt_digest(
+        old, new, path, old_mode, old_oid, new_mode, new_oid,
+        old_intent, new_intent, line_number)
+    if os.environ.get("WIKI_V2_AUTHENTICATED_REPAIR_SHA256") != expected:
+        raise GuardError("receipt canonical-id-repair ausente ou divergente")
+
+
+def anchored_canonical_shard_pins(commit: str) -> dict[str, str]:
+    """Byte-exact pins for canonical shards named by anchored archives.
+
+    Cadeia de autoridade, toda em evidência já commitada no parent: o anchor
+    hardcoded (espelho de integrity.go) pina os bytes do archive; cada linha
+    do archive pina ``canonical_shard`` + ``canonical_shard_sha256``.  Um path
+    só entra no mapa com digest único e válido; pin ambíguo nunca autoriza.
+    """
+    pins: dict[str, str] = {}
+    for archive_path in sorted(ANCHORED_SUPERSESSION_ARCHIVES):
+        expected = ANCHORED_SUPERSESSION_ARCHIVES[archive_path]
+        listed = git(["ls-tree", "-z", commit, "--", archive_path])
+        if not listed:
+            continue
+        payload = blob(commit, archive_path)
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise GuardError(
+                f"archive ancorado diverge do anchor de produção: {archive_path}")
+        for line_number, raw in enumerate(payload.splitlines(), 1):
+            if not raw:
+                raise GuardError(f"linha vazia em {archive_path}:{line_number}")
+            record = decode_object(raw, f"{archive_path}:{line_number}")
+            if record.get("record_type") != "v2_duplicate_intent_supersession":
+                continue
+            shard = record.get("canonical_shard")
+            digest = record.get("canonical_shard_sha256")
+            if (not isinstance(shard, str) or "/" in shard or
+                    not isinstance(digest, str) or
+                    HEX64.fullmatch(digest.lower()) is None):
+                raise GuardError(
+                    f"pin canônico inválido em {archive_path}:{line_number}")
+            path = "data/editorial/v2_pages/" + shard
+            if FINALIZED.fullmatch(path) is None:
+                # Shard histórico fora do padrão canônico de path: nunca pode
+                # aparecer em ``changed`` (que é sempre FINALIZED), logo nunca
+                # autoriza nada — apenas não entra no mapa de pins.
+                continue
+            previous = pins.get(path)
+            if previous is not None and previous != digest.lower():
+                raise GuardError(f"pin canônico ambíguo para {path}")
+            pins[path] = digest.lower()
+    return pins
+
+
+def anchored_membership_additions(
+    new: str, changed: list[str], parent_members: dict[str, int],
+) -> dict[str, int]:
+    """Candidate-portfolio membership, restricted to byte-pinned shards.
+
+    A regra de ouro do produto continua intacta: o portfolio do PARENT é a
+    autoridade de membership, porque um candidato não pode fabricar página e
+    autorização na mesma transação.  A única exceção é o shard cujo blob
+    candidato inteiro bate byte a byte no ``canonical_shard_sha256`` de um
+    archive de supersessão ancorado em produção: esses bytes já foram
+    autenticados por evidência commitada antes desta transação (o mesmo
+    modelo de autoridade do ``check_semantic_recut``, que também consome
+    ``portfolio_membership(new)`` sob receipt próprio), então nenhum byte da
+    página pôde ser fabricado aqui.  Byte fora do pin nunca ganha a exceção;
+    intent sem linha única no portfolio candidato reprova; a exceção nunca
+    mascara ambiguidade pré-existente no parent (só cobre count==0).
+    """
+    pins = anchored_canonical_shard_pins(new)
+    eligible = [path for path in changed if path in pins]
+    if not eligible:
+        return {}
+    additions: dict[str, int] = {}
+    candidate_members = portfolio_membership(new)
+    for path in eligible:
+        payload = blob(new, path)
+        if hashlib.sha256(payload).hexdigest() != pins[path]:
+            # Conteúdo divergente do pin não recebe autoridade nenhuma; a
+            # checagem estrita contra o parent segue valendo para este path.
+            continue
+        for line_number, raw in enumerate(payload.splitlines(), 1):
+            if not raw:
+                raise GuardError(f"linha vazia em {path}:{line_number}")
+            record = decode_object(raw, f"{path}:{line_number}")
+            intent = record.get("intent_id")
+            if (not isinstance(intent, str) or
+                    CANONICAL_INTENT_ID.fullmatch(intent) is None):
+                raise GuardError(
+                    f"intent_id inválido em shard ancorado {path}:{line_number}")
+            if candidate_members.get(intent, 0) != 1:
+                raise GuardError(
+                    "shard ancorado sem linha única no portfolio candidato: "
+                    f"{path}:{intent}")
+            if parent_members.get(intent, 0) == 0:
+                additions[intent] = 1
+    return additions
+
+
+def check_finalized_product(
+    old: str, new: str, changed: list[str], *, require_worktree: bool,
+) -> list[tuple[str, str, str]]:
+    """Validate ordinary finalized-page product invariants, without authority.
+
+    The parent portfolio is deliberately the membership authority.  A candidate
+    cannot add its own portfolio row and consume it in the same transaction.
+    The single exception is a shard whose full candidate bytes equal the
+    canonical-shard digest recorded by a production-anchored supersession
+    archive (see ``anchored_membership_additions``): that evidence predates the
+    transaction, so consuming its portfolio row here manufactures nothing.
+    This function reads only immutable Git objects unless the authenticated
+    legacy workflow explicitly asks for the additional worktree CAS bind.
+    """
+    if set(old) == {"0"}:
+        raise GuardError("produto v2 não aceita commit raiz sem parent auditável")
+    members = portfolio_membership(old)
+    additions = anchored_membership_additions(new, changed, members)
+    if additions:
+        members = dict(members)
+        members.update(additions)
+    return check_page_product(
+        new, changed, members=members, require_worktree=require_worktree)
+
+
+def check_page_product(
+    commit: str,
+    paths: list[str],
+    *,
+    members: dict[str, int],
+    require_worktree: bool,
+) -> list[tuple[str, str, str]]:
+    """Validate exact page blobs against an already authenticated membership."""
+    entries: list[tuple[str, str, str]] = []
+    active_locations: dict[str, tuple[str, int]] = {}
+    for path in paths:
+        mode, object_id = tree_entry(commit, path)
+        if mode != "100644":
+            raise GuardError(f"shard finalizado não é blob mode 100644: {path}")
+        payload = blob(commit, path)
+        if require_worktree:
+            worktree_matches(commit, path, payload)
+        if not payload or not payload.endswith(b"\n"):
+            raise GuardError(f"shard finalizado vazio/sem LF terminal: {path}")
+        seen: set[str] = set()
+        for line_number, raw in enumerate(payload.splitlines(), 1):
+            if not raw:
+                raise GuardError(f"linha vazia em {path}:{line_number}")
+            record = decode_object(raw, f"{path}:{line_number}")
+            intent = record.get("intent_id")
+            if (not isinstance(intent, str) or
+                    CANONICAL_INTENT_ID.fullmatch(intent) is None or
+                    intent in seen):
+                raise GuardError(
+                    f"intent_id ausente/inválido/duplicado em {path}:{line_number}")
+            seen.add(intent)
+            skipped = record.get("skipped") is True
+            membership_count = members.get(intent, 0)
+            # Authenticated supersession tombstones are closed historical
+            # evidence, not active portfolio pages. Some deliberately retain
+            # the canonical intent join; orphan quarantine tombstones do not.
+            # The Go supersession gate authenticates the tombstone transition.
+            if ((not skipped and membership_count != 1) or
+                    (skipped and membership_count > 1)):
+                raise GuardError(membership_hint(path, str(intent), membership_count))
+            assert_public_state_closed(record, f"{path}:{line_number}")
+            if not skipped:
+                previous = active_locations.get(intent)
+                if previous is not None:
+                    raise GuardError(
+                        "intent ativo duplicado entre shards: "
+                        f"{intent} primeiro={previous[0]}:{previous[1]} "
+                        f"duplicado={path}:{line_number}")
+                active_locations[intent] = (path, line_number)
+        entries.append((path, mode, object_id))
+    return entries
+
+
+def collect_page_product_issues(
+    commit: str,
+    paths: list[str],
+    *,
+    members: dict[str, int],
+) -> set[ProductIssue]:
+    """Collect bounded, location-stable legacy issues without blessing them.
+
+    Inventory modes and portfolio structure remain hard failures.  Page-level
+    issues are collected so the ref transaction can enforce a monotonic
+    migration: no new issue, no issue moved to another path, and no unresolved
+    issue in a page touched by the candidate.
+    """
+    issues: set[ProductIssue] = set()
+    active_locations: dict[str, tuple[str, int]] = {}
+    entries = finalized_tree_entries(commit)
+    payloads = blobs_for_entries(entries, paths, "v2")
+    for path in paths:
+        mode, _object_id, _size = entries[path]
+        if mode != "100644":
+            raise GuardError(f"shard finalizado não é blob mode 100644: {path}")
+        payload = payloads[path]
+        if not payload or not payload.endswith(b"\n"):
+            issues.add(("jsonl-shape", path, 0, "empty-or-missing-terminal-lf"))
+        lines = payload.splitlines()
+        if not lines:
+            continue
+        seen: set[str] = set()
+        for line_number, raw in enumerate(lines, 1):
+            if not raw:
+                issues.add(("jsonl-shape", path, line_number, "empty-line"))
+                continue
+            try:
+                record = decode_object(raw, f"{path}:{line_number}")
+            except GuardError:
+                issues.add(("json-record", path, line_number,
+                            hashlib.sha256(raw).hexdigest()))
+                continue
+            intent = record.get("intent_id")
+            if (not isinstance(intent, str) or
+                    CANONICAL_INTENT_ID.fullmatch(intent) is None):
+                issues.add(("intent", path, line_number, "invalid"))
+                continue
+            if intent in seen:
+                issues.add(("intent", path, line_number,
+                            f"duplicate-in-shard:{intent}"))
+            seen.add(intent)
+            skipped = record.get("skipped") is True
+            membership_count = members.get(intent, 0)
+            if ((not skipped and membership_count != 1) or
+                    (skipped and membership_count > 1)):
+                issues.add(("membership", path, line_number,
+                            f"{intent}:{membership_count}:{int(skipped)}"))
+            issues.update(public_state_product_issues(
+                record, path, line_number, intent))
+            if not skipped:
+                previous = active_locations.get(intent)
+                if previous is not None:
+                    issues.add((
+                        "active-duplicate", path, line_number,
+                        f"{intent}:{previous[0]}:{previous[1]}",
+                    ))
+                else:
+                    active_locations[intent] = (path, line_number)
+    return issues
+
+
+def describe_product_issue(issue: ProductIssue) -> str:
+    kind, path, line_number, detail = issue
+    if kind == "membership":
+        intent = detail.split(":", 1)[0]
+        contagem = 0
+        partes = detail.split(":", 1)
+        if len(partes) == 2 and partes[1].isdigit():
+            contagem = int(partes[1])
+        return membership_hint(path, intent, contagem)
+    if kind == "public-state":
+        return f"estado público aberto no produto candidato: {path}:{line_number}:{detail}"
+    if kind == "active-duplicate":
+        return f"intent ativo duplicado entre shards: {path}:{line_number}:{detail}"
+    return f"produto candidato inválido: {kind}:{path}:{line_number}:{detail}"
+
+
+def check_candidate_product(old: str, new: str, changed: list[str]) -> None:
+    """Prove that candidate-wide product state is monotonic and fail closed.
+
+    Checking only changed page shards left a portfolio-only or semantic-only
+    transaction able to orphan already-finalized pages.  Requiring a historically
+    red parent to become globally green in the same commit, however, deadlocked
+    every forward repair.  Compare complete immutable trees instead: the
+    candidate may remove legacy issues, but may neither add one nor retain one
+    in a touched page.  The separate parent-membership check below still
+    prevents manufacturing page authority alongside a new/changed page.
+    """
+    candidate_paths = finalized_tree_files(new)
+    if not candidate_paths:
+        raise GuardError("estoque v2 candidato está vazio")
+    candidate_issues = collect_page_product_issues(
+        new, candidate_paths, members=portfolio_membership(new))
+    if not candidate_issues:
+        return
+    if set(old) == {"0"}:
+        raise GuardError(describe_product_issue(sorted(candidate_issues)[0]))
+    parent_paths = finalized_tree_files(old)
+    parent_issues = collect_page_product_issues(
+        old, parent_paths, members=portfolio_membership(old))
+    introduced = candidate_issues - parent_issues
+    if introduced:
+        raise GuardError(describe_product_issue(sorted(introduced)[0]))
+    touched = set(changed)
+    retained_touched = sorted(
+        issue for issue in candidate_issues if issue[1] in touched)
+    if retained_touched:
+        raise GuardError(
+            "shard tocado manteve defeito legado: " +
+            describe_product_issue(retained_touched[0]))
+
+
+def check(old: str, new: str, *, product_only: bool = False) -> None:
+    if not OID.fullmatch(new) or not (OID.fullmatch(old) or set(old) == {"0"}):
+        raise GuardError("OID old/new inválido")
+    changed = changed_finalized(old, new)
+    # A remoção é auditada ANTES de qualquer invariante de produto: um `git rm`
+    # casual precisa ouvir "sem recibo de quarentena", não um erro de membership
+    # rio abaixo. Vale para as duas rotas (produto e closure privada), porque a
+    # quarentena legítima roda pela rota de produto do launcher autenticado.
+    assert_removals_are_quarantined(new, removed_finalized(old, new))
+    if product_only:
+        check_candidate_product(old, new, changed)
+        if changed:
+            check_finalized_product(
+                old, new, changed, require_worktree=False)
+        return
+    if not changed:
+        return
+    author, committer = commit_identity(new)
+    if author != WORKFLOW_IDENTITY or committer != WORKFLOW_IDENTITY:
+        raise GuardError("delta v2 não veio da identidade Workflow esperada")
+    if (os.environ.get("WIKI_V2_AUTHENTICATED_COMMIT_OID") != new or
+            os.environ.get("WIKI_V2_AUTHENTICATED_OLD_OID") != old):
+        raise GuardError("delta v2 perdeu o bind old/new do finalizer")
+    recovery = authenticated_recovery(new)
+    closure_kind = os.environ.get("WIKI_V2_AUTHENTICATED_CLOSURE_KIND")
+    if closure_kind == "canonical-id-repair":
+        if set(old) == {"0"}:
+            raise GuardError("canonical-id-repair não aceita commit raiz")
+        check_canonical_id_repair(old, new, changed, recovery=recovery)
+        return
+    if closure_kind == "semantic-recut":
+        if set(old) == {"0"}:
+            raise GuardError("semantic-recut privado não aceita commit raiz")
+        check_semantic_recut(old, new, changed)
+        return
+    if closure_kind not in {"mass", "review"}:
+        raise GuardError("kind autenticado da closure v2 ausente/inválido")
+    entries = check_finalized_product(
+        old, new, changed, require_worktree=not recovery)
+    expected_receipt = receipt_digest(old, new, entries)
+    if os.environ.get("WIKI_V2_AUTHENTICATED_CLOSURE_SHA256") != expected_receipt:
+        raise GuardError("receipt da closure v2 diverge do delta candidato")
+
+
+def main() -> int:
+    global ROOT
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default=os.fspath(INSTALL_ROOT))
+    parser.add_argument("--old", required=True)
+    parser.add_argument("--new", required=True)
+    parser.add_argument(
+        "--product-only", action="store_true",
+        help="valida somente invariantes de produto old/new, sem receipt privado",
+    )
+    arguments = parser.parse_args()
+    try:
+        candidate_root = pathlib.Path(arguments.root)
+        if (not candidate_root.is_absolute() or
+                candidate_root.resolve(strict=True) != candidate_root or
+                not (candidate_root / ".git").exists()):
+            raise GuardError("root Git não é diretório canônico")
+        ROOT = candidate_root
+        check(
+            arguments.old, arguments.new,
+            product_only=arguments.product_only)
+    except (GuardError, OSError, subprocess.SubprocessError) as error:
+        print(f"v2-finalized-reference: REPROVADO: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

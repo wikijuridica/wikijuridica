@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# ensaio-instancia — sobe uma instância ISOLADA do portal, em porta própria, para
+# provar o comportamento real de uma mudança ANTES de ela tocar produção.
+#
+# POR QUE ESTA FERRAMENTA EXISTE (ordem do dono, 2026-09-01): "preparar testes
+# isolados, abrindo em outra porta para ver o comportamento real, e só aplicar em
+# produção com certeza que vai disparar automaticamente e sem ficar entregando
+# algo que não tenha certeza".
+#
+# ★ A ARMADILHA QUE ELA FECHA, E QUE JÁ CUSTOU PRODUÇÃO: PORTA DIFERENTE NÃO
+#   ISOLA DISCO. Em 2026-08-19 uma segunda instância deste mesmo binário subiu em
+#   outra porta com o MESMO WorkingDirectory; as duas disputaram
+#   var/on-demand-cache, o índice de busca foi destruído, o MCP passou a devolver
+#   isError e a busca humana respondia 200 com "Nenhum resultado" — falha que
+#   nenhum health check pegava. O comentário em cmd/server/main.go:37-47 registra
+#   o incidente. Por isso aqui NENHUMA instância sobe sem WIKI_CACHE_DIR e
+#   WIKI_ACCESS_LOG_DIR próprios: são obrigatórios, não opcionais.
+#
+# ★ E O MOTIVO ANTI-FRAUDE DO LEDGER SEPARADO: a instância de ensaio atende
+#   requisições reais de quem a sonda, com warming=false e bot_simulation=false.
+#   No ledger que decide SEO elas seriam indistinguíveis de visita autêntica de
+#   público. WIKI_ACCESS_LOG_DIR as manda para fora do repositório servido e
+#   WIKI_INSTANCE carimba cada linha com o nome do ensaio.
+#
+# O ESPELHO É POR CÓPIA INTEGRAL (cp -a). Já foi hardlink, e custou produção:
+# ver o comentário em criar(). Escrita in-place (os.WriteFile do Go) atravessa
+# hardlink; só cópia isola de verdade. 5,7 GB, ~1 min.
+#
+# Uso:
+#   tools/ensaio-instancia criar   NOME          # monta o espelho isolado
+#   tools/ensaio-instancia subir   NOME [PORTA]  # sobe o servidor (default 8091)
+#   tools/ensaio-instancia estado  NOME
+#   tools/ensaio-instancia derrubar NOME
+#   tools/ensaio-instancia destruir NOME         # remove o espelho
+#   tools/ensaio-instancia verificar-isolamento NOME
+set -euo pipefail
+
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+
+BASE="$ROOT/var/ensaio"
+PORTA_PADRAO=8091
+
+# Portas que NÃO podem ser usadas: 8088 (nginx do wiki), 8089 (Go em produção),
+# 8080/8081 (projeto vizinho divorcio — colidir com ele é proibido pelo contrato).
+PORTAS_PROIBIDAS="8080 8081 8088 8089"
+
+erro() {
+	printf '\033[31merro:\033[0m %s\n' "$*" >&2
+	exit 1
+}
+info() { printf '  %s\n' "$*"; }
+
+nome_valido() {
+	[[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || erro "nome inválido: use [a-z0-9-], até 41 chars"
+}
+
+dir_de() { printf '%s/%s' "$BASE" "$1"; }
+
+criar() {
+	local nome="$1"
+	nome_valido "$nome"
+	local dir
+	dir="$(dir_de "$nome")"
+	[ -e "$dir" ] && erro "ensaio '$nome' já existe em $dir (use destruir antes)"
+
+	info "montando espelho por hardlink em $dir"
+	mkdir -p "$dir"
+
+	# Diretórios de DADO que o servidor lê e que o ensaio pode precisar mutar:
+	# espelhados por hardlink. cp -al falha se o destino existir, então cada um
+	# vai limpo. (Código NÃO vai por hardlink — ver abaixo.)
+	# ★ TUDO POR CÓPIA. NADA POR HARDLINK. Quarto e definitivo defeito que o ensaio
+	#   apanhou em si mesmo (2026-09-01), e este custou produção: `cmd/build public`
+	#   rodado no espelho escreveu os 10.144 index.html de PRODUÇÃO através do
+	#   hardlink. A premissa "os produtores escrevem por tmp+rename" vale para os
+	#   geradores Python; o Go escreve com os.WriteFile, que TRUNCA E REGRAVA O
+	#   MESMO INODE — e inode compartilhado é o arquivo de produção. O sinal foi
+	#   "mesmo inode, nada escrito" seguido de produção com o markup novo. A borda
+	#   segurou o dano (cache HIT por sete dias); o manifesto ficou incoerente e o
+	#   servidor Go não reiniciaria. 5,7 GB copiados custam ~1 min em NVMe; um
+	#   deploy fora de hora custa muito mais.
+	local espelhados=(public content data)
+	for d in "${espelhados[@]}"; do
+		[ -d "$ROOT/$d" ] || continue
+		cp -a "$ROOT/$d" "$dir/$d"
+		info "copiado: $d ($(du -sh "$dir/$d" | cut -f1))"
+	done
+
+	# ★ CÓDIGO TAMBÉM VAI POR HARDLINK, NUNCA POR SYMLINK — e isto não é estilo.
+	#
+	# Medido em 2026-09-01, no primeiro uso desta própria ferramenta: os geradores
+	# deste repositório resolvem a raiz como
+	#     ROOT = Path(__file__).resolve().parent.parent
+	# (tools/generate-page-content-revision:67). Com `tools/` em SYMLINK, o
+	# `.resolve()` segue o link e ROOT vira /opt/wiki — ou seja, um gerador rodado
+	# de dentro do ensaio lia e ESCREVERIA no ledger de PRODUÇÃO, com o operador
+	# convencido de estar isolado. Foi exatamente o que aconteceu: um teste de
+	# churn de 30% no ledger do ensaio devolveu 0,6%, porque o gerador estava
+	# lendo o ledger de produção.
+	#
+	# Hardlink não tem o que resolver: `__file__.resolve()` devolve o caminho
+	# dentro do ensaio, e ROOT passa a ser o espelho. É a diferença entre um ensaio
+	# que prova e um ensaio que mente.
+	# ★ CÓDIGO VAI POR CÓPIA, NÃO POR HARDLINK — e este é o segundo defeito que o
+	#   ensaio revelou em si mesmo (2026-09-01). Hardlink resolvia o problema do
+	#   symlink (ROOT apontando para produção), mas criou outro: todo fonte Go do
+	#   repositório passou a ter DOIS links, e o gerador da atestação do validador
+	#   (internal/v2ingest/cmd/generate-validator-fingerprint-attestation) recusa
+	#   fonte com mais de um link — "expected a regular file with one link" — porque
+	#   fonte sombreada por outro caminho é exatamente o que a atestação existe para
+	#   impedir. Resultado: com um ensaio vivo, NENHUM commit que tocasse Go passava
+	#   no pre-commit. Código são ~55 MB: cópia é barata e é uma árvore própria de
+	#   verdade. Hardlink fica só para public/, content/ e data/ (5,7 GB), onde o
+	#   custo importa e a escrita atômica dos produtores protege.
+	for d in internal cmd tools ops; do
+		[ -d "$ROOT/$d" ] && cp -a "$ROOT/$d" "$dir/$d"
+	done
+	for f in go.mod go.sum; do
+		[ -e "$ROOT/$f" ] && cp -a "$ROOT/$f" "$dir/$f"
+	done
+
+	# ★ LOCKS COM ÂNCORA POR HARDLINK NÃO SE ESPELHAM — terceiro defeito que o
+	#   ensaio apanhou em si mesmo (2026-09-01). internal/build e o publicador
+	#   tomam um lease sobre data/ops/.public-state.lock cuja integridade é um PAR
+	#   lock/âncora com link count exato; `cp -al data` deu a esse par um terceiro
+	#   link e o build recusou: "lock/anchor structure is not canonical". Correto
+	#   da parte dele — é a guarda contra adulteração. O espelho remove as suas
+	#   cópias hardlinkadas e deixa cada produtor criar o par próprio no primeiro
+	#   uso, dentro do espelho.
+	rm -f "$dir/data/ops/.public-state.lock" "$dir/data/ops/.public-state.lock.anchor" \
+		"$dir/data/ops/.v2_ingest_transaction.lock" "$dir/data/ops/.v2_ingest_transaction.lock.anchor"
+
+	# O que é EXCLUSIVO do ensaio e nunca pode apontar para produção.
+	mkdir -p "$dir/var/on-demand-cache" "$dir/var/access-log" "$dir/var/log"
+
+	cat >"$dir/ENSAIO.json" <<JSON
+{
+  "instancia": "$nome",
+  "criado_em": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "raiz_de_producao": "$ROOT",
+  "espelho": "hardlink (cp -al) — rename atômico do produtor quebra o link",
+  "isolado": ["WIKI_CACHE_DIR", "WIKI_ACCESS_LOG_DIR", "WIKI_INSTANCE", "WIKI_HTTP_ADDR"],
+  "aviso": "NUNCA aponte este ensaio para var/on-demand-cache de producao: incidente de 2026-08-19 destruiu o indice de busca em producao."
+}
+JSON
+	info "pronto. subir com: tools/ensaio-instancia subir $nome"
+}
+
+porta_livre() {
+	local p="$1"
+	for proibida in $PORTAS_PROIBIDAS; do
+		[ "$p" = "$proibida" ] && erro "porta $p é de produção ou do projeto vizinho — proibida"
+	done
+	if ss -ltn "sport = :$p" 2>/dev/null | grep -q ":$p"; then
+		erro "porta $p já está ocupada"
+	fi
+}
+
+subir() {
+	local nome="$1"
+	nome_valido "$nome"
+	local porta="${2:-$PORTA_PADRAO}"
+	local dir
+	dir="$(dir_de "$nome")"
+	[ -d "$dir" ] || erro "ensaio '$nome' não existe — rode: tools/ensaio-instancia criar $nome"
+	porta_livre "$porta"
+
+	local bin="$ROOT/var/ensaio/.bin/wikijuridica-server-ensaio"
+	mkdir -p "$(dirname "$bin")"
+	info "compilando o binário do ensaio (não toca o de produção em bin/)"
+	"$ROOT/tools/go-modern" build -o "$bin" ./cmd/server
+
+	local pidf="$dir/var/ensaio.pid"
+	if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+		erro "ensaio '$nome' já está no ar (pid $(cat "$pidf"))"
+	fi
+
+	info "subindo em 127.0.0.1:$porta com cache e ledger PRÓPRIOS"
+	(
+		cd "$dir"
+		WIKI_HTTP_ADDR="127.0.0.1:$porta" \
+			WIKI_CACHE_DIR="$dir/var/on-demand-cache" \
+			WIKI_ACCESS_LOG_DIR="$dir/var/access-log" \
+			WIKI_INSTANCE="ensaio-$nome" \
+			nohup "$bin" >>"$dir/var/log/servidor.log" 2>&1 &
+		echo $! >"$pidf"
+	)
+	# ESPERA DENTRO DO CURL, NÃO `sleep` NO SHELL. O boot constrói o índice de busca
+	# sobre o acervo inteiro antes de aceitar conexão: medido em 2026-09-01, um
+	# `sleep 2` declarou falha num processo que estava vivo e apenas aquecendo.
+	# `--retry-connrefused` faz o próprio curl esperar a porta abrir (até ~90 s),
+	# o que também respeita a regra do repositório contra espera ociosa em shell.
+	local pid code
+	pid="$(cat "$pidf" 2>/dev/null || true)"
+	[ -n "$pid" ] || erro "o ensaio não gravou pid — veja $dir/var/log/servidor.log"
+	code="$(curl -sS -o /dev/null -w '%{http_code}' \
+		--retry 30 --retry-delay 3 --retry-connrefused --retry-all-errors \
+		--max-time 10 "http://127.0.0.1:$porta/healthz" 2>/dev/null || true)"
+	if ! kill -0 "$pid" 2>/dev/null; then
+		erro "o processo do ensaio morreu durante o boot — veja $dir/var/log/servidor.log"
+	fi
+	info "pid $pid · /healthz responde ${code:-000} · porta $porta"
+	[ "$code" = "200" ] || erro "o ensaio não ficou pronto (último status: ${code:-000}) — veja $dir/var/log/servidor.log"
+	printf '%s\n' "$porta" >"$dir/var/ensaio.porta"
+	info "no ar. sonde com: curl -sS -A 'wikijuridica-superficie-probe/1.0' http://127.0.0.1:$porta/..."
+}
+
+estado() {
+	local nome="$1"
+	local dir
+	dir="$(dir_de "$nome")"
+	[ -d "$dir" ] || erro "ensaio '$nome' não existe"
+	local pidf="$dir/var/ensaio.pid"
+	local porta
+	porta="$(cat "$dir/var/ensaio.porta" 2>/dev/null || echo '-')"
+	if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+		info "ensaio '$nome': NO AR (pid $(cat "$pidf"), porta $porta)"
+	else
+		info "ensaio '$nome': parado (porta registrada $porta)"
+	fi
+	info "espelho: $dir"
+	du -sh "$dir/var" 2>/dev/null | sed 's/^/  var proprio: /'
+}
+
+derrubar() {
+	local nome="$1"
+	local dir
+	dir="$(dir_de "$nome")"
+	local pidf="$dir/var/ensaio.pid"
+	if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
+		kill "$(cat "$pidf")"
+		info "sinal enviado ao pid $(cat "$pidf")"
+		sleep 1
+	else
+		info "não estava no ar"
+	fi
+	rm -f "$pidf"
+}
+
+destruir() {
+	local nome="$1"
+	nome_valido "$nome"
+	local dir
+	dir="$(dir_de "$nome")"
+	[ -d "$dir" ] || erro "ensaio '$nome' não existe"
+	# GUARDA: só remove sob var/ensaio, e só depois de conferir que o marcador está lá.
+	[ -f "$dir/ENSAIO.json" ] || erro "recusando remover $dir: sem ENSAIO.json, não é um espelho meu"
+	case "$dir" in "$BASE"/*) : ;; *) erro "recusando remover fora de $BASE" ;; esac
+	derrubar "$nome" || true
+	rm -rf "$dir"
+	info "espelho removido: $dir"
+}
+
+# verificar-isolamento é o que transforma "acho que está isolado" em prova.
+verificar_isolamento() {
+	local nome="$1"
+	local dir
+	dir="$(dir_de "$nome")"
+	[ -d "$dir" ] || erro "ensaio '$nome' não existe"
+	local falhas=0
+
+	echo "verificando isolamento do ensaio '$nome':"
+
+	# 1. O cache do ensaio não pode ser o de produção.
+	local cache="$dir/var/on-demand-cache"
+	if [ "$(readlink -f "$cache")" = "$(readlink -f "$ROOT/var/on-demand-cache")" ]; then
+		printf '  [FALHA] cache do ensaio aponta para o de PRODUÇÃO\n'
+		falhas=$((falhas + 1))
+	else
+		printf '  [ok] cache próprio: %s\n' "$cache"
+	fi
+
+	# 2. O ledger de acesso do ensaio não pode cair em data/ops/access.
+	if [ -d "$dir/var/access-log" ] && [ ! -e "$ROOT/data/ops/access/.ensaio-$nome" ]; then
+		printf '  [ok] ledger de acesso próprio: %s\n' "$dir/var/access-log"
+	else
+		printf '  [FALHA] ledger do ensaio pode estar caindo no de produção\n'
+		falhas=$((falhas + 1))
+	fi
+
+	# 3. O processo do ensaio não pode estar escutando em porta de produção.
+	local porta
+	porta="$(cat "$dir/var/ensaio.porta" 2>/dev/null || echo '')"
+	if [ -n "$porta" ]; then
+		for proibida in $PORTAS_PROIBIDAS; do
+			if [ "$porta" = "$proibida" ]; then
+				printf '  [FALHA] ensaio registrado na porta de produção %s\n' "$porta"
+				falhas=$((falhas + 1))
+			fi
+		done
+		[ "$falhas" -eq 0 ] && printf '  [ok] porta fora de produção: %s\n' "$porta"
+	fi
+
+	# 4. PROVA DE QUE O ESPELHO NÃO ESCREVE EM PRODUÇÃO: o teste do hardlink.
+	#    Escreve num arquivo do espelho por rename atômico e confere que o gêmeo
+	#    de produção NÃO mudou. Se mudar, o espelho é perigoso e o ensaio é inútil.
+	# A prova é de escrita IN-PLACE (truncar e regravar o mesmo inode), que é o
+	# que os.WriteFile faz — e não de rename, que qualquer hardlink passa. A
+	# versão anterior desta prova testava só o rename, e por isso aprovou um
+	# espelho que deixou o build reescrever produção.
+	local alvo_rel="public/.ensaio-isolamento-probe"
+	local alvo_ens="$dir/$alvo_rel" alvo_prod="$ROOT/$alvo_rel"
+	printf 'producao\n' >"$alvo_prod"
+	[ -e "$alvo_ens" ] || cp -a "$alvo_prod" "$alvo_ens"
+	if [ "$(stat -c %i "$alvo_ens")" = "$(stat -c %i "$alvo_prod")" ]; then
+		printf '  [FALHA] espelho e produção compartilham inode — escrita in-place vaza\n'
+		falhas=$((falhas + 1))
+	else
+		printf 'ensaio\n' >"$alvo_ens" # in-place, como o Go faz
+		if [ "$(cat "$alvo_prod")" = "producao" ]; then
+			printf '  [ok] escrita IN-PLACE no espelho NÃO alterou produção\n'
+		else
+			printf '  [FALHA] escrita in-place no espelho VAZOU para produção — não use este ensaio\n'
+			falhas=$((falhas + 1))
+		fi
+	fi
+	rm -f "$alvo_prod" "$alvo_ens"
+
+	# 5. A CHECAGEM QUE FALTAVA, e que só existe porque o ensaio pegou a si mesmo:
+	#    provar que um GERADOR rodado de dentro do espelho resolve a raiz para o
+	#    espelho, e não para produção. Com `tools/` em symlink isto reprova.
+	local raiz_vista
+	raiz_vista="$(cd "$dir" && python3 -c "
+from pathlib import Path
+print(Path('tools/generate-page-content-revision').resolve().parent.parent)
+" 2>/dev/null || echo desconhecida)"
+	if [ "$raiz_vista" = "$(readlink -f "$dir")" ]; then
+		printf '  [ok] gerador resolve a raiz para o ENSAIO: %s\n' "$raiz_vista"
+	else
+		printf '  [FALHA] gerador resolve a raiz para %s — escreveria em PRODUÇÃO\n' "$raiz_vista"
+		falhas=$((falhas + 1))
+	fi
+
+	if [ "$falhas" -gt 0 ]; then
+		printf '\nisolamento REPROVADO: %d falha(s)\n' "$falhas"
+		return 1
+	fi
+	printf '\nisolamento APROVADO — este ensaio não alcança produção\n'
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+criar)
+	[ $# -ge 1 ] || erro "uso: ensaio-instancia criar NOME"
+	criar "$1"
+	;;
+subir)
+	[ $# -ge 1 ] || erro "uso: ensaio-instancia subir NOME [PORTA]"
+	subir "$@"
+	;;
+estado)
+	[ $# -ge 1 ] || erro "uso: ensaio-instancia estado NOME"
+	estado "$1"
+	;;
+derrubar)
+	[ $# -ge 1 ] || erro "uso: ensaio-instancia derrubar NOME"
+	derrubar "$1"
+	;;
+destruir)
+	[ $# -ge 1 ] || erro "uso: ensaio-instancia destruir NOME"
+	destruir "$1"
+	;;
+verificar-isolamento)
+	[ $# -ge 1 ] || erro "uso: ensaio-instancia verificar-isolamento NOME"
+	verificar_isolamento "$1"
+	;;
+*)
+	sed -n '1,40p' "$0" | grep -E '^# ' | sed 's/^# \?//'
+	exit 2
+	;;
+esac

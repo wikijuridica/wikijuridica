@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""check-cache-rule-rollback-frescor — restaurar o rollback devolveria a borda
+ao que esta no ar, ou a um defeito ja corrigido?
+
+READ-ONLY. Nao escreve arquivo nenhum, nao toca a zona.
+
+POR QUE EXISTE, com a medicao que o originou. Em 2026-08-28 o arquivo
+`ops/cloudflare/cache-rule-rollback.json` estava congelado em 2026-08-12T17:30
+(mtime), escrito a mao, sem nenhuma data legivel DENTRO dele. A regra viva
+naquele dia era a versao 15 do ruleset, last_updated 2026-08-26T15:55:35Z. Os
+dois corpos divergiam em dois campos que decidem comportamento:
+
+  - `vary` AUSENTE no snapshot. A regra viva declara
+    `vary.headers.accept = {normalize, media_types:["text/markdown"]}`, que e o
+    que fecha a borda em DUAS variantes por URL (HTML e Markdown) em vez de uma
+    chave por valor de Accept distinto. Restaurar o snapshot devolveria o
+    envenenamento por Vary que este projeto mediu e corrigiu em 2026-08-26
+    (commit be4a6cf4, superficie de erro 404).
+  - `edge_ttl` em `override_origin 604800` no snapshot contra `respect_origin`
+    no vivo. Restaurar pregaria sete dias de TTL por cima do que a origem
+    declara, inclusive nas superficies que hoje pedem 300s.
+
+Um arquivo de rollback envelhece CALADO: ninguem o le entre uma emergencia e
+outra, e quando alguem le e porque a borda ja esta quebrada -- o pior momento
+para descobrir que o remedio e a doenca anterior.
+
+O QUE ESTE GATE JULGA, e o que ele deliberadamente NAO julga.
+
+FAIL (exit 1) e um so: restaurar o snapshot MUDARIA o comportamento vivo. Isso e
+comparacao de CONTEUDO, nao de carimbo, e a escolha e deliberada. O gate irmao
+`tools/check-edge-tiered-drift` ja pagou essa licao: metadado que muda sozinho
+(`modified_on`, `version`) faz o gate gritar toda semana ate o operador aprender
+a ignora-lo. Versao do ruleset sobe por qualquer edicao da fase, inclusive por um
+PUT que reponha exatamente o mesmo corpo depois de um apagao de painel -- e nesse
+caso restaurar o snapshot e INOCUO, porque o corpo e o mesmo. Reprovar ali seria
+falso positivo em cima de quem esta apagando incendio.
+
+Carimbo defasado ou ausente com conteudo identico sai AVISO e exit 0, nomeado na
+saida: nao ha defeito a corrigir, ha uma foto sem data a regravar.
+
+Exit 2 e sempre "NAO CONSEGUI MEDIR", nunca veredito: sem credencial, API fora,
+API com success:false, snapshot ausente ou JSON invalido, e -- importante -- zona
+com ZERO regras de cache. Zona vazia e defeito da ZONA, e quem o julga e
+`tools/check-edge-rule-drift`; aqui nao ha regra viva com que comparar o
+snapshot, e reprovar o snapshot por isso apontaria o dedo para o arquivo errado.
+
+Uso:
+    tools/check-cache-rule-rollback-frescor
+    tools/check-cache-rule-rollback-frescor --json
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import urllib.error
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+SNAPSHOT = os.path.join(RAIZ, "ops/cloudflare/cache-rule-rollback.json")
+FASE = "http_request_cache_settings"
+API = "https://api.cloudflare.com/client/v4"
+ZONA_PADRAO = "b2e1366a94c5dcac97f2fc264f18928f"
+
+# Campos que a API REGENERA a cada PUT. Guardar `id`/`version`/`ref` num corpo de
+# rollback nao e so ruido: e ruido que faz duas fotos iguais parecerem diferentes.
+VOLATEIS = ("id", "version", "ref", "last_updated")
+
+
+# REUSO, e nao copia, da leitura de credencial. `tools/check-edge-rule-drift` nao
+# tem extensao .py, entao `import` normal nao o alcanca; o SourceFileLoader
+# carrega o arquivo como modulo. E seguro porque la o trabalho todo esta atras de
+# `if __name__ == "__main__"`. O que se ganha: a descoberta cara de 2026-08-26 --
+# CLOUDFLARE_API_TOKEN e Global API Key (X-Auth-Email/X-Auth-Key), nao Bearer --
+# vive num arquivo so, e a definicao de "duas regras sao a mesma" (`normaliza`)
+# tambem. Gerador e gate compartilhando o mesmo normalizador e o que impede o bug
+# classico: o gerador grava um corpo que o proprio gate reprova.
+def irmao():
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-edge-rule-drift")
+    loader = importlib.machinery.SourceFileLoader("check_edge_rule_drift", caminho)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)
+    return modulo
+
+
+def limpar_regra(regra):
+    """Corpo que vai para o arquivo de rollback: tudo o que decide comportamento,
+    mais a `description` (texto humano, util para quem le o rollback as pressas),
+    sem os campos que a API regenera."""
+    return {k: v for k, v in regra.items() if k not in VOLATEIS}
+
+
+def _clausulas(expressao):
+    """Quebra a expressao de filtro nas conjuncoes de topo. Nao e parser de
+    wirefilter: serve so para o diff dizer QUAL condicao entrou ou saiu, que e a
+    unica parte da expressao que um humano precisa ler as pressas."""
+    return [c.strip() for c in " ".join((expressao or "").split()).split(" and ") if c.strip()]
+
+
+def diferencas(regras_snapshot, regras_vivas, normaliza):
+    """Diff CONCEITUAL entre o que o snapshot restauraria e o que esta no ar.
+
+    Devolve lista de linhas legiveis. Vazia significa: restaurar nao muda nada.
+    Desce um nivel dentro de `action_parameters` porque a diferenca que importa e
+    sempre uma chave nomeada (`vary`, `edge_ttl`, `cache`), e imprimir o objeto
+    inteiro esconde qual delas mudou."""
+    linhas = []
+    a = [normaliza(r) for r in regras_snapshot]
+    b = [normaliza(r) for r in regras_vivas]
+    if len(a) != len(b):
+        linhas.append(f"numero de regras: snapshot {len(a)}, vivo {len(b)}")
+    for i in range(max(len(a), len(b))):
+        se = a[i] if i < len(a) else None
+        vi = b[i] if i < len(b) else None
+        if se == vi:
+            continue
+        if se is None:
+            linhas.append(f"regra {i}: existe no ar e NAO existe no snapshot")
+            continue
+        if vi is None:
+            linhas.append(f"regra {i}: existe no snapshot e NAO existe no ar")
+            continue
+        for chave in ("action", "enabled"):
+            if se.get(chave) != vi.get(chave):
+                linhas.append(f"regra {i}.{chave}:")
+                linhas.append(f"    snapshot restauraria : {json.dumps(se.get(chave), ensure_ascii=False)[:300]}")
+                linhas.append(f"    no ar agora          : {json.dumps(vi.get(chave), ensure_ascii=False)[:300]}")
+        # A expressao tem 600+ caracteres e as duas versoes so diferem no FIM.
+        # Imprimir os primeiros 300 mostraria dois prefixos identicos e faria o
+        # operador concluir que nao ha diferenca -- medido na primeira execucao
+        # deste gate, em 2026-08-28. O diff util e por CLAUSULA.
+        if se.get("expression") != vi.get("expression"):
+            ce = _clausulas(se.get("expression"))
+            cv = _clausulas(vi.get("expression"))
+            linhas.append(f"regra {i}.expression: {len(ce)} clausulas no snapshot, {len(cv)} no ar")
+            for c in cv:
+                if c not in ce:
+                    linhas.append(f"    o snapshot PERDERIA : {c}")
+            for c in ce:
+                if c not in cv:
+                    linhas.append(f"    o snapshot TRARIA   : {c}")
+        pa = se.get("action_parameters") or {}
+        pb = vi.get("action_parameters") or {}
+        for chave in sorted(set(pa) | set(pb)):
+            if pa.get(chave) == pb.get(chave):
+                continue
+            linhas.append(f"regra {i}.action_parameters.{chave}:")
+            linhas.append(f"    snapshot restauraria : {json.dumps(pa.get(chave), ensure_ascii=False)[:300]}")
+            linhas.append(f"    no ar agora          : {json.dumps(pb.get(chave), ensure_ascii=False)[:300]}")
+    return linhas
+
+
+def avaliar(snapshot, vivo, normaliza):
+    """Nucleo puro do gate: nao le arquivo, nao abre socket. Recebe o snapshot ja
+    carregado (ou None) e o ruleset vivo ja lido (ou None) e devolve
+    (exit_code, linhas). Puro de proposito -- o teste de falso positivo em
+    tools/test_check_cache_rule_rollback_frescor.py roda OFFLINE, e gate de borda
+    cujo teste depende de rede e gate que ninguem roda."""
+    linhas = []
+    if snapshot is None:
+        return 2, ["nao consegui medir: snapshot ausente ou ilegivel"]
+    if vivo is None:
+        return 2, ["nao consegui medir: nao ha ruleset vivo para comparar"]
+
+    regras_vivas = vivo.get("rules") or []
+    if not regras_vivas:
+        # NAO e defeito do snapshot. Ja aconteceu de verdade: em 2026-08-22 a fase
+        # ficou com ZERO regras por edicao de painel. Julgar o snapshot contra uma
+        # zona vazia acusaria o arquivo certo pelo motivo errado.
+        return 2, [
+            "nao consegui medir: a zona esta com ZERO regras de cache.",
+            "  Quem julga zona vazia e tools/check-edge-rule-drift; sem regra viva",
+            "  nao ha com que comparar o snapshot.",
+        ]
+
+    regras_snapshot = snapshot.get("rules")
+    if not isinstance(regras_snapshot, list):
+        return 2, ["nao consegui medir: o snapshot nao tem array 'rules'"]
+
+    captura = snapshot.get("_captura") or {}
+    versao_viva = str(vivo.get("version"))
+    versao_carimbo = str(captura.get("ruleset_version")) if captura.get("ruleset_version") is not None else None
+    linhas.append(f"ruleset vivo : version {versao_viva} | last_updated {vivo.get('last_updated')}")
+    if captura:
+        linhas.append(f"snapshot     : capturado em {captura.get('capturado_em')} | ruleset version {versao_carimbo}")
+    else:
+        linhas.append("snapshot     : SEM carimbo de captura (foto sem data)")
+
+    diff = diferencas(regras_snapshot, regras_vivas, normaliza)
+    if diff:
+        linhas.append("check-cache-rule-rollback-frescor: FAIL")
+        linhas.append("  - restaurar este snapshot MUDARIA o que a borda faz hoje.")
+        for l in diff:
+            linhas.append("    " + l)
+        linhas.append("  Regravar a foto com: tools/generate-cache-rule-rollback")
+        return 1, linhas
+
+    if not captura:
+        linhas.append("check-cache-rule-rollback-frescor: OK com AVISO")
+        linhas.append("  - conteudo identico ao vivo (restaurar e inocuo), mas a foto nao tem data.")
+        linhas.append("  Regravar com: tools/generate-cache-rule-rollback")
+        return 0, linhas
+
+    if versao_carimbo != versao_viva:
+        linhas.append("check-cache-rule-rollback-frescor: OK com AVISO")
+        linhas.append(f"  - carimbo defasado: vivo na version {versao_viva}, foto carimbada na {versao_carimbo}.")
+        linhas.append("    O conteudo e identico, entao restaurar nao muda comportamento; o que")
+        linhas.append("    envelheceu foi so o carimbo. Regravar: tools/generate-cache-rule-rollback")
+        return 0, linhas
+
+    linhas.append("check-cache-rule-rollback-frescor: OK (a foto de rollback e o que esta no ar)")
+    return 0, linhas
+
+
+def ler_snapshot(caminho):
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return None, f"snapshot ausente em {caminho}"
+    except (OSError, ValueError) as e:
+        return None, f"snapshot ilegivel em {caminho}: {e}"
+
+
+def ler_vivo(mod):
+    env = mod.ambiente()
+    zona = env.get("CLOUDFLARE_ZONE_ID", ZONA_PADRAO)
+    cabecalhos, rotulo = mod._credenciais(env)
+    if cabecalhos is None:
+        return None, "sem credencial Cloudflare (.env.local sem CLOUDFLARE_ZONE_TOKEN nem par EMAIL/API_TOKEN)"
+    url = f"{API}/zones/{zona}/rulesets/phases/{FASE}/entrypoint"
+    try:
+        resp = mod.pega(url, cabecalhos)
+    except urllib.error.HTTPError as e:
+        return None, f"API respondeu HTTP {e.code} ({rotulo}): {e.reason}"
+    except Exception as e:
+        return None, f"nao alcancei a API da Cloudflare ({rotulo}): {e}"
+    if not resp.get("success"):
+        return None, f"API sem sucesso ({rotulo}): {resp.get('errors')}"
+    return resp.get("result"), None
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="O rollback da Cache Rule e foto do que esta no ar?")
+    p.add_argument("--json", action="store_true", help="saida em JSON de uma linha")
+    args = p.parse_args(argv)
+
+    try:
+        mod = irmao()
+    except Exception as e:
+        print(f"check-cache-rule-rollback-frescor: nao consegui medir\n  - tools/check-edge-rule-drift ilegivel: {e}")
+        return 2
+
+    snapshot, erro_snap = ler_snapshot(SNAPSHOT)
+    vivo, erro_vivo = (None, None) if snapshot is None else ler_vivo(mod)
+
+    if erro_snap or erro_vivo:
+        motivo = erro_snap or erro_vivo
+        if args.json:
+            print(json.dumps({"gate": "cache-rule-rollback-frescor", "codigo": 2, "motivo": motivo}, ensure_ascii=False))
+        else:
+            print("check-cache-rule-rollback-frescor: nao consegui medir")
+            print(f"  - {motivo}")
+            print("  Indisponibilidade de API nao e defeito de snapshot: exit 2, nao 1.")
+        return 2
+
+    codigo, linhas = avaliar(snapshot, vivo, mod.normaliza)
+    if args.json:
+        print(json.dumps({"gate": "cache-rule-rollback-frescor", "codigo": codigo,
+                          "linhas": linhas}, ensure_ascii=False))
+    else:
+        for l in linhas:
+            print(l)
+    return codigo
+
+
+if __name__ == "__main__":
+    sys.exit(main())

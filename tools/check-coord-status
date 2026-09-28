@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# tools/check-coord-status — READ-ONLY.
+#
+# Verdade ao vivo de quem está rodando o quê no servidor, sem adivinhar.
+# Junta presença declarada (.agents/runtime/coordination/presence/*.json),
+# panes tmux reais, processos pesados descendentes de cada pane, carga do
+# servidor e as últimas mensagens do bus. É o comando que qualquer agente
+# roda ANTES de disparar comando pesado ou escrever em artefato compartilhado.
+#
+# Uso:
+#   tools/check-coord-status
+#   tools/check-coord-status --quiet        # so o essencial vivo (ou WIKI_QUIET=1)
+#
+# Flags:
+#   --quiet | -q   opcional. Reduz SO a verbosidade: omite as presencas [STALE]
+#                  (agente que nao se atualiza ha >15 min ja nao e verdade ao
+#                  vivo) e os corpos das mensagens do bus, que o
+#                  tools/check-coord-inbox entrega na integra ao destinatario.
+#                  Continua imprimindo panes, processos pesados, carga e o
+#                  .git/index.lock — que sao o veredito deste check. Nenhuma
+#                  verificacao, nenhum filtro de seguranca e nenhum exit code
+#                  muda; o modo padrao (sem a flag) permanece identico.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COORD_DIR="$ROOT/.agents/runtime/coordination"
+PRESENCE_DIR="$COORD_DIR/presence"
+
+# Argumento desconhecido continua sendo ignorado em silencio, exatamente como
+# antes desta flag existir: este check nunca teve parser e endurecer isso agora
+# quebraria chamador existente.
+QUIET=0
+if [ "${WIKI_QUIET:-0}" = "1" ]; then
+	QUIET=1
+fi
+for arg in "$@"; do
+	case "$arg" in
+	--quiet | -q) QUIET=1 ;;
+	esac
+done
+export WIKI_QUIET="$QUIET"
+
+echo "=== coord-status ($(date +%Y-%m-%dT%H:%M:%S%z)) ==="
+echo
+
+# ---------------------------------------------------------------------------
+echo "--- presença declarada (${PRESENCE_DIR#"$ROOT"/}) ---"
+python3 - "$ROOT" <<'PYEOF'
+import json
+import os
+import stat
+import sys
+from datetime import datetime
+
+root = sys.argv[1]
+quiet = os.environ.get("WIKI_QUIET") == "1"
+MAX_PRESENCE_FILES = 256
+MAX_PRESENCE_ENTRIES = 512
+MAX_PRESENCE_BYTES = 32 * 1024
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+now = datetime.now().astimezone()
+
+
+def open_directory_tree():
+    current = os.open("/", DIRECTORY_FLAGS)
+    try:
+        components = [part for part in root.split(os.sep) if part]
+        components.extend([".agents", "runtime", "coordination", "presence"])
+        for component in components:
+            nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            named = os.stat(component, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(nxt)
+            if (not stat.S_ISDIR(named.st_mode) or
+                    (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                os.close(nxt)
+                raise RuntimeError("ancestral trocado")
+            os.close(current)
+            current = nxt
+        return current
+    except FileNotFoundError:
+        os.close(current)
+        return None
+    except Exception:
+        os.close(current)
+        raise
+
+
+def display(value, limit):
+    if not isinstance(value, (str, int, float)):
+        return "?"
+    text = str(value)[:limit]
+    return "".join(character if ord(character) >= 32 else "�" for character in text)
+
+
+presence_fd = open_directory_tree()
+if presence_fd is None:
+    print("(nenhum arquivo de presença — nenhum agente se registrou ainda)")
+    raise SystemExit(0)
+try:
+    files = []
+    entry_count = 0
+    with os.scandir(presence_fd) as entries:
+        for entry in entries:
+            entry_count += 1
+            if entry_count > MAX_PRESENCE_ENTRIES:
+                print(
+                    f"(erro: entradas de presence excedem o teto de {MAX_PRESENCE_ENTRIES})",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            if not entry.name.endswith(".json"):
+                continue
+            files.append(entry.name)
+            if len(files) > MAX_PRESENCE_FILES:
+                print(
+                    f"(erro: presenças excedem o teto de {MAX_PRESENCE_FILES})",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+    files.sort()
+    if not files:
+        print("(nenhum arquivo de presença)")
+    suppressed_stale = 0
+    for name in files:
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=presence_fd,
+            )
+            try:
+                opened = os.fstat(fd)
+                named = os.stat(name, dir_fd=presence_fd, follow_symlinks=False)
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                        not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                    raise RuntimeError("não é regular exclusivo/identidade mudou")
+                if opened.st_size > MAX_PRESENCE_BYTES:
+                    raise RuntimeError(f"excede {MAX_PRESENCE_BYTES} bytes")
+                payload = bytearray()
+                while len(payload) <= MAX_PRESENCE_BYTES:
+                    chunk = os.read(fd, min(8192, MAX_PRESENCE_BYTES + 1 - len(payload)))
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                if len(payload) > MAX_PRESENCE_BYTES or os.read(fd, 1):
+                    raise RuntimeError(f"excede {MAX_PRESENCE_BYTES} bytes")
+                after = os.fstat(fd)
+                current = os.stat(name, dir_fd=presence_fd, follow_symlinks=False)
+                if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                     after.st_ctime_ns, after.st_mode, after.st_nlink) !=
+                        (opened.st_dev, opened.st_ino, opened.st_size,
+                         opened.st_mtime_ns, opened.st_ctime_ns, opened.st_mode,
+                         opened.st_nlink) or
+                        (current.st_dev, current.st_ino, current.st_size,
+                         current.st_mtime_ns, current.st_ctime_ns, current.st_mode,
+                         current.st_nlink) !=
+                        (after.st_dev, after.st_ino, after.st_size,
+                         after.st_mtime_ns, after.st_ctime_ns, after.st_mode, 1)):
+                    raise RuntimeError("mudou durante leitura")
+            finally:
+                os.close(fd)
+            rec = json.loads(bytes(payload).decode("utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("JSON não é objeto")
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError, RuntimeError, ValueError) as exc:
+            print(f"  (aviso: {name} ilegível/inseguro: {exc})", file=sys.stderr)
+            continue
+        updated_at = rec.get("updated_at", "")
+        age_txt = "idade desconhecida"
+        stale = False
+        try:
+            updated_dt = datetime.fromisoformat(updated_at)
+            age_min = (now - updated_dt).total_seconds() / 60.0
+            stale = age_min > 15
+            age_txt = f"{age_min:.1f} min atrás"
+        except (TypeError, ValueError):
+            pass
+        flag = " [STALE]" if stale else ""
+        # Verbosidade apenas: presença stale continua sendo lida, validada e
+        # contada — só não é impressa linha a linha no modo silencioso.
+        if quiet and stale:
+            suppressed_stale += 1
+            continue
+        print(f"  {display(rec.get('agent','?'),96):<28} tool={display(rec.get('tool','?'),16):<7} "
+              f"pane={display(rec.get('pane','?'),32):<6} pid={display(rec.get('pid','?'),16):<8} "
+              f"tty={display(rec.get('tty','?'),32):<10} {age_txt}{flag}")
+        print(f"      frente: {display(rec.get('front',''),1024)}")
+        print(f"      heavy : {display(rec.get('heavy',''),2048)}")
+    if suppressed_stale:
+        print(f"  ({suppressed_stale} presenças [STALE] omitidas — rode sem --quiet para ver todas)")
+        if suppressed_stale == len(files):
+            print("  (nenhuma presença viva: ninguém se atualizou nos últimos 15 min)")
+finally:
+    os.close(presence_fd)
+PYEOF
+echo
+
+# ---------------------------------------------------------------------------
+echo "--- panes tmux ---"
+TMUX_PANES="$(tmux list-panes -a -F '#{session_name} #{pane_id} #{pane_pid} #{pane_current_command} #{pane_tty}' 2>/dev/null || true)"
+if [ -z "$TMUX_PANES" ]; then
+	echo "(tmux não está rodando ou não há panes visíveis neste ambiente)"
+else
+	printf '%-16s %-8s %-10s %-20s %s\n' "session" "pane" "pid" "cmd" "tty"
+	echo "$TMUX_PANES" | while read -r session pane pid cmd ttyname; do
+		printf '%-16s %-8s %-10s %-20s %s\n' "$session" "$pane" "$pid" "$cmd" "$ttyname"
+	done
+fi
+echo
+
+# ---------------------------------------------------------------------------
+echo "--- processos pesados (descendentes de panes com >20% CPU ou comando pesado) ---"
+PS_SNAPSHOT="$(ps -eo pid,ppid,pcpu,args --no-headers 2>/dev/null || true)"
+PANE_PIDS="$(echo "$TMUX_PANES" | awk '{print $3}' | grep -E '^[0-9]+$' || true)"
+if [ -z "$PANE_PIDS" ] || [ -z "$PS_SNAPSHOT" ]; then
+	echo "(sem panes tmux ou sem snapshot de processos para cruzar)"
+else
+	python3 - "$PANE_PIDS" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+pane_pids_raw = sys.argv[1]
+pane_pids = [int(x) for x in pane_pids_raw.split() if x.strip().isdigit()]
+
+# pid deste próprio processo de análise: precisa ser excluído da árvore antes
+# de rodar `ps`, senão o script sempre se auto-reporta como processo pesado
+# (ele mesmo casa no padrão "python3", e o `ps` que ele lança abaixo casa por
+# %CPU alto por ser instantâneo e curto). Isso não afeta a detecção de OUTROS
+# processos python3 pesados de outros agentes — só exclui a própria subárvore.
+self_pid = os.getpid()
+
+out = subprocess.run(
+    ["ps", "-eo", "pid,ppid,pcpu,args", "--no-headers"],
+    capture_output=True, text=True, check=False,
+).stdout
+
+procs = {}
+children = {}
+for line in out.splitlines():
+    parts = line.strip().split(None, 3)
+    if len(parts) < 4:
+        continue
+    pid_s, ppid_s, pcpu_s, args = parts
+    try:
+        pid, ppid, pcpu = int(pid_s), int(ppid_s), float(pcpu_s)
+    except ValueError:
+        continue
+    procs[pid] = (ppid, pcpu, args)
+    children.setdefault(ppid, []).append(pid)
+
+# Duas classes: comandos intrinsecamente pesados aparecem por nome mesmo
+# ociosos (build/test/commit indicam trabalho global em curso); interpretadores
+# genericos (python3/node) so aparecem acima do piso de CPU — senao toda sessao
+# Codex/MCP ociosa a 0.0% vira ruido na listagem.
+HEAVY_ALWAYS = ("go build", "go test", "go-modern", ".test",
+                "git commit", "lab-cycle", "check-all")
+HEAVY_IF_ACTIVE = ("python3", "node")
+INTERPRETER_CPU_FLOOR = 5.0
+
+def is_heavy(pcpu, args):
+    if pcpu > 20.0:
+        return True
+    if any(p in args for p in HEAVY_ALWAYS):
+        return True
+    return pcpu >= INTERPRETER_CPU_FLOOR and any(p in args for p in HEAVY_IF_ACTIVE)
+
+def walk(pid, depth, root_pid, found):
+    for child in children.get(pid, []):
+        if child == self_pid:
+            # não reportar a si mesmo (nem sua subárvore, ex.: o `ps` acima)
+            continue
+        ppid, pcpu, args = procs.get(child, (None, 0.0, ""))
+        if is_heavy(pcpu, args):
+            found.append((root_pid, child, pcpu, args))
+        walk(child, depth + 1, root_pid, found)
+
+any_found = False
+for root_pid in pane_pids:
+    found = []
+    walk(root_pid, 0, root_pid, found)
+    for root, pid, pcpu, args in found:
+        any_found = True
+        print(f"  pane_pid={root:<8} pid={pid:<8} cpu={pcpu:>5.1f}%  {args[:100]}")
+
+if not any_found:
+    print("(nenhum processo pesado detectado sob os panes atuais)")
+PYEOF
+fi
+echo
+
+# ---------------------------------------------------------------------------
+echo "--- carga do servidor ---"
+CORES="$(nproc 2>/dev/null || echo '?')"
+LOADAVG="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
+echo "  cores: $CORES"
+echo "  load1/5/15: $LOADAVG"
+if [ -f "$ROOT/.git/index.lock" ]; then
+	echo "  .git/index.lock: PRESENTE (há commit em andamento — NÃO rode outro commit agora)"
+else
+	echo "  .git/index.lock: ausente (livre para commit)"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+echo "--- últimas mensagens do bus (max 3) ---"
+python3 - "$ROOT" <<'PYEOF'
+import collections
+import fcntl
+import json
+import os
+import stat
+import sys
+
+root = sys.argv[1]
+quiet = os.environ.get("WIKI_QUIET") == "1"
+MAX_BUS_BYTES = 8 * 1024 * 1024
+MAX_LINE_BYTES = 16 * 1024
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def fail(message):
+    print(f"(erro: {message})", file=sys.stderr)
+    raise SystemExit(1)
+
+
+current = os.open("/", DIRECTORY_FLAGS)
+try:
+    try:
+        components = [part for part in root.split(os.sep) if part]
+        components.extend([".agents", "runtime", "coordination"])
+        for component in components:
+            nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            named = os.stat(component, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(nxt)
+            if (not stat.S_ISDIR(named.st_mode) or
+                    (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                os.close(nxt)
+                fail("ancestral de coordenação foi trocado")
+            os.close(current)
+            current = nxt
+    except FileNotFoundError:
+        print("(sem mensagens)")
+        raise SystemExit(0)
+    try:
+        fd = os.open(
+            "bus.jsonl",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=current,
+        )
+    except FileNotFoundError:
+        print("(sem mensagens)")
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(fd)
+        named = os.stat("bus.jsonl", dir_fd=current, follow_symlinks=False)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+                (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+            fail("bus.jsonl não é regular exclusivo/estável")
+        if opened.st_size > MAX_BUS_BYTES:
+            fail(f"bus.jsonl excede {MAX_BUS_BYTES} bytes")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Append concorrente é o estado NORMAL do bus num repo que opera
+            # centenas de agentes: contenção de lock não é corrupção. O veredito
+            # real deste check (presença, panes, carga, .git/index.lock) já foi
+            # impresso acima e se sustenta sem as 3 últimas mensagens. Falhar
+            # aqui transformava a sonda read-only que o contrato manda rodar
+            # ANTES de todo comando pesado em falsa quebra de sistema, e o agente
+            # ficava repetindo o comando sem progresso. As validações de
+            # integridade abaixo (tamanho, regularidade, mutação durante a
+            # leitura) continuam FATAIS — só a contenção vira omissão explícita.
+            print(
+                "  (bus em append neste instante — últimas mensagens omitidas;"
+                " releia com tools/check-coord-status ou leia o seu inbox com"
+                " tools/check-coord-inbox --agent SEU_ID)"
+            )
+            raise SystemExit(0)
+        payload = bytearray()
+        while len(payload) <= MAX_BUS_BYTES:
+            chunk = os.read(fd, min(65536, MAX_BUS_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_BUS_BYTES or os.read(fd, 1):
+            fail(f"bus.jsonl excede {MAX_BUS_BYTES} bytes")
+        after = os.fstat(fd)
+        latest = os.stat("bus.jsonl", dir_fd=current, follow_symlinks=False)
+        if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+             after.st_ctime_ns, after.st_mode, after.st_nlink) !=
+                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+                 opened.st_ctime_ns, opened.st_mode, opened.st_nlink) or
+                (latest.st_dev, latest.st_ino, latest.st_size,
+                 latest.st_mtime_ns, latest.st_ctime_ns, latest.st_mode,
+                 latest.st_nlink) !=
+                (after.st_dev, after.st_ino, after.st_size,
+                 after.st_mtime_ns, after.st_ctime_ns, after.st_mode, 1)):
+            fail("bus.jsonl mudou durante a leitura")
+    finally:
+        os.close(fd)
+finally:
+    os.close(current)
+
+records = collections.deque(maxlen=3)
+for line_number, line in enumerate(bytes(payload).splitlines(), start=1):
+    if len(line) > MAX_LINE_BYTES:
+        fail(f"linha {line_number} excede {MAX_LINE_BYTES} bytes")
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        continue
+    if isinstance(record, dict):
+        records.append(record)
+
+if not records:
+    print("(sem mensagens)")
+    raise SystemExit(0)
+
+
+def display(value, limit):
+    if not isinstance(value, str):
+        return "?"
+    text = value[:limit]
+    return "".join(
+        character if character in "\n\t" or ord(character) >= 32 else "�"
+        for character in text
+    )
+
+for rec in records:
+    ts = display(rec.get("ts", "?"), 80)
+    frm = display(rec.get("from", "?"), 96)
+    to = display(rec.get("to", "?"), 96)
+    priority = display(rec.get("priority", "normal"), 16)
+    subject = display(rec.get("subject", ""), 256)
+    body = display(rec.get("body", ""), 4096)
+    print(f"  [{ts}] {frm}→{to} ({priority}) {subject}")
+    # O corpo integral pertence ao destinatário: tools/check-coord-inbox
+    # --agent SEU_ID entrega a mensagem inteira. Aqui ele é eco redundante.
+    if quiet:
+        if body.strip():
+            print("      (corpo omitido — leia com tools/check-coord-inbox --agent SEU_ID)")
+    else:
+        print(f"      {body}")
+PYEOF

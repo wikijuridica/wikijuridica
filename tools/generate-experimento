@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""generate-experimento — cria um experimento A/B **cluster-randomizado por página**.
+
+★ O QUE ELE FAZ, EM UMA LINHA
+Sorteia por sha256 quais páginas do acervo entram no experimento e em qual
+braço, VALIDA o texto da variante contra o contrato de indexação e a ética da
+OAB, e grava um registro auditável em `data/ai/experimentos.jsonl`.
+
+★ O QUE ELE NÃO FAZ, E POR QUÊ
+1. **Não escreve prosa.** DEC-017: a máquina nunca inventa texto público. O
+   texto da variante ou já é autoral e está no estoque v2 (o `h1` publicado
+   virando `<title>`; frases inteiras do `opening` virando meta description) ou
+   é permutação de conteúdo já aprovado (ordem do FAQ). Onde não existe texto
+   autoral — o "resumo em 3 linhas" — o experimento nasce em
+   `aguardando_prosa`, dizendo quantas páginas esperam texto humano. Nenhuma
+   frase é composta aqui.
+2. **Não publica nem altera página.** A aplicação da variante é do gerador
+   datado com CAS do pipeline v2 (lease de época + lock + CAS por sha256 da
+   linha viva); este comando só declara a coorte. O comando exato de aplicação
+   sai impresso no fim e fica gravado no registro.
+3. **Não varia por visitante.** A unidade é a PÁGINA: o acervo é estático atrás
+   de uma CDN de 7 dias, e variar por visitante exigiria Vary/cookie (mata o
+   cache) ou decisão por User-Agent (cloaking).
+
+★ ENSAIO POR PADRÃO
+Sem `--aplicar` nada toca o disco — nem o ledger é criado. É a regra do
+repositório, e aqui ela vale duas vezes: um experimento registrado ocupa o teto
+de 5% do acervo e bloqueia as páginas dele para qualquer outro experimento.
+
+★ O TETO DE 5% É GLOBAL
+Somam-se as páginas de TODOS os experimentos ativos. Uma página já em
+experimento é recusada por interferência: duas variantes ao mesmo tempo na
+mesma página tornam o desfecho ininterpretável.
+
+Saídas: 0 sucesso · 2 fonte ausente · 3 nada elegível ou teto esgotado ·
+4 experimento com este id já existe no ledger.
+"""
+import argparse
+import collections
+import datetime as dt
+import glob
+import importlib
+import json
+import os
+import sys
+
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+X = importlib.import_module("experimentos")
+
+# Cada fator declara: o campo que muda, a origem do texto da variante e o que
+# ainda falta para poder aplicar. `bloqueio` é impedimento ESTRUTURAL conhecido,
+# não opinião — quem lê o registro sabe por que a variante não pode ir ao ar.
+FATORES = {
+    "titulo": {
+        "campo": "title",
+        "braco_variante": "titulo_do_h1",
+        "transformacao": "title := h1 autoral do estoque v2",
+        "origem_do_texto": "autoral: o H1 que o autor já publicou na própria página",
+        "estado": "aguardando_revisao_autoral",
+        "bloqueio": None,
+    },
+    "meta_description": {
+        "campo": "meta_description",
+        "braco_variante": "meta_do_abre",
+        "transformacao": "meta_description := primeiras frases INTEIRAS do opening autoral",
+        "origem_do_texto": "autoral: frases inteiras do parágrafo de abertura, sem recorte no meio",
+        "estado": "aguardando_revisao_autoral",
+        "bloqueio": None,
+    },
+    "ordem_faq": {
+        "campo": "faq",
+        "braco_variante": "faq_reordenado",
+        "transformacao": "faq := permutação determinística das MESMAS perguntas",
+        "origem_do_texto": "nenhum texto novo: é permutação do conteúdo já aprovado",
+        "estado": "aguardando_aplicacao",
+        "bloqueio": None,
+    },
+    "resumo_tres_linhas": {
+        "campo": "resumo",
+        "braco_variante": "resumo_no_topo",
+        "transformacao": "resumo := três linhas escritas pelo autor, no topo do corpo",
+        "origem_do_texto": "NÃO EXISTE — texto humano a escrever (DEC-017)",
+        "estado": "aguardando_prosa",
+        "bloqueio": ("o estoque v2 não tem campo `resumo` e o `internal/render` não "
+                     "emite bloco de resumo; aplicar exige mudança em Go (internal/render, "
+                     "internal/pagemarkdown e o contrato de HTML), que é outra frente"),
+    },
+}
+
+
+def carrega_universo(raiz):
+    """Páginas publicadas (manifesto) casadas com o texto do estoque v2.
+
+    O manifesto é quem sabe o PATH — medido em 2026-09-10: `public_path` está
+    vazio nos 11.039 registros v2 casados, então derivar path do estoque daria
+    coorte vazia sem dizer por quê.
+    """
+    manifesto = os.path.join(raiz, X.MANIFESTO_REL)
+    if not os.path.isfile(manifesto):
+        raise X.FonteAusente(f"{X.MANIFESTO_REL} não existe — é o universo de páginas publicadas")
+    shards = sorted(glob.glob(os.path.join(raiz, X.SHARDS_REL, "*.jsonl")))
+    if not shards:
+        raise X.FonteAusente(f"{X.SHARDS_REL}/*.jsonl não existe — é a fonte do texto autoral")
+
+    v2 = {}
+    for caminho in shards:
+        nome = os.path.basename(caminho)
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if intent:
+                    v2[intent] = (nome, registro)
+
+    paginas = []
+    with open(manifesto, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            if registro.get("page_status") != "published" or registro.get("index_policy") != "index":
+                continue
+            intent = registro.get("unique_intent_id")
+            shard, texto = v2.get(intent, (None, None))
+            caminho = X.normaliza_path(registro.get("path"))
+            paginas.append({
+                "path": caminho,
+                "intent_id": intent,
+                "shard": shard,
+                "area": caminho.strip("/").split("/")[0] if caminho.strip("/") else "(raiz)",
+                "title_manifesto": X.limpa(registro.get("title")),
+                "v2": texto,
+            })
+    return paginas
+
+
+def resume_motivo(motivo):
+    """`titulo_longo:68` vira `titulo_longo`; `promessa_oab:garantia` fica inteiro.
+
+    O censo de recusa serve para ver O QUE barra a variante. Com o número
+    colado, uma causa única virava 21 linhas de uma letra de diferença e a
+    leitura se perdia — mas a etiqueta do detector (promessa, encoding,
+    vocabulário) é informação, não ruído, e permanece.
+    """
+    cabeca, _, cauda = motivo.partition(":")
+    return cabeca if cauda.isdigit() else motivo
+
+
+def elegibilidade(fator, paginas, detectores, ocupadas):
+    """Quem pode carregar a variante, e o CENSO de quem não pode e por quê.
+
+    A ordem é determinística (por path) para que a resolução de colisão de
+    título/meta não dependa da ordem em que o disco devolveu os arquivos.
+    """
+    titulos_do_acervo = {p["title_manifesto"] for p in paginas if p["title_manifesto"]}
+    metas_do_acervo = set()
+    for pagina in paginas:
+        if pagina["v2"]:
+            titulos_do_acervo.add(X.limpa(pagina["v2"].get("title")))
+            meta = X.limpa(pagina["v2"].get("meta_description"))
+            if meta:
+                metas_do_acervo.add(meta)
+
+    recusas = collections.Counter()
+    elegiveis = []
+    reivindicados = set()
+    for pagina in sorted(paginas, key=lambda p: p["path"]):
+        if pagina["path"] in ocupadas:
+            recusas["interferencia:ja_em_" + ocupadas[pagina["path"]]] += 1
+            continue
+        registro = pagina["v2"]
+        if registro is None:
+            recusas["sem_registro_v2"] += 1
+            continue
+
+        if fator == "titulo":
+            atual = X.limpa(registro.get("title"))
+            candidato = X.limpa(registro.get("h1"))
+            if not candidato:
+                recusas["h1_ausente"] += 1
+                continue
+            if candidato == atual:
+                recusas["h1_igual_ao_title"] += 1
+                continue
+            # O conjunto entra INTEIRO, sem `- {atual}`: o candidato já foi
+            # recusado acima se fosse igual ao próprio título, então não há
+            # colisão consigo mesmo a excluir — e a subtração copiava um
+            # conjunto de 11 mil títulos por página, o que fazia a passada
+            # sobre o acervo inteiro custar O(n²) (lentidão em 10k é P0 neste
+            # repositório, não detalhe).
+            motivos = X.valida_titulo(candidato, detectores, titulos_do_acervo)
+            if candidato in reivindicados:
+                motivos.append("colide_com_outra_variante")
+            if motivos:
+                recusas[resume_motivo(motivos[0])] += 1
+                continue
+            reivindicados.add(candidato)
+            pagina = dict(pagina, texto_atual=atual, texto_variante=candidato)
+
+        elif fator == "meta_description":
+            atual = X.limpa(registro.get("meta_description"))
+            candidato = X.recorte_por_frase(registro.get("opening"), X.META_MIN, X.META_MAX)
+            if not candidato:
+                recusas["opening_sem_recorte_de_70_a_160"] += 1
+                continue
+            if candidato == atual:
+                recusas["recorte_igual_a_meta_atual"] += 1
+                continue
+            motivos = X.valida_meta(candidato, detectores, metas_do_acervo)  # idem: sem cópia por página
+            if candidato in reivindicados:
+                motivos.append("colide_com_outra_variante")
+            if motivos:
+                recusas[resume_motivo(motivos[0])] += 1
+                continue
+            reivindicados.add(candidato)
+            pagina = dict(pagina, texto_atual=atual, texto_variante=candidato)
+
+        elif fator == "ordem_faq":
+            faq = registro.get("faq") or []
+            if len(faq) < 2:
+                recusas[f"faq_com_{len(faq)}_perguntas"] += 1
+                continue
+            pagina = dict(pagina, texto_atual=" | ".join(X.limpa(q.get("q")) for q in faq),
+                          texto_variante=None, faq_n=len(faq))
+
+        elif fator == "resumo_tres_linhas":
+            # Sem texto: a máquina não escreve resumo. A página é elegível para
+            # ENTRAR na fila de prosa, e o registro conta quantas esperam autor.
+            pagina = dict(pagina, texto_atual=None, texto_variante=None, prosa_pendente=True)
+
+        else:
+            raise ValueError(f"fator desconhecido: {fator}")
+
+        elegiveis.append(pagina)
+    return elegiveis, recusas
+
+
+def sorteia(elegiveis, sal, bracos, limite):
+    """Coorte e braços, tudo por sha256 do path — reprodutível por terceiros.
+
+    O corte é pelo MENOR `u_selecao`: equivale a um limiar, é determinístico e
+    não privilegia área, tamanho nem ordem de leitura do disco. O limiar
+    efetivo vai gravado, então qualquer pessoa confere a pertinência de uma
+    página só com o hash.
+    """
+    com_u = []
+    for pagina in elegiveis:
+        u = X.u_de(sal, "selecao", pagina["path"])
+        com_u.append((u, pagina))
+    com_u.sort(key=lambda par: (par[0], par[1]["path"]))
+    escolhidas = com_u[:limite]
+    limiar = escolhidas[-1][0] if escolhidas else 0.0
+
+    coorte = []
+    for u_sel, pagina in escolhidas:
+        braco, u_braco = X.atribui_braco(sal, pagina["path"], bracos)
+        item = {
+            "path": pagina["path"],
+            "intent_id": pagina["intent_id"],
+            "shard": pagina["shard"],
+            "area": pagina["area"],
+            "braco": braco,
+            "u_selecao": round(u_sel, 12),
+            "u_braco": round(u_braco, 12),
+        }
+        for chave in ("texto_atual", "texto_variante", "faq_n", "prosa_pendente"):
+            if chave in pagina:
+                item[chave] = pagina[chave]
+        if pagina.get("faq_n") and braco != bracos[0]:
+            item["permutacao"] = X.permutacao_faq(sal, pagina["path"], pagina["faq_n"])
+        if braco == bracos[0]:
+            # Controle não recebe variante nenhuma: o texto atual permanece, e
+            # nenhuma prosa é esperada dele — marcar o controle como pendente
+            # inflaria a fila de escrita do autor com páginas que não mudam.
+            item["texto_variante"] = None
+            item.pop("permutacao", None)
+            item.pop("prosa_pendente", None)
+        coorte.append(item)
+    coorte.sort(key=lambda item: item["path"])
+    return coorte, limiar
+
+
+def monta_registro(args, raiz, universo, elegiveis, recusas, coorte, limiar, teto, bracos, agora):
+    espec = FATORES[args.fator]
+    variante = [item for item in coorte if item["braco"] == bracos[1]]
+    pendencias = {}
+    estado = espec["estado"]
+    if args.fator == "resumo_tres_linhas":
+        pendencias["paginas_sem_prosa"] = len(variante)
+    if args.fator in ("titulo", "meta_description"):
+        pendencias["paginas_aguardando_ok_do_autor"] = len(variante)
+
+    desfechos = []
+    for nome, definicao in X.DESFECHOS.items():
+        desfechos.append({
+            "nome": nome,
+            "papel": "primario" if nome == args.desfecho_primario else "secundario",
+            "fonte": definicao["fonte"],
+            "unidade": definicao["unidade"],
+            "modelo": definicao["modelo"],
+            "chave": definicao["chave"],
+            "ressalvas": definicao["ressalvas"],
+        })
+
+    return {
+        "schema_version": X.SCHEMA_VERSION,
+        "tipo": "experimento",
+        "experimento_id": args.id,
+        "date": agora[:10],
+        "gerado_em": agora,
+        "estado": estado,
+        "fator": args.fator,
+        "campo_alterado": espec["campo"],
+        "escopo": {
+            "universo": X.MANIFESTO_REL,
+            "area": args.area,
+            "paginas_publicadas": len(universo),
+            "paginas_no_escopo": sum(1 for p in universo if args.area in (None, p["area"])),
+        },
+        "aleatorizacao": {
+            "unidade": "pagina",
+            "motivo": ("acervo estático atrás de CDN com s-maxage=604800: variar por "
+                       "visitante exigiria Vary/cookie (mata o cache) ou decisão por "
+                       "User-Agent (cloaking)"),
+            "sal": args.sal,
+            "dominio": X.DOMINIO,
+            "receita": X.RECEITA_HASH,
+            "limiar_selecao": round(limiar, 12),
+            "verificacao": ("página pertence à coorte se é elegível e "
+                            "u_de(sal,'selecao',path) <= limiar_selecao"),
+        },
+        "teto": teto,
+        "bracos": [
+            {"nome": bracos[0], "transformacao": "nenhuma (controle)",
+             "paginas": sum(1 for item in coorte if item["braco"] == bracos[0])},
+            {"nome": bracos[1], "transformacao": espec["transformacao"],
+             "origem_do_texto": espec["origem_do_texto"],
+             "paginas": len(variante)},
+        ],
+        "elegibilidade": {
+            "avaliadas": sum(1 for p in universo if args.area in (None, p["area"])),
+            "elegiveis": len(elegiveis),
+            "recusas": dict(sorted(recusas.items(), key=lambda par: (-par[1], par[0]))),
+        },
+        "contrato_de_texto": {
+            "title_caracteres": [X.TITULO_MIN, X.TITULO_MAX],
+            "meta_description_caracteres": [X.META_MIN, X.META_MAX],
+            "unicidade": "title e meta description únicos no acervo",
+            "etica": "promessa de resultado (Provimento OAB 205/2021) reprovada pelo "
+                     "detector de tools/generate-v2-publication-severity",
+        },
+        "janela_dias": args.janela_dias,
+        "desfecho_primario": args.desfecho_primario,
+        "desfechos": desfechos,
+        "regra_de_veredito": {
+            "fixada_antes_da_medicao": True,
+            "p_variante_melhor_para_adotar": args.p_adotar,
+            "p_variante_melhor_para_descartar": args.p_descartar,
+            "piso_eventos_por_braco": args.piso_eventos,
+            "piso_page_days_por_braco": args.piso_page_days,
+            "exige_ic95_do_quociente_excluir_1": True,
+            "abaixo_do_piso": "sem_decisao, com o N que falta declarado",
+            "so_o_desfecho_primario_decide": True,
+        },
+        "aplicado_em": None,
+        "bloqueios": [espec["bloqueio"]] if espec["bloqueio"] else [],
+        "pendencias": pendencias,
+        "comando_de_aplicacao": comando_de_aplicacao(args.id, args.fator),
+        "coorte": coorte,
+    }
+
+
+def comando_de_aplicacao(experimento_id, fator):
+    """O caminho SANCIONADO de escrita no estoque v2 — nomeado, não executado."""
+    if fator == "resumo_tres_linhas":
+        return ("BLOQUEADO: não há campo `resumo` no estoque v2 nem bloco de resumo em "
+                "internal/render; a aplicação depende de mudança em Go, fora desta frente")
+    return (f"tools/generate-v2-experimento-aplicar-{dt.date.today():%Y%m%d} "
+            f"--experimento {experimento_id} --aplicar  "
+            "# gerador datado: canonical_stock_write_lease + lock exclusivo + CAS por "
+            "sha256 da linha viva em data/editorial/v2_pages/<shard>.jsonl; depois "
+            "./tools/deploy-publico SEM --ressemear (muda texto servido: a re-datação é verdadeira)")
+
+
+def imprime_ensaio(registro, amostra):
+    espec = FATORES[registro["fator"]]
+    escopo = registro["escopo"]
+    eleg = registro["elegibilidade"]
+    print(f"experimento      {registro['experimento_id']}")
+    print(f"fator            {registro['fator']}  (campo `{registro['campo_alterado']}`)")
+    print(f"estado           {registro['estado']}")
+    print(f"escopo           área={escopo['area'] or 'acervo inteiro'}  "
+          f"páginas no escopo={escopo['paginas_no_escopo']} de {escopo['paginas_publicadas']} publicadas")
+    print(f"sal              {registro['aleatorizacao']['sal']}")
+    print(f"receita          {registro['aleatorizacao']['receita']}")
+    print(f"limiar seleção   {registro['aleatorizacao']['limiar_selecao']}")
+    print()
+    print(f"ELEGIBILIDADE    {eleg['elegiveis']} elegíveis de {eleg['avaliadas']} avaliadas")
+    for motivo, quantas in eleg["recusas"].items():
+        print(f"    recusa       {quantas:>6}  {motivo}")
+    print()
+    teto = registro["teto"]
+    print(f"TETO GLOBAL      {teto['fracao']:.0%} do acervo = {teto['paginas']} páginas")
+    print(f"    ocupado      {teto['ocupado_por_ativos']} por {teto['experimentos_ativos']} experimento(s) ativo(s)")
+    print(f"    disponível   {teto['disponivel']}")
+    print(f"    coorte       {len(registro['coorte'])}")
+    print()
+    for braco in registro["bracos"]:
+        print(f"BRAÇO            {braco['nome']:<18} {braco['paginas']:>5} páginas  — {braco['transformacao']}")
+    print()
+    variante = [item for item in registro["coorte"] if item["braco"] == registro["bracos"][1]["nome"]]
+    if variante:
+        print(f"AMOSTRA DA VARIANTE (primeiras {min(amostra, len(variante))} de {len(variante)}, ordem de path)")
+        for item in variante[:amostra]:
+            print(f"  {item['path']}")
+            if registro["fator"] == "ordem_faq":
+                print(f"      perguntas ({item.get('faq_n')}) -> nova ordem {item.get('permutacao')}")
+            elif item.get("texto_variante"):
+                atual = item.get("texto_atual") or ""
+                novo = item["texto_variante"]
+                print(f"      atual   ({len(atual):>3}) {atual}")
+                print(f"      variante({len(novo):>3}) {novo}")
+            else:
+                print("      variante: texto humano a escrever (a máquina não compõe — DEC-017)")
+        print()
+    print(f"JANELA           {registro['janela_dias']} dias   desfecho primário: {registro['desfecho_primario']}")
+    for desfecho in registro["desfechos"]:
+        print(f"    {desfecho['papel']:<10} {desfecho['nome']:<20} {desfecho['fonte']}")
+    print()
+    if registro["bloqueios"]:
+        for bloqueio in registro["bloqueios"]:
+            print(f"BLOQUEIO         {bloqueio}")
+        print()
+    if registro["pendencias"]:
+        for chave, valor in registro["pendencias"].items():
+            print(f"PENDÊNCIA        {chave}: {valor}")
+        print()
+    print(f"APLICAÇÃO        {registro['comando_de_aplicacao']}")
+    print()
+    print(f"origem do texto  {espec['origem_do_texto']}")
+
+
+def muda_estado(args, registros, agora):
+    """Acrescenta uma linha `tipo=estado` — a transição do experimento.
+
+    É a peça que fecha o ciclo: sem ela `aplicado_em` fica nulo para sempre
+    (toda medição sairia como A/A) e as páginas de um experimento encerrado
+    seguiriam ocupando o teto de 5% do acervo, impedindo o próximo.
+    """
+    eid = args.marcar_aplicado or args.encerrar
+    vivos = X.dobra_experimentos(registros)
+    if eid not in vivos:
+        print(f"erro: experimento {eid} não está no ledger. Ids: "
+              + ", ".join(sorted(vivos)), file=sys.stderr)
+        return 3, None
+    atual = vivos[eid]
+    linha = {"schema_version": X.SCHEMA_VERSION, "tipo": "estado",
+             "experimento_id": eid, "date": agora[:10], "gerado_em": agora,
+             "estado_anterior": atual.get("estado")}
+    if args.marcar_aplicado:
+        aplicado_em = args.aplicado_em or agora[:10]
+        try:
+            dt.date.fromisoformat(aplicado_em)
+        except ValueError:
+            print("erro: --aplicado-em tem de ser uma data ISO (AAAA-MM-DD)", file=sys.stderr)
+            return 3, None
+        if atual.get("pendencias", {}).get("paginas_sem_prosa"):
+            print(f"erro: {eid} ainda tem "
+                  f"{atual['pendencias']['paginas_sem_prosa']} páginas sem prosa humana — "
+                  "não se marca como aplicado o que não foi escrito (DEC-017)", file=sys.stderr)
+            return 3, None
+        linha["estado"] = "aplicado"
+        linha["aplicado_em"] = aplicado_em
+        linha["motivo"] = ("variante escrita no estoque v2 pelo gerador datado com CAS e "
+                           "publicada; a janela de medição começa nesta data")
+    else:
+        if args.estado not in X.ESTADOS_TERMINAIS:
+            print(f"erro: --encerrar exige --estado entre {', '.join(X.ESTADOS_TERMINAIS)}",
+                  file=sys.stderr)
+            return 3, None
+        linha["estado"] = args.estado
+        linha["motivo"] = args.motivo or "encerrado pelo operador"
+        linha["paginas_liberadas"] = len(atual.get("coorte") or [])
+    return 0, linha
+
+
+def principal(argv=None):
+    parser = argparse.ArgumentParser(
+        description="cria um experimento A/B cluster-randomizado por página (ensaio por padrão)")
+    parser.add_argument("--fator", default=None, choices=sorted(FATORES),
+                        help="o que varia entre os braços (obrigatório ao criar)")
+    parser.add_argument("--marcar-aplicado", default=None, metavar="ID",
+                        help="registra que a variante foi ao ar; a janela conta a partir daí")
+    parser.add_argument("--aplicado-em", default=None, metavar="AAAA-MM-DD",
+                        help="data da publicação da variante (padrão: hoje)")
+    parser.add_argument("--encerrar", default=None, metavar="ID",
+                        help="encerra o experimento e LIBERA as páginas dele do teto de 5%%")
+    parser.add_argument("--estado", default=None, choices=sorted(X.ESTADOS_TERMINAIS),
+                        help="estado terminal de --encerrar")
+    parser.add_argument("--motivo", default=None, help="motivo da transição, gravado na linha")
+    parser.add_argument("--area", default=None,
+                        help="restringe ao primeiro segmento do path (ex.: familia)")
+    parser.add_argument("--id", default=None, help="identificador do experimento")
+    parser.add_argument("--sal", default=None,
+                        help="sal do sorteio (padrão: o próprio id — determinístico e gravado)")
+    parser.add_argument("--paginas", type=int, default=None,
+                        help="teto de páginas desta coorte (o teto global de 5%% continua valendo)")
+    parser.add_argument("--fracao", type=float, default=None,
+                        help="fração das páginas elegíveis a sortear (0 a 1)")
+    parser.add_argument("--janela-dias", type=int, default=X.JANELA_DIAS_PADRAO)
+    parser.add_argument("--desfecho-primario", default=X.DESFECHO_PRIMARIO_PADRAO,
+                        choices=sorted(X.DESFECHOS))
+    parser.add_argument("--p-adotar", type=float, default=0.95)
+    parser.add_argument("--p-descartar", type=float, default=0.05)
+    parser.add_argument("--piso-eventos", type=int, default=30,
+                        help="eventos mínimos por braço no desfecho primário para haver veredito")
+    parser.add_argument("--piso-page-days", type=int, default=100,
+                        help="páginas×dias mínimos por braço para haver veredito")
+    parser.add_argument("--amostra", type=int, default=8, help="linhas da coorte a imprimir")
+    parser.add_argument("--json", action="store_true", help="imprime o registro em JSON")
+    parser.add_argument("--aplicar", action="store_true",
+                        help="grava no ledger; sem esta bandeira nada toca o disco")
+    parser.add_argument("--raiz", default=X.raiz_do_repo(__file__))
+    args = parser.parse_args(argv)
+
+    agora = X.agora_utc()
+
+    if args.marcar_aplicado or args.encerrar:
+        if args.marcar_aplicado and args.encerrar:
+            print("erro: --marcar-aplicado e --encerrar são exclusivos", file=sys.stderr)
+            return 3
+        try:
+            registros = X.le_ledger(args.raiz)
+        except ValueError as erro:
+            print(f"ledger ilegível: {erro}", file=sys.stderr)
+            return 2
+        codigo, linha = muda_estado(args, registros, agora)
+        if codigo:
+            return codigo
+        print(json.dumps(linha, ensure_ascii=False, sort_keys=True, indent=2)
+              if args.json else
+              f"transição       {linha['experimento_id']}: "
+              f"{linha['estado_anterior']} -> {linha['estado']}"
+              + (f"  (aplicado_em {linha['aplicado_em']})" if linha.get("aplicado_em") else "")
+              + (f"  libera {linha['paginas_liberadas']} páginas do teto"
+                 if linha.get("paginas_liberadas") else ""))
+        aviso = sys.stderr if args.json else sys.stdout
+        if args.aplicar:
+            caminho = X.acrescenta_ao_ledger(args.raiz, linha)
+            print(f"\nGRAVADO em {os.path.relpath(caminho, args.raiz)}", file=aviso)
+        else:
+            print("\nENSAIO — nada foi escrito. Use --aplicar para registrar a transição.",
+                  file=aviso)
+        return 0
+
+    if not args.fator:
+        print("erro: informe --fator ao criar um experimento (ou --marcar-aplicado/--encerrar)",
+              file=sys.stderr)
+        return 3
+    if not args.id:
+        sufixo = args.area or "acervo"
+        args.id = f"exp-{agora[:10].replace('-', '')}-{args.fator.replace('_', '-')}-{sufixo}"
+    if not args.sal:
+        args.sal = args.id
+    if not 0 <= args.p_descartar < args.p_adotar <= 1:
+        print("erro: exija 0 <= --p-descartar < --p-adotar <= 1", file=sys.stderr)
+        return 3
+
+    try:
+        registros = X.le_ledger(args.raiz)
+        universo = carrega_universo(args.raiz)
+        detectores = X.carrega_detectores(args.raiz)
+    except X.FonteAusente as erro:
+        print(f"fonte ausente: {erro}", file=sys.stderr)
+        return 2
+    except ValueError as erro:
+        # Linha corrompida no ledger é erro de fonte, não traceback: um
+        # experimento invisível liberaria as páginas dele para outro.
+        print(f"ledger ilegível: {erro}", file=sys.stderr)
+        return 2
+
+    if any(r.get("tipo") == "experimento" and r.get("experimento_id") == args.id for r in registros):
+        print(f"erro: já existe experimento com id {args.id} no ledger — escolha outro --id "
+              "(o ledger é append-only e nunca se reescreve)", file=sys.stderr)
+        return 4
+
+    ativos = X.experimentos_ativos(registros)
+    ocupadas = X.paginas_ocupadas(registros)
+    teto_paginas = int(len(universo) * X.TETO_FRACAO_ACERVO)
+    disponivel = max(0, teto_paginas - len(ocupadas))
+    teto = {"fracao": X.TETO_FRACAO_ACERVO, "paginas": teto_paginas,
+            "acervo": len(universo), "ocupado_por_ativos": len(ocupadas),
+            "experimentos_ativos": len(ativos), "disponivel": disponivel}
+
+    no_escopo = [p for p in universo if args.area in (None, p["area"])]
+    if not no_escopo:
+        areas = sorted({p["area"] for p in universo})
+        print(f"erro: nenhuma página publicada na área {args.area!r}. Áreas: {', '.join(areas)}",
+              file=sys.stderr)
+        return 3
+
+    elegiveis, recusas = elegibilidade(args.fator, no_escopo, detectores, ocupadas)
+    if not elegiveis:
+        print(f"erro: nenhuma página elegível para o fator {args.fator} no escopo. "
+              f"Censo de recusa: {dict(recusas)}", file=sys.stderr)
+        return 3
+
+    limite = min(len(elegiveis), disponivel)
+    if args.fracao is not None:
+        if not 0 < args.fracao <= 1:
+            print("erro: --fracao tem de estar em (0, 1]", file=sys.stderr)
+            return 3
+        limite = min(limite, int(round(args.fracao * len(elegiveis))))
+    if args.paginas is not None:
+        limite = min(limite, max(0, args.paginas))
+    if limite <= 0:
+        print(f"erro: teto global esgotado — {len(ocupadas)} de {teto_paginas} páginas já estão "
+              f"em {len(ativos)} experimento(s) ativo(s). Encerre um antes de abrir outro.",
+              file=sys.stderr)
+        return 3
+
+    espec = FATORES[args.fator]
+    bracos = ["controle", espec["braco_variante"]]
+    coorte, limiar = sorteia(elegiveis, args.sal, bracos, limite)
+    registro = monta_registro(args, args.raiz, universo, elegiveis, recusas,
+                              coorte, limiar, teto, bracos, agora)
+
+    if args.json:
+        print(json.dumps(registro, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        imprime_ensaio(registro, args.amostra)
+
+    # Com --json o stdout é JSON e nada mais: o aviso de estado vai para o
+    # stderr, senão `| jq` e `| python -m json.tool` quebram com "Extra data".
+    aviso = sys.stderr if args.json else sys.stdout
+    if args.aplicar:
+        caminho = X.acrescenta_ao_ledger(args.raiz, registro)
+        print(f"\nGRAVADO em {os.path.relpath(caminho, args.raiz)} — {len(coorte)} páginas, "
+              f"estado {registro['estado']}.", file=aviso)
+    else:
+        print("\nENSAIO — nada foi escrito. Use --aplicar para registrar o experimento.",
+              file=aviso)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(principal())

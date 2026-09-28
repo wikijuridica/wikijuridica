@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Varre shards de sitemap com carência VENCIDA e os retira do disco.
+
+POR QUE ISTO EXISTE
+===================
+Quando uma publicação encolhe o plano de sitemap, os shards que saíram do
+índice não são apagados na hora: ficam em CARÊNCIA por 8 dias, servindo 200
+para quem já tinha baixado o índice anterior — é o que evita devolver 4xx ao
+Googlebot que guardou a lista velha. O mecanismo está em internal/sitemapgrace
+e a marca vive dentro do próprio XML, nunca num ledger externo (um registro que
+se perdesse transformaria cada carência num boot quebrado).
+
+O QUE NÃO TINHA DONO
+====================
+A entrada na carência é automática. A SAÍDA não era: o único código que varre
+shard vencido é o cmd/publish-v2-direct, ou seja, a limpeza só acontecia se
+alguém publicasse. E publishedmanifest.Validate — que roda no BOOT do servidor
+— recusa shard fora do índice cuja carência não seja mais válida, com "shard is
+not listed". O comentário lá é explícito: "reprovar aqui não é um aviso: é o
+portal fora do ar".
+
+Somando as duas coisas: um shard retirado num dia em que ninguém publique nos 8
+dias seguintes derruba o servidor no próximo restart. Medido em 2026-08-27:
+três shards (pages-0033/34/35) retirados em 26/08 23:28 UTC, vencendo em 03/09.
+
+A GUARDA
+========
+Remover shard é escrita em produção, então isto NUNCA remove às cegas: antes de
+apagar, confere que TODAS as URLs daquele shard estão cobertas por algum shard
+do plano vivo. Uma URL que ficasse de fora viraria 404 para quem seguisse o
+índice antigo — exatamente o dano que a carência existia para evitar. Shard
+vencido com URL órfã é reportado e MANTIDO, porque nesse caso o defeito é outro
+e apagar esconderia.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+
+SHARDS = "public/sitemaps"
+INDICE = "public/sitemap.xml"
+MARCA = "sitemap-shard-em-carencia"
+PERIODO = timedelta(days=8)  # espelha sitemapgrace.Period
+ALERTA_ANTES = timedelta(hours=48)
+
+# REGISTRY DE SHARD (internal/sitemap.ShardRegistry) — TOMBAMENTO NO INSTANTE
+# REAL DA REMOCAO, medido como buraco em 2026-09-03.
+#
+# O nome do shard e uma IDENTIDADE de coorte (internal/sitemap/shard_registry.go),
+# e "numero que ja respondeu 410 nunca e reatribuido" so vale se ExpireRetired
+# de fato tombar o ordinal quando o arquivo sai do ar. Mas ExpireRetired so e
+# chamado por cmd/publish-v2-direct, no PUBLISH — e publish e evento por
+# CONTEUDO, nao por tempo. Este script roda por TEMPO (ExecStartPre do
+# servico, systemd timer), entao pode remover um shard fisicamente em um dia
+# sem nenhum publish acontecer perto.
+#
+# Pior: pages-0035.xml (medido em 2026-09-03) prova que a chave pode nem
+# EXISTIR no registry. SeedFromPlan (a semeadura) so itera plan.Shards — o
+# plano AO VIVO — entao um shard que ja estava em carencia no instante da
+# semeadura nunca ganhou chave em `assigned`. Sem chave, `Retire`/`ExpireRetired`
+# NUNCA alcancam esse ordinal por construcao: nao ha o que rotear.
+#
+# Por isso o tombamento tem DOIS caminhos (tomba_ordinal_expirado, abaixo):
+# ordinal com chave em assigned+retired usa a MESMA logica de ExpireRetired
+# (tira a chave, poe o numero em tombstones); ordinal SEM chave alguma —
+# o caso orfao — vai direto para tombstones, porque nao ha chave a que
+# amarrar. `tools/seed-sitemap-registry --adotar-orfaos` fecha o buraco pela
+# ORIGEM (da a esses ordinais uma chave sintetica, para que o ExpireRetired
+# do publish tambem os alcance); este tombamento aqui e a rede de seguranca
+# para o caso em que a adocao ainda nao rodou ou nao roda a tempo.
+REGISTRY = "data/ops/sitemap_shard_registry.json"
+
+
+def agora_utc():
+    """Ponto de injecao do relogio. Quem testa troca esta funcao por uma que
+    devolve um instante fixo no futuro, sem depender do relogio real nem de
+    um shard que so vence de verdade em 2026-09-05."""
+    return datetime.now(timezone.utc)
+
+
+def ordinal_do_nome(nome):
+    """Extrai o ordinal de 'pages-0035.xml'. None se o nome nao casar."""
+    m = re.match(r"pages-(\d+)\.xml$", nome)
+    return int(m.group(1)) if m else None
+
+
+def le_registry():
+    """Le o registry do disco. Ausente devolve None: o sweep segue
+    funcionando sem registry, exatamente como funcionava antes de ele
+    existir — o registry e reforco, nunca uma dependencia dura daqui."""
+    if not os.path.isfile(REGISTRY):
+        return None
+    with open(REGISTRY, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def grava_registry(registro):
+    """Grava o registry de forma atomica (tmp+rename), preservando a MESMA
+    ordem de chave que internal/sitemap.ShardRegistry.Salva produz — o
+    arquivo continua sendo lido pelo Go, e um formato estranho nao pode
+    quebrar isso."""
+    saida = {
+        "next_id": registro["next_id"],
+        "assigned": registro.get("assigned", {}),
+        "tombstones": sorted(registro.get("tombstones") or []),
+        "retired": registro.get("retired", {}),
+        "schema_version": registro.get("schema_version") or "sitemap_shard_registry_v1",
+    }
+    if registro.get("por_que"):
+        saida["por_que"] = registro["por_que"]
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(saida, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, REGISTRY)
+
+
+def tomba_ordinal_expirado(ordinal, seco):
+    """Tomba UM ordinal cujo shard fisico acabou de vencer a carencia (ou
+    vai vencer, em --seco). Devolve uma linha de relato, ou None quando nao
+    ha registry em uso.
+
+    Ordem deliberada em relacao a remocao do arquivo: este tombamento roda
+    ANTES de os.remove() em main(). Se o processo cair entre os dois passos,
+    o pior caso e um ordinal tombado um instante antes de o arquivo sumir de
+    fato — inocuo, porque o UNICO efeito de tombstones e "nunca mais
+    reatribuir este numero". O caminho inverso (remover primeiro) e o que
+    reproduziria o buraco medido em 2026-09-03: arquivo removido, ordinal
+    invisivel ao registry para sempre.
+    """
+    registro = le_registry()
+    if registro is None:
+        return None
+    tombstones = set(registro.get("tombstones") or [])
+    if ordinal in tombstones:
+        return f"registry: ordinal {ordinal} ja tombado, nada a fazer"
+    next_id = registro.get("next_id", 1)
+    if ordinal >= next_id:
+        return (f"AVISO: ordinal {ordinal} >= next_id ({next_id}) do registry — "
+                f"NAO tombado. Isto seria tombar um numero que o registry nunca "
+                f"alocou, e e inconsistencia grave demais para silenciar.")
+    assigned = registro.get("assigned", {})
+    retired = registro.get("retired", {})
+    chave_dona = next((chave for chave, valor in assigned.items() if valor == ordinal), None)
+    if chave_dona is not None and chave_dona not in retired:
+        return (f"AVISO: ordinal {ordinal} pertence a chave {chave_dona!r}, que NAO "
+                f"esta marcada 'retired' no registry — NAO tombado. A marca em disco "
+                f"e o registry discordam sobre esta coorte; isso pede investigacao, "
+                f"nao um tombamento silencioso.")
+
+    alvo = f"chave {chave_dona!r}" if chave_dona is not None else "orfao de registry, sem chave em assigned"
+    if seco:
+        return f"--seco: tombaria ordinal {ordinal} no registry ({alvo})"
+
+    if chave_dona is not None:
+        del assigned[chave_dona]
+        del retired[chave_dona]
+    tombstones.add(ordinal)
+    registro["assigned"] = assigned
+    registro["retired"] = retired
+    registro["tombstones"] = sorted(tombstones)
+    grava_registry(registro)
+    return f"registry: ordinal {ordinal} tombado ({alvo})"
+
+
+def locs(caminho):
+    with open(caminho, encoding="utf-8") as fh:
+        return set(re.findall(r"<loc>([^<]+)</loc>", fh.read()))
+
+
+def retirado_em(caminho):
+    """Instante da marca de carência, ou None se o arquivo não estiver marcado."""
+    with open(caminho, encoding="utf-8") as fh:
+        cabeca = fh.read(2048)
+    if MARCA not in cabeca:
+        return None
+    achado = re.search(r"retirado-em=(\S+)", cabeca)
+    if not achado:
+        return None
+    try:
+        return datetime.fromisoformat(achado.group(1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def nomes_no_indice():
+    if not os.path.exists(INDICE):
+        return set()
+    with open(INDICE, encoding="utf-8") as fh:
+        return set(re.findall(r"pages-\d+\.xml", fh.read()))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seco", action="store_true", help="relata sem remover")
+    args = ap.parse_args()
+
+    if not os.path.isdir(SHARDS):
+        print(f"{SHARDS} nao existe; nada a varrer")
+        return 0
+
+    agora = agora_utc()
+    indexados = nomes_no_indice()
+
+    plano = set()
+    candidatos = []
+    for nome in sorted(os.listdir(SHARDS)):
+        if not nome.startswith("pages-") or not nome.endswith(".xml"):
+            continue
+        caminho = os.path.join(SHARDS, nome)
+        if nome in indexados:
+            plano |= locs(caminho)
+            continue
+        marca = retirado_em(caminho)
+        if marca is None:
+            print(f"AVISO: {nome} esta fora do indice e NAO tem marca de carencia. "
+                  f"Nesse estado ele reprova publishedmanifest.Validate e trava o "
+                  f"boot do servidor. Nao removo por conta propria — investigue.",
+                  file=sys.stderr)
+            continue
+        candidatos.append((nome, caminho, marca))
+
+    removidos = expirando = 0
+    for nome, caminho, marca in candidatos:
+        vence = marca + PERIODO
+        restante = vence - agora
+        if restante > ALERTA_ANTES:
+            print(f"  {nome}: em carencia, vence em {vence:%Y-%m-%d %H:%M}Z "
+                  f"({restante.days}d)")
+            continue
+        if restante > timedelta(0):
+            expirando += 1
+            print(f"ATENCAO: {nome} vence em {vence:%Y-%m-%d %H:%M}Z — menos de 48h. "
+                  f"Sem publicacao ou varredura ate la, o boot do servidor trava.")
+            continue
+
+        orfas = locs(caminho) - plano
+        if orfas:
+            print(f"ERRO: {nome} VENCEU em {vence:%Y-%m-%d %H:%M}Z mas {len(orfas)} "
+                  f"URL(s) dele nao estao em nenhum shard do plano. Remover agora "
+                  f"criaria 404 para quem seguir o indice antigo. MANTIDO. "
+                  f"Exemplo: {sorted(orfas)[0]}", file=sys.stderr)
+            return 1
+
+        ordinal = ordinal_do_nome(nome)
+        if args.seco:
+            print(f"  --seco: removeria {nome} (venceu em {vence:%Y-%m-%d %H:%M}Z, "
+                  f"todas as {len(locs(caminho))} URLs cobertas pelo plano)")
+            if ordinal is not None:
+                relato = tomba_ordinal_expirado(ordinal, seco=True)
+                if relato:
+                    print(f"    {relato}")
+        else:
+            # O registry e tombado ANTES do os.remove(): ver a ordem
+            # deliberada no docstring de tomba_ordinal_expirado.
+            if ordinal is not None:
+                relato = tomba_ordinal_expirado(ordinal, seco=False)
+                if relato:
+                    print(f"    {relato}")
+            os.remove(caminho)
+            gemea = caminho + ".br"
+            if os.path.exists(gemea):
+                os.remove(gemea)
+            print(f"  removido {nome}: carencia venceu em {vence:%Y-%m-%d %H:%M}Z e "
+                  f"as URLs dele ja estao no plano")
+        removidos += 1
+
+    print(f"\ncarencia: {len(candidatos)} shard(s) fora do indice | "
+          f"{removidos} vencido(s) | {expirando} vencendo em menos de 48h")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

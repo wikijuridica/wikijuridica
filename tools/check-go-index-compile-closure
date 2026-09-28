@@ -1,0 +1,3059 @@
+#!/usr/bin/python3 -I
+"""Compile the exact staged Go snapshot without reading worktree sources."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import time
+from typing import Iterable
+
+
+SCRIPT_PATH = pathlib.Path(__file__).resolve()
+INSTALL_ROOT = SCRIPT_PATH.parent.parent
+SELF_REL = "tools/check-go-index-compile-closure"
+CHECKER_REL = "tools/check-go-compile-closure"
+PINNED_GO_VERSION = "go1.26.6"
+PINNED_TOOLCHAIN_REL = pathlib.PurePosixPath(".toolchains/go1.26.6")
+PINNED_GO_VERSION_PAYLOAD = (
+    b'go1.26.6\ntime 2026-08-11T00:40:52Z\n')
+PINNED_TOOL_DIGESTS = {
+    "bin/go": (
+        "29e6e0b8be61beb1489ceae62b304343566de8a1dc700af74bde7aeb9c80ad45"),
+    "bin/gofmt": (
+        "0ef6fe2d15c972d15b8ecb75dcb9c861e042ac94a0e48baf0202a840648b0fdc"),
+    "pkg/tool/linux_amd64/asm": (
+        "769ac2d73d09b7cc5479acdeb9f168c1772743420ffca2d9e990a9b0348d2836"),
+    "pkg/tool/linux_amd64/cgo": (
+        "0cd2b021821f031ad471a0e0bb39cd85bf777bcdc4defa452ef6028962d05d83"),
+    "pkg/tool/linux_amd64/compile": (
+        "73da54c06c0702ae7c8cff309dd3958980af7ae0307cf319d7d0cb2bbd3fafd2"),
+    "pkg/tool/linux_amd64/cover": (
+        "85ba5716eb34ba8d59768cc16b3efb175fa9e77094c61abe64bd01f1395a3d58"),
+    "pkg/tool/linux_amd64/fix": (
+        "828561f14726b440f5bdd42fae256b653b81e66b5956f54d6d129baff77c35ca"),
+    "pkg/tool/linux_amd64/link": (
+        "048670775edfd89c6551149c197816dacdcc12c518b29ff1c533751b2dc4b976"),
+    "pkg/tool/linux_amd64/preprofile": (
+        "01d22ac9a97f84d1cb0ab55e70c62e77e9cd44c2c15697c799e64e4d02bc04a7"),
+    "pkg/tool/linux_amd64/vet": (
+        "aac651257358bbd1cfe3c92c821c7536482086f1b370eed9f58a0aaa789507cd"),
+}
+GIT_BIN = pathlib.Path("/usr/bin/git")
+SHELL_BIN = pathlib.Path(os.path.realpath("/bin/sh"))
+ENV_BIN = pathlib.Path("/usr/bin/env")
+DIRNAME_BIN = pathlib.Path("/usr/bin/dirname")
+MAX_INDEX_BYTES = 512 * 1024 * 1024
+MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_RUNTIME_BYTES = 64 * 1024 * 1024
+
+
+def _host_root_owner_uids() -> frozenset:
+    """UIDs aceitos como "dono root do host" para binários/dirs de sistema.
+
+    Em host normal, apenas root (0). Sob user namespace com root NÃO mapeado
+    (ex.: sandbox Cowork), todo arquivo do host-root aparece como o uid de
+    overflow 65534 ("nobody") e é imutável para o usuário do namespace; nesse
+    regime — detectado por /proc/self/uid_map sem linha mapeando o uid 0 —
+    65534 carrega a mesma confiança que root. Em host sem userns o 65534
+    continua reprovado como sempre. Corrige falso-positivo medido em
+    2026-07-29: commit legítimo de conteúdo reprovava no sandbox porque
+    /usr/bin/git e /tmp são nobody:nogroup sob userns.
+    """
+    try:
+        with open("/proc/self/uid_map", "rb") as handle:
+            payload = handle.read(4096)
+    except OSError:
+        return frozenset({0})
+    for line in payload.decode("ascii", errors="replace").splitlines():
+        fields = line.split()
+        if fields and fields[0] == "0":
+            return frozenset({0})
+    return frozenset({0, 65534})
+
+
+_HOST_ROOT_UIDS = _host_root_owner_uids()
+MAX_SELECTED_FILES = 100_000
+MAX_SELECTED_BYTES = 512 * 1024 * 1024
+GIT_BATCH_TARGET_BYTES = 32 * 1024 * 1024
+GIT_BATCH_MAX_OBJECTS = 1024
+COMPILE_TIMEOUT_SECONDS = 120
+GOFMT_TIMEOUT_SECONDS = 30
+API_SURFACE_TIMEOUT_SECONDS = 15
+WORKSPACE_PARENT_PREFIX = "wiki-go-index-closure-u"
+WORKSPACE_KEY_DOMAIN = b"wiki-go-index-closure-workspace-v1\0"
+OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+ACTIVE_DEADLINE: float | None = None
+
+
+# This helper is part of the authenticated Python wrapper rather than a
+# mutable worktree executable.  It uses the Go parser/printer (not textual
+# matching) to prove the deliberately narrow case in which compiling only the
+# changed package cannot hide a source-compatibility break in a dependant.
+# Anything it cannot prove returns direct_only=false and keeps the existing
+# reverse-dependency closure.
+API_SURFACE_HELPER = r'''package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+type pair struct {
+	Path          string   `json:"path"`
+	Before        string   `json:"before"`
+	After         string   `json:"after"`
+	BeforePackage []string `json:"before_package"`
+	AfterPackage  []string `json:"after_package"`
+}
+
+type manifest struct {
+	Pairs []pair `json:"pairs"`
+}
+
+type result struct {
+	DirectOnly bool   `json:"direct_only"`
+	Reason     string `json:"reason"`
+}
+
+type fingerprint struct {
+	Package    string
+	Imports    []string
+	Directives []string
+	Public     []string
+	Private    []string
+	PrivateNames []string
+	Generated  bool
+	TestFile   bool
+}
+
+func render(fset *token.FileSet, node ast.Node) (string, error) {
+	var output strings.Builder
+	if err := format.Node(&output, fset, node); err != nil {
+		return "", err
+	}
+	return output.String(), nil
+}
+
+func stripComments(node ast.Node) {
+	ast.Inspect(node, func(current ast.Node) bool {
+		switch value := current.(type) {
+		case *ast.GenDecl:
+			value.Doc = nil
+		case *ast.FuncDecl:
+			value.Doc = nil
+		case *ast.TypeSpec:
+			value.Doc = nil
+			value.Comment = nil
+		case *ast.ValueSpec:
+			value.Doc = nil
+			value.Comment = nil
+		case *ast.Field:
+			value.Doc = nil
+			value.Comment = nil
+		}
+		return true
+	})
+}
+
+func exportedGenDecl(declaration *ast.GenDecl) bool {
+	for _, raw := range declaration.Specs {
+		switch spec := raw.(type) {
+		case *ast.TypeSpec:
+			if ast.IsExported(spec.Name.Name) {
+				return true
+			}
+		case *ast.ValueSpec:
+			for _, name := range spec.Names {
+				if ast.IsExported(name.Name) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func fileFingerprint(path string) (fingerprint, error) {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(
+		fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		return fingerprint{}, err
+	}
+	value := fingerprint{
+		Package: parsed.Name.Name,
+		Generated: ast.IsGenerated(parsed),
+		TestFile: strings.HasSuffix(filepath.Base(path), "_test.go"),
+	}
+	cgo := false
+	for _, spec := range parsed.Imports {
+		copy := *spec
+		copy.Doc = nil
+		copy.Comment = nil
+		encoded, err := render(fset, &copy)
+		if err != nil {
+			return fingerprint{}, err
+		}
+		value.Imports = append(value.Imports, encoded)
+		pathValue, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			return fingerprint{}, fmt.Errorf("invalid import literal: %w", err)
+		}
+		cgo = cgo || pathValue == "C"
+	}
+	sort.Strings(value.Imports)
+	for _, group := range parsed.Comments {
+		for _, comment := range group.List {
+			text := strings.TrimSpace(comment.Text)
+			if cgo || strings.HasPrefix(text, "//go:") ||
+				strings.HasPrefix(text, "// +build") ||
+				strings.Contains(text, "#cgo") {
+				value.Directives = append(value.Directives, text)
+			}
+		}
+	}
+	for _, raw := range parsed.Decls {
+		switch declaration := raw.(type) {
+		case *ast.FuncDecl:
+			copy := *declaration
+			copy.Body = nil
+			stripComments(&copy)
+			encoded, err := render(fset, &copy)
+			if err != nil {
+				return fingerprint{}, err
+			}
+			receiver := ""
+			if declaration.Recv != nil && len(declaration.Recv.List) == 1 {
+				receiver = receiverBase(declaration.Recv.List[0].Type)
+			}
+			if (ast.IsExported(declaration.Name.Name) && !value.TestFile &&
+				(receiver == "" || ast.IsExported(receiver))) {
+				value.Public = append(value.Public, encoded)
+			} else {
+				value.Private = append(value.Private, encoded)
+				value.PrivateNames = append(value.PrivateNames, declaration.Name.Name)
+			}
+		case *ast.GenDecl:
+			if declaration.Tok == token.IMPORT {
+				continue
+			}
+			copy := *declaration
+			stripComments(&copy)
+			encoded, err := render(fset, &copy)
+			if err != nil {
+				return fingerprint{}, err
+			}
+			// Keep a grouped declaration whole.  Splitting its specs would hide
+			// iota/inherited type or value changes affecting an exported name.
+			if exportedGenDecl(declaration) && !value.TestFile {
+				value.Public = append(value.Public, encoded)
+			} else {
+				value.Private = append(value.Private, encoded)
+				for _, rawSpec := range declaration.Specs {
+					switch spec := rawSpec.(type) {
+					case *ast.TypeSpec:
+						if spec.Name.Name != "_" {
+							value.PrivateNames = append(value.PrivateNames, spec.Name.Name)
+						}
+					case *ast.ValueSpec:
+						for _, name := range spec.Names {
+							if name.Name != "_" {
+								value.PrivateNames = append(value.PrivateNames, name.Name)
+							}
+						}
+					}
+				}
+			}
+		default:
+			return fingerprint{}, fmt.Errorf("unsupported declaration %T", raw)
+		}
+	}
+	sort.Strings(value.Public)
+	sort.Strings(value.Private)
+	sort.Strings(value.PrivateNames)
+	return value, nil
+}
+
+func addedNames(before, after []string) []string {
+	counts := make(map[string]int, len(before))
+	for _, item := range before {
+		counts[item]++
+	}
+	var result []string
+	for _, item := range after {
+		if counts[item] > 0 {
+			counts[item]--
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func shadowsPredeclared(names []string) bool {
+	for _, name := range names {
+		if types.Universe.Lookup(name) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func onlyBuildDirectives(directives []string) bool {
+	for _, directive := range directives {
+		if !strings.HasPrefix(directive, "//go:build") &&
+			!strings.HasPrefix(directive, "// +build") {
+			return false
+		}
+	}
+	return true
+}
+
+type packageModel struct {
+	Package     string
+	Signatures  map[string][]string
+	Dependencies map[string]map[string]bool
+	Names       map[string]map[string]bool
+	TypeNames   map[string][]string
+	TypeMethods map[string]map[string]bool
+	Public      map[string]bool
+}
+
+func newPackageModel() packageModel {
+	return packageModel{
+		Signatures: make(map[string][]string),
+		Dependencies: make(map[string]map[string]bool),
+		Names: make(map[string]map[string]bool),
+		TypeNames: make(map[string][]string),
+		TypeMethods: make(map[string]map[string]bool),
+		Public: make(map[string]bool),
+	}
+}
+
+func receiverBase(expression ast.Expr) string {
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.ParenExpr:
+		return receiverBase(value.X)
+	case *ast.StarExpr:
+		return receiverBase(value.X)
+	case *ast.IndexExpr:
+		return receiverBase(value.X)
+	case *ast.IndexListExpr:
+		return receiverBase(value.X)
+	default:
+		return ""
+	}
+}
+
+func identifiers(node ast.Node) []string {
+	set := make(map[string]bool)
+	ast.Inspect(node, func(current ast.Node) bool {
+		if identifier, ok := current.(*ast.Ident); ok && identifier.Name != "_" {
+			set[identifier.Name] = true
+		}
+		return true
+	})
+	result := make([]string, 0, len(set))
+	for name := range set {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func addName(model *packageModel, name, key string) {
+	if name == "" || name == "_" {
+		return
+	}
+	if model.Names[name] == nil {
+		model.Names[name] = make(map[string]bool)
+	}
+	model.Names[name][key] = true
+}
+
+func addDeclaration(
+	model *packageModel, key, signature string, dependencies []string,
+	names, typeNames []string, receiver string, public bool,
+) {
+	model.Signatures[key] = append(model.Signatures[key], signature)
+	if model.Dependencies[key] == nil {
+		model.Dependencies[key] = make(map[string]bool)
+	}
+	for _, dependency := range dependencies {
+		model.Dependencies[key][dependency] = true
+	}
+	for _, name := range names {
+		addName(model, name, key)
+	}
+	model.TypeNames[key] = append(model.TypeNames[key], typeNames...)
+	if receiver != "" {
+		if model.TypeMethods[receiver] == nil {
+			model.TypeMethods[receiver] = make(map[string]bool)
+		}
+		model.TypeMethods[receiver][key] = true
+	}
+	model.Public[key] = model.Public[key] || public
+}
+
+func buildPackageModel(paths []string) (packageModel, error) {
+	model := newPackageModel()
+	seen := make(map[string]bool)
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			return packageModel{}, fmt.Errorf("invalid/duplicate package file")
+		}
+		seen[path] = true
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(
+			fset, path, nil, parser.ParseComments|parser.SkipObjectResolution)
+		if err != nil {
+			return packageModel{}, err
+		}
+		if model.Package == "" {
+			model.Package = parsed.Name.Name
+		} else if model.Package != parsed.Name.Name {
+			return packageModel{}, fmt.Errorf("mixed package names")
+		}
+		testFile := strings.HasSuffix(filepath.Base(path), "_test.go")
+		for _, raw := range parsed.Decls {
+			switch declaration := raw.(type) {
+			case *ast.FuncDecl:
+				copy := *declaration
+				copy.Body = nil
+				stripComments(&copy)
+				signature, err := render(fset, &copy)
+				if err != nil {
+					return packageModel{}, err
+				}
+				receiver := ""
+				if declaration.Recv != nil && len(declaration.Recv.List) == 1 {
+					receiver = receiverBase(declaration.Recv.List[0].Type)
+				}
+				key := "func:" + declaration.Name.Name
+				names := []string{declaration.Name.Name}
+				if receiver != "" {
+					key = "method:" + receiver + ":" + declaration.Name.Name
+					names = nil
+				}
+				addDeclaration(
+					&model, key, signature, identifiers(&copy), names, nil,
+					receiver, ast.IsExported(declaration.Name.Name) &&
+						!testFile && (receiver == "" || ast.IsExported(receiver)))
+			case *ast.GenDecl:
+				if declaration.Tok == token.IMPORT {
+					continue
+				}
+				copy := *declaration
+				stripComments(&copy)
+				signature, err := render(fset, &copy)
+				if err != nil {
+					return packageModel{}, err
+				}
+				var names, typeNames []string
+				for _, rawSpec := range declaration.Specs {
+					switch spec := rawSpec.(type) {
+					case *ast.TypeSpec:
+						names = append(names, spec.Name.Name)
+						typeNames = append(typeNames, spec.Name.Name)
+					case *ast.ValueSpec:
+						for _, name := range spec.Names {
+							names = append(names, name.Name)
+						}
+					}
+				}
+				sort.Strings(names)
+				keyNames := names
+				if len(keyNames) == 0 {
+					keyNames = []string{signature}
+				}
+				key := "gen:" + declaration.Tok.String() + ":" +
+					strings.Join(keyNames, ",")
+				addDeclaration(
+					&model, key, signature, identifiers(&copy), names,
+					typeNames, "", exportedGenDecl(declaration) && !testFile)
+			default:
+				return packageModel{}, fmt.Errorf(
+					"unsupported declaration %T", raw)
+			}
+		}
+	}
+	for key := range model.Signatures {
+		sort.Strings(model.Signatures[key])
+		sort.Strings(model.TypeNames[key])
+	}
+	return model, nil
+}
+
+func publicReach(model packageModel) map[string]bool {
+	reached := make(map[string]bool)
+	queue := make([]string, 0, len(model.Public))
+	for key, public := range model.Public {
+		if public {
+			reached[key] = true
+			queue = append(queue, key)
+		}
+	}
+	for len(queue) > 0 {
+		key := queue[0]
+		queue = queue[1:]
+		for name := range model.Dependencies[key] {
+			for dependency := range model.Names[name] {
+				if !reached[dependency] {
+					reached[dependency] = true
+					queue = append(queue, dependency)
+				}
+			}
+		}
+		for _, typeName := range model.TypeNames[key] {
+			for method := range model.TypeMethods[typeName] {
+				if !reached[method] {
+					reached[method] = true
+					queue = append(queue, method)
+				}
+			}
+		}
+	}
+	return reached
+}
+
+func packageDeltaTouchesPublic(beforePaths, afterPaths []string) (bool, error) {
+	before, err := buildPackageModel(beforePaths)
+	if err != nil {
+		return true, err
+	}
+	after, err := buildPackageModel(afterPaths)
+	if err != nil {
+		return true, err
+	}
+	if before.Package != "" && after.Package != "" &&
+		before.Package != after.Package {
+		return true, nil
+	}
+	beforeReach := publicReach(before)
+	afterReach := publicReach(after)
+	keys := make(map[string]bool)
+	for key := range before.Signatures {
+		keys[key] = true
+	}
+	for key := range after.Signatures {
+		keys[key] = true
+	}
+	for key := range keys {
+		if !reflect.DeepEqual(before.Signatures[key], after.Signatures[key]) &&
+			(beforeReach[key] || afterReach[key] ||
+				before.Public[key] || after.Public[key]) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func packagePaths(paths []string, fallback string) []string {
+	if len(paths) != 0 {
+		return paths
+	}
+	if fallback == "" {
+		return nil
+	}
+	return []string{fallback}
+}
+
+func classify(input manifest) result {
+	if len(input.Pairs) == 0 {
+		return result{Reason: "no_changed_go_files"}
+	}
+	for _, item := range input.Pairs {
+		if item.Path == "" || (item.Before == "" && item.After == "") {
+			return result{Reason: "invalid_changed_go_file"}
+		}
+		if item.Before == "" {
+			after, err := fileFingerprint(item.After)
+			if err != nil {
+				return result{Reason: "candidate_parse_error: " + err.Error()}
+			}
+			// Test packages, including external foo_test packages, cannot alter
+			// the production export surface. The direct go-list -test route still
+			// compiles their exact candidate variant and catches type errors.
+			if after.TestFile {
+				continue
+			}
+			if after.Generated || len(after.Public) != 0 ||
+				!onlyBuildDirectives(after.Directives) ||
+				shadowsPredeclared(after.PrivateNames) {
+				return result{Reason: "added_file_surface_not_proven_private"}
+			}
+			touches, err := packageDeltaTouchesPublic(
+				packagePaths(item.BeforePackage, item.Before),
+				packagePaths(item.AfterPackage, item.After))
+			if err != nil || touches {
+				return result{Reason: "private_delta_reaches_exported_surface"}
+			}
+			continue
+		}
+		if item.After == "" {
+			before, err := fileFingerprint(item.Before)
+			if err != nil {
+				return result{Reason: "baseline_parse_error: " + err.Error()}
+			}
+			if before.TestFile {
+				continue
+			}
+			if before.Generated || len(before.Public) != 0 ||
+				!onlyBuildDirectives(before.Directives) ||
+				shadowsPredeclared(before.PrivateNames) {
+				return result{Reason: "deleted_file_surface_not_proven_private"}
+			}
+			touches, err := packageDeltaTouchesPublic(
+				packagePaths(item.BeforePackage, item.Before),
+				packagePaths(item.AfterPackage, item.After))
+			if err != nil || touches {
+				return result{Reason: "private_delta_reaches_exported_surface"}
+			}
+			continue
+		}
+		before, err := fileFingerprint(item.Before)
+		if err != nil {
+			return result{Reason: "baseline_parse_error: " + err.Error()}
+		}
+		after, err := fileFingerprint(item.After)
+		if err != nil {
+			return result{Reason: "candidate_parse_error: " + err.Error()}
+		}
+		if before.Generated || after.Generated {
+			return result{Reason: "generated_file_changed"}
+		}
+		if before.Package != after.Package {
+			return result{Reason: "package_changed"}
+		}
+		if before.TestFile != after.TestFile {
+			return result{Reason: "test_file_identity_changed"}
+		}
+		if before.TestFile {
+			continue
+		}
+		if !reflect.DeepEqual(before.Imports, after.Imports) {
+			return result{Reason: "imports_changed"}
+		}
+		if !reflect.DeepEqual(before.Directives, after.Directives) {
+			return result{Reason: "build_compiler_or_cgo_directive_changed"}
+		}
+		if !reflect.DeepEqual(before.Public, after.Public) {
+			return result{Reason: "exported_surface_changed"}
+		}
+		// Existing private declarations must retain their full signature and
+		// expression.  This closes aliases, inferred vars/consts, constraints,
+		// embedding and promoted-method paths.  New private declarations and
+		// function-body-only edits are the only extra safe cases.
+		if shadowsPredeclared(addedNames(before.PrivateNames, after.PrivateNames)) {
+			return result{Reason: "private_addition_shadows_predeclared"}
+		}
+		if shadowsPredeclared(addedNames(after.PrivateNames, before.PrivateNames)) {
+			return result{Reason: "private_removal_unshadows_predeclared"}
+		}
+		if !reflect.DeepEqual(before.Private, after.Private) {
+			if (!onlyBuildDirectives(before.Directives) ||
+					!onlyBuildDirectives(after.Directives)) {
+				return result{Reason: "private_delta_with_compiler_or_cgo_directive"}
+			}
+			touches, err := packageDeltaTouchesPublic(
+				packagePaths(item.BeforePackage, item.Before),
+				packagePaths(item.AfterPackage, item.After))
+			if err != nil || touches {
+				return result{Reason: "private_delta_reaches_exported_surface"}
+			}
+		}
+	}
+	return result{DirectOnly: true, Reason: "body_or_proven_private_delta_only"}
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: api-surface-helper MANIFEST")
+		os.Exit(2)
+	}
+	payload, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	var input manifest
+	if err := json.Unmarshal(payload, &input); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(classify(input)); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+'''
+
+
+class SnapshotError(RuntimeError):
+    """The staged snapshot cannot be authenticated or compiled safely."""
+
+
+def _remaining_timeout(cap_seconds: float) -> float:
+    if ACTIVE_DEADLINE is None:
+        return cap_seconds
+    remaining = ACTIVE_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise SnapshotError("orçamento global do gate Go foi excedido")
+    return max(0.001, min(cap_seconds, remaining))
+
+
+def _require_budget() -> None:
+    _remaining_timeout(1.0)
+
+
+def _safe_payload(
+    path: pathlib.Path, *, max_bytes: int, allow_multilink: bool = False,
+) -> tuple[bytes, tuple[int, ...]]:
+    # allow_multilink existe SÓ para binário de sistema resolvido por
+    # _resolve_system_binary (2026-09-24): no uutils da torre, env e dirname
+    # são nomes de um multicall com 116 hardlinks. O índice, o próprio script,
+    # a toolchain e o shell continuam exigindo st_nlink == 1 pelo default.
+    if not path.is_absolute():
+        raise SnapshotError(f"path precisa ser absoluto: {path}")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    parent = os.open("/", directory_flags)
+    try:
+        parts = path.parts[1:]
+        if not parts:
+            raise SnapshotError(f"path não aponta arquivo: {path}")
+        for component in parts[:-1]:
+            child = os.open(component, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        descriptor = os.open(
+            parts[-1], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent)
+    except OSError as error:
+        os.close(parent)
+        raise SnapshotError(f"arquivo ausente/inseguro: {path}") from error
+    os.close(parent)
+    try:
+        before = os.fstat(descriptor)
+        link_count_ok = before.st_nlink == 1 or (
+            allow_multilink and before.st_nlink > 1)
+        if (not stat.S_ISREG(before.st_mode) or not link_count_ok or
+                before.st_size < 0 or before.st_size > max_bytes):
+            raise SnapshotError(
+                f"arquivo não é regular único ou excede limite: {path}")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            _require_budget()
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SnapshotError(f"arquivo truncou durante leitura: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SnapshotError(f"arquivo cresceu durante leitura: {path}")
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+            before.st_gid, before.st_nlink, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+            after.st_gid, after.st_nlink, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        )
+        if identity_before != identity_after:
+            raise SnapshotError(f"arquivo mudou durante leitura: {path}")
+        return b"".join(chunks), identity_before
+    finally:
+        os.close(descriptor)
+
+
+# BINÁRIO DE SISTEMA PODE SER SYMLINK DE ROOT (2026-09-24). No Ubuntu 26.04 o
+# coreutils é o uutils (pacote coreutils-from-uutils): /usr/bin/env e
+# /usr/bin/dirname são symlinks de root para ../lib/cargo/bin/coreutils/<nome>,
+# e o alvo é um binário multicall com st_nlink=116 — medido na torre, a máquina
+# de produção desde o cutover daquele dia. _safe_payload abre com O_NOFOLLOW e
+# exige st_nlink == 1, então TODO commit com Go staged reprovava ali com
+# "arquivo ausente/inseguro: /usr/bin/env". A ameaça que esta guarda cobre é a
+# mesma do binario_confiavel do .githooks/pre-commit: nada injetado por PATH e
+# nada gravável por terceiros. Por isso a cadeia é caminhada elo a elo com
+# lstat/readlink, sem seguir às cegas: cada symlink tem de ser de dono root
+# (ou do regime 65534 de userns, ver _host_root_owner_uids), o diretório de
+# cada elo — inclusive o do arquivo final — tem de ser de root e sem escrita de
+# grupo/outros, e a cadeia tem teto de saltos. O binding (bytes + identidade)
+# continua sobre o arquivo final, então "não mudou durante a execução" segue
+# conferido na revalidação. SHELL_BIN fica fora: já sai resolvido na constante
+# e o dash é arquivo regular com um só link nas duas máquinas (medido).
+MAX_SYSTEM_BINARY_SYMLINK_HOPS = 8
+
+
+def _require_trusted_system_directory(
+    directory: pathlib.PurePosixPath, declared: pathlib.Path,
+) -> None:
+    try:
+        info = os.lstat(directory)
+    except OSError as error:
+        raise SnapshotError(
+            f"diretório de binário de sistema ausente: {directory} "
+            f"(de {declared})") from error
+    if (not stat.S_ISDIR(info.st_mode) or
+            info.st_uid not in _HOST_ROOT_UIDS or
+            stat.S_IMODE(info.st_mode) & 0o022):
+        raise SnapshotError(
+            "diretório de binário de sistema não pertence a root/host-root ou "
+            f"é gravável por grupo/outros: {directory} (de {declared})")
+
+
+def _resolve_system_binary(path: pathlib.Path) -> pathlib.Path:
+    """Resolve a cadeia de symlinks de um binário de sistema, elo a elo."""
+    if not path.is_absolute():
+        raise SnapshotError(f"binário de sistema precisa ser absoluto: {path}")
+    resolved = pathlib.PurePosixPath("/")
+    pending = list(pathlib.PurePosixPath(path).parts[1:])
+    hops = 0
+    while pending:
+        component = pending.pop(0)
+        if component in ("", "."):
+            continue
+        if component == "..":
+            # `resolved` nunca contém symlink, então subir um nível aqui é o
+            # mesmo ".." que o kernel aplicaria.
+            resolved = resolved.parent
+            continue
+        candidate = resolved / component
+        try:
+            info = os.lstat(candidate)
+        except OSError as error:
+            raise SnapshotError(
+                f"binário de sistema ausente: {candidate} (de {path})") from error
+        if not stat.S_ISLNK(info.st_mode):
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > MAX_SYSTEM_BINARY_SYMLINK_HOPS:
+            raise SnapshotError(
+                "cadeia de symlinks de binário de sistema excede "
+                f"{MAX_SYSTEM_BINARY_SYMLINK_HOPS} saltos: {path}")
+        if info.st_uid not in _HOST_ROOT_UIDS:
+            raise SnapshotError(
+                "symlink de binário de sistema não pertence a root/host-root: "
+                f"{candidate} (de {path})")
+        _require_trusted_system_directory(resolved, path)
+        try:
+            target = os.readlink(candidate)
+        except OSError as error:
+            raise SnapshotError(
+                f"symlink de binário de sistema ilegível: {candidate} "
+                f"(de {path})") from error
+        if not target:
+            raise SnapshotError(
+                f"symlink de binário de sistema vazio: {candidate} (de {path})")
+        target_path = pathlib.PurePosixPath(target)
+        if target_path.is_absolute():
+            resolved = pathlib.PurePosixPath("/")
+            pending = list(target_path.parts[1:]) + pending
+        else:
+            pending = list(target_path.parts) + pending
+    if resolved == pathlib.PurePosixPath("/"):
+        raise SnapshotError(f"binário de sistema não aponta arquivo: {path}")
+    _require_trusted_system_directory(resolved.parent, path)
+    return pathlib.Path(resolved)
+
+
+def _require_trusted_executable(
+    identity: tuple[int, ...], label: str,
+) -> None:
+    mode = stat.S_IMODE(identity[2])
+    if (not mode & stat.S_IXUSR or mode & 0o022 or
+            identity[3] not in _HOST_ROOT_UIDS):
+        raise SnapshotError(f"runtime possui identidade/mode inseguro: {label}")
+
+
+def _bind_system_binary(
+    path: pathlib.Path,
+) -> tuple[pathlib.Path, tuple[bytes, tuple[int, ...]]]:
+    """Prende bytes e identidade do arquivo final da cadeia de `path`.
+
+    Devolve o caminho final absoluto, que é a chave do binding e o caminho
+    revalidado depois da execução (com allow_multilink=True).
+    """
+    resolved = _resolve_system_binary(path)
+    binding = _safe_payload(
+        resolved, max_bytes=MAX_RUNTIME_BYTES, allow_multilink=True)
+    label = os.fspath(path) if resolved == path else f"{path} -> {resolved}"
+    _require_trusted_executable(binding[1], label)
+    return resolved, binding
+
+
+def _runtime_directory_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_nlink, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _safe_runtime_directory(path: pathlib.Path) -> tuple[int, ...]:
+    """Bind a runtime directory without following any component symlink."""
+    if not path.is_absolute() or len(path.parts) < 2:
+        raise SnapshotError(f"diretório runtime precisa ser absoluto: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if (not stat.S_ISDIR(before.st_mode) or before.st_nlink < 2 or
+                before.st_uid not in (_HOST_ROOT_UIDS | {os.getuid()}) or
+                mode & 0o022):
+            raise SnapshotError(
+                f"diretório runtime possui identidade/mode inseguro: {path}")
+        after = os.fstat(descriptor)
+        identity = _runtime_directory_identity(before)
+        if identity != _runtime_directory_identity(after):
+            raise SnapshotError(
+                f"diretório runtime mudou durante autenticação: {path}")
+        return identity
+    except OSError as error:
+        raise SnapshotError(
+            f"diretório runtime ausente/inseguro: {path}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _git_environment(index_file: pathlib.Path | None = None) -> dict[str, str]:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = os.fspath(index_file)
+    return environment
+
+
+def _run_git(
+    root: pathlib.Path, arguments: list[str], *,
+    index_file: pathlib.Path | None = None,
+    input_payload: bytes | None = None,
+    max_output: int = MAX_GIT_OUTPUT_BYTES,
+) -> bytes:
+    completed = subprocess.run(
+        [os.fspath(GIT_BIN), "--no-replace-objects",
+         "-c", f"safe.directory={root}",
+         "-c", "core.fsmonitor=false",
+         "-c", "core.untrackedCache=false",
+         "-c", "core.hooksPath=/dev/null", *arguments],
+        cwd=root, env=_git_environment(index_file), input=input_payload,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=_remaining_timeout(120),
+        check=False,
+    )
+    if (len(completed.stdout) > max_output or
+            len(completed.stderr) > MAX_GIT_OUTPUT_BYTES):
+        raise SnapshotError("saída Git excedeu limite")
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.decode(
+            "utf-8", errors="replace").split())[:1200]
+        raise SnapshotError(
+            f"git {arguments[0]} falhou rc={completed.returncode}: {detail}")
+    return completed.stdout
+
+
+def _git_text(
+    root: pathlib.Path, arguments: list[str], *,
+    index_file: pathlib.Path | None = None,
+) -> str:
+    try:
+        value = _run_git(root, arguments, index_file=index_file).decode(
+            "utf-8", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise SnapshotError("Git não retornou UTF-8") from error
+    return value
+
+
+def _canonical_root(argument: pathlib.Path) -> pathlib.Path:
+    # Mesma regra de _authenticate_runtime (2026-09-24): symlink de root para
+    # git passa se a cadeia inteira for confiável; o arquivo final é quem
+    # responde por dono, mode e tipo. Executar pelo caminho declarado segue
+    # correto, porque só root altera um elo que passou por esta resolução.
+    git_path = _resolve_system_binary(GIT_BIN)
+    try:
+        git_info = git_path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise SnapshotError("Git confiável está ausente") from error
+    if (not stat.S_ISREG(git_info.st_mode) or git_path.is_symlink() or
+            git_info.st_uid not in _HOST_ROOT_UIDS or
+            stat.S_IMODE(git_info.st_mode) & 0o022 or
+            not git_info.st_mode & stat.S_IXUSR):
+        raise SnapshotError("Git confiável possui identidade/mode inseguro")
+    try:
+        root = argument.resolve(strict=True)
+    except OSError as error:
+        raise SnapshotError(f"root ausente: {argument}") from error
+    if not root.is_dir():
+        raise SnapshotError(f"root não é diretório: {root}")
+    observed = pathlib.Path(_git_text(root, ["rev-parse", "--show-toplevel"]))
+    if observed.resolve(strict=True) != root:
+        raise SnapshotError("root diverge do toplevel Git")
+    return root
+
+
+def _canonical_index_path(
+    root: pathlib.Path, argument: str | None,
+) -> pathlib.Path:
+    raw = argument or os.environ.get("GIT_INDEX_FILE")
+    if raw is None:
+        raw = _git_text(root, ["rev-parse", "--git-path", "index"])
+    path = pathlib.Path(raw)
+    if not path.is_absolute():
+        path = root / path
+    absolute = pathlib.Path(os.path.abspath(path))
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise SnapshotError("índice Git ausente") from error
+    if resolved != absolute:
+        raise SnapshotError("índice Git ou ancestral é symlink")
+    # Partial commits and linked worktrees may place their authoritative index
+    # outside the primary gitdir.  Location is not authority: the byte-exact,
+    # regular, single-link file is copied to private storage and revalidated
+    # after compilation, while every referenced blob is authenticated by OID.
+    return resolved
+
+
+def _write_exclusive(path: pathlib.Path, payload: bytes, mode: int) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        mode,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written < 1:
+                raise SnapshotError(f"escrita não avançou: {path}")
+            view = view[written:]
+        # Sem fsync deliberadamente: esta árvore é apagada no finally de
+        # _locked_workspace, poucos segundos depois, e nada aqui precisa
+        # sobreviver a queda de energia. A autenticação do snapshot vem da
+        # verificação de OID sobre os bytes em memória, não da durabilidade em
+        # disco, e read-after-write no mesmo host já é garantido pelo POSIX.
+        # Medição: ~1,3 s de fsync por execução (1.976 arquivos) saindo de um
+        # orçamento de gate que é a própria causa das reprovações por tempo.
+    finally:
+        os.close(descriptor)
+
+
+def _workspace_paths(root: pathlib.Path) -> tuple[
+        pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Return stable per-repository/per-uid paths outside the worktree."""
+    uid = os.getuid()
+    digest = hashlib.sha256()
+    digest.update(WORKSPACE_KEY_DOMAIN)
+    digest.update(str(uid).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(os.fsencode(root))
+    key = digest.hexdigest()[:32]
+    parent = pathlib.Path("/tmp") / f"{WORKSPACE_PARENT_PREFIX}{uid}"
+    return (
+        parent,
+        parent / f"{key}.workspace",
+        parent / f"{key}.lock",
+    )
+
+
+def _directory_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+    )
+
+
+def _validate_private_directory(
+    info: os.stat_result, path: pathlib.Path, *, uid: int,
+) -> None:
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or
+            stat.S_IMODE(info.st_mode) != 0o700 or info.st_nlink < 2):
+        raise SnapshotError(
+            f"diretório de workspace possui owner/mode/nlink inseguro: {path}")
+
+
+def _open_workspace_parent(parent: pathlib.Path) -> int:
+    tmp_info = os.lstat("/tmp")
+    tmp_mode = stat.S_IMODE(tmp_info.st_mode)
+    if (not stat.S_ISDIR(tmp_info.st_mode) or stat.S_ISLNK(tmp_info.st_mode) or
+            tmp_info.st_uid not in _HOST_ROOT_UIDS or
+            (tmp_mode & 0o002 and not tmp_mode & stat.S_ISVTX)):
+        raise SnapshotError("/tmp possui owner/mode inseguro")
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise SnapshotError(
+            f"não foi possível criar namespace de workspace: {parent}") from error
+    try:
+        info = os.lstat(parent)
+        _validate_private_directory(info, parent, uid=os.getuid())
+        descriptor = os.open(
+            parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise SnapshotError(
+            f"namespace de workspace ausente/inseguro: {parent}") from error
+    observed = os.fstat(descriptor)
+    if _directory_identity(observed) != _directory_identity(info):
+        os.close(descriptor)
+        raise SnapshotError("namespace de workspace mudou durante abertura")
+    return descriptor
+
+
+def _validate_lock(
+    info: os.stat_result, path: pathlib.Path, *, uid: int,
+) -> None:
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid or
+            stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or
+            info.st_size != 0):
+        raise SnapshotError(
+            f"lock do workspace possui owner/mode/nlink inseguro: {path}")
+
+
+def _remove_private_contents(
+    descriptor: int, path: pathlib.Path, *, uid: int,
+) -> None:
+    """Unlink only descendants of an already authenticated private directory."""
+    for name in os.listdir(descriptor):
+        if not name or name in {".", ".."} or "/" in name or "\0" in name:
+            raise SnapshotError(f"workspace contém nome inseguro: {path}")
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        child_path = path / name
+        if info.st_uid != uid:
+            raise SnapshotError(
+                f"workspace contém artefato de outro owner: {child_path}")
+        if stat.S_ISDIR(info.st_mode):
+            if stat.S_IMODE(info.st_mode) & 0o022:
+                raise SnapshotError(
+                    f"workspace contém diretório gravável por terceiros: {child_path}")
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                observed = os.fstat(child)
+                if (_directory_identity(observed) != _directory_identity(info) or
+                        observed.st_nlink < 2):
+                    raise SnapshotError(
+                        f"diretório do workspace mudou durante limpeza: {child_path}")
+                _remove_private_contents(child, child_path, uid=uid)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+            continue
+        if info.st_nlink != 1:
+            raise SnapshotError(
+                f"workspace contém artefato com hardlink: {child_path}")
+        os.unlink(name, dir_fd=descriptor)
+
+
+def _prepare_workspace(
+    parent_descriptor: int, workspace: pathlib.Path,
+) -> tuple[int, tuple[int, ...]]:
+    uid = os.getuid()
+    name = workspace.name
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        try:
+            stale = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as error:
+            raise SnapshotError(
+                f"workspace determinístico existente é symlink/inseguro: {workspace}") from error
+        try:
+            stale_info = os.fstat(stale)
+            _validate_private_directory(stale_info, workspace, uid=uid)
+            _remove_private_contents(stale, workspace, uid=uid)
+        finally:
+            os.close(stale)
+        os.rmdir(name, dir_fd=parent_descriptor)
+        os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        print(
+            f"check-go-index-compile-closure: workspace determinístico existente descartado e reconstruído do zero: {workspace}",
+            file=sys.stderr,
+        )
+    except OSError as error:
+        raise SnapshotError(
+            f"não foi possível criar workspace determinístico: {workspace}") from error
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+    info = os.fstat(descriptor)
+    _validate_private_directory(info, workspace, uid=uid)
+    return descriptor, _directory_identity(info)
+
+
+@contextmanager
+def _locked_workspace(root: pathlib.Path) -> Iterable[pathlib.Path]:
+    """Serialize the heavy Go gate and rebuild a stable-path snapshot."""
+    parent, workspace, lock_path = _workspace_paths(root)
+    parent_descriptor = _open_workspace_parent(parent)
+    lock_descriptor = -1
+    workspace_descriptor = -1
+    workspace_identity: tuple[int, ...] | None = None
+    acquired = False
+    try:
+        try:
+            lock_descriptor = os.open(
+                lock_path.name,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as error:
+            raise SnapshotError(
+                f"lock do workspace ausente/inseguro: {lock_path}") from error
+        lock_info = os.fstat(lock_descriptor)
+        _validate_lock(lock_info, lock_path, uid=os.getuid())
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise SnapshotError(
+                "gate Go pesado já está em execução para este repositório "
+                "(lock concorrente; fail-fast, sem espera)") from error
+        acquired = True
+        observed_lock = os.stat(
+            lock_path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if ((_directory_identity(observed_lock) !=
+             _directory_identity(lock_info)) or observed_lock.st_nlink != 1):
+            raise SnapshotError("lock do workspace mudou durante aquisição")
+        workspace_descriptor, workspace_identity = _prepare_workspace(
+            parent_descriptor, workspace)
+        yield workspace
+    finally:
+        cleanup_error: BaseException | None = None
+        if workspace_descriptor >= 0 and workspace_identity is not None:
+            try:
+                observed = os.stat(
+                    workspace.name, dir_fd=parent_descriptor,
+                    follow_symlinks=False)
+                current = os.fstat(workspace_descriptor)
+                if (_directory_identity(observed) != workspace_identity or
+                        _directory_identity(current) != workspace_identity):
+                    raise SnapshotError(
+                        "workspace determinístico mudou durante execução")
+                _remove_private_contents(
+                    workspace_descriptor, workspace, uid=os.getuid())
+                os.close(workspace_descriptor)
+                workspace_descriptor = -1
+                os.rmdir(workspace.name, dir_fd=parent_descriptor)
+            except BaseException as error:
+                cleanup_error = error
+        if workspace_descriptor >= 0:
+            os.close(workspace_descriptor)
+        if acquired:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        # Keep the zero-byte lock inode stable. Unlinking it after unlock lets a
+        # contender hold the old inode while a third process creates and locks
+        # a new one, splitting the serialization domain. Only snapshot bytes
+        # are ephemeral and are removed above on every ordinary exit.
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        os.close(parent_descriptor)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _copy_index(index: pathlib.Path, destination: pathlib.Path) -> tuple[
+        bytes, tuple[int, ...]]:
+    payload, identity = _safe_payload(index, max_bytes=MAX_INDEX_BYTES)
+    mode = stat.S_IMODE(identity[2])
+    if (not mode & stat.S_IRUSR or mode & 0o133):
+        raise SnapshotError(
+            f"índice Git possui mode gravável/executável inseguro: {index}")
+    _write_exclusive(destination, payload, 0o600)
+    return payload, identity
+
+
+def _canonical_relative(raw: bytes) -> str:
+    try:
+        value = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise SnapshotError("índice contém path não UTF-8") from error
+    path = pathlib.PurePosixPath(value)
+    if (not value or path.is_absolute() or path.as_posix() != value or
+            any(part in {"", ".", ".."} for part in path.parts)):
+        raise SnapshotError(f"índice contém path não canônico: {value!r}")
+    return value
+
+
+def _index_entries(
+    root: pathlib.Path, index_file: pathlib.Path, object_format: str,
+    pathspecs: tuple[str, ...] = (),
+) -> dict[str, tuple[str, str]]:
+    arguments = ["ls-files", "--stage", "-z"]
+    if pathspecs:
+        arguments.extend(["--", *pathspecs])
+    payload = _run_git(
+        root, arguments, index_file=index_file)
+    entries: dict[str, tuple[str, str]] = {}
+    expected_oid_length = 40 if object_format == "sha1" else 64
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_path = raw.split(b"\t", 1)
+            mode, oid, stage = metadata.decode("ascii").split(" ")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SnapshotError("índice contém entrada inválida") from error
+        path = _canonical_relative(raw_path)
+        if (stage != "0" or path in entries or OID.fullmatch(oid) is None or
+                len(oid) != expected_oid_length):
+            raise SnapshotError(
+                f"índice contém conflito/entrada ambígua: {path}")
+        entries[path] = (mode, oid)
+    if not entries and not pathspecs:
+        raise SnapshotError("índice Git está vazio")
+    return entries
+
+
+def _selected_entries(
+    entries: dict[str, tuple[str, str]],
+) -> dict[str, tuple[str, str]]:
+    go_paths = [path for path in entries if path.endswith(".go")]
+    if not go_paths:
+        raise SnapshotError("índice não contém fontes Go")
+    for path in go_paths:
+        if entries[path][0] not in {"100644", "100755"}:
+            raise SnapshotError(f"fonte Go não é blob regular: {path}")
+    package_dirs = {pathlib.PurePosixPath(path).parent.as_posix()
+                    for path in go_paths}
+    package_ancestors: set[str] = set()
+    for package in package_dirs:
+        parts = pathlib.PurePosixPath(package).parts
+        package_ancestors.update(
+            "/".join(parts[:length])
+            for length in range(1, len(parts) + 1))
+
+    selected: dict[str, tuple[str, str]] = {}
+    for path, entry in entries.items():
+        parts = pathlib.PurePosixPath(path).parts
+        ancestors = {
+            "/".join(parts[:length])
+            for length in range(1, len(parts))
+        }
+        # Module manifests are few and define which compiler root owns every
+        # package.  Materialize all of them so a nested module can never be
+        # mistaken for a package of the repository root.  Package descendants
+        # include embed inputs, assembly, C headers and generated compiler
+        # inputs; selecting the complete bounded subtree lets the Go command,
+        # rather than a second incomplete parser, resolve build patterns.
+        module_manifest = pathlib.PurePosixPath(path).name in {"go.mod", "go.sum"}
+        inside_package = (
+            "." in package_dirs or bool(ancestors.intersection(package_dirs)))
+        if (path in {"go.mod", "go.sum", SELF_REL, CHECKER_REL} or
+                module_manifest or inside_package):
+            if entry[0] not in {"100644", "100755"}:
+                raise SnapshotError(
+                    f"snapshot Go contém symlink/submodule/mode inseguro: {path}")
+            selected[path] = entry
+    for required in ("go.mod", "go.sum", SELF_REL, CHECKER_REL):
+        if required not in selected:
+            raise SnapshotError(f"snapshot Go perdeu path obrigatório: {required}")
+    if len(selected) > MAX_SELECTED_FILES:
+        raise SnapshotError("snapshot Go excedeu limite de arquivos")
+    return selected
+
+
+def _changed_go_paths(
+    root: pathlib.Path, index_file: pathlib.Path,
+    entries: dict[str, tuple[str, str]],
+) -> list[str]:
+    """Return canonical staged A/C/M Go paths, never worktree paths."""
+    payload = _run_git(
+        root,
+        ["diff", "--cached", "--name-only", "--no-renames",
+         "--diff-filter=ACM", "-z", "--", "*.go"],
+        index_file=index_file,
+    )
+    changed: list[str] = []
+    seen: set[str] = set()
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        path = _canonical_relative(raw)
+        if not path.endswith(".go"):
+            raise SnapshotError(f"diff Go devolveu path inesperado: {path}")
+        if path in seen:
+            raise SnapshotError(f"diff Go devolveu path duplicado: {path}")
+        entry = entries.get(path)
+        if entry is None or entry[0] not in {"100644", "100755"}:
+            raise SnapshotError(
+                f"diff Go referencia path ausente/não regular no índice: {path}")
+        seen.add(path)
+        changed.append(path)
+    return sorted(changed)
+
+
+def _changed_index_versions(
+    root: pathlib.Path, index_file: pathlib.Path,
+    entries: dict[str, tuple[str, str]] | None, object_format: str,
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """Return every authenticated staged transition, including deletions.
+
+    Compiler inputs are not limited to ``*.go``: go:embed payloads, assembly,
+    C headers and generator outputs are ordinary paths below a package
+    directory.  The complete raw delta is therefore the routing authority.
+    """
+    payload = _run_git(
+        root,
+        ["diff", "--cached", "--raw", "--no-abbrev", "--no-renames",
+         "--diff-filter=AMDT", "-z"],
+        index_file=index_file,
+    )
+    chunks = payload.split(b"\0")
+    if chunks and chunks[-1] == b"":
+        chunks.pop()
+    if len(chunks) % 2:
+        raise SnapshotError("diff raw staged retornou registro truncado")
+    oid_length = 40 if object_format == "sha1" else 64
+    zero_oid = "0" * oid_length
+    result: dict[str, tuple[str, str | None, str | None]] = {}
+    for offset in range(0, len(chunks), 2):
+        try:
+            metadata = chunks[offset].decode("ascii", errors="strict")
+            fields = metadata.split(" ")
+        except UnicodeDecodeError as error:
+            raise SnapshotError(
+                "diff raw staged retornou metadata não ASCII") from error
+        if (len(fields) != 5 or not fields[0].startswith(":") or
+                fields[4] not in {"A", "M", "D", "T"}):
+            raise SnapshotError("diff raw staged retornou metadata inválida")
+        old_mode = fields[0][1:]
+        new_mode, old_oid, new_oid, status_code = fields[1:]
+        if (not re.fullmatch(r"[0-7]{6}", old_mode) or
+                not re.fullmatch(r"[0-7]{6}", new_mode) or
+                len(old_oid) != oid_length or len(new_oid) != oid_length or
+                (old_oid != zero_oid and OID.fullmatch(old_oid) is None) or
+                (new_oid != zero_oid and OID.fullmatch(new_oid) is None)):
+            raise SnapshotError("diff raw staged retornou mode/OID inválido")
+        path = _canonical_relative(chunks[offset + 1])
+        if path in result:
+            raise SnapshotError(
+                f"diff raw staged retornou path duplicado: {path}")
+        if status_code == "A":
+            valid_transition = old_oid == zero_oid and new_oid != zero_oid
+        elif status_code == "D":
+            valid_transition = old_oid != zero_oid and new_oid == zero_oid
+        else:
+            valid_transition = old_oid != zero_oid and new_oid != zero_oid
+        if not valid_transition:
+            raise SnapshotError(
+                f"diff raw staged retornou transição {status_code} inválida: {path}")
+        if status_code == "D":
+            if entries is not None and path in entries:
+                raise SnapshotError(
+                    f"diff raw staged marcou deleção ainda presente: {path}")
+        elif entries is not None:
+            entry = entries.get(path)
+            if entry is None or entry[1] != new_oid:
+                raise SnapshotError(
+                    f"diff raw staged divergiu da entrada staged: {path}")
+        result[path] = (
+            status_code,
+            None if old_oid == zero_oid else old_oid,
+            None if new_oid == zero_oid else new_oid,
+        )
+    return result
+
+
+def _changed_go_versions(
+    root: pathlib.Path, index_file: pathlib.Path,
+    entries: dict[str, tuple[str, str]], object_format: str,
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """Return authenticated status/old OID/new OID for staged Go changes."""
+    payload = _run_git(
+        root,
+        ["diff", "--cached", "--raw", "--no-abbrev", "--no-renames",
+         "--diff-filter=AMDT", "-z", "--", "*.go"],
+        index_file=index_file,
+    )
+    chunks = payload.split(b"\0")
+    if chunks and chunks[-1] == b"":
+        chunks.pop()
+    if len(chunks) % 2:
+        raise SnapshotError("diff raw Go retornou registro truncado")
+    oid_length = 40 if object_format == "sha1" else 64
+    zero_oid = "0" * oid_length
+    result: dict[str, tuple[str, str | None, str | None]] = {}
+    for offset in range(0, len(chunks), 2):
+        try:
+            metadata = chunks[offset].decode("ascii", errors="strict")
+            fields = metadata.split(" ")
+        except UnicodeDecodeError as error:
+            raise SnapshotError("diff raw Go retornou metadata não ASCII") from error
+        if (len(fields) != 5 or not fields[0].startswith(":") or
+                fields[4] not in {"A", "M", "D", "T"}):
+            raise SnapshotError("diff raw Go retornou metadata inválida")
+        old_mode = fields[0][1:]
+        new_mode, old_oid, new_oid, status_code = fields[1:]
+        if (not re.fullmatch(r"[0-7]{6}", old_mode) or
+                not re.fullmatch(r"[0-7]{6}", new_mode) or
+                len(old_oid) != oid_length or len(new_oid) != oid_length or
+                (old_oid != zero_oid and OID.fullmatch(old_oid) is None) or
+                (new_oid != zero_oid and OID.fullmatch(new_oid) is None)):
+            raise SnapshotError("diff raw Go retornou mode/OID inválido")
+        path = _canonical_relative(chunks[offset + 1])
+        if not path.endswith(".go") or path in result:
+            raise SnapshotError(
+                f"diff raw Go retornou path inválido/duplicado: {path}")
+        if status_code == "A":
+            valid_transition = old_oid == zero_oid and new_oid != zero_oid
+        elif status_code == "D":
+            valid_transition = old_oid != zero_oid and new_oid == zero_oid
+        else:
+            valid_transition = old_oid != zero_oid and new_oid != zero_oid
+        if not valid_transition:
+            raise SnapshotError(
+                f"diff raw Go retornou transição {status_code} inválida: {path}")
+        if status_code == "D":
+            if path in entries:
+                raise SnapshotError(
+                    f"diff raw Go marcou deleção ainda presente no índice: {path}")
+        else:
+            entry = entries.get(path)
+            if (entry is None or entry[0] not in {"100644", "100755"} or
+                    entry[1] != new_oid):
+                raise SnapshotError(
+                    f"diff raw Go divergiu da entrada staged: {path}")
+        result[path] = (
+            status_code,
+            None if old_oid == zero_oid else old_oid,
+            None if new_oid == zero_oid else new_oid,
+        )
+    return result
+
+
+def _directory_contains(directory: str, path: str) -> bool:
+    """Whether a canonical repository path is inside a package directory."""
+    directory_parts = (() if directory == "." else
+                       pathlib.PurePosixPath(directory).parts)
+    path_parts = pathlib.PurePosixPath(path).parts
+    return path_parts[:len(directory_parts)] == directory_parts
+
+
+def _nearest_module_root(directory: str, module_roots: set[str]) -> str:
+    candidates = [
+        root for root in module_roots if _directory_contains(root, directory)
+    ]
+    if not candidates:
+        raise SnapshotError(
+            f"pacote staged não pertence a módulo Go candidato: {directory}")
+    return max(
+        candidates,
+        key=lambda value: 0 if value == "." else
+        len(pathlib.PurePosixPath(value).parts),
+    )
+
+
+def _relative_to_module(path: str, module_root: str) -> str:
+    pure = pathlib.PurePosixPath(path)
+    if module_root == ".":
+        return pure.as_posix()
+    try:
+        return pure.relative_to(pathlib.PurePosixPath(module_root)).as_posix()
+    except ValueError as error:
+        raise SnapshotError(
+            f"path {path} foge do módulo candidato {module_root}") from error
+
+
+def _build_impact_routes(
+    entries: dict[str, tuple[str, str]],
+    changes: dict[str, tuple[str, str | None, str | None]],
+) -> dict[str, dict[str, object]]:
+    """Map the exact staged delta to compiler roots and package inputs.
+
+    A path affects compilation when it is a module manifest or is at/below a
+    directory containing Go source in either side of the staged transition.
+    That intentionally includes embed assets, .s/.S, C/C++/Objective-C files,
+    headers and generated inputs without maintaining an inevitably stale file
+    extension allowlist.  Paths outside package trees remain a cheap skip.
+    """
+    module_roots = {
+        pathlib.PurePosixPath(path).parent.as_posix()
+        for path, (mode, _) in entries.items()
+        if pathlib.PurePosixPath(path).name == "go.mod" and
+        mode in {"100644", "100755"}
+    }
+    if "." not in module_roots:
+        raise SnapshotError("snapshot Go perdeu go.mod raiz regular")
+
+    package_dirs = {
+        pathlib.PurePosixPath(path).parent.as_posix()
+        for path in entries if path.endswith(".go")
+    }
+    # A package deleted by this transaction is still a build-impact boundary:
+    # its dependants must be checked against the candidate where it is absent.
+    package_dirs.update(
+        pathlib.PurePosixPath(path).parent.as_posix()
+        for path, (status_code, _, _) in changes.items()
+        if path.endswith(".go") and status_code == "D"
+    )
+
+    routes: dict[str, dict[str, object]] = {}
+
+    def route(module_root: str) -> dict[str, object]:
+        return routes.setdefault(module_root, {
+            "package_dirs": set(),
+            "changed_paths": set(),
+            "force_full": False,
+            "direct_safe": True,
+        })
+
+    for path in sorted(changes):
+        pure = pathlib.PurePosixPath(path)
+        # Prefix lookup is O(path depth), not O(changes * packages). This
+        # remains cheap when the repository grows from thousands to millions
+        # of tracked content paths.
+        path_ancestors = {"."}
+        path_ancestors.update(
+            "/".join(pure.parts[:length])
+            for length in range(1, len(pure.parts))
+        )
+        impacted_dirs = package_dirs.intersection(path_ancestors)
+
+        basename = pure.name
+        manifest_root = pure.parent.as_posix()
+        is_module_manifest = (
+            basename == "go.mod" or
+            (basename == "go.sum" and
+             f"{manifest_root + '/' if manifest_root != '.' else ''}go.mod"
+             in entries)
+        )
+        if is_module_manifest:
+            if manifest_root in module_roots:
+                owner = manifest_root
+            else:
+                # Deleting a nested go.mod makes that subtree part of the
+                # nearest surviving parent module in the candidate snapshot.
+                owner = _nearest_module_root(manifest_root, module_roots)
+            target = route(owner)
+            target["force_full"] = True
+            target["direct_safe"] = False
+            cast_paths = target["changed_paths"]
+            assert isinstance(cast_paths, set)
+            cast_paths.add(path)
+            if basename == "go.mod":
+                # A module boundary/path/replace transition can affect every
+                # repository module that consumes it through a local replace.
+                # There are few module roots and manifest edits are rare, so a
+                # complete per-module topology check is both safer and cheaper
+                # than maintaining a second partial parser for Go directives.
+                for dependent_root in module_roots:
+                    dependent = route(dependent_root)
+                    dependent["force_full"] = True
+                    dependent["direct_safe"] = False
+                    dependent_paths = dependent["changed_paths"]
+                    assert isinstance(dependent_paths, set)
+                    dependent_paths.add(path)
+
+        by_module: dict[str, set[str]] = {}
+        for directory in impacted_dirs:
+            owner = _nearest_module_root(directory, module_roots)
+            by_module.setdefault(owner, set()).add(directory)
+        for owner, directories in by_module.items():
+            target = route(owner)
+            cast_dirs = target["package_dirs"]
+            cast_paths = target["changed_paths"]
+            assert isinstance(cast_dirs, set)
+            assert isinstance(cast_paths, set)
+            cast_dirs.update(directories)
+            cast_paths.add(path)
+            # A Go file can use the narrow AST route only when it is compiler
+            # source for exactly its own package.  If an ancestor package can
+            # observe it through go:embed, the reverse closure is required.
+            if (not path.endswith(".go") or
+                    directories != {pure.parent.as_posix()}):
+                target["direct_safe"] = False
+
+    for target in routes.values():
+        cast_dirs = target["package_dirs"]
+        cast_paths = target["changed_paths"]
+        assert isinstance(cast_dirs, set)
+        assert isinstance(cast_paths, set)
+        if not cast_dirs and not cast_paths:
+            target["force_full"] = True
+            target["direct_safe"] = False
+    return routes
+
+
+def _git_blob_oid(payload: bytes, object_format: str) -> str:
+    header = f"blob {len(payload)}\0".encode("ascii")
+    algorithm = hashlib.sha1 if object_format == "sha1" else hashlib.sha256
+    digest = algorithm()
+    digest.update(header)
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _blob_sizes(
+    root: pathlib.Path, object_ids: Iterable[str], index_file: pathlib.Path,
+) -> dict[str, int]:
+    ordered = sorted(set(object_ids))
+    sizes: dict[str, int] = {}
+    for offset in range(0, len(ordered), 4096):
+        _require_budget()
+        group = ordered[offset:offset + 4096]
+        output = _run_git(
+            root, ["cat-file", "--batch-check"], index_file=index_file,
+            input_payload=b"".join(oid.encode("ascii") + b"\n" for oid in group))
+        lines = output.splitlines()
+        if len(lines) != len(group):
+            raise SnapshotError("cat-file batch-check perdeu objeto")
+        for expected, raw in zip(group, lines):
+            try:
+                observed, kind, raw_size = raw.decode("ascii").split(" ")
+                size = int(raw_size)
+            except (UnicodeDecodeError, ValueError) as error:
+                raise SnapshotError("cat-file retornou metadata inválida") from error
+            if (observed != expected or kind != "blob" or size < 0 or
+                    size > MAX_SELECTED_BYTES):
+                raise SnapshotError("cat-file encontrou objeto inválido")
+            sizes[expected] = size
+    if sum(sizes.values()) > MAX_SELECTED_BYTES:
+        raise SnapshotError("snapshot Go excedeu limite de bytes")
+    return sizes
+
+
+def _blob_groups(object_ids: Iterable[str], sizes: dict[str, int]) -> list[list[str]]:
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0
+    for oid in sorted(set(object_ids)):
+        estimated = sizes[oid] + len(oid) + len(str(sizes[oid])) + 16
+        if current and (len(current) >= GIT_BATCH_MAX_OBJECTS or
+                        current_bytes + estimated > GIT_BATCH_TARGET_BYTES):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(oid)
+        current_bytes += estimated
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _read_blob_group(
+    root: pathlib.Path, group: list[str], sizes: dict[str, int],
+    index_file: pathlib.Path, object_format: str,
+) -> dict[str, bytes]:
+    output = _run_git(
+        root, ["cat-file", "--batch"], index_file=index_file,
+        input_payload=b"".join(oid.encode("ascii") + b"\n" for oid in group),
+        max_output=GIT_BATCH_TARGET_BYTES + 1024 * 1024)
+    cursor = 0
+    result: dict[str, bytes] = {}
+    for expected in group:
+        _require_budget()
+        newline = output.find(b"\n", cursor)
+        if newline < 0:
+            raise SnapshotError("cat-file batch truncou header")
+        try:
+            observed, kind, raw_size = output[cursor:newline].decode(
+                "ascii").split(" ")
+            size = int(raw_size)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SnapshotError("cat-file batch retornou header inválido") from error
+        cursor = newline + 1
+        if (observed != expected or kind != "blob" or
+                sizes.get(expected) != size or cursor + size >= len(output)):
+            raise SnapshotError("cat-file batch divergiu do inventário")
+        payload = output[cursor:cursor + size]
+        cursor += size
+        if output[cursor:cursor + 1] != b"\n":
+            raise SnapshotError("cat-file batch perdeu delimitador")
+        cursor += 1
+        if _git_blob_oid(payload, object_format) != expected:
+            raise SnapshotError("blob materializado divergiu do OID")
+        result[expected] = payload
+    if cursor != len(output):
+        raise SnapshotError("cat-file batch devolveu bytes extras")
+    return result
+
+
+def _ensure_directory(root: pathlib.Path, relative_parent: pathlib.PurePosixPath) -> None:
+    current = root
+    for part in relative_parent.parts:
+        current = current / part
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode):
+                raise SnapshotError(f"ancestral materializado não é diretório: {current}")
+
+
+def _materialize(
+    root: pathlib.Path, entries: dict[str, tuple[str, str]],
+    blobs: dict[str, bytes],
+) -> None:
+    for relative, (mode, oid) in sorted(entries.items()):
+        _require_budget()
+        path = pathlib.PurePosixPath(relative)
+        _ensure_directory(root, path.parent)
+        _write_exclusive(
+            root.joinpath(*path.parts), blobs[oid],
+            0o500 if mode == "100755" else 0o400)
+
+
+def _pinned_toolchain_root(runtime_root: pathlib.Path) -> pathlib.Path:
+    return runtime_root.joinpath(*PINNED_TOOLCHAIN_REL.parts)
+
+
+def _authenticate_pinned_toolchain(
+    runtime_root: pathlib.Path,
+) -> tuple[
+    dict[pathlib.Path, tuple[bytes, tuple[int, ...]]],
+    dict[pathlib.Path, tuple[int, ...]],
+]:
+    toolchain_root = _pinned_toolchain_root(runtime_root)
+    directory_bindings = {
+        toolchain_root: _safe_runtime_directory(toolchain_root),
+    }
+    owner_uid = directory_bindings[toolchain_root][3]
+    file_bindings: dict[
+        pathlib.Path, tuple[bytes, tuple[int, ...]]] = {}
+
+    version_path = toolchain_root / "VERSION"
+    version_binding = _safe_payload(version_path, max_bytes=4096)
+    version_payload, version_identity = version_binding
+    if (version_payload != PINNED_GO_VERSION_PAYLOAD or
+            version_identity[3] != owner_uid or
+            stat.S_IMODE(version_identity[2]) & 0o022):
+        raise SnapshotError(
+            "VERSION da toolchain autenticada diverge do conteúdo oficial "
+            f"exato de {PINNED_GO_VERSION}")
+    file_bindings[version_path] = version_binding
+
+    for relative, expected_digest in PINNED_TOOL_DIGESTS.items():
+        path = toolchain_root.joinpath(
+            *pathlib.PurePosixPath(relative).parts)
+        binding = _safe_payload(path, max_bytes=MAX_RUNTIME_BYTES)
+        payload, identity = binding
+        mode = stat.S_IMODE(identity[2])
+        observed_digest = hashlib.sha256(payload).hexdigest()
+        if (not mode & stat.S_IXUSR or mode & 0o022 or
+                identity[3] != owner_uid or
+                observed_digest != expected_digest):
+            raise SnapshotError(
+                "binário da toolchain autenticada diverge de seu digest "
+                f"oficial: {path}")
+        file_bindings[path] = binding
+    return file_bindings, directory_bindings
+
+
+def _validate_staged_checker_contract(checker_payload: bytes) -> None:
+    try:
+        checker_script = checker_payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise SnapshotError("checker staged não é UTF-8") from error
+    if "\x00" in checker_script:
+        raise SnapshotError("checker staged contém NUL")
+    expected_assignments = {
+        "PINNED_GOROOT": (
+            f'PINNED_GOROOT="$ROOT/{PINNED_TOOLCHAIN_REL.as_posix()}"'),
+        "GO_BIN": 'GO_BIN="$PINNED_GOROOT/bin/go"',
+        "VERSION_FILE": 'VERSION_FILE="$PINNED_GOROOT/VERSION"',
+    }
+    lines = checker_script.splitlines()
+    for variable, expected in expected_assignments.items():
+        observed = [line for line in lines if line.startswith(variable + "=")]
+        if observed != [expected]:
+            raise SnapshotError(
+                "checker staged diverge do contrato da toolchain autenticada: "
+                + variable)
+    required_fragments = (
+        f'[ "$PINNED_VERSION" != "{PINNED_GO_VERSION}" ]',
+        'GOROOT="$PINNED_GOROOT" "$GO_BIN" env GOVERSION)',
+        f'[ "$OBSERVED_VERSION" != "{PINNED_GO_VERSION}" ]',
+        'GOROOT="$PINNED_GOROOT" \\\n\t"$GO_BIN" "$@" >/dev/null',
+    )
+    if any(fragment not in checker_script for fragment in required_fragments):
+        raise SnapshotError(
+            "checker staged diverge das validações da toolchain autenticada")
+    observed_versions = set(re.findall(r"go1\.26\.\d+", checker_script))
+    if observed_versions != {PINNED_GO_VERSION}:
+        raise SnapshotError(
+            "checker staged referencia versão divergente da toolchain "
+            "autenticada")
+
+
+def _authenticate_non_build_authority_delta(
+    root: pathlib.Path,
+    index_file: pathlib.Path,
+    object_format: str,
+    routing_entries: dict[str, tuple[str, str]],
+    workspace: pathlib.Path,
+) -> None:
+    """Authenticate gate authorities without pretending they are Go inputs.
+
+    The Python router and shell checker decide how a later Go delta is
+    compiled, but neither file is itself a compiler input.  Recompiling every
+    Go package when only one of these authorities changes is both expensive
+    and semantically irrelevant: it does not test the Python logic.  The
+    proportional path instead proves that this running Python process is the
+    exact staged blob, validates the exact staged shell contract and asks an
+    authenticated system shell to parse it.  The dedicated regression suite
+    remains the semantic validation for authority changes.
+    """
+    for relative in (SELF_REL, CHECKER_REL):
+        entry = routing_entries.get(relative)
+        if entry is None or entry[0] != "100755":
+            raise SnapshotError(
+                f"autoridade staged perdeu blob executável: {relative}")
+
+    self_binding = _safe_payload(
+        SCRIPT_PATH, max_bytes=4 * 1024 * 1024)
+    self_payload, self_identity = self_binding
+    self_mode = stat.S_IMODE(self_identity[2])
+    if (self_identity[3] != os.getuid() or
+            self_mode not in {0o500, 0o755} or
+            _git_blob_oid(self_payload, object_format) !=
+            routing_entries[SELF_REL][1]):
+        raise SnapshotError(
+            "runtime Python diverge do blob staged autenticado: " + SELF_REL)
+
+    checker_oid = routing_entries[CHECKER_REL][1]
+    sizes = _blob_sizes(root, [checker_oid], index_file)
+    checker_payload = _read_blob_group(
+        root, [checker_oid], sizes, index_file, object_format)[checker_oid]
+    _validate_staged_checker_contract(checker_payload)
+
+    shell_binding = _safe_payload(SHELL_BIN, max_bytes=MAX_RUNTIME_BYTES)
+    _, shell_identity = shell_binding
+    shell_mode = stat.S_IMODE(shell_identity[2])
+    if (shell_identity[3] not in _HOST_ROOT_UIDS or
+            not shell_mode & stat.S_IXUSR or
+            shell_mode & 0o022):
+        raise SnapshotError(
+            f"shell de sintaxe possui identidade/mode inseguro: {SHELL_BIN}")
+    candidate = workspace / "staged-checker-syntax.sh"
+    _write_exclusive(candidate, checker_payload, 0o400)
+    try:
+        completed = subprocess.run(
+            [os.fspath(SHELL_BIN), "-n", os.fspath(candidate)],
+            cwd=workspace,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_remaining_timeout(5),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SnapshotError("validação sintática do checker excedeu 5s") from error
+    if (len(completed.stdout) > 1024 * 1024 or
+            len(completed.stderr) > 1024 * 1024):
+        raise SnapshotError("validação sintática do checker excedeu limite de saída")
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.decode(
+            "utf-8", errors="replace").split())[:1200]
+        raise SnapshotError(
+            f"checker staged possui sintaxe inválida rc={completed.returncode}: "
+            f"{detail}")
+
+    _revalidate_file(
+        SCRIPT_PATH, self_binding, max_bytes=4 * 1024 * 1024)
+    _revalidate_file(
+        SHELL_BIN, shell_binding, max_bytes=MAX_RUNTIME_BYTES)
+
+
+def _authenticate_runtime(
+    entries: dict[str, tuple[str, str]], object_format: str,
+    runtime_root: pathlib.Path,
+) -> tuple[
+    dict[pathlib.Path, tuple[bytes, tuple[int, ...]]],
+    dict[pathlib.Path, tuple[int, ...]],
+    frozenset[pathlib.Path],
+]:
+    bindings: dict[pathlib.Path, tuple[bytes, tuple[int, ...]]] = {}
+    for relative in (SELF_REL, CHECKER_REL):
+        if entries[relative][0] != "100755":
+            raise SnapshotError(
+                f"runtime staged perdeu mode executável: {relative}")
+
+    # This Python process was loaded from SELF_REL, so those live bytes remain
+    # an execution dependency and must equal the staged authority.  The shell
+    # checker is different: _compile_snapshot executes its authenticated blob
+    # directly, never its mutable worktree pathname.
+    self_path = SCRIPT_PATH
+    self_payload, self_identity = _safe_payload(
+        self_path, max_bytes=4 * 1024 * 1024)
+    self_mode = stat.S_IMODE(self_identity[2])
+    # Normal worktrees keep tracked executables at 0755. The authenticated
+    # private gate deliberately materializes the same staged blob as 0500 so
+    # no other uid can read or execute it. Both modes are immutable to group
+    # and others and preserve the exact-byte bind checked below.
+    if (self_mode not in (0o500, 0o755) or
+            _git_blob_oid(self_payload, object_format) != entries[SELF_REL][1]):
+        raise SnapshotError(
+            "runtime worktree diverge do blob staged autenticado: " + SELF_REL)
+    bindings[self_path] = (self_payload, self_identity)
+
+    # Git, env e dirname são resolvidos pela cadeia de symlinks de root e
+    # presos no arquivo final, com st_nlink > 1 aceito só para eles (uutils na
+    # torre, 2026-09-24 — ver _resolve_system_binary). O shell segue no regime
+    # estrito: caminho já resolvido na constante e um único link.
+    system_binaries: set[pathlib.Path] = set()
+    for path, is_system_binary in (
+            (GIT_BIN, True),
+            (SHELL_BIN, False),
+            (ENV_BIN, True),
+            (DIRNAME_BIN, True)):
+        if is_system_binary:
+            bound_path, binding = _bind_system_binary(path)
+            system_binaries.add(bound_path)
+        else:
+            bound_path = path
+            binding = _safe_payload(path, max_bytes=MAX_RUNTIME_BYTES)
+            _require_trusted_executable(binding[1], os.fspath(path))
+        bindings[bound_path] = binding
+    toolchain_files, toolchain_directories = (
+        _authenticate_pinned_toolchain(runtime_root))
+    bindings.update(toolchain_files)
+    return bindings, toolchain_directories, frozenset(system_binaries)
+
+
+def _check_staged_gofmt(
+    snapshot: pathlib.Path, paths: list[str], gofmt_bin: pathlib.Path,
+) -> None:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "LC_ALL": "C",
+    }
+    for relative in paths:
+        _require_budget()
+        pure = pathlib.PurePosixPath(relative)
+        materialized = snapshot.joinpath(*pure.parts)
+        staged, _ = _safe_payload(materialized, max_bytes=MAX_SELECTED_BYTES)
+        try:
+            completed = subprocess.run(
+                [os.fspath(gofmt_bin), os.fspath(materialized)],
+                cwd=snapshot, env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=_remaining_timeout(_teto_de_subprocesso_sob_carga(GOFMT_TIMEOUT_SECONDS)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SnapshotError(
+                f"gofmt excedeu {GOFMT_TIMEOUT_SECONDS}s: {relative}") from error
+        if (len(completed.stdout) > MAX_SELECTED_BYTES or
+                len(completed.stderr) > MAX_GIT_OUTPUT_BYTES):
+            raise SnapshotError(f"gofmt excedeu limite de saída: {relative}")
+        if completed.returncode != 0:
+            detail = " ".join(completed.stderr.decode(
+                "utf-8", errors="replace").split())[:1200]
+            raise SnapshotError(
+                f"gofmt falhou rc={completed.returncode}: {relative}: {detail}")
+        if completed.stdout != staged:
+            raise SnapshotError(
+                f"fonte Go staged não está formatada por gofmt: {relative}")
+
+
+def _go_metadata_environment(
+    workspace: pathlib.Path, runtime_root: pathlib.Path,
+) -> dict[str, str]:
+    home = os.environ.get("HOME", "/nonexistent")
+    if not pathlib.PurePath(home).is_absolute():
+        raise SnapshotError("HOME precisa ser absoluto")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": home,
+        "LC_ALL": "C",
+        "TMPDIR": os.fspath(workspace),
+        "GOENV": "off",
+        "GOTOOLCHAIN": "local",
+        "GOWORK": "off",
+        "GOFLAGS": "",
+        "GOPATH": os.fspath(pathlib.Path(home) / "go"),
+        "GOMODCACHE": os.fspath(pathlib.Path(home) / "go" / "pkg" / "mod"),
+        "GOCACHE": os.fspath(pathlib.Path(home) / ".cache" / "go-build"),
+        "GOROOT": os.fspath(_pinned_toolchain_root(runtime_root)),
+    }
+    return environment
+
+
+def _candidate_module_roots(
+    entries: dict[str, tuple[str, str]],
+) -> set[str]:
+    roots = {
+        pathlib.PurePosixPath(path).parent.as_posix()
+        for path, (mode, _) in entries.items()
+        if pathlib.PurePosixPath(path).name == "go.mod" and
+        mode in {"100644", "100755"}
+    }
+    if "." not in roots:
+        raise SnapshotError("snapshot Go perdeu go.mod raiz regular")
+    return roots
+
+
+def _local_replace_dependencies(
+    snapshot: pathlib.Path, workspace: pathlib.Path,
+    runtime_root: pathlib.Path, module_roots: set[str],
+) -> dict[str, set[str]]:
+    """Read local replace edges with the authenticated staged Go parser.
+
+    A nested module is not isolated when another candidate module consumes it
+    through ``replace => ./path``.  The edge must come from the materialized
+    staged go.mod, and its target must be another materialized module root;
+    otherwise the compile could silently read mutable worktree/external bytes.
+    """
+    snapshot_root = snapshot.resolve(strict=True)
+    go_bin = _pinned_toolchain_root(runtime_root) / "bin" / "go"
+    environment = _go_metadata_environment(workspace, runtime_root)
+    dependencies: dict[str, set[str]] = {
+        module_root: set() for module_root in module_roots
+    }
+    for module_root in sorted(module_roots):
+        _require_budget()
+        module_snapshot = (
+            snapshot if module_root == "." else
+            snapshot.joinpath(*pathlib.PurePosixPath(module_root).parts)
+        )
+        try:
+            completed = subprocess.run(
+                [os.fspath(go_bin), "mod", "edit", "-json"],
+                cwd=module_snapshot,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=_remaining_timeout(10),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SnapshotError(
+                f"leitura de replace staged excedeu 10s: {module_root}") from error
+        if (len(completed.stdout) > 4 * 1024 * 1024 or
+                len(completed.stderr) > MAX_GIT_OUTPUT_BYTES):
+            raise SnapshotError(
+                f"go mod edit excedeu limite de saída: {module_root}")
+        if completed.returncode != 0:
+            detail = " ".join(completed.stderr.decode(
+                "utf-8", errors="replace").split())[:2400]
+            raise SnapshotError(
+                f"go mod edit staged falhou rc={completed.returncode} "
+                f"no módulo {module_root}: {detail}")
+        try:
+            decoded = json.loads(completed.stdout.decode(
+                "utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SnapshotError(
+                f"go mod edit staged retornou JSON inválido: {module_root}") from error
+        if not isinstance(decoded, dict):
+            raise SnapshotError(
+                f"go mod edit staged retornou contrato inválido: {module_root}")
+        replacements = decoded.get("Replace")
+        if replacements is None:
+            continue
+        if not isinstance(replacements, list):
+            raise SnapshotError(
+                f"go mod edit staged perdeu lista Replace: {module_root}")
+        for replacement in replacements:
+            if not isinstance(replacement, dict):
+                raise SnapshotError(
+                    f"go mod edit staged retornou replace inválido: {module_root}")
+            new = replacement.get("New")
+            if not isinstance(new, dict):
+                raise SnapshotError(
+                    f"go mod edit staged perdeu destino de replace: {module_root}")
+            target_path = new.get("Path")
+            target_version = new.get("Version")
+            if not isinstance(target_path, str) or not target_path:
+                raise SnapshotError(
+                    f"go mod edit staged perdeu path de replace: {module_root}")
+            if target_version not in (None, ""):
+                if not isinstance(target_version, str):
+                    raise SnapshotError(
+                        f"go mod edit staged retornou versão inválida: {module_root}")
+                continue
+            raw_target = pathlib.Path(target_path)
+            if not raw_target.is_absolute():
+                raw_target = module_snapshot / raw_target
+            try:
+                target = raw_target.resolve(strict=True)
+                relative = target.relative_to(snapshot_root)
+            except (OSError, ValueError) as error:
+                raise SnapshotError(
+                    "replace local foge do snapshot staged: "
+                    f"{module_root} => {target_path}") from error
+            if not target.is_dir():
+                raise SnapshotError(
+                    "replace local não aponta diretório staged: "
+                    f"{module_root} => {target_path}")
+            target_root = relative.as_posix()
+            if target_root == ".":
+                target_root = "."
+            if target_root not in module_roots:
+                raise SnapshotError(
+                    "replace local não aponta go.mod staged autenticado: "
+                    f"{module_root} => {target_path}")
+            if target_root != module_root:
+                dependencies[module_root].add(target_root)
+    return dependencies
+
+
+def _expand_routes_for_local_replaces(
+    routes: dict[str, dict[str, object]],
+    dependencies: dict[str, set[str]],
+) -> None:
+    """Add the transitive consumers of every changed candidate module."""
+    impacted = set(routes)
+    changed = True
+    while changed:
+        changed = False
+        for consumer, targets in dependencies.items():
+            if not targets.intersection(impacted):
+                continue
+            if consumer not in impacted:
+                impacted.add(consumer)
+                changed = True
+            target = routes.setdefault(consumer, {
+                "package_dirs": set(),
+                "changed_paths": set(),
+                "force_full": True,
+                "direct_safe": False,
+            })
+            if not target.get("force_full") or target.get("direct_safe"):
+                changed = True
+            target["force_full"] = True
+            target["direct_safe"] = False
+
+
+def _decode_concatenated_json(payload: bytes) -> list[dict[str, object]]:
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise SnapshotError("go list metadata não retornou UTF-8") from error
+    decoder = json.JSONDecoder()
+    records: list[dict[str, object]] = []
+    cursor = 0
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text):
+            break
+        try:
+            value, cursor = decoder.raw_decode(text, cursor)
+        except json.JSONDecodeError as error:
+            raise SnapshotError("go list metadata retornou JSON truncado") from error
+        if not isinstance(value, dict):
+            raise SnapshotError("go list metadata retornou registro não objeto")
+        records.append(value)
+    return records
+
+
+def _staged_module_path(
+    snapshot: pathlib.Path, module_root: str = ".",
+) -> str:
+    module_path = ""
+    manifest = (
+        snapshot / "go.mod" if module_root == "." else
+        snapshot.joinpath(*pathlib.PurePosixPath(module_root).parts, "go.mod")
+    )
+    try:
+        for line in manifest.read_text(
+                encoding="utf-8", errors="strict").splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "module":
+                module_path = fields[1]
+                break
+    except (OSError, UnicodeError) as error:
+        raise SnapshotError("go.mod staged não pôde ser lido") from error
+    if not module_path or any(character.isspace() for character in module_path):
+        raise SnapshotError("go.mod staged não possui module path canônico")
+    return module_path
+
+
+def _direct_packages_if_surface_stable(
+    snapshot: pathlib.Path, workspace: pathlib.Path,
+    runtime_root: pathlib.Path,
+    versions: dict[str, tuple[str, str | None, str | None]],
+    old_blobs: dict[str, bytes],
+    module_root: str = ".",
+) -> tuple[list[str] | None, str]:
+    """Prove the narrow body/private-addition route with Go's real AST."""
+    if not versions:
+        return None, "no_changed_go_files"
+    if any(status_code == "T" for status_code, _, _ in versions.values()):
+        return None, "retyped_go_file"
+
+    module_path = _staged_module_path(snapshot, module_root)
+    scratch_digest = hashlib.sha256(
+        ("api-surface-v1\0" + module_root).encode("utf-8"),
+    ).hexdigest()[:24]
+    classification_workspace = workspace / ("surface-" + scratch_digest)
+    classification_workspace.mkdir(mode=0o700)
+    baseline = classification_workspace / "baseline"
+    baseline.mkdir(mode=0o700)
+    pairs: list[dict[str, str]] = []
+    changed_packages: set[str] = set()
+    for relative, (_, old_oid, new_oid) in sorted(versions.items()):
+        if old_oid is not None and old_oid not in old_blobs:
+            raise SnapshotError(
+                f"baseline autenticada ausente para classificação Go: {relative}")
+        pure = pathlib.PurePosixPath(relative)
+        before_value = ""
+        if old_oid is not None:
+            before = baseline.joinpath(*pure.parts)
+            _ensure_directory(baseline, pure.parent)
+            _write_exclusive(before, old_blobs[old_oid], 0o400)
+            before_value = os.fspath(before)
+        after_value = ""
+        if new_oid is not None:
+            after = snapshot.joinpath(*pure.parts)
+            if not after.is_file():
+                raise SnapshotError(
+                    f"fonte staged sumiu antes da classificação: {relative}")
+            after_value = os.fspath(after)
+        pairs.append({
+            "path": relative,
+            "before": before_value,
+            "after": after_value,
+        })
+        parent = pure.parent.as_posix()
+        relative_parent = _relative_to_module(parent, module_root)
+        changed_packages.add(
+            module_path if relative_parent == "." else
+            module_path + "/" + relative_parent)
+
+    package_files: dict[str, tuple[list[str], list[str]]] = {}
+    for item in pairs:
+        pure = pathlib.PurePosixPath(item["path"])
+        parent = pure.parent.as_posix()
+        if parent not in package_files:
+            candidate_directory = snapshot.joinpath(*pure.parent.parts)
+            if not candidate_directory.is_dir():
+                return None, "deleted_package_requires_reverse"
+            after_files = sorted(
+                os.fspath(path) for path in candidate_directory.iterdir()
+                if path.is_file() and path.name.endswith(".go"))
+            before_files: list[str] = []
+            for candidate_value in after_files:
+                candidate = pathlib.Path(candidate_value)
+                relative_candidate = (
+                    pure.parent / candidate.name).as_posix()
+                version = versions.get(relative_candidate)
+                if version is not None and version[0] == "A":
+                    continue
+                if version is not None and version[1] is not None:
+                    before_files.append(os.fspath(
+                        baseline.joinpath(
+                            *pathlib.PurePosixPath(relative_candidate).parts)))
+                else:
+                    before_files.append(candidate_value)
+            for relative_deleted, (status_code, old_oid, _) in versions.items():
+                deleted = pathlib.PurePosixPath(relative_deleted)
+                if (status_code == "D" and old_oid is not None and
+                        deleted.parent == pure.parent):
+                    before_files.append(os.fspath(
+                        baseline.joinpath(*deleted.parts)))
+            package_files[parent] = (
+                sorted(set(before_files)), sorted(set(after_files)))
+        before_package, after_package = package_files[parent]
+        item["before_package"] = before_package
+        item["after_package"] = after_package
+
+    helper_path = classification_workspace / "api-surface-helper.go"
+    manifest_path = classification_workspace / "api-surface-manifest.json"
+    _write_exclusive(helper_path, API_SURFACE_HELPER.encode("utf-8"), 0o400)
+    manifest_payload = json.dumps(
+        {"pairs": pairs}, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    _write_exclusive(manifest_path, manifest_payload, 0o400)
+    go_bin = _pinned_toolchain_root(runtime_root) / "bin" / "go"
+    environment = _go_metadata_environment(
+        classification_workspace, runtime_root)
+    environment["GO111MODULE"] = "off"
+    try:
+        completed = subprocess.run(
+            [os.fspath(go_bin), "run", os.fspath(helper_path),
+             os.fspath(manifest_path)],
+            cwd=classification_workspace, env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_remaining_timeout(_teto_de_subprocesso_sob_carga(API_SURFACE_TIMEOUT_SECONDS)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SnapshotError(
+            "classificação estrutural Go excedeu "
+            f"{_teto_de_subprocesso_sob_carga(API_SURFACE_TIMEOUT_SECONDS)}s (base {API_SURFACE_TIMEOUT_SECONDS}s ajustada pela carga)") from error
+    if (len(completed.stdout) > 1024 * 1024 or
+            len(completed.stderr) > MAX_GIT_OUTPUT_BYTES):
+        raise SnapshotError("classificação estrutural Go excedeu limite de saída")
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.decode(
+            "utf-8", errors="replace").split())[:2400]
+        raise SnapshotError(
+            "classificação estrutural Go falhou "
+            f"rc={completed.returncode}: {detail}")
+    try:
+        decoded = json.loads(completed.stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SnapshotError(
+            "classificação estrutural Go retornou JSON inválido") from error
+    if (not isinstance(decoded, dict) or
+            set(decoded) != {"direct_only", "reason"} or
+            not isinstance(decoded.get("direct_only"), bool) or
+            not isinstance(decoded.get("reason"), str) or
+            not decoded["reason"] or len(decoded["reason"]) > 1000):
+        raise SnapshotError(
+            "classificação estrutural Go retornou contrato inválido")
+    if not decoded["direct_only"]:
+        return None, decoded["reason"]
+    if not changed_packages:
+        raise SnapshotError("classificação direta perdeu pacote alterado")
+    return sorted(changed_packages), decoded["reason"]
+
+
+def _affected_packages(
+    module_snapshot: pathlib.Path, workspace: pathlib.Path,
+    runtime_root: pathlib.Path, changed_package_dirs: list[str],
+    force_full: bool = False, direct_packages: list[str] | None = None,
+) -> list[str]:
+    if direct_packages is not None:
+        if not direct_packages:
+            raise SnapshotError("rota Go direta recebeu lista vazia")
+        return direct_packages
+    if force_full or not changed_package_dirs:
+        # Direct/CI invocations may validate a clean candidate.  The hook only
+        # calls this program for a build-impact delta, but retaining the complete
+        # closure here keeps the checker useful and its authentication tests
+        # meaningful without relying on that outer routing decision.
+        return ["./..."]
+
+    module_path = _staged_module_path(module_snapshot)
+
+    changed_imports = {
+        module_path if directory == "." else module_path + "/" + directory
+        for directory in changed_package_dirs
+    }
+    go_bin = _pinned_toolchain_root(runtime_root) / "bin" / "go"
+    command = [
+        os.fspath(go_bin), "list", "-tags=devcmds", "-test", "-json",
+        "-mod=readonly", "-buildvcs=false", "./...",
+    ]
+    try:
+        completed = subprocess.run(
+            command, cwd=module_snapshot,
+            env=_go_metadata_environment(workspace, runtime_root),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=_remaining_timeout(20), check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # ESTOURO AQUI É AMBIENTE, NÃO DEFEITO — e reprovar tratava um pelo
+        # outro. `go list -test -json ./...` percorre os ~504 pacotes do módulo;
+        # com a máquina carregada (medido: load 24, com deploy, workflow de
+        # agentes e suíte concorrentes) ele passa dos 20 s sem que nada no código
+        # esteja errado. O commit era recusado com a mesma cara de uma quebra de
+        # compilação, e a única saída do desenvolvedor era esperar sem saber o
+        # quê.
+        #
+        # A saída correta já existe neste arquivo: `./...` é o SUPERCONJUNTO
+        # seguro — compila tudo, nunca menos. Cair nele numa perda de orçamento
+        # deixa a verificação MAIS estrita, não menos, e custa apenas tempo de
+        # CPU. É o inverso de afrouxar o gate.
+        print(
+            "go-index-compile-closure: descoberta reversa estourou o orçamento "
+            "(ambiente carregado); caindo no superconjunto seguro ./...",
+            file=sys.stderr,
+        )
+        return ["./..."]
+    if (len(completed.stdout) > MAX_GIT_OUTPUT_BYTES or
+            len(completed.stderr) > MAX_GIT_OUTPUT_BYTES):
+        raise SnapshotError("descoberta da closure reversa excedeu limite de saída")
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.decode(
+            "utf-8", errors="replace").split())[:2400]
+        raise SnapshotError(
+            f"go list da closure reversa falhou rc={completed.returncode}: {detail}")
+
+    selected: set[str] = set()
+    observed_changed: set[str] = set()
+    for record in _decode_concatenated_json(completed.stdout):
+        import_path = record.get("ImportPath")
+        for_test = record.get("ForTest")
+        dependencies = record.get("Deps", [])
+        directory = record.get("Dir")
+        if (not isinstance(import_path, str) or
+                not isinstance(dependencies, list) or
+                not all(isinstance(value, str) for value in dependencies) or
+                not isinstance(directory, str)):
+            raise SnapshotError("go list metadata perdeu ImportPath/Dir/Deps")
+        base = for_test if isinstance(for_test, str) and for_test else import_path
+        try:
+            relative_directory = pathlib.Path(directory).resolve(
+                strict=True).relative_to(module_snapshot.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise SnapshotError(
+                f"go list metadata saiu do snapshot: {directory}") from error
+        relative_posix = relative_directory.as_posix()
+        expected_base = (
+            module_path if relative_posix == "." else
+            module_path + "/" + relative_posix)
+        # `go list -test` also emits a synthetic `pkg.test` main.  Its Dir is
+        # the source package directory but it is not a package importable by a
+        # second go command.  Test variants carry ForTest and map back to the
+        # exact directory import; only directory-authenticated bases may root
+        # the compile closure.
+        if base != expected_base:
+            continue
+        if base in changed_imports:
+            observed_changed.add(base)
+        dependency_set = set(dependencies)
+        if base in changed_imports or dependency_set.intersection(changed_imports):
+            selected.add(base)
+
+    existing_changed: set[str] = set()
+    for changed_directory in changed_package_dirs:
+        parent = pathlib.PurePosixPath(changed_directory)
+        directory = module_snapshot.joinpath(*parent.parts)
+        if directory.is_dir() and any(directory.glob("*.go")):
+            existing_changed.add(
+                module_path if parent.as_posix() == "." else
+                module_path + "/" + parent.as_posix())
+    missing = existing_changed - observed_changed
+    if missing:
+        raise SnapshotError(
+            "pacote Go alterado não pertence ao perfil devcmds staged: " +
+            ", ".join(sorted(missing)))
+    if existing_changed and not selected:
+        raise SnapshotError("closure reversa staged ficou vazia")
+    # A package fully deleted from the candidate cannot be a compile root.  A
+    # metadata pass already catches ordinary missing imports; keep the full
+    # export closure for this uncommon case so build-tagged dependants cannot
+    # turn a deletion into a false green.
+    return sorted(selected) if selected else ["./..."]
+
+
+def _staged_tree(
+    root: pathlib.Path, index_file: pathlib.Path, workspace: pathlib.Path,
+) -> str:
+    """Árvore que o índice dado commitaria (`git write-tree`).
+
+    `write-tree` ESCREVE no índice em que roda (grava a extensão cache-tree),
+    então rodá-lo sobre a cópia privada quebra a conferência byte a byte dela,
+    e sobre a autoridade deixa o gate escrevendo em `.git/index`. Por isso ele
+    roda numa cópia descartável dentro do workspace: este gate não escreve nem
+    na autoridade nem no que compilou.
+
+    Índice com entrada unmerged não tem árvore: o git aborta com rc=128 e
+    "unmerged". Esse caso é conflito, e é reprovado com a mesma palavra que
+    `_index_entries` usa, porque a suíte e o operador procuram por ela.
+    """
+    scratch = workspace / f"tree-{index_file.name}.index"
+    fd = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with open(fd, "wb") as target, open(index_file, "rb") as source:
+            target.write(source.read())
+    except OSError as error:
+        raise SnapshotError(
+            f"não foi possível copiar o índice para {scratch}") from error
+    try:
+        return _git_text(root, ["write-tree"], index_file=scratch)
+    except SnapshotError as error:
+        if "unmerged" in str(error):
+            raise SnapshotError(
+                "índice contém conflito (entrada unmerged); resolva antes de "
+                "commitar") from error
+        raise
+
+
+def _revalidate_staged_tree(
+    root: pathlib.Path, index_path: pathlib.Path, workspace: pathlib.Path,
+    expected_tree: str,
+) -> None:
+    """Reprova se o CONTEÚDO staged mudou desde a captura — e só ele."""
+    observed = _staged_tree(root, index_path, workspace)
+    if observed != expected_tree:
+        raise SnapshotError(
+            f"árvore staged mudou durante compilação: {expected_tree[:12]} -> {observed[:12]}")
+
+
+def _revalidate_file(
+    path: pathlib.Path, expected: tuple[bytes, tuple[int, ...]], *, max_bytes: int,
+    allow_multilink: bool = False,
+) -> None:
+    observed = _safe_payload(
+        path, max_bytes=max_bytes, allow_multilink=allow_multilink)
+    if observed != expected:
+        raise SnapshotError(f"arquivo mudou durante compilação: {path}")
+
+
+def _revalidate_runtime_directory(
+    path: pathlib.Path, expected: tuple[int, ...],
+) -> None:
+    observed = _safe_runtime_directory(path)
+    if observed != expected:
+        raise SnapshotError(f"diretório runtime mudou durante compilação: {path}")
+
+
+def _compile_snapshot(
+    snapshot: pathlib.Path, workspace: pathlib.Path, checker_payload: bytes,
+    parallelism: int | None, checker_path: pathlib.Path,
+    builds: list[tuple[str, list[str]]],
+) -> tuple[int, bytes, bytes]:
+    home = os.environ.get("HOME", "/nonexistent")
+    if not pathlib.PurePath(home).is_absolute():
+        raise SnapshotError("HOME precisa ser absoluto")
+    try:
+        checker_script = checker_payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise SnapshotError("checker staged não é UTF-8") from error
+    if "\x00" in checker_script:
+        raise SnapshotError("checker staged contém NUL")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": home,
+        "LC_ALL": "C",
+        "TMPDIR": os.fspath(workspace),
+    }
+    goroot = os.environ.get("GOROOT")
+    if goroot is not None:
+        goroot_path = pathlib.Path(goroot)
+        if not goroot_path.is_absolute() or not goroot_path.is_dir():
+            raise SnapshotError("GOROOT privado precisa ser diretório absoluto")
+        environment["GOROOT"] = os.fspath(goroot_path)
+    if not builds:
+        raise SnapshotError("plano de compilação staged ficou vazio")
+    combined_stdout = bytearray()
+    combined_stderr = bytearray()
+    for module_root, packages in builds:
+        module_snapshot = (
+            snapshot if module_root == "." else
+            snapshot.joinpath(*pathlib.PurePosixPath(module_root).parts)
+        )
+        if not module_snapshot.is_dir():
+            raise SnapshotError(
+                f"raiz de módulo staged não foi materializada: {module_root}")
+        command = [
+            os.fspath(SHELL_BIN), "-c", checker_script,
+            os.fspath(checker_path), "--root", os.fspath(module_snapshot),
+        ]
+        if parallelism is not None:
+            command.extend(["--parallelism", str(parallelism)])
+        for package in packages:
+            command.extend(["--package", package])
+        # O tempo realmente concedido é o MENOR entre o teto de compilação e o
+        # que sobrou do orçamento do gate — quase nunca é o teto. Reportar a
+        # constante fazia a mensagem mentir: um operador que a lesse concluiria
+        # que subir WIKI_COMMIT_GATE_TIMEOUT_SECONDS resolveria, quando o
+        # orçamento maior é limitado pelo teto e a segunda tentativa se perde.
+        # O teto de compilação estica pelo MESMO fator do orçamento global:
+        # esticar só o orçamento não adiantaria nada, porque _remaining_timeout
+        # devolve o MENOR dos dois e o teto voltaria a ser o limitante.
+        fator_carga, _ = _load_stretch_factor()
+        effective_timeout = _remaining_timeout(COMPILE_TIMEOUT_SECONDS * fator_carga)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=module_snapshot, env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=effective_timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise SnapshotError(
+                f"compile closure excedeu {effective_timeout:.1f}s concedidos "
+                f"(teto de compilação {COMPILE_TIMEOUT_SECONDS}s; o restante do "
+                f"orçamento do gate pode reduzi-lo) no módulo {module_root}"
+            ) from error
+        combined_stdout.extend(completed.stdout)
+        combined_stderr.extend(completed.stderr)
+        if (len(combined_stdout) > MAX_GIT_OUTPUT_BYTES or
+                len(combined_stderr) > MAX_GIT_OUTPUT_BYTES):
+            raise SnapshotError("compile closure excedeu limite de saída")
+        if completed.returncode != 0:
+            return (completed.returncode, bytes(combined_stdout),
+                    bytes(combined_stderr))
+    return 0, bytes(combined_stdout), bytes(combined_stderr)
+
+
+def _run_bounded(
+    root_argument: pathlib.Path, index_argument: str | None,
+    parallelism: int | None = None,
+    runtime_root_argument: pathlib.Path = INSTALL_ROOT,
+) -> int:
+    started = time.monotonic()
+    root = _canonical_root(root_argument)
+    runtime_root = runtime_root_argument.resolve(strict=True)
+    if not runtime_root.is_dir() or runtime_root.is_symlink():
+        raise SnapshotError(
+            f"runtime root ausente, não diretório ou symlink: {runtime_root}")
+    checker_path = runtime_root / CHECKER_REL
+    gofmt_bin = _pinned_toolchain_root(runtime_root) / "bin" / "gofmt"
+    index_path = _canonical_index_path(root, index_argument)
+    with _locked_workspace(root) as workspace:
+        private_index = workspace / "snapshot.index"
+        index_binding = _copy_index(index_path, private_index)
+        # A PROVA DE QUE O ÍNDICE REAL NÃO MUDOU É A ÁRVORE STAGED, não o arquivo.
+        # Medido em 2026-09-01: com subagentes rodando `git status`/`git diff` em
+        # paralelo, este gate reprovou o MESMO commit três vezes com "arquivo mudou
+        # durante compilação: .git/index" — e nada staged tinha mudado. `git status`
+        # reescreve .git/index para atualizar o stat cache (inode, mtime e alguns
+        # bytes mudam) sem tocar no que está staged. Comparar o arquivo é comparar
+        # o cache; comparar a árvore (`git write-tree`) é comparar o conteúdo que
+        # vai ser commitado, que é a única coisa que este gate precisa garantir. A
+        # cópia privada continua conferida byte a byte — ela é o que se compilou,
+        # e é DELA que sai a árvore de referência (abaixo, depois da checagem de
+        # conflito): assim não existe janela entre copiar e capturar.
+        private_index_binding = _safe_payload(
+            private_index, max_bytes=MAX_INDEX_BYTES)
+        if (private_index_binding[0] != index_binding[0] or
+                stat.S_IMODE(private_index_binding[1][2]) != 0o600):
+            raise SnapshotError("cópia privada do índice divergiu da autoridade")
+        object_format = _git_text(
+            root, ["rev-parse", "--show-object-format"],
+            index_file=private_index)
+        if object_format not in {"sha1", "sha256"}:
+            raise SnapshotError(f"formato de objeto não suportado: {object_format}")
+        # The routing probe emits only Go sources and module manifests. Avoid
+        # materializing a Python dictionary for every tracked content object on
+        # a non-build commit; this is the hot path as the factory approaches
+        # millions of pages.
+        routing_entries = _index_entries(
+            root, private_index, object_format, (
+                ":(glob)**/*.go", ":(glob)**/go.mod", ":(glob)**/go.sum",
+                SELF_REL, CHECKER_REL,
+            ))
+        staged_tree_before = _staged_tree(root, private_index, workspace)
+        changed_index_versions = _changed_index_versions(
+            root, private_index, None, object_format)
+        routes = _build_impact_routes(routing_entries, changed_index_versions)
+        if changed_index_versions and not routes:
+            # Content/docs outside every Go package directory are not compiler
+            # inputs.  Keep this path before toolchain authentication and blob
+            # materialization so ordinary factory commits remain sub-second.
+            _authenticate_non_build_authority_delta(
+                root, private_index, object_format, routing_entries,
+                workspace)
+            _revalidate_file(
+                private_index, private_index_binding, max_bytes=MAX_INDEX_BYTES)
+            _revalidate_staged_tree(root, index_path, workspace, staged_tree_before)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            print(
+                "go-index-compile-closure: SKIP "
+                f"reason=no_staged_build_impact changed_paths="
+                f"{len(changed_index_versions)} elapsed_ms={elapsed_ms} "
+                f"workspace={workspace}")
+            return 0
+        if not changed_index_versions:
+            # A direct clean invocation is an explicit CI/authentication probe,
+            # unlike the hook (which only runs for a staged delta).
+            routes = {".": {
+                "package_dirs": set(),
+                "changed_paths": set(),
+                "force_full": True,
+                "direct_safe": False,
+            }}
+        all_entries = _index_entries(root, private_index, object_format)
+        authenticated_changes = _changed_index_versions(
+            root, private_index, all_entries, object_format)
+        if authenticated_changes != changed_index_versions:
+            raise SnapshotError(
+                "inventário staged de roteamento divergiu do índice completo")
+        selected = _selected_entries(all_entries)
+        changed_go_paths = _changed_go_paths(
+            root, private_index, all_entries)
+        changed_go_versions = _changed_go_versions(
+            root, private_index, all_entries, object_format)
+        expected_changed_go = {
+            path for path in changed_index_versions if path.endswith(".go")}
+        if set(changed_go_versions) != expected_changed_go:
+            raise SnapshotError(
+                "inventários staged Go por nome e OID divergiram")
+        (runtime_bindings, runtime_directory_bindings,
+         runtime_system_binaries) = _authenticate_runtime(
+            all_entries, object_format, runtime_root)
+        sizes = _blob_sizes(
+            root, (oid for _, oid in selected.values()), private_index)
+        materialized_bytes = sum(
+            sizes[oid] for _, oid in selected.values())
+        if materialized_bytes > MAX_SELECTED_BYTES:
+            raise SnapshotError("snapshot Go excedeu limite materializado")
+        blobs: dict[str, bytes] = {}
+        for group in _blob_groups((oid for _, oid in selected.values()), sizes):
+            _require_budget()
+            blobs.update(_read_blob_group(
+                root, group, sizes, private_index, object_format))
+        checker_payload = blobs[selected[CHECKER_REL][1]]
+        _validate_staged_checker_contract(checker_payload)
+        old_oids = {
+            old_oid for _, old_oid, _ in changed_go_versions.values()
+            if old_oid is not None
+        }
+        old_sizes = _blob_sizes(root, old_oids, private_index)
+        old_blobs: dict[str, bytes] = {}
+        for group in _blob_groups(old_oids, old_sizes):
+            _require_budget()
+            old_blobs.update(_read_blob_group(
+                root, group, old_sizes, private_index, object_format))
+        snapshot = workspace / "root"
+        snapshot.mkdir(mode=0o700)
+        _materialize(snapshot, selected, blobs)
+        module_roots = _candidate_module_roots(all_entries)
+        local_replace_dependencies = _local_replace_dependencies(
+            snapshot, workspace, runtime_root, module_roots)
+        _expand_routes_for_local_replaces(
+            routes, local_replace_dependencies)
+        _check_staged_gofmt(snapshot, changed_go_paths, gofmt_bin)
+        builds: list[tuple[str, list[str]]] = []
+        surface_reasons: list[str] = []
+        closure_modes: list[str] = []
+        affected_package_count = 0
+        for module_root, raw_route in sorted(routes.items()):
+            raw_direct_safe = raw_route["direct_safe"]
+            raw_force_full = raw_route["force_full"]
+            raw_changed_paths = raw_route["changed_paths"]
+            raw_package_dirs = raw_route["package_dirs"]
+            assert isinstance(raw_direct_safe, bool)
+            assert isinstance(raw_force_full, bool)
+            assert isinstance(raw_changed_paths, set)
+            assert isinstance(raw_package_dirs, set)
+            module_snapshot = (
+                snapshot if module_root == "." else
+                snapshot.joinpath(*pathlib.PurePosixPath(module_root).parts)
+            )
+            relative_package_dirs = sorted({
+                _relative_to_module(directory, module_root)
+                for directory in raw_package_dirs
+            })
+            module_versions = {
+                path: changed_go_versions[path]
+                for path in raw_changed_paths
+                if path in changed_go_versions
+            }
+            direct_packages: list[str] | None = None
+            surface_reason = "module_or_non_go_change"
+            if (raw_direct_safe and not raw_force_full and
+                    raw_changed_paths and
+                    len(module_versions) == len(raw_changed_paths)):
+                direct_packages, surface_reason = (
+                    _direct_packages_if_surface_stable(
+                        snapshot, workspace, runtime_root, module_versions,
+                        old_blobs, module_root))
+            affected_packages = _affected_packages(
+                module_snapshot, workspace, runtime_root,
+                relative_package_dirs, raw_force_full, direct_packages)
+            builds.append((module_root, affected_packages))
+            affected_package_count += len(affected_packages)
+            closure_modes.append(
+                "direct" if direct_packages is not None else "reverse")
+            surface_reasons.append(
+                surface_reason if len(routes) == 1 else
+                f"{module_root}:{surface_reason}")
+        closure_mode = (
+            closure_modes[0] if len(set(closure_modes)) == 1 else "mixed")
+        surface_reason = ",".join(surface_reasons)
+        _revalidate_file(
+            private_index, private_index_binding, max_bytes=MAX_INDEX_BYTES)
+        returncode, stdout, stderr = _compile_snapshot(
+            snapshot, workspace, checker_payload, parallelism, checker_path,
+            builds)
+        _revalidate_file(
+            private_index, private_index_binding, max_bytes=MAX_INDEX_BYTES)
+        _revalidate_staged_tree(root, index_path, workspace, staged_tree_before)
+        for path, binding in runtime_bindings.items():
+            _revalidate_file(
+                path, binding, max_bytes=MAX_RUNTIME_BYTES,
+                allow_multilink=path in runtime_system_binaries)
+        for path, identity in runtime_directory_bindings.items():
+            _revalidate_runtime_directory(path, identity)
+    if stdout:
+        sys.stdout.buffer.write(stdout)
+    if stderr:
+        sys.stderr.buffer.write(stderr)
+    if returncode == 0:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        bytes_per_second = int(
+            materialized_bytes / max(elapsed_ms / 1000, 0.001))
+        print(
+            "go-index-compile-closure: PASS "
+            f"files={len(selected)} bytes={materialized_bytes} "
+            f"modules={len(builds)} "
+            f"affected_packages={affected_package_count} "
+            f"closure_mode={closure_mode} "
+            f"surface_reason={surface_reason.replace(' ', '_')[:1000]} "
+            f"elapsed_ms={elapsed_ms} bytes_per_second={bytes_per_second} "
+            f"workspace={workspace}")
+    return returncode
+
+
+# Teto do alargamento por carga. Quatro vezes o orçamento é muito e é
+# deliberado: acima disso a espera deixa de ser "a máquina está ocupada" e passa
+# a ser "alguma coisa travou", e aí falhar é a resposta certa.
+MAX_LOAD_STRETCH = 4.0
+
+
+def _load_stretch_factor() -> tuple[float, str]:
+    """Quanto o orçamento precisa esticar por causa da CARGA da máquina.
+
+    POR QUE ISTO NÃO É "CORRIGIR AUMENTANDO TIMEOUT", que a política do
+    repositório proíbe: aquela proibição vale para lentidão que é DEFEITO — 10 mil
+    páginas demorando porque o algoritmo é ruim. Aqui o trabalho tem tamanho fixo
+    (compilar a closure de um commit) e o que varia é a máquina, que é
+    compartilhada com ondas de agentes. Medido no dia em que este código nasceu:
+    com load 21 e 8 núcleos, a mesma compilação que cabe folgada em 80 s não cabe
+    — e o commit era recusado com a MESMA cara de uma quebra de compilação,
+    mandando o desenvolvedor procurar defeito onde não havia.
+
+    A verificação continua idêntica; só o relógio acompanha a máquina.
+    """
+    try:
+        with open("/proc/loadavg", encoding="ascii") as manipulador:
+            carga = float(manipulador.read().split()[0])
+        nucleos = os.cpu_count() or 1
+    except (OSError, ValueError, IndexError):
+        return 1.0, "carga indisponível"
+    por_nucleo = carga / nucleos
+    if por_nucleo <= 1.0:
+        return 1.0, f"carga {carga:.1f} em {nucleos} núcleos"
+    fator = min(por_nucleo, MAX_LOAD_STRETCH)
+    return fator, f"carga {carga:.1f} em {nucleos} núcleos ({por_nucleo:.1f}x por núcleo)"
+
+
+
+def _teto_de_subprocesso_sob_carga(base: int) -> int:
+    """Estica um teto INTERNO de subprocesso pelo mesmo fator do orçamento global.
+
+    POR QUE ESTA FUNÇÃO EXISTE, e por que ela não é "corrigir aumentando timeout".
+    _load_stretch_factor já resolvia isso para o orçamento global, com o racional
+    escrito logo acima: o trabalho tem tamanho fixo, o que varia é a máquina
+    compartilhada. Só que os TETOS INTERNOS de cada subprocesso — compilação,
+    gofmt, classificação de superfície de API — ficaram para trás como constantes
+    fixas, e o resultado foi o defeito que aquela função existe para impedir,
+    reaparecendo por outra porta.
+
+    Medido em 2026-09-05, com load 27 em 8 núcleos: o orçamento global esticou
+    corretamente, e o commit foi recusado assim mesmo, por
+    "classificação estrutural Go excedeu 15s". Commit correto, código correto,
+    mensagem indistinguível de erro estrutural de verdade — exatamente o
+    diagnóstico falso descrito acima.
+
+    A verificação continua idêntica; só o relógio acompanha a máquina. E o teto
+    global continua valendo por cima: _remaining_timeout corta pelo ACTIVE_DEADLINE,
+    então esticar um teto interno NUNCA permite gastar mais do que o orçamento
+    total concedido — quem pediu `--budget-seconds 1` continua abortando em 1 s.
+    """
+    fator, _ = _load_stretch_factor()
+    if fator <= 1.0:
+        return base
+    return int(base * fator)
+
+def run(
+    root_argument: pathlib.Path, index_argument: str | None,
+    parallelism: int | None = None, budget_seconds: int = 120,
+    runtime_root_argument: pathlib.Path = INSTALL_ROOT,
+    stretch_under_load: bool = False,
+) -> int:
+    global ACTIVE_DEADLINE
+    if budget_seconds <= 0:
+        raise SnapshotError("--budget-seconds must be a positive integer")
+    # O ALARGAMENTO VALE SÓ PARA O ORÇAMENTO PADRÃO, nunca para um pedido
+    # explícito. Quem passa --budget-seconds está declarando um limite de
+    # propósito — um teste que exige aborto em 1 s, um chamador que precisa de
+    # resposta rápida — e esticar isso por conta própria transformaria a opção
+    # numa sugestão. O teste do próprio gate cobra essa distinção.
+    if stretch_under_load:
+        fator, descricao = _load_stretch_factor()
+        if fator > 1.0:
+            esticado = int(budget_seconds * fator)
+            print(
+                f"go-index-compile-closure: orçamento {budget_seconds}s -> {esticado}s "
+                f"({descricao}); a verificação é a mesma, só o relógio acompanha a máquina",
+                file=sys.stderr,
+            )
+            budget_seconds = esticado
+    previous = ACTIVE_DEADLINE
+    ACTIVE_DEADLINE = time.monotonic() + budget_seconds
+    try:
+        return _run_bounded(
+            root_argument, index_argument, parallelism,
+            runtime_root_argument)
+    finally:
+        ACTIVE_DEADLINE = previous
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=pathlib.Path, default=INSTALL_ROOT)
+    parser.add_argument("--index-file")
+    parser.add_argument("--parallelism", type=int)
+    # default=None para distinguir "não pediram nada" de "pediram 120".
+    # Só o primeiro caso pode esticar sob carga.
+    parser.add_argument("--budget-seconds", type=int, default=None)
+    parser.add_argument(
+        "--runtime-root", type=pathlib.Path, default=INSTALL_ROOT,
+        help="trusted root containing the Go toolchain and staged checker path",
+    )
+    arguments = parser.parse_args()
+    if arguments.parallelism is not None and arguments.parallelism <= 0:
+        parser.error("--parallelism must be a positive integer")
+    # Pedido EXPLÍCITO é honrado à risca (inclusive na validação); ausência de
+    # pedido cai no padrão de 120 s, que é o único que estica sob carga.
+    pediu_orcamento = arguments.budget_seconds is not None
+    if pediu_orcamento and arguments.budget_seconds <= 0:
+        parser.error("--budget-seconds must be a positive integer")
+    orcamento = arguments.budget_seconds if pediu_orcamento else 120
+    try:
+        return run(
+            arguments.root, arguments.index_file, arguments.parallelism,
+            orcamento, arguments.runtime_root,
+            stretch_under_load=not pediu_orcamento)
+    except (SnapshotError, OSError, subprocess.SubprocessError) as error:
+        print(f"go-index-compile-closure: REPROVADO: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

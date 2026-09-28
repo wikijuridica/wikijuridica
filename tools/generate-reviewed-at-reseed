@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""generate-reviewed-at-reseed — repara UMA VEZ o carimbo de revisao contaminado.
+
+POR QUE EXISTE (medido em 2026-08-28).
+
+`tools/run-daily-content` chama `cmd/publish-v2-direct -reviewed-at "$HOJE"`.
+A guarda que preservaria a data anterior lia `reviewedAtPorRota(institutional)`,
+e `loadInstitutionalPages` DESCARTA o acervo por construcao. O mapa cobria ~10
+rotas institucionais; as 10.101 do acervo recebiam a data de hoje, todo dia.
+
+Consequencia: 10.111 rotas do manifesto com `reviewed_at: 2026-08-28`, e o rodape
+de cada pagina afirmando "Revisao: Rafael Toledo em 28 de agosto de 2026" -- num
+dia em que `data/ops/page_content_revision.jsonl` registra que NENHUMA pagina
+mudou de conteudo. A data no corpo mudava os bytes, o write-if-changed
+corretamente reescrevia o arquivo, e mtime/ETag/Last-Modified das 10.331 rotas
+trocavam as 04:37. O Googlebot perdia o validador e recebia 200+corpo onde caberia
+304 -- das duas requisicoes de pagina que ele fez na origem em 27-28/08, ZERO
+trouxeram cabecalho condicional.
+
+O DEFEITO DE CODIGO JA FOI CORRIGIDO (commit 35af3602). Esta ferramenta repara o
+DADO que ficou para tras, e roda uma vez so. Depois dela, nenhum processo escreve
+data em lugar nenhum: a guarda corrigida preserva o que ja existe.
+
+POR QUE O DADO PRECISA DE REPARO, e nao so o codigo: 100% do manifesto esta
+carimbado com a data de hoje, e o historico git tambem (ontem = 08-27). Se a
+proxima publicacao apenas "preservar o que existe", ela congela a data fabricada
+para sempre.
+
+A FONTE DO REPARO E DERIVADA, NUNCA INVENTADA: `content_revised_at`, que vive na
+propria entrada de content/pages.json e e escrito por
+`tools/generate-page-content-revision` a partir do `content_sha256` -- o hash do
+conteudo. Medido: 0 divergencias entre pages.json e o ledger nas 10.107 rotas
+comuns, e o campo NAO foi contaminado pelo carimbo (o diff de campo do ledger
+entre HEAD e a worktree mostra `served_sha256` mudando em 299 rotas e
+`content_sha256` em ZERO).
+
+RESSALVA HONESTA, que fica no codigo para ninguem a perder: `reviewed_at` e
+carimbo de transacao em toda a historia git deste repo -- nao existe um valor
+"limpo" anterior a restaurar. `content_revised_at` e a melhor ancora DISPONIVEL
+(a data em que o conteudo daquela rota mudou pela ultima vez), nao a data de um
+ato de revisao profissional. O reparo troca uma data falsa por uma data derivada
+e verificavel, que e o que a doc do Google exige do lastmod: "consistently and
+verifiably accurate".
+"""
+import argparse
+import datetime
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+PAGES = RAIZ / "content" / "pages.json"
+MANIFESTO = RAIZ / "data" / "editorial" / "published_manifest.jsonl"
+LEDGER = RAIZ / "data" / "ops" / "page_content_revision.jsonl"
+BACKUP = RAIZ / ".agents" / "runtime"
+
+LAYOUT_DIA = "2026-01-02"[:10]  # AAAA-MM-DD tem 10 caracteres
+
+
+def dia(valor):
+    """Trunca instante ISO para o dia.
+
+    NAO E COSMETICO. `internal/render/dates.go` (parseISODate) so aceita
+    AAAA-MM-DD; o que nao parseia volta intacto e escapado para o HTML. Copiar
+    `2026-08-27T16:53:48Z` verbatim para `reviewed_at` faria o instante cru vazar
+    VISIVEL no rodape da pagina, ao lado da inscricao na OAB. Medido: 3 entradas
+    de content/pages.json tem instante em vez de dia (/sobre/, /fontes/,
+    /noticias/tst-20260825/). Espelha content.RevisionDay (content.go:395).
+    """
+    valor = (valor or "").strip()
+    return valor[:10] if len(valor) > 10 else valor
+
+
+def escreve_atomico(destino: pathlib.Path, conteudo: str) -> None:
+    """tmp + rename no MESMO diretorio: ou o arquivo antigo, ou o novo inteiro.
+
+    content/pages.json carrega texto redigido, pago pelo dono. Escrita
+    interrompida no meio deixaria um prefixo -- e o contrato do repo proibe
+    perder trabalho escrito.
+    """
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(destino.parent), prefix=destino.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as saida:
+            saida.write(conteudo)
+            saida.flush()
+            os.fsync(saida.fileno())
+        os.replace(tmp, destino)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def preserva(origem: pathlib.Path, carimbo: str) -> pathlib.Path:
+    BACKUP.mkdir(parents=True, exist_ok=True)
+    alvo = BACKUP / f"{origem.name}.pre-reseed-{carimbo}"
+    shutil.copy2(origem, alvo)
+    return alvo
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-carimbo", default=None,
+                    help="a data FALSA a substituir (AAAA-MM-DD). Sem isto, usa a data "
+                         "majoritaria do manifesto, que e a assinatura do carimbo em massa. "
+                         "NAO e hardcoded: se a onda rodar de novo antes do reparo, o alvo muda sozinho.")
+    ap.add_argument("--dry-run", action="store_true", help="mede e relata, sem gravar")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if not PAGES.is_file() or not MANIFESTO.is_file():
+        print("FALHA: content/pages.json ou published_manifest.jsonl ausente", file=sys.stderr)
+        return 2
+
+    paginas = json.loads(PAGES.read_text(encoding="utf-8"))
+    manifesto = [json.loads(l) for l in MANIFESTO.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    # A data-alvo sai da MEDICAO, nunca de constante. Carimbo em massa tem
+    # assinatura propria: uma data que domina o manifesto inteiro.
+    if args.data_carimbo:
+        alvo = args.data_carimbo
+    else:
+        contagem = {}
+        for registro in manifesto:
+            d = dia(registro.get("reviewed_at"))
+            if d:
+                contagem[d] = contagem.get(d, 0) + 1
+        if not contagem:
+            print("FALHA: nenhum reviewed_at no manifesto", file=sys.stderr)
+            return 2
+        alvo, quantas = max(contagem.items(), key=lambda kv: kv[1])
+        fracao = quantas / len(manifesto)
+        if fracao < 0.5:
+            print(f"NADA A FAZER: a data mais comum ({alvo}) cobre {fracao:.1%} do "
+                  f"manifesto -- abaixo de 50%. Isso nao tem assinatura de carimbo "
+                  f"em massa, e reparar seria inventar.")
+            return 0
+
+    # Fonte do reparo: content_revised_at da propria entrada.
+    fonte = {}
+    for p in paginas:
+        caminho = p.get("path")
+        derivada = dia(p.get("content_revised_at"))
+        if caminho and derivada:
+            fonte[caminho] = derivada
+    # Complemento pelo ledger, para rota que nao tenha o campo em pages.json.
+    if LEDGER.is_file():
+        for linha in LEDGER.read_text(encoding="utf-8").splitlines():
+            if not linha.strip():
+                continue
+            reg = json.loads(linha)
+            fonte.setdefault(reg["path"], dia(reg.get("revised_on")))
+
+    trocadas_pages, sem_fonte_pages = 0, []
+    novas_paginas = []
+    for p in paginas:
+        copia = dict(p)
+        if dia(copia.get("reviewed_at")) == alvo:
+            nova = fonte.get(copia.get("path"))
+            if nova:
+                copia["reviewed_at"] = nova
+                trocadas_pages += 1
+            else:
+                # Sem ancora derivada: a estreia e a melhor verdade disponivel, e
+                # ela NAO esta contaminada para estas rotas (medido).
+                estreia = dia(copia.get("publication_date"))
+                if estreia and estreia != alvo:
+                    copia["reviewed_at"] = estreia
+                    trocadas_pages += 1
+                else:
+                    sem_fonte_pages.append(copia.get("path"))
+        novas_paginas.append(copia)
+
+    trocadas_man, sem_fonte_man = 0, []
+    novo_manifesto = []
+    for registro in manifesto:
+        copia = dict(registro)
+        if dia(copia.get("reviewed_at")) == alvo:
+            nova = fonte.get(copia.get("path"))
+            if nova:
+                copia["reviewed_at"] = nova
+                trocadas_man += 1
+            else:
+                estreia = dia(copia.get("approved_at"))
+                if estreia and estreia != alvo:
+                    copia["reviewed_at"] = estreia
+                    trocadas_man += 1
+                else:
+                    sem_fonte_man.append(copia.get("path"))
+        novo_manifesto.append(copia)
+
+    relatorio = {
+        "schema_version": "reviewed_at_reseed_v1",
+        "data_carimbo_substituida": alvo,
+        "pages_json": {"trocadas": trocadas_pages, "sem_fonte": len(sem_fonte_pages),
+                       "exemplos_sem_fonte": sem_fonte_pages[:5]},
+        "manifesto": {"trocadas": trocadas_man, "sem_fonte": len(sem_fonte_man),
+                      "exemplos_sem_fonte": sem_fonte_man[:5]},
+        "dry_run": bool(args.dry_run),
+    }
+
+    if args.json:
+        print(json.dumps(relatorio, ensure_ascii=False, indent=2))
+    else:
+        print(f"data de carimbo em massa detectada: {alvo}")
+        print(f"  content/pages.json      : {trocadas_pages} trocada(s), {len(sem_fonte_pages)} sem fonte derivada")
+        print(f"  published_manifest.jsonl: {trocadas_man} trocada(s), {len(sem_fonte_man)} sem fonte derivada")
+        for caminho in sem_fonte_man[:5]:
+            print(f"    sem fonte: {caminho}")
+
+    if args.dry_run:
+        print("\n--dry-run: nada gravado")
+        return 0
+
+    carimbo = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    b1 = preserva(PAGES, carimbo)
+    b2 = preserva(MANIFESTO, carimbo)
+    escreve_atomico(PAGES, json.dumps(novas_paginas, ensure_ascii=False, indent=2) + "\n")
+    escreve_atomico(MANIFESTO,
+                    "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in novo_manifesto))
+    print(f"\ngravado. anterior preservado em:\n  {b1}\n  {b2}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

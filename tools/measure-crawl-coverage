@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""measure-crawl-coverage — indicador PRINCIPAL do projeto: quanto do acervo
+cada crawler já pediu, não quantas requisições ele fez num dia.
+
+POR QUE ESTE É O NÚMERO QUE IMPORTA (docs/plans/2026-08-11-recuperacao-crawl.md,
+C1b): "requests/dia" mede atividade, não descoberta. Medido em 2026-08-11: o
+Googlebot cobriu 7.156 de 9.835 URLs do sitemap (72,8%) e estava ACELERANDO a
+descoberta (+3.962 URLs novas no dia anterior) quando o volume diário caiu — um
+crawler que "terminou o ciclo" não deixaria 27% do acervo por ver. As 2.679
+URLs nunca pedidas são o que este produtor lista, para que a recuperação (IndexNow
+em lote, sinal de frescor) tenha alvo exato em vez de "publicar e esperar".
+
+COMO MEDE: GraphQL httpRequestsAdaptiveGroups, agrupado por clientRequestPath E
+por `verifiedBotCategory`, filtrado por userAgent_like — 1 dia por consulta (o
+plano Free recusa janela maior: "cannot request a time range wider than 1d"). O
+dataset tem retenção de 8 dias; por isso este produtor GUARDA ESTADO
+(crawl_coverage_state.json) com o conjunto de paths já vistos por crawler —
+cobertura ACUMULADA sobrevive à rotação do dataset, que um recálculo do zero a
+cada execução não sobreviveria.
+
+★ POR QUE A IDENTIDADE PASSOU A SER AUTENTICADA (correção de 2026-08-12, v2)
+
+Contar crawler pela STRING do User-Agent soma as sondas dos nossos próprios
+agentes de auditoria. O cabeçalho `X-Bot-Simulation`, que marca simulação, só é
+visível ao nginx — a borda da Cloudflare nunca o vê, e o GraphQL não expõe
+cabeçalho arbitrário. Números do mesmo dia, medidos lado a lado:
+
+  - no access log local, 2.053 de 2.061 linhas "Googlebot" eram `bot_sim=true`
+    — inflação de 258x;
+  - na série diária da borda POR UA: 08-06=194, 08-07=150, 08-11=1040,
+    08-12=~50; por BOT VERIFICADO: 30, 102, 1038 e 9;
+  - primeira sondagem desta correção (janela de 20 h, UA `%Googlebot/2.1%`):
+    110 grupos, dos quais 99 SEM verificação e 11 verificados.
+
+O 08-11 é a prova de que a dimensão não está engolindo tráfego real: 1.038
+verificados contra 1.040 por UA — quando o rastreio é do crawler de verdade, a
+verificação apanha quase tudo. A diferença brutal aparece nos dias em que a
+"série" era, na maior parte, a nossa própria sonda.
+
+`verifiedBotCategory` é a verificação da PRÓPRIA Cloudflare (rDNS + faixa de IP
+publicada pelo operador) e FUNCIONA no plano Free — o comentário anterior desta
+ferramenta, que dizia o contrário, estava errado e é o que sustentava o campo
+`user_agent_authenticated: false`. Linha com categoria vazia significa que a
+Cloudflare NÃO autenticou aquele cliente: ou é UA forjado, ou é sonda nossa. Nos
+dois casos não é descoberta de acervo pelo crawler, então não entra na
+cobertura — e o volume descartado é GRAVADO, porque descarte silencioso é a
+origem da próxima medição enganosa.
+
+O QUE O NÚMERO NOVO É, E O QUE ELE NÃO É: é um PISO, duas vezes. Exclui
+requisição real que a Cloudflare não conseguiu autenticar, e o dataset é
+AMOSTRADO (sampleInterval chega a ~4,5 em dia pesado, então path pedido uma
+única vez pode sumir da amostra). Subestimar é melhor que inventar precisão.
+
+TETO DA API: 10.000 grupos por consulta. Este produtor AVISA a partir de 9.500
+— acima disso o número SUBESTIMA a cobertura real do dia (a cauda foi cortada).
+No nosso acervo (9.835 URLs) isso é improvável para um único crawler, mas a
+verificação fica de qualquer forma, porque o comportamento do crawler não é
+garantido.
+
+CREDENCIAL: `.env.local`, resolvida por tools/cloudflare_auth.py (escopo
+"leitura"): CLOUDFLARE_ZONE_TOKEN (Bearer de escopo de zona) quando presente;
+senão CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN — uma Global API Key: os headers
+são X-Auth-Email/X-Auth-Key, NUNCA Authorization Bearer, que devolve "Invalid
+API Token". Nunca ecoada em log ou saída.
+
+Uso:
+    tools/measure-crawl-coverage
+    tools/measure-crawl-coverage --crawler googlebot
+    tools/measure-crawl-coverage --dias 8
+    tools/measure-crawl-coverage --json
+"""
+import argparse
+import datetime
+import ipaddress
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from urllib.parse import urlsplit
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+import cloudflare_auth  # noqa: E402  (idem)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ENV = os.path.join(ROOT, ".env.local")
+SITE = os.path.join(ROOT, "content/site.json")
+SITEMAPS_DIR = os.path.join(ROOT, "public/sitemaps")
+STATE_PATH = os.path.join(ROOT, "data/ops/crawl_coverage_state.json")
+SERIE = os.path.join(ROOT, "data/ops/crawl_coverage_daily.jsonl")
+NUNCA_PEDIDAS_PATH = os.path.join(ROOT, "data/ops/crawl_coverage_never_requested.json")
+API = "https://api.cloudflare.com/client/v4"
+# v2 (2026-08-12): a cobertura passou a exigir `verifiedBotCategory` da
+# Cloudflare. O bump existe para que um leitor da série — ou um verificador de
+# honestidade — distinga linha ANTES da correção (contagem por string de
+# User-Agent, que somava sonda de auditoria) de linha DEPOIS. Sem o bump não há
+# como saber se o produtor corrigido já rodou de fato; só que as linhas antigas
+# continuam do jeito que estavam.
+STATE_SCHEMA = "crawl_coverage_state_v2"
+STATE_SCHEMA_LEGADO = "crawl_coverage_state_v1"
+# v3 (2026-09-02): segunda lane de verificação, POR IP oficial, para o
+# crawler que a Cloudflare não autentica por `verifiedBotCategory` mas publica
+# a própria faixa — medido no PerplexityBot: ~1.200 req/dia à borda, 100% dos
+# IPs nos 8 prefixos de data/ops/bot_ip_ranges/perplexitybot.json, categoria
+# sempre vazia. Até aqui essas requisições caíam inteiras em
+# `requisicoes_descartadas`/`paths_ua_only` porque o filtro
+# `if not categoria: continue` as descartava — a Perplexity nunca contava para
+# cobertura, por construção. `identity_verification` por linha passa a poder
+# ser "ip_range_at_edge" (só a faixa contribuiu) ou "cloudflare_and_ip_range"
+# (as duas), ao lado do "cloudflare_verified_bot_category" que já existia. O
+# bump existe porque `cumulative_sitemap_coverage` cresce para o crawler que
+# ganha a segunda lane — comparar v2 com v3 pelo número cru compararia
+# populações diferentes sem dizer.
+SERIE_SCHEMA = "crawl_coverage_daily_v3"
+ZONE_TAG = "b2e1366a94c5dcac97f2fc264f18928f"
+
+# Rótulo do método de identidade gravado em cada linha nova. É o vocabulário
+# que `check-bot-telemetry-honesty` reconhece como "produtor corrigido rodou".
+IDENTIDADE = "cloudflare_verified_bot_category"
+IDENTIDADE_IP_RANGE = "ip_range_at_edge"
+IDENTIDADE_CLOUDFLARE_E_IP_RANGE = "cloudflare_and_ip_range"
+# Rótulo do que ficou para trás. O acumulado por UA NÃO é apagado (o ledger e o
+# estado são registro de trabalho, não rascunho) — ele é CONGELADO e marcado,
+# para servir de contraste ao número honesto.
+IDENTIDADE_LEGADA = "user_agent_unverified"
+
+# TETO DE ENDEREÇOS EXPANDIDOS POR CRAWLER, antes de montar `clientIP_in`. Sem
+# ele, expandir a faixa oficial do Googlebot (317 prefixos, muitos /64 IPv6)
+# tentaria iterar ~2,7×10^21 endereços — trava a ferramenta, não a API. Medido
+# em 2026-09-02: só o PerplexityBot (18 endereços, 8 prefixos majoritariamente
+# /32) fica dentro do teto; bingbot (4.736), gptbot (3.472), oai-searchbot
+# (2.496), claudebot (1.094) e chatgpt-user (36.016) ficam de fora e são
+# PULADOS — nomeados no aviso, nunca silenciosos.
+TETO_ENDERECOS_FAIXA_IP = 1024
+
+# Retenção medida empiricamente contra a API (mesmo teto documentado em
+# generate-bot-agents-daily): pedir dia mais velho que isso devolve
+# `code: quota`, "cannot request data older than 1w1d".
+RETENCAO_DIAS = 8
+
+# Teto por consulta — documentado pela própria Cloudflare para este dataset.
+LIMITE_GRUPOS = 10000
+# A partir daqui o AVISO dispara: a cauda pode ter sido cortada e o número do
+# dia SUBESTIMA a cobertura real.
+AVISO_GRUPOS = 9500
+
+# crawler -> fragmento LIKE do User-Agent. Mais específico primeiro
+# (Googlebot/2.1 exclui GoogleOther e Googlebot-Image, que têm token próprio).
+CRAWLERS = {
+    "googlebot": "%Googlebot/2.1%",
+    "googleother": "%GoogleOther%",
+    "bingbot": "%bingbot%",
+    "gptbot": "%GPTBot%",
+    "claudebot": "%ClaudeBot%",
+    "oai-searchbot": "%OAI-SearchBot%",
+    "chatgpt-user": "%ChatGPT-User%",
+    "perplexitybot": "%PerplexityBot%",
+    "amazonbot": "%Amazonbot%",
+    "yandexbot": "%YandexBot%",
+}
+
+# `verifiedBotCategory` entra como DIMENSÃO, não como filtro de categoria: cada
+# crawler cai numa categoria diferente ("Search Engine Crawler" para Googlebot e
+# Bingbot, "AI Crawler" para GPTBot/Amazonbot, "AI Assistant" para ChatGPT-User),
+# e filtrar por uma delas apagaria os outros sem aviso. Pedindo a dimensão, a
+# ferramenta vê a categoria que veio, separa o verificado do não-verificado e
+# REGISTRA os dois — que é o mesmo padrão de tools/check-crawler-error-budget.
+CONSULTA = """
+query($zone: String!, $since: Time!, $until: Time!, $limite: Int!, $ua: String!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $limite,
+        filter: {datetime_geq: $since, datetime_leq: $until, userAgent_like: $ua},
+        orderBy: [count_DESC]) {
+      count
+      avg { sampleInterval }
+      dimensions { clientRequestPath verifiedBotCategory }
+    }
+  } }
+}
+"""
+
+# SEGUNDA LANE (v3): mesma forma, `clientIP_in` no lugar de depender de
+# `verifiedBotCategory` — toda linha que este filtro devolve JÁ está
+# verificada, porque só endereços da faixa oficial do operador entram no
+# `$ips`. `userAgent_like` continua na consulta como reforço (não conta
+# tráfego de outro cliente que por acaso saia do mesmo IP), mas quem prova a
+# identidade aqui é o IP, não o User-Agent. Existência confirmada por
+# introspecção GraphQL ao vivo em 2026-09-02 (`clientIP_in` no filtro de
+# ZoneHttpRequestsAdaptiveGroupsFilter_InputObject).
+CONSULTA_IP_FAIXA = """
+query($zone: String!, $since: Time!, $until: Time!, $limite: Int!, $ua: String!, $ips: [String!]) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $limite,
+        filter: {datetime_geq: $since, datetime_leq: $until, userAgent_like: $ua, clientIP_in: $ips},
+        orderBy: [count_DESC]) {
+      count
+      avg { sampleInterval }
+      dimensions { clientRequestPath }
+    }
+  } }
+}
+"""
+
+
+def ler_env():
+    return cloudflare_auth.ambiente(ENV)
+
+
+def cabecalhos(env):
+    """Cabecalhos de leitura -- CLOUDFLARE_ZONE_TOKEN (menor privilegio) com
+    fallback para CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN (Global API Key).
+    Delegado a tools/cloudflare_auth.py desde 2026-09-03."""
+    cab, _ = cloudflare_auth.cabecalhos("leitura", env=env)
+    return cab
+
+
+def graphql(headers, variaveis, consulta=CONSULTA):
+    corpo = json.dumps({"query": consulta, "variables": variaveis}).encode()
+    pedido = urllib.request.Request(API + "/graphql", data=corpo, headers=headers)
+    try:
+        with urllib.request.urlopen(pedido, timeout=90) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+    except urllib.error.HTTPError as erro:
+        return None, "HTTP %s" % erro.code
+    except Exception as erro:
+        return None, str(erro)[:160]
+    if dados.get("errors"):
+        return None, "; ".join(e.get("message", "?") for e in dados["errors"][:2])
+    zonas = (dados.get("data") or {}).get("viewer", {}).get("zones") or []
+    return (zonas[0] if zonas else {}), ""
+
+
+def ler_sitemap_paths():
+    """Todas as <loc> em public/sitemaps/*.xml, normalizadas para PATH (sem
+    esquema/domínio/query) — é isso que casa com clientRequestPath do GraphQL."""
+    paths = set()
+    if not os.path.isdir(SITEMAPS_DIR):
+        return paths
+    for nome in sorted(os.listdir(SITEMAPS_DIR)):
+        if not nome.endswith(".xml"):
+            continue
+        caminho = os.path.join(SITEMAPS_DIR, nome)
+        try:
+            arvore = ET.parse(caminho)
+        except ET.ParseError:
+            continue
+        for elemento in arvore.getroot().iter():
+            if elemento.tag.rsplit("}", 1)[-1] != "loc":
+                continue
+            bruto = (elemento.text or "").strip()
+            if not bruto:
+                continue
+            partido = urlsplit(bruto)
+            path = partido.path or "/"
+            paths.add(path)
+    return paths
+
+
+def carregar_estado():
+    """Estado acumulado, com o namespace legado CONGELADO sob ressalva.
+
+    O v1 tinha um único namespace (`crawlers`) alimentado por string de
+    User-Agent — o mesmo defeito que esta correção ataca. Ele NÃO é apagado:
+    vira registro histórico marcado (`identity: user_agent_unverified`,
+    `frozen_at`) e para de crescer. O acumulado honesto passa a viver em
+    `crawlers_verified`, que só ingere path de requisição autenticada pela
+    Cloudflare. Se os dois continuassem crescendo, a ressalva deixaria de ser
+    verdade na primeira execução seguinte.
+    """
+    vazio = {"schema_version": STATE_SCHEMA, "crawlers": {}, "crawlers_verified": {}}
+    if not os.path.isfile(STATE_PATH):
+        return vazio
+    try:
+        with open(STATE_PATH, encoding="utf-8") as handle:
+            estado = json.load(handle)
+    except Exception:
+        return vazio
+    estado.setdefault("crawlers", {})
+    estado.setdefault("crawlers_verified", {})
+    if estado.get("schema_version") != STATE_SCHEMA:
+        congelado = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for registro in estado["crawlers"].values():
+            registro.setdefault("identity", IDENTIDADE_LEGADA)
+            registro.setdefault("frozen_at", congelado)
+            registro.setdefault("caveat", (
+                "SOB RESSALVA: acumulado por string de User-Agent, sem verificacao "
+                "da Cloudflare — soma sonda propria de auditoria (bot_sim), que a "
+                "borda nao distingue. Congelado em %s; o acumulado valido esta em "
+                "crawlers_verified." % congelado))
+        estado["schema_version"] = STATE_SCHEMA
+        estado["legacy_frozen_at"] = congelado
+    return estado
+
+
+def salvar_estado(estado):
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(estado, handle, ensure_ascii=False, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, STATE_PATH)
+
+
+def coletar_dia(headers, dia, ua_like):
+    """Um dia UTC de um crawler, já separado entre VERIFICADO e descartado.
+
+    Devolve (coleta, truncado, erro), onde `coleta` traz:
+      paths            — paths pedidos por cliente que a Cloudflare autenticou;
+      paths_ua_only    — paths que SÓ apareceram sem verificação (é o que a
+                         medição antiga contava como cobertura);
+      requisicoes_descartadas / grupos_descartados — o volume que ficou de fora,
+                         nomeado em vez de sumir em silêncio;
+      categorias       — quais categorias de bot verificado apareceram, para que
+                         uma categoria inesperada seja vista e não presumida.
+    """
+    ini = datetime.datetime.combine(dia, datetime.time.min, datetime.timezone.utc)
+    fim = ini + datetime.timedelta(hours=23, minutes=59, seconds=59)
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    # O GRAMPO CONTINUA, e agora ele DEIXA RASTRO.
+    #
+    # Grampear `fim = agora` esta certo: nao da para consultar o futuro. O que
+    # estava errado era o silencio. O timer roda 04:10 UTC e as chegadas do
+    # Googlebot comecam depois; a linha do dia corrente cobria ~4h10 e era lida
+    # como o dia inteiro.
+    #
+    # O CUSTO MEDIDO, em 2026-08-28: para a mesma data, tres numeros circulavam --
+    # 0 (esta serie), 13 (log de origem) e 31 (borda, dia UTC fechado). Nenhum
+    # errado: mediam populacoes diferentes. Mas quem lia o 0 concluia que o
+    # Googlebot nao veio, e o `no_groups_returned: true` reforcava a leitura.
+    #
+    # A linha passa a declarar a propria janela. Consumidor que precisa de dia
+    # fechado (comparacao entre datas, deteccao de estagnacao) le
+    # `window_complete` e ignora o parcial, em vez de compara-lo com dias
+    # inteiros.
+    janela_completa = fim <= agora and (ini + datetime.timedelta(hours=23, minutes=59, seconds=59)) <= agora
+    if fim > agora:
+        fim = agora
+        janela_completa = False
+    zona_dados, erro = graphql(headers, {
+        "zone": ZONE_TAG,
+        "since": ini.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "until": fim.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limite": LIMITE_GRUPOS,
+        "ua": ua_like,
+    })
+    if erro:
+        return None, False, erro, janela_completa
+    grupos = zona_dados.get("httpRequestsAdaptiveGroups", [])
+    truncado = len(grupos) >= AVISO_GRUPOS
+    coleta = {
+        "paths": set(),
+        "paths_ua_only": set(),
+        "requisicoes_verificadas": 0,
+        "requisicoes_estimadas": 0,
+        "requisicoes_descartadas": 0,
+        "grupos_descartados": 0,
+        "categorias": {},
+    }
+    sem_verificacao = set()
+    for grupo in grupos:
+        dimensoes = grupo.get("dimensions") or {}
+        path = (dimensoes.get("clientRequestPath") or "").split("?", 1)[0]
+        if not path:
+            continue
+        categoria = (dimensoes.get("verifiedBotCategory") or "").strip()
+        quantidade = grupo.get("count", 0)
+        # AMOSTRA E ESTIMATIVA SAO NUMEROS DIFERENTES, e o repo ja pagou por
+        # confundi-los. `httpRequestsAdaptiveGroups` e AMOSTRADO: `count` e
+        # quantas linhas a amostra viu, e `sampleInterval` e o fator para chegar
+        # ao volume real. `tools/generate-bot-agents-daily` sempre pediu os dois;
+        # esta ferramenta pedia so o `count`, entao as duas series do mesmo
+        # repositorio contavam em unidades diferentes -- e alguem ia compara-las.
+        # Medido em 2026-08-28: claudebot em 2026-08-07 aparecia como 9.667 aqui
+        # e 43.065 la, mesma chave, fator 4,45.
+        intervalo = ((grupo.get("avg") or {}).get("sampleInterval") or 1) or 1
+        estimada = int(round(quantidade * intervalo))
+        if not categoria:
+            coleta["requisicoes_descartadas"] += quantidade
+            coleta["grupos_descartados"] += 1
+            sem_verificacao.add(path)
+            continue
+        coleta["paths"].add(path)
+        coleta["requisicoes_verificadas"] += quantidade
+        coleta["requisicoes_estimadas"] += estimada
+        coleta["categorias"][categoria] = coleta["categorias"].get(categoria, 0) + quantidade
+    # Um path pode ter sido pedido pelo crawler de verdade E pela sonda no mesmo
+    # dia; só é "somente UA" o que nunca apareceu verificado.
+    coleta["paths_ua_only"] = sem_verificacao - coleta["paths"]
+    return coleta, truncado, "", janela_completa
+
+
+def enderecos_da_faixa(chave, faixas):
+    """Lista de IPs individuais (string) da faixa oficial do agente, ou
+    (None, total_enderecos) se ausente ou acima de TETO_ENDERECOS_FAIXA_IP.
+
+    NUNCA itera uma rede grande sem medir primeiro: `num_addresses` é O(1) por
+    prefixo (aritmética, não iteração), então o teto é checado ANTES de
+    qualquer `for ip in rede`. Sem isso, a faixa do Googlebot (317 prefixos,
+    boa parte /64 IPv6) tentaria montar ~2,7×10^21 strings.
+    """
+    redes = faixas.get(chave) or []
+    if not redes:
+        return None, 0
+    total = sum(rede.num_addresses for rede in redes)
+    if total == 0 or total > TETO_ENDERECOS_FAIXA_IP:
+        return None, total
+    enderecos = []
+    for rede in redes:
+        enderecos.extend(str(ip) for ip in rede)
+    return enderecos, total
+
+
+def coletar_dia_ip_range(headers, dia, ua_like, ips):
+    """A SEGUNDA LANE de um dia UTC: paths pedidos por IP dentro da faixa
+    oficial do operador — verificado por CONSTRUÇÃO, nunca por
+    `verifiedBotCategory`. Mesma janela e mesmo grampo de `coletar_dia` (ver o
+    comentário lá para o racional de `window_complete`).
+
+    Devolve (paths, requisicoes, requisicoes_estimadas, grupos, truncado,
+    erro). Erro aqui não derruba a coleta principal: quem chama decide.
+    """
+    ini = datetime.datetime.combine(dia, datetime.time.min, datetime.timezone.utc)
+    fim = ini + datetime.timedelta(hours=23, minutes=59, seconds=59)
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    if fim > agora:
+        fim = agora
+    zona_dados, erro = graphql(headers, {
+        "zone": ZONE_TAG,
+        "since": ini.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "until": fim.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limite": LIMITE_GRUPOS,
+        "ua": ua_like,
+        "ips": ips,
+    }, consulta=CONSULTA_IP_FAIXA)
+    if erro:
+        return set(), 0, 0, 0, False, erro
+    grupos = zona_dados.get("httpRequestsAdaptiveGroups", [])
+    truncado = len(grupos) >= AVISO_GRUPOS
+    paths = set()
+    requisicoes = 0
+    requisicoes_estimadas = 0
+    for grupo in grupos:
+        dimensoes = grupo.get("dimensions") or {}
+        path = (dimensoes.get("clientRequestPath") or "").split("?", 1)[0]
+        if not path:
+            continue
+        quantidade = grupo.get("count", 0)
+        intervalo = ((grupo.get("avg") or {}).get("sampleInterval") or 1) or 1
+        paths.add(path)
+        requisicoes += quantidade
+        requisicoes_estimadas += int(round(quantidade * intervalo))
+    return paths, requisicoes, requisicoes_estimadas, len(grupos), truncado, ""
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--crawler", action="append",
+                        help="restringe a um ou mais crawlers (repita a flag); default: todos")
+    parser.add_argument("--dias", type=int, default=RETENCAO_DIAS,
+                        help="janelas retroativas de 24h a (re)consultar nesta execucao")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    crawlers_alvo = args.crawler or sorted(CRAWLERS)
+    desconhecidos = [c for c in crawlers_alvo if c not in CRAWLERS]
+    if desconhecidos:
+        print("measure-crawl-coverage: crawler(s) desconhecido(s): %s (disponiveis: %s)"
+              % (", ".join(desconhecidos), ", ".join(sorted(CRAWLERS))), file=sys.stderr)
+        return 2
+    dias = min(args.dias, RETENCAO_DIAS)
+    if args.dias > RETENCAO_DIAS:
+        print("measure-crawl-coverage: --dias %d acima da retencao de %d dias do dataset; usando %d"
+              % (args.dias, RETENCAO_DIAS, dias), file=sys.stderr)
+
+    env = ler_env()
+    headers = cabecalhos(env)
+    if not headers:
+        print("measure-crawl-coverage: sem credencial Cloudflare em .env.local "
+              "(CLOUDFLARE_ZONE_TOKEN ou CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN)", file=sys.stderr)
+        return 2
+
+    sitemap_paths = ler_sitemap_paths()
+    if not sitemap_paths:
+        print("measure-crawl-coverage: nenhuma <loc> lida em %s"
+              % os.path.relpath(SITEMAPS_DIR, ROOT), file=sys.stderr)
+        return 2
+    total_sitemap = len(sitemap_paths)
+
+    estado = carregar_estado()
+    hoje = datetime.datetime.now(datetime.timezone.utc).date()
+
+    registros_serie = []
+    nunca_pedidas = {}
+    falhas = []
+    avisos_truncamento = []
+    # Segunda lane (v3): faixa de IP oficial, lida direto de
+    # data/ops/bot_ip_ranges/ — a mesma fonte e a mesma função
+    # (botagents.ler_faixas/em_faixa) que tools/check-crawler-error-budget usa.
+    # `faixas_puladas_por_teto` nomeia o crawler cuja faixa excede
+    # TETO_ENDERECOS_FAIXA_IP: descarte NUNCA silencioso.
+    faixas = botagents.ler_faixas(ROOT)
+    faixas_puladas_por_teto = {}
+    falhas_ip_range = []
+
+    print("=== COBERTURA DE CRAWL (bot VERIFICADO pela Cloudflare) — %d URLs no sitemap ==="
+          % total_sitemap)
+    for nome_crawler in crawlers_alvo:
+        ua_like = CRAWLERS[nome_crawler]
+        # Namespace LEGADO: só é lido, para contraste. Nunca mais cresce.
+        legado = estado["crawlers"].get(nome_crawler, {})
+        legado_vistos = set(legado.get("paths_seen", []))
+
+        registro_crawler = estado["crawlers_verified"].setdefault(nome_crawler, {
+            "paths_first_seen": {}, "days_ingested": [], "last_updated": "",
+            "identity": IDENTIDADE, "verified_bot_categories": {},
+        })
+
+        ips_faixa, total_enderecos_faixa = enderecos_da_faixa(nome_crawler, faixas)
+        if ips_faixa is None and total_enderecos_faixa > TETO_ENDERECOS_FAIXA_IP:
+            faixas_puladas_por_teto[nome_crawler] = total_enderecos_faixa
+        total_cf_verificadas_execucao = 0
+        total_ip_verificadas_execucao = 0
+        # path -> PRIMEIRO dia em que o crawler VERIFICADO o pediu.
+        #
+        # Por que um mapa, e não o conjunto que o v1 guardava: com conjunto, a
+        # cobertura acumulada de um dia só era calculável na ORDEM em que os
+        # dias fossem processados — e o v1 processava do mais novo para o mais
+        # velho, o que fazia a "acumulada" DIMINUIR com o tempo na série (medido
+        # na primeira execução desta correção: 7.147 em 08-05 e 4 em 08-12, a
+        # leitura invertida). Pior, a série do timer reprocessa a mesma janela
+        # de 8 dias a cada execução: com conjunto, a segunda passada acharia
+        # tudo "já visto" e gravaria zero novidade em todo dia. Com o primeiro
+        # dia de cada path guardado, acumulada e novidade são funções da DATA,
+        # idempotentes sob reprocessamento.
+        #
+        # LIMITE HONESTO: o dataset retém 8 dias, então "primeiro dia" é o
+        # primeiro dia DENTRO DA JANELA — path rastreado há três semanas e
+        # revisitado ontem aparece como novidade de ontem.
+        primeiro_dia = dict(registro_crawler.get("paths_first_seen", {}))
+        dias_ja_lidos = set(registro_crawler.get("days_ingested", []))
+        categorias_acumuladas = dict(registro_crawler.get("verified_bot_categories", {}))
+
+        dias_processados_agora = []
+        coletas = {}
+        # Ordem CRESCENTE de data: é a ordem em que a cobertura acumula.
+        for recuo in range(dias - 1, -1, -1):
+            dia = hoje - datetime.timedelta(days=recuo)
+            coleta, truncado, erro, janela_completa = coletar_dia(headers, dia, ua_like)
+            if erro:
+                falhas.append((nome_crawler, dia.isoformat(), erro))
+                continue
+            # SEGUNDA LANE: paths verificados por IP oficial, quando a faixa
+            # existe e cabe no teto. Cada path que ela devolve é verificado por
+            # CONSTRUÇÃO (só endereço oficial entra em `clientIP_in`), então
+            # entra na cobertura mesmo com `verifiedBotCategory` vazia — era
+            # exatamente isso que descartava o PerplexityBot por inteiro.
+            identidade_dia = IDENTIDADE
+            coleta["paths_ip_range"] = set()
+            coleta["requisicoes_ip_range_verificadas"] = 0
+            coleta["requisicoes_ip_range_estimadas"] = 0
+            coleta["grupos_ip_range"] = 0
+            if ips_faixa:
+                (paths_ip, req_ip, req_ip_est, grupos_ip, truncado_ip,
+                 erro_ip) = coletar_dia_ip_range(headers, dia, ua_like, ips_faixa)
+                if erro_ip:
+                    falhas_ip_range.append((nome_crawler, dia.isoformat(), erro_ip))
+                else:
+                    coleta["paths_ip_range"] = paths_ip
+                    coleta["requisicoes_ip_range_verificadas"] = req_ip
+                    coleta["requisicoes_ip_range_estimadas"] = req_ip_est
+                    coleta["grupos_ip_range"] = grupos_ip
+                    if truncado_ip:
+                        avisos_truncamento.append(
+                            (nome_crawler + " (faixa de IP)", dia.isoformat(), len(paths_ip)))
+                    coleta["paths"] |= paths_ip
+                    coleta["paths_ua_only"] -= paths_ip
+                    total_cf_verificadas_execucao += coleta["requisicoes_verificadas"]
+                    total_ip_verificadas_execucao += req_ip
+                    if req_ip and coleta["requisicoes_verificadas"]:
+                        identidade_dia = IDENTIDADE_CLOUDFLARE_E_IP_RANGE
+                    elif req_ip:
+                        identidade_dia = IDENTIDADE_IP_RANGE
+            coleta["identity_verification"] = identidade_dia
+            paths_do_dia = coleta["paths"]
+            if truncado:
+                avisos_truncamento.append((nome_crawler, dia.isoformat(), len(paths_do_dia)))
+            dias_ja_lidos.add(dia.isoformat())
+            dias_processados_agora.append(dia.isoformat())
+            coletas[dia.isoformat()] = (coleta, truncado, janela_completa)
+            for categoria, quantidade in coleta["categorias"].items():
+                categorias_acumuladas[categoria] = categorias_acumuladas.get(categoria, 0) + quantidade
+            for path in paths_do_dia:
+                anterior = primeiro_dia.get(path)
+                if anterior is None or dia.isoformat() < anterior:
+                    primeiro_dia[path] = dia.isoformat()
+
+        for data_iso in sorted(coletas):
+            coleta, truncado, janela_completa = coletas[data_iso]
+            paths_do_dia = coleta["paths"]
+            cobertura_paths = {p for p, d in primeiro_dia.items() if d <= data_iso} & sitemap_paths
+            novas_no_dia = {p for p, d in primeiro_dia.items() if d == data_iso} & sitemap_paths
+            registros_serie.append({
+                "schema_version": SERIE_SCHEMA,
+                "date": data_iso,
+                "crawler": nome_crawler,
+                "user_agent_filter": ua_like,
+                "paths_requested_that_day": len(paths_do_dia),
+                "new_sitemap_urls_that_day": len(novas_no_dia),
+                "cumulative_sitemap_coverage": len(cobertura_paths),
+                "sitemap_total": total_sitemap,
+                "cumulative_coverage_pct": round(100.0 * len(cobertura_paths) / total_sitemap, 2),
+                "query_truncated": truncado,
+                "query_group_limit": LIMITE_GRUPOS,
+                # Dia dentro da retenção que voltou VAZIO não é "zero rastreio"
+                # com a mesma confiança de um dia com dado: pode ser o limite da
+                # janela de 8 dias chegando. Fica marcado para não ser lido como
+                # queda de crawler.
+                "no_groups_returned": not paths_do_dia and not coleta["grupos_descartados"],
+                # ★ A identidade é AUTENTICADA pela Cloudflare
+                # (verifiedBotCategory = rDNS + faixa de IP do operador) E/OU
+                # por faixa de IP oficial lida direto de data/ops/
+                # bot_ip_ranges/ (v3, 2026-09-02) — ver `coleta["paths_ip_
+                # range"]` para o que só a segunda lane trouxe. O filtro de
+                # User-Agent continua existindo para escolher QUAL crawler
+                # medir, mas não é o que prova identidade sozinho — era
+                # exatamente essa confusão que somava a sonda de auditoria
+                # deste repositório à cobertura.
+                "identity_verification": coleta["identity_verification"],
+                "user_agent_authenticated": True,
+                # O que ficou de fora, nomeado. Descarte silencioso é a origem
+                # da próxima medição enganosa.
+                "requests_verified": coleta["requisicoes_verificadas"],
+                # A amostra e a estimativa, lado a lado e nomeadas, para nenhum
+                # consumidor precisar adivinhar em que unidade o numero esta.
+                "requests_sampled": coleta["requisicoes_verificadas"],
+                "requests_estimated": coleta["requisicoes_estimadas"],
+                "requests_discarded_unverified": coleta["requisicoes_descartadas"],
+                "groups_discarded_unverified": coleta["grupos_descartados"],
+                "paths_seen_only_unverified": len(coleta["paths_ua_only"]),
+                # A SEGUNDA LANE, nomeada à parte — nunca somada em silêncio ao
+                # que a Cloudflare verificou. `paths_ip_range` pode conter path
+                # que `paths` (CF) também já tinha; a UNIÃO é que forma a
+                # cobertura, o cruzamento não precisa ser exato.
+                "paths_ip_range_count": len(coleta["paths_ip_range"]),
+                "requests_ip_range_sampled": coleta["requisicoes_ip_range_verificadas"],
+                "requests_ip_range_estimated": coleta["requisicoes_ip_range_estimadas"],
+                "groups_ip_range": coleta["grupos_ip_range"],
+                "verified_bot_categories": dict(sorted(coleta["categorias"].items())),
+                # Contraste explícito com a medição antiga, na própria linha:
+                # quem ler a série vê o número inflado e o honesto lado a lado,
+                # em vez de achar que a cobertura despencou sozinha.
+                "legacy_ua_cumulative_coverage": len(legado_vistos & sitemap_paths),
+                "legacy_ua_identity": IDENTIDADE_LEGADA,
+                # O dataset é AMOSTRADO: path pedido uma única vez pode não
+                # entrar na amostra. A cobertura é PISO, nunca teto.
+                "sampled_dataset": True,
+                # A JANELA REAL DA LINHA, para o consumidor nao comparar 4h10
+                # com um dia inteiro. Ver o comentario em `coletar_dia`.
+                "window_complete": bool(janela_completa),
+                "coverage_is_floor": True,
+            })
+
+        vistos = set(primeiro_dia)
+        registro_crawler["paths_first_seen"] = dict(sorted(primeiro_dia.items()))
+        registro_crawler["paths_seen_count"] = len(primeiro_dia)
+        registro_crawler["days_ingested"] = sorted(dias_ja_lidos)
+        registro_crawler["verified_bot_categories"] = dict(sorted(categorias_acumuladas.items()))
+        registro_crawler["last_updated"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        # Identidade do CRAWLER (não do dia): medida nesta própria execução,
+        # nunca herdada de uma execução anterior que pode ter tido outra
+        # composição de lanes.
+        if total_ip_verificadas_execucao and total_cf_verificadas_execucao:
+            registro_crawler["identity"] = IDENTIDADE_CLOUDFLARE_E_IP_RANGE
+        elif total_ip_verificadas_execucao:
+            registro_crawler["identity"] = IDENTIDADE_IP_RANGE
+        else:
+            registro_crawler["identity"] = IDENTIDADE
+
+        cobertura_final = vistos & sitemap_paths
+        pct = 100.0 * len(cobertura_final) / total_sitemap
+        cobertura_legada = legado_vistos & sitemap_paths
+        nunca = sorted(sitemap_paths - vistos)
+        nunca_pedidas[nome_crawler] = {
+            "as_of": hoje.isoformat(),
+            "identity_verification": registro_crawler["identity"],
+            "never_requested_count": len(nunca),
+            "never_requested_paths": nunca,
+            # O contraste fica no próprio arquivo: quem comparar com a versão
+            # anterior vê de onde veio a diferença, em vez de suspeitar de bug.
+            "legacy_ua_cumulative_coverage": len(cobertura_legada),
+            "legacy_ua_never_requested_count": len(sitemap_paths - legado_vistos),
+        }
+        print("  %-16s VERIFICADO=%5d/%-5d (%5.1f%%)  nunca-pedidas=%-5d  dias-lidos=%d"
+              % (nome_crawler, len(cobertura_final), total_sitemap, pct, len(nunca),
+                 len(dias_ja_lidos)))
+        # `delta`, nunca "inflacao": o acumulado legado congelou no momento da
+        # migracao e o verificado continua ingerindo, entao a diferenca mistura
+        # contaminacao por UA com rastreio novo. Chamar isso de inflacao seria
+        # atribuir causa a um numero que nao a comprova — o mesmo erro de
+        # metodo que esta correcao existe para desfazer. Comparacao limpa so
+        # existe para crawler cujo legado foi atualizado na mesma janela (hoje,
+        # so o googlebot, que e o unico no timer).
+        print("  %-16s   por UA (legado congelado, sob ressalva)=%5d (%5.1f%%)   delta=%+d URLs%s"
+              % ("", len(cobertura_legada),
+                 100.0 * len(cobertura_legada) / total_sitemap,
+                 len(cobertura_final) - len(cobertura_legada),
+                 "  [dias processados agora: %s]" % ", ".join(dias_processados_agora)
+                 if dias_processados_agora else "  [sem consulta nova valida]"))
+
+    print("\n  IDENTIDADE: cada requisicao contada acima foi autenticada pela Cloudflare")
+    print("  (verifiedBotCategory = rDNS + faixa de IP publicada pelo operador) OU por faixa de")
+    print("  IP OFICIAL lida direto de data/ops/bot_ip_ranges/ (segunda lane, v3 — para o")
+    print("  operador que a Cloudflare nao autentica mas que publica a propria faixa, ex.")
+    print("  PerplexityBot). `identity_verification`, por linha, diz qual das duas sustenta o")
+    print("  numero daquele dia. Requisicao com o User-Agent do crawler mas SEM nenhuma das")
+    print("  duas verificacoes nao entra — e majoritariamente a sonda de auditoria deste proprio")
+    print("  repositorio, que a borda nao distingue porque o cabecalho X-Bot-Simulation so")
+    print("  chega ao nginx.")
+    if faixas_puladas_por_teto:
+        print("  Faixa oficial GRANDE DEMAIS para expandir (teto de %d enderecos) fica de fora "
+              "da segunda lane," % TETO_ENDERECOS_FAIXA_IP)
+        print("  nomeada acima em vez de tentar — ver 'SEGUNDA LANE PULADA'.")
+    print("  O numero e PISO: exclui requisicao real que nenhuma das duas autenticou, e o")
+    print("  dataset e AMOSTRADO (path pedido uma unica vez pode nao entrar na amostra).")
+    print("  Verificacao independente, por IP/rDNS no log de origem:")
+    print("  data/ops/origin_bot_traffic_daily.jsonl (tools/generate-bot-traffic-origin).")
+
+    if falhas:
+        print("\n--- falhas de consulta ---")
+        for crawler, dia, erro in falhas:
+            print("  %s %s: %s" % (crawler, dia, erro))
+    if avisos_truncamento:
+        print("\n--- AVISO: consulta perto/no teto de %d grupos (numero do dia PODE SUBESTIMAR) ---"
+              % LIMITE_GRUPOS)
+        for crawler, dia, quantidade in avisos_truncamento:
+            print("  %s %s: %d grupos" % (crawler, dia, quantidade))
+    if faixas_puladas_por_teto:
+        print("\n--- SEGUNDA LANE (faixa de IP) PULADA — acima do teto de %d enderecos ---"
+              % TETO_ENDERECOS_FAIXA_IP)
+        for crawler, total in sorted(faixas_puladas_por_teto.items(), key=lambda kv: -kv[1]):
+            print("  %-16s faixa oficial com %d endereco(s): expandir travaria a ferramenta, "
+                  "nao a API" % (crawler, total))
+    if falhas_ip_range:
+        print("\n--- falhas de consulta (segunda lane, faixa de IP) — a lane principal segue valendo ---")
+        for crawler, dia, erro in falhas_ip_range:
+            print("  %s %s: %s" % (crawler, dia, erro))
+
+    salvar_estado(estado)
+
+    os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+    with open(SERIE, "a", encoding="utf-8") as handle:
+        for registro in registros_serie:
+            handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+    print("\nserie gravada em %s (%d registro(s))"
+          % (os.path.relpath(SERIE, ROOT), len(registros_serie)))
+    print("append-only: dedupe por (date, crawler) mantendo a ULTIMA linha")
+
+    os.makedirs(os.path.dirname(NUNCA_PEDIDAS_PATH), exist_ok=True)
+    # MERGE, nunca substituição. O timer roda `--crawler googlebot`, e este
+    # arquivo era reescrito inteiro a cada execução: uma execução manual com
+    # outros crawlers APAGAVA a lista do googlebot, e a execução seguinte do
+    # timer apagava a dos outros. A lista de URLs nunca pedidas é o alvo da
+    # recuperação (IndexNow em lote, sinal de frescor) — perdê-la porque outra
+    # execução mediu outro crawler é destruir trabalho por efeito colateral.
+    # Cada crawler carrega o próprio `as_of`, então lista velha é reconhecível
+    # como velha em vez de sumir.
+    consolidado = {}
+    # AS CHAVES DE TOPO QUE NAO SAO MINHAS SOBREVIVEM, e ignorar isso apagava
+    # trabalho de outra ferramenta toda madrugada.
+    #
+    # Este produtor gravava um dicionario FIXO de quatro chaves. Qualquer chave
+    # de topo escrita por outro produtor -- por exemplo o bloco `refresh` que
+    # tools/generate-crawl-never-requested-refresh grava com a janela de origem
+    # e a regra aplicada -- desaparecia no run das 04:10 UTC, em silencio. O
+    # conserto durava menos de uma noite, e ninguem veria: o arquivo continua
+    # valido, so mais pobre.
+    #
+    # Agora o objeto anterior e carregado inteiro e este produtor SOBRESCREVE
+    # apenas as chaves que ele mesmo produz. Achado por refutacao adversarial em
+    # 2026-08-28.
+    anterior = {}
+    if os.path.isfile(NUNCA_PEDIDAS_PATH):
+        try:
+            with open(NUNCA_PEDIDAS_PATH, encoding="utf-8") as handle:
+                carregado = json.load(handle)
+            if isinstance(carregado, dict):
+                anterior = carregado
+                consolidado = anterior.get("crawlers") or {}
+            else:
+                print("aviso: %s nao e objeto JSON; as chaves de topo anteriores nao "
+                      "puderam ser preservadas" % os.path.relpath(NUNCA_PEDIDAS_PATH, ROOT),
+                      file=sys.stderr)
+        except (OSError, ValueError) as erro:
+            print("aviso: nao consegui ler %s (%s); as chaves de topo anteriores nao "
+                  "puderam ser preservadas"
+                  % (os.path.relpath(NUNCA_PEDIDAS_PATH, ROOT), type(erro).__name__),
+                  file=sys.stderr)
+    consolidado.update(nunca_pedidas)
+    saida = dict(anterior)
+    saida.update({"schema_version": "crawl_coverage_never_requested_v2",
+                  # Método PADRÃO desta ferramenta; o método REAL de cada
+                  # crawler (que pode ser ip_range_at_edge ou
+                  # cloudflare_and_ip_range) está em
+                  # crawlers.<nome>.identity_verification, dentro de
+                  # `consolidado` — não sobrescrever aquele com este.
+                  "identity_verification": IDENTIDADE,
+                  "sitemap_total": total_sitemap, "crawlers": consolidado})
+    tmp = NUNCA_PEDIDAS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(saida, handle, ensure_ascii=False, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, NUNCA_PEDIDAS_PATH)
+    print("URLs nunca pedidas (lista completa, por crawler; %d crawler(s) no arquivo) em %s"
+          % (len(consolidado), os.path.relpath(NUNCA_PEDIDAS_PATH, ROOT)))
+
+    if args.json:
+        print(json.dumps({"series": registros_serie, "never_requested": nunca_pedidas},
+                          ensure_ascii=False, indent=2))
+
+    # Falha de consulta é erro de verdade: sem exit != 0 um timer/credencial
+    # quebrada passaria despercebido e o indicador principal do projeto
+    # silenciosamente pararia de atualizar, repetindo o defeito de
+    # check-edge-traffic ("indisponivel" com exit 0) que ja causou perda de
+    # dado em outra serie deste mesmo projeto.
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

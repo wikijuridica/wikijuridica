@@ -1,0 +1,726 @@
+#!/usr/bin/env bash
+# vigilia — mantém a sessão gráfica deste host ACORDADA, com botão no painel.
+#
+# POR QUE EXISTE. Este laptop é a origem da WikiJuridica: se ele dorme, o portal
+# sai do ar e a volta depende de presença física (sem ethernet, sem IPMI). A
+# SUSPENSÃO da máquina já está morta em quatro camadas independentes, e não é
+# esta ferramenta que faz isso — ela apenas PROVA (subcomando `guardas`):
+#   1. /etc/systemd/system/{suspend,sleep,hibernate,...}.target -> /dev/null
+#   2. /etc/systemd/sleep.conf.d/10-servidor-nao-suspende.conf  AllowSuspend=no
+#   3. /etc/systemd/logind.conf.d/no-suspend.conf   HandleLidSwitch/IdleAction=ignore
+#   4. xfce4-power-manager: inactivity-on-ac=0, lid-action-on-ac=0
+# Prova viva: logind responde "na" (not available) em CanSuspend — o pedido de
+# suspensão não existe mais como capacidade do sistema, não é só "desencorajado".
+#
+# O QUE AINDA DORME, e é o que esta ferramenta liga e desliga: a TELA e o
+# bloqueio da sessão. Medido em 2026-09-10, antes desta ferramenta:
+#   xset screensaver timeout 600 s | DPMS standby 900 s, off 1500 s
+#   xfce4-power-manager dpms-on-ac-sleep=15 min, dpms-on-ac-off=25 min
+#   light-locker lock-after-screensaver=5 s  (tranca 5 s depois do blank)
+# Ou seja: 25 min sem teclado e a tela apaga e a sessão tranca. A CPU segue
+# 100 % disponível nesse estado — apagar a tela não reduz clock nem watt do
+# pacote; o teto real é o RAPL PL1=15 W de wikijuridica-energia.service, que é
+# medido e NÃO se mexe aqui.
+#
+# NÃO EXISTE "suspender com a CPU rodando". S3 (mem) e s2idle param a execução
+# de TODOS os núcleos por definição do ACPI: não há estado de suspensão em que o
+# servidor Go continue respondendo. O substituto honesto é o subcomando `tela`:
+# tela apagada, máquina inteira trabalhando.
+#
+# Sem sudo por desenho: um botão de painel não tem tty nem askpass, e comando
+# que pede senha falha em silêncio no clique.
+#
+# Uso:
+#   vigilia on|off|toggle     liga/desliga a vigília (tela nunca apaga)
+#   vigilia status            estado real, lido do X e do xfconf
+#   vigilia guardas           confere as quatro camadas anti-suspensão
+#   vigilia tela              apaga a tela AGORA e segue trabalhando
+#   vigilia aplicar           reaplica o estado salvo (usado no autostart)
+#   vigilia genmon            saída para o plugin genmon do painel
+#   vigilia painel            (re)instala os dois botões no painel, idempotente
+
+set -uo pipefail
+
+ESTADO_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vigilia"
+ESTADO="$ESTADO_DIR/estado"
+BASE="$ESTADO_DIR/baseline"
+
+# Valores de fábrica deste host, medidos em 2026-09-10. Servem de rede de
+# segurança quando `off` roda sem baseline salvo (ex.: primeira execução depois
+# de um `on` feito à mão).
+FABRICA_S_TIMEOUT=600
+FABRICA_S_CYCLE=600
+FABRICA_DPMS_STANDBY=900
+FABRICA_DPMS_SUSPEND=0
+FABRICA_DPMS_OFF=1500
+FABRICA_XFPM_DPMS=true
+
+# Standby da vigília. NÃO é zero por um motivo medido em 2026-09-10: com os três
+# tempos de DPMS em 0 o Xorg desarma a máquina de estados e `xset dpms force
+# off` vira NOOP — o botão "apagar a tela" não funcionaria. Com Standby armado,
+# o force off apaga. 65535 s (18 h 12 min) é o teto real: o campo é de 16 bits e
+# qualquer valor maior dá a volta (604800 virou 14976 no teste). Consequência
+# aceita: depois de 18 h SEM UM ÚNICO evento de teclado ou mouse a tela entra em
+# standby — que é exatamente o estado desejado quando ninguém está na máquina, e
+# a CPU segue 100 % ligada nele.
+VIGILIA_STANDBY=65535
+
+[ -n "${DISPLAY:-}" ] || export DISPLAY=:0
+mkdir -p "$ESTADO_DIR"
+
+erro() { printf 'vigilia: %s\n' "$*" >&2; }
+
+tem_x() { xset q >/dev/null 2>&1; }
+
+# Um X pode existir e NÃO ter a extensão DPMS — é o caso dos Xvfb/Xephyr que
+# rodam nesta máquina (waydroid, testes). Sem esta guarda, `vigilia on` num
+# DISPLAY assim escrevia `dpms-enabled=false` no xfconf REAL, deixava o
+# `xset dpms` falhar com "unknown option 65535" e ainda assim saía com 0:
+# medido em 2026-09-10 com DISPLAY=:99.
+# O cabeçalho "DPMS (Energy Star):" SAI ATÉ SEM a extensão (aí a linha seguinte
+# é "Server does not have the DPMS Extension"): grep por 'DPMS' casa nos dois e
+# não serve de teste. O que só existe com extensão é "DPMS is Enabled/Disabled".
+tem_dpms() { xset q 2>/dev/null | grep -qE 'DPMS is (Enabled|Disabled)'; }
+
+exige_x_com_dpms() {
+	tem_x || {
+		erro "sem X em DISPLAY=$DISPLAY"
+		return 3
+	}
+	tem_dpms || {
+		erro "o X de DISPLAY=$DISPLAY não tem a extensão DPMS — nada a fazer aqui"
+		return 4
+	}
+	return 0
+}
+
+# --- leitura do estado real do X -------------------------------------------
+# `xset q` imprime o bloco DPMS uma vez por tela; sempre o primeiro casamento.
+xset_campo() { xset q 2>/dev/null | awk -v pat="$1" -v col="$2" '$0 ~ pat {print $col; exit}'; }
+
+s_timeout() { xset_campo 'timeout:' 2; }
+s_cycle() { xset_campo 'timeout:' 4; }
+dpms_standby() { xset_campo 'Standby:' 2; }
+dpms_suspend() { xset_campo 'Standby:' 4; }
+dpms_off() { xset_campo 'Standby:' 6; }
+dpms_ligado() { xset q 2>/dev/null | grep -q 'DPMS is Enabled' && echo true || echo false; }
+tela_ligada() { xset q 2>/dev/null | grep -q 'Monitor is On' && echo true || echo false; }
+# `prefer blanking`. A vigília grava `noblank` e a versão anterior NUNCA
+# restaurava: o X ficava em `prefer blanking: no` para sempre, e no timeout o
+# servidor desenhava o padrão em vez de apagar.
+s_blank() { xset q 2>/dev/null | grep -q 'prefer blanking:  yes' && echo blank || echo noblank; }
+
+xfpm_dpms() {
+	xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled 2>/dev/null || echo desconhecido
+}
+
+# Falha aqui NÃO pode ser calada: se o xfconfd estiver morto ou o
+# xfconf-query ausente, o xfce4-power-manager continua dono do DPMS e reimpõe
+# os 15/25 min por cima do `xset` — a vigília pareceria ligada e apagaria a
+# tela do mesmo jeito. O `xset` ainda vale a pena, então isto avisa e segue.
+xfpm_set_dpms() {
+	local saida
+	if ! saida=$(xfconf-query -c xfce4-power-manager \
+		-p /xfce4-power-manager/dpms-enabled -n -t bool -s "$1" 2>&1); then
+		erro "não consegui gravar dpms-enabled=$1 no xfconf ($saida)."
+		erro "o xfce4-power-manager pode reimpor os tempos e apagar a tela."
+		return 1
+	fi
+	# READBACK: escrita que "deu certo" e não valeu é o pior dos dois mundos —
+	# `estado=on` gravado e o power-manager ainda dono do DPMS, sem aviso nenhum.
+	if [ "$(xfpm_dpms)" != "$1" ]; then
+		erro "gravei dpms-enabled=$1 mas o xfconf devolve $(xfpm_dpms)."
+		erro "o xfce4-power-manager segue dono do DPMS e vai reimpor os tempos."
+		return 1
+	fi
+	return 0
+}
+
+# Vigília ativa = screensaver desligado, Suspend e Off do DPMS em zero e o
+# Standby no valor desta ferramenta. É estado OBSERVADO no X, não flag em
+# arquivo — arquivo mente depois de um reinício do X ou de um `xset` de terceiro.
+# O teste é "o X NÃO tem como apagar a tela sozinho", não "os campos estão nos
+# valores que EU escrevo". Medido em 2026-09-10: um terceiro rodou `xset -dpms`
+# e a versão anterior desta função respondia LIGADA com o DPMS desabilitado e o
+# monitor apagado — certo por acidente. Os dois caminhos que não apagam são:
+#   (a) DPMS desabilitado por completo;
+#   (b) DPMS habilitado com Suspend e Off em 0 e Standby em 0 ou no teto.
+# Standby intermediário (900 s, o de fábrica) APAGA o painel: não é vigília.
+vigilia_ativa() {
+	tem_x || return 1
+	[ "$(s_timeout)" = "0" ] || return 1
+	[ "$(dpms_ligado)" = "false" ] && return 0
+	[ "$(dpms_suspend)" = "0" ] || return 1
+	[ "$(dpms_off)" = "0" ] || return 1
+	case "$(dpms_standby)" in
+	0 | "$VIGILIA_STANDBY") return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Captura CAMPO POR CAMPO, não o bloco inteiro. A versão anterior só recusava a
+# captura quando os TRÊS tempos estavam zerados ao mesmo tempo, e o caffeine
+# produz exatamente o estado que escapa dessa guarda:
+#   /usr/bin/caffeine  -> xdg-screensaver suspend -> `xset s off` (e `xset -dpms`)
+#   e NUNCA toca em Standby/Suspend/Off.
+# Ou seja, com um vídeo em tela cheia o X fica `0|600|900|0|1500`: `S_TIMEOUT=0`
+# com `DPMS_OFF=1500`. A guarda antiga deixava passar, gravava `S_TIMEOUT=0`, e o
+# `off` seguinte rodava `xset s 0 600` — screensaver nunca mais armava, e o
+# light-locker (que só tranca em ScreenSaverNotify) nunca mais trancava a sessão.
+# Estado ESTÁVEL e ruim: cada `on` regravava o mesmo zero.
+s_desligado() { [ "$(s_timeout)" = "0" ]; }
+dpms_sem_apagar() {
+	[ "$(dpms_suspend)" = "0" ] || return 1
+	[ "$(dpms_off)" = "0" ] || return 1
+	case "$(dpms_standby)" in 0 | "$VIGILIA_STANDBY") return 0 ;; *) return 1 ;; esac
+}
+
+salvar_baseline() {
+	local t c st su of xf blank
+	if s_desligado; then
+		# screensaver desligado JAMAIS é escolha do dono neste host: é vigília ou é
+		# caffeine. Preserva o que já houver de válido; senão, fábrica.
+		if baseline_valido; then
+			t=$(sed -n 's/^S_TIMEOUT=//p' "$BASE")
+			c=$(sed -n 's/^S_CYCLE=//p' "$BASE")
+		else
+			t=$FABRICA_S_TIMEOUT
+			c=$FABRICA_S_CYCLE
+		fi
+		blank=$(sed -n 's/^S_BLANK=//p' "$BASE" 2>/dev/null)
+		case "$blank" in blank | noblank) ;; *) blank=blank ;; esac
+	else
+		t=$(s_timeout)
+		c=$(s_cycle)
+		blank=$(s_blank)
+	fi
+	if dpms_sem_apagar; then
+		if baseline_valido; then
+			st=$(sed -n 's/^DPMS_STANDBY=//p' "$BASE")
+			su=$(sed -n 's/^DPMS_SUSPEND=//p' "$BASE")
+			of=$(sed -n 's/^DPMS_OFF=//p' "$BASE")
+		else
+			st=$FABRICA_DPMS_STANDBY
+			su=$FABRICA_DPMS_SUSPEND
+			of=$FABRICA_DPMS_OFF
+		fi
+	else
+		st=$(dpms_standby)
+		su=$(dpms_suspend)
+		of=$(dpms_off)
+	fi
+	# dpms-enabled=false só existe porque ESTA ferramenta o escreve: nunca vira
+	# baseline, senão o `off` devolvia o DPMS desligado e o power-manager ficava
+	# fora do jogo para sempre.
+	xf=$(xfpm_dpms)
+	[ "$xf" = false ] && xf=$FABRICA_XFPM_DPMS
+	case "$xf" in true | false) ;; *) xf=$FABRICA_XFPM_DPMS ;; esac
+	{
+		echo "S_TIMEOUT=$t"
+		echo "S_CYCLE=$c"
+		echo "S_BLANK=$blank"
+		echo "DPMS_STANDBY=$st"
+		echo "DPMS_SUSPEND=$su"
+		echo "DPMS_OFF=$of"
+		echo "XFPM_DPMS=$xf"
+	} >"$BASE"
+}
+
+# `[ -s "$BASE" ]` aceitava QUALQUER arquivo não-vazio — inclusive o baseline com
+# campos vazios que o defeito do X-sem-DPMS gravou, que ficou no disco do dono e
+# que 25 verificações verdes não pegaram (a bancada preserva o que encontra).
+baseline_valido() {
+	[ -s "$BASE" ] || return 1
+	local k v achou=0
+	for k in S_TIMEOUT S_CYCLE DPMS_STANDBY DPMS_SUSPEND DPMS_OFF; do
+		v=$(sed -n "s/^$k=//p" "$BASE" | head -1)
+		case "$v" in '' | *[!0-9]*) return 1 ;; esac
+		achou=$((achou + 1))
+	done
+	[ "$achou" = 5 ] || return 1
+	# baseline que não apaga nada é artefato, não escolha do dono
+	v=$(sed -n 's/^S_TIMEOUT=//p' "$BASE" | head -1)
+	[ "$v" = 0 ] && return 1
+	v=$(sed -n 's/^DPMS_OFF=//p' "$BASE" | head -1)
+	[ "$v" = 0 ] && [ "$(sed -n 's/^DPMS_STANDBY=//p' "$BASE" | head -1)" != "$FABRICA_DPMS_STANDBY" ] && return 1
+	return 0
+}
+
+ler_baseline() {
+	S_TIMEOUT=$FABRICA_S_TIMEOUT
+	S_CYCLE=$FABRICA_S_CYCLE
+	S_BLANK=blank
+	DPMS_STANDBY=$FABRICA_DPMS_STANDBY
+	DPMS_SUSPEND=$FABRICA_DPMS_SUSPEND
+	DPMS_OFF=$FABRICA_DPMS_OFF
+	XFPM_DPMS=$FABRICA_XFPM_DPMS
+	if baseline_valido; then
+		# shellcheck disable=SC1090
+		. "$BASE"
+	fi
+	case "${S_BLANK:-blank}" in blank | noblank) ;; *) S_BLANK=blank ;; esac
+	# A validação numérica e a recusa de baseline-sem-apagamento vivem em
+	# `baseline_valido`, uma só vez: baseline reprovado nem chega a ser lido, e as
+	# variáveis ficam nos valores de fábrica atribuídos acima.
+	case "$XFPM_DPMS" in true | false) ;; *) XFPM_DPMS=$FABRICA_XFPM_DPMS ;; esac
+}
+
+notificar() {
+	command -v notify-send >/dev/null 2>&1 || return 0
+	# `timeout` porque isto roda no clique do painel: notify-send fala D-Bus e
+	# trava indefinidamente se o xfce4-notifyd estiver pendurado. Botão de painel
+	# que não retorna é botão quebrado.
+	timeout 5 notify-send -a vigilia -i "$2" -t 4000 "$1" "$3" 2>/dev/null || true
+}
+
+# --- ações -----------------------------------------------------------------
+ligar() {
+	exige_x_com_dpms || return $?
+	salvar_baseline
+	# xfce4-power-manager reimporia os tempos: ele para de mandar em DPMS.
+	xfpm_set_dpms false
+	xset s off s noblank
+	# DPMS fica HABILITADO e ARMADO no teto de 18 h: não apaga sozinho na prática,
+	# e `vigilia tela` continua podendo apagar sob demanda.
+	xset +dpms
+	xset dpms "$VIGILIA_STANDBY" 0 0
+	echo on >"$ESTADO"
+	notificar "Vigília ligada" video-display "Tela nunca apaga. Máquina nunca dorme."
+	status
+}
+
+desligar() {
+	exige_x_com_dpms || return $?
+	ler_baseline
+	xset s "$S_TIMEOUT" "$S_CYCLE"
+	xset s "$S_BLANK"
+	xset +dpms
+	xset dpms "$DPMS_STANDBY" "$DPMS_SUSPEND" "$DPMS_OFF"
+	xfpm_set_dpms "$XFPM_DPMS"
+	echo off >"$ESTADO"
+	notificar "Vigília desligada" video-display \
+		"Tela volta a apagar em ${DPMS_OFF}s. A MÁQUINA continua sem suspender."
+	status
+}
+
+alternar() { if vigilia_ativa; then desligar; else ligar; fi; }
+
+apagar_tela() {
+	exige_x_com_dpms || return $?
+	# Substituto honesto de "suspender com a CPU rodando": só o painel apaga.
+	xset +dpms
+	# Standby em 0 desarma o force off (medido 2026-09-10): arma antes de apagar.
+	[ "$(dpms_standby)" = "0" ] && xset dpms "$VIGILIA_STANDBY" 0 0
+	# ASSENTAMENTO. O `force off` sai no release do clique do lançador, e qualquer
+	# evento de ponteiro nos milissegundos seguintes (o dedo saindo do touchpad)
+	# reacende o painel na hora. Meio segundo é o bastante para o gesto terminar.
+	sleep 0.5
+	xset dpms force off
+	echo "tela apagada — servidor, agentes e timers seguem rodando."
+	echo "qualquer tecla ou movimento do mouse acende de volta."
+	echo "estado do monitor agora: $(xset q | grep -m1 -o 'Monitor is [A-Za-z]*')"
+	# Medido em 2026-09-10: apagar a tela dispara o light-locker
+	# (`lock-after-screensaver=5`), que TRANCA a sessão trocando de VT para o
+	# greeter do lightdm — `loginctl show-session` passa a dizer `Active=no`. Não
+	# é dano e não afeta a produção, mas custa digitar a senha, e quem clica no
+	# botão tem que saber disso ANTES.
+	if pgrep -x light-locker >/dev/null 2>&1; then
+		local seg
+		seg=$(gsettings get apps.light-locker lock-after-screensaver 2>/dev/null | awk '{print $NF}')
+		echo "ATENÇÃO: o light-locker vai TRANCAR a sessão em ${seg:-alguns} s — sua senha será pedida ao acender."
+	fi
+}
+
+# --- verificação das guardas anti-suspensão --------------------------------
+guardas() {
+	local falhas=0 ok
+	printf '%-46s %s\n' 'GUARDA' 'ESTADO'
+
+	local can
+	can=$(dbus-send --system --print-reply --dest=org.freedesktop.login1 \
+		/org/freedesktop/login1 org.freedesktop.login1.Manager.CanSuspend 2>/dev/null |
+		awk -F'"' '/string/ {print $2; exit}')
+	if [ "$can" = "na" ]; then
+		ok='OK  logind: CanSuspend="na" (capacidade inexistente)'
+	else
+		ok="FALHA  logind: CanSuspend=\"${can:-sem resposta}\""
+		falhas=$((falhas + 1))
+	fi
+	printf '%-46s %s\n' 'logind aceita pedido de suspensão?' "$ok"
+
+	local t est
+	for t in suspend.target sleep.target hibernate.target \
+		suspend-then-hibernate.target hybrid-sleep.target; do
+		est=$(systemctl is-enabled "$t" 2>/dev/null)
+		if [ "$est" = masked ]; then
+			ok='OK  masked'
+		else
+			ok="FALHA  $est"
+			falhas=$((falhas + 1))
+		fi
+		printf '%-46s %s\n' "unit $t" "$ok"
+	done
+
+	if grep -qs '^AllowSuspend=no' /etc/systemd/sleep.conf.d/*.conf; then
+		ok='OK  AllowSuspend=no'
+	else
+		ok='FALHA  AllowSuspend não está em no'
+		falhas=$((falhas + 1))
+	fi
+	printf '%-46s %s\n' 'sleep.conf.d' "$ok"
+
+	local k
+	for k in HandleLidSwitch HandleLidSwitchExternalPower IdleAction; do
+		if grep -qs "^$k=ignore" /etc/systemd/logind.conf.d/*.conf; then
+			ok='OK  ignore'
+		else
+			ok="FALHA  $k não está em ignore"
+			falhas=$((falhas + 1))
+		fi
+		printf '%-46s %s\n' "logind.conf.d $k" "$ok"
+	done
+
+	local v
+	for k in inactivity-on-ac lid-action-on-ac lid-action-on-battery; do
+		v=$(xfconf-query -c xfce4-power-manager -p "/xfce4-power-manager/$k" 2>/dev/null)
+		if [ "$v" = "0" ]; then
+			ok='OK  0 (nunca)'
+		else
+			ok="FALHA  $v"
+			falhas=$((falhas + 1))
+		fi
+		printf '%-46s %s\n' "xfce4-power-manager $k" "$ok"
+	done
+
+	printf '%-46s %s\n' 'suspensões desde o boot (journal)' \
+		"$(journalctl -b 2>/dev/null | grep -c 'PM: suspend entry') evento(s)"
+	printf '%-46s %s\n' 'uptime' "$(uptime -p 2>/dev/null)"
+
+	if [ "$falhas" -eq 0 ]; then
+		echo
+		echo 'TODAS as guardas de pé: a máquina não tem como suspender.'
+		return 0
+	fi
+	echo
+	echo "$falhas guarda(s) fora do lugar — a máquina PODE dormir."
+	return 1
+}
+
+status() {
+	local ativa
+	if vigilia_ativa; then ativa='LIGADA — tela nunca apaga'; else ativa='desligada'; fi
+	echo "vigília:            $ativa"
+	# `caffeine` (PID vivo desde o boot) zera os mesmos tempos do X quando um
+	# vídeo entra em tela cheia. Se ele mexeu, a vigília aparece LIGADA sem que
+	# ninguém tenha clicado — e o `estado` salvo denuncia a divergência.
+	local salvo caff
+	salvo=$([ -s "$ESTADO" ] && cat "$ESTADO" || echo 'nunca usado')
+	caff=$(pgrep -x caffeine >/dev/null 2>&1 &&
+		echo "rodando (PID $(pgrep -x caffeine | head -1))" || echo 'parado')
+	echo "escolha salva:      $salvo"
+	echo "caffeine:           $caff — desliga o screensaver em tela cheia (xset s off)"
+	# As DUAS divergências, não só uma. A que importa de verdade é a segunda: o
+	# resume do caffeine roda `xset s <valor salvo>` e RESSUSCITA o screensaver por
+	# baixo de uma vigília ligada — a sessão volta a trancar sem ninguém pedir.
+	if vigilia_ativa && [ "$salvo" != on ]; then
+		echo "                    ATENÇÃO: a tela não apaga, mas não foi 'vigilia on' — outro programa mexeu"
+	fi
+	if [ "$salvo" = on ] && ! vigilia_ativa; then
+		echo "                    ATENÇÃO: escolha=on e a tela VOLTOU a apagar (resume do caffeine?) — rode 'vigilia on'"
+	fi
+	echo "prefer blanking:    $(s_blank)"
+	if tem_x; then
+		echo "screensaver:        timeout $(s_timeout)s cycle $(s_cycle)s"
+		echo "DPMS:               $(dpms_ligado) — standby $(dpms_standby)s suspend $(dpms_suspend)s off $(dpms_off)s"
+		echo "monitor:            $(tela_ligada)"
+		[ "$(tela_ligada)" = false ] &&
+			echo "                    tela APAGADA agora — qualquer tecla acende; a CPU não parou"
+		[ "$(dpms_ligado)" = false ] &&
+			echo "                    DPMS desabilitado por terceiro (xset -dpms): 'vigilia on' normaliza"
+	else
+		echo "X:                  inacessível em DISPLAY=$DISPLAY"
+	fi
+	echo "xfpm dpms-enabled:  $(xfpm_dpms)"
+	echo "suspensão:          $(dbus-send --system --print-reply --dest=org.freedesktop.login1 \
+		/org/freedesktop/login1 org.freedesktop.login1.Manager.CanSuspend 2>/dev/null |
+		awk -F'"' '/string/ {print $2; exit}') (na = impossível)"
+}
+
+aplicar() {
+	# Chamado pelo autostart: o X é novo a cada login e não guarda `xset`.
+	[ -s "$ESTADO" ] || return 0
+	[ "$(cat "$ESTADO")" = on ] || return 0
+	tem_x && tem_dpms || return 0
+	xfpm_set_dpms false
+	xset s off s noblank
+	xset +dpms
+	xset dpms "$VIGILIA_STANDBY" 0 0
+}
+
+genmon() {
+	# O plugin genmon falha CALADO quando não executa o comando: nada aparece no
+	# painel e nada aparece em log nenhum. Para provar que ele executa, ligue o
+	# rastro — uma linha sobrescrita a cada chamada:
+	#   VIGILIA_LOG=~/.config/vigilia/genmon.last  (no rc do plugin, ou no teste)
+	# Fora de depuração ele fica DESLIGADO: a chamada é de 5 em 5 segundos, e um
+	# SSD com 49 % de vida não precisa de 17 mil escritas por dia de diagnóstico.
+	[ -n "${VIGILIA_LOG:-}" ] && printf '%s pid=%s display=%s ativa=%s\n' \
+		"$(date +%FT%T)" "$PPID" "${DISPLAY:-}" \
+		"$(vigilia_ativa && echo sim || echo nao)" >"$VIGILIA_LOG" 2>/dev/null
+	# O rótulo é TEXTO com marcação Pango, não emoji: 👁/😴 (U+1F441, U+1F634) não
+	# existem na fonte do painel deste host e o plugin renderiza com LARGURA ZERO
+	# — botão invisível, medido em 2026-09-10 na primeira tentativa.
+	local rotulo dica
+	if vigilia_ativa; then
+		rotulo='<span foreground="#8ae234" weight="bold">VIGÍLIA</span>'
+		dica='vigília LIGADA — a tela não apaga e a sessão não tranca'
+	else
+		rotulo='<span foreground="#888a85">vigília</span>'
+		dica="vigília desligada — a tela apaga sozinha em $(dpms_off)s"
+	fi
+
+	local can
+	can=$(dbus-send --system --print-reply --dest=org.freedesktop.login1 \
+		/org/freedesktop/login1 org.freedesktop.login1.Manager.CanSuspend 2>/dev/null |
+		awk -F'"' '/string/ {print $2; exit}')
+	local guarda
+	if [ "$can" = "na" ]; then
+		guarda='máquina NÃO suspende: 4 guardas de pé (vigilia guardas)'
+	else
+		guarda="ATENÇÃO: logind aceita suspender (CanSuspend=$can) — rode 'vigilia guardas'"
+		rotulo='<span foreground="#ef2929" weight="bold">SUSPENDE!</span>'
+	fi
+
+	printf '<txt>%s</txt>\n' "$rotulo"
+	printf '<tool>%s\n%s\n\nclique: liga/desliga a vigília</tool>\n' "$dica" "$guarda"
+	printf '<txtclick>%s toggle</txtclick>\n' "$(readlink -f "$0")"
+}
+
+# Serializa quem ESCREVE. Clique duplo no painel dispara dois `toggle` em
+# paralelo: os dois leem "desligada", os dois ligam, e o segundo `salvar_baseline`
+# pode rodar depois de o primeiro já ter zerado os tempos — baseline de vigília
+# gravado como se fosse o do dono. Leitura (`status`, `guardas`, `genmon`) fica
+# fora do lock: o painel chama `genmon` de 5 em 5 s e não pode ficar na fila.
+com_lock() {
+	local acao="$1"
+	shift
+	# Quem já tomou o lock avisa por aqui (a bancada toma o lock da execução
+	# inteira). Sem isto, cada chamada da bancada esperaria os 10 s do timeout.
+	if [ -n "${VIGILIA_SEM_LOCK:-}" ]; then
+		"$acao" "$@"
+		return $?
+	fi
+	if command -v flock >/dev/null 2>&1; then
+		exec 9>"$ESTADO_DIR/lock" || {
+			"$acao" "$@"
+			return $?
+		}
+		flock -w 10 9 || erro "não consegui o lock em 10 s; seguindo sem ele"
+		"$acao" "$@"
+		return $?
+	fi
+	"$acao" "$@"
+}
+
+# --- (re)instalação dos botões no painel -----------------------------------
+# POR QUE EXISTE: os dois botões foram postos no painel à mão, com
+# `xfconf-query`. Sem este subcomando, perder o plugin (remoção acidental, reset
+# do xfconf, host reinstalado a partir de ops/host-state) exigiria repetir a
+# sequência de cabeça. É a rota de recuperação que o CHECKLIST-REBOOT aponta.
+PLUGIN_SO=/usr/lib/x86_64-linux-gnu/xfce4/panel/plugins/libgenmon.so
+PANEL_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/xfce4/panel"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+EU="$(readlink -f "$0")"
+
+painel_ids() { xfconf-query -c xfce4-panel -p /panels/panel-1/plugin-ids 2>/dev/null | grep -E '^[0-9]+$'; }
+painel_tipo() { xfconf-query -c xfce4-panel -p "/plugins/plugin-$1" 2>/dev/null; }
+
+# TODOS os plugins registrados, não só os que estão no array do painel 1.
+# Medido em 2026-09-10: procurar só no array fazia o `painel` criar um plugin
+# NOVO (23/24) quando o antigo (21/22) apenas tinha caído do array — ou seja, a
+# rota de recuperação duplicava o botão em vez de recuperá-lo.
+painel_ids_registrados() {
+	xfconf-query -c xfce4-panel -l 2>/dev/null | sed -n 's|^/plugins/plugin-\([0-9]\+\)$|\1|p'
+}
+
+# Já existe um genmon nosso? Devolve o id. Reconhece pelo Command do rc, não
+# pelo número: 21 pode ter sido tomado por outro plugin adicionado pela GUI.
+painel_id_genmon() {
+	local id
+	for id in $(painel_ids_registrados); do
+		[ "$(painel_tipo "$id")" = genmon ] || continue
+		grep -qs "vigilia genmon" "$PANEL_DIR/genmon-$id.rc" && {
+			echo "$id"
+			return 0
+		}
+	done
+	return 1
+}
+
+painel_id_launcher() {
+	local id
+	for id in $(painel_ids_registrados); do
+		[ "$(painel_tipo "$id")" = launcher ] || continue
+		grep -qs "vigilia tela" "$PANEL_DIR/launcher-$id"/*.desktop 2>/dev/null && {
+			echo "$id"
+			return 0
+		}
+	done
+	return 1
+}
+
+painel_id_livre() {
+	local usado max=0 id
+	# Varre TODOS os /plugins/plugin-N, não só os do painel 1: id repetido em
+	# painel diferente faz o xfce4-panel descartar um dos dois calado.
+	for usado in $(xfconf-query -c xfce4-panel -l 2>/dev/null |
+		sed -n 's|^/plugins/plugin-\([0-9]\+\)$|\1|p'); do
+		[ "$usado" -gt "$max" ] && max=$usado
+	done
+	id=$((max + 1))
+	echo "$id"
+}
+
+painel_escrever_rc_genmon() {
+	# Font=(default) é o valor que o próprio plugin grava e que QUEBRA o CSS: o
+	# rótulo renderiza com largura zero e o botão fica invisível. Sempre fonte real.
+	cat >"$PANEL_DIR/genmon-$1.rc" <<RC
+Command=$EU genmon
+UpdatePeriod=5000
+Text=vigília
+UseLabel=0
+Font=Sans Bold 10
+RC
+}
+
+painel_escrever_launcher() {
+	mkdir -p "$PANEL_DIR/launcher-$1" "$APPS_DIR"
+	local alvo="$APPS_DIR/vigilia-apagar-tela.desktop"
+	if [ ! -s "$alvo" ]; then
+		cat >"$alvo" <<DESK
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Apagar a tela (máquina segue trabalhando)
+Comment=Apaga só o painel LCD. Servidor, agentes e timers continuam rodando — substituto real de "suspender com a CPU ligada", que o ACPI não permite. ATENÇÃO: o light-locker tranca a sessão 5 s depois, e sua senha será pedida ao acender.
+Exec=$EU tela
+Icon=video-display
+Terminal=false
+StartupNotify=false
+Categories=Settings;
+DESK
+	fi
+	cp -f "$alvo" "$PANEL_DIR/launcher-$1/vigilia-apagar-tela.desktop"
+}
+
+painel_por_no_fim() {
+	# Reescreve o array inteiro: xfconf não tem "append". A ordem do array é a
+	# ordem visual, e os ids que já estão lá são preservados. Deduplica nas DUAS
+	# pontas: id repetido no array faz o xfce4-panel descartar um dos dois calado
+	# (medido em 2026-09-10: o array terminou "23 24 23 24" e o painel comeu um).
+	local args=() id vistos=" "
+	# "$@" e nao $*: com $*, um id com espaco viraria dois ids.
+	for id in $(painel_ids) "$@"; do
+		case "$vistos" in *" $id "*) continue ;; esac
+		vistos="$vistos$id "
+		args+=(-t int -s "$id")
+	done
+	xfconf-query -c xfce4-panel -p /panels/panel-1/plugin-ids "${args[@]}" >/dev/null 2>&1
+}
+
+instalar_painel() {
+	tem_x || {
+		erro "sem X em DISPLAY=$DISPLAY"
+		return 3
+	}
+	command -v xfconf-query >/dev/null 2>&1 || {
+		erro "xfconf-query ausente"
+		return 5
+	}
+	[ -e "$PLUGIN_SO" ] || {
+		erro "plugin genmon ausente. Instale antes: sudo apt-get install -y xfce4-genmon-plugin"
+		return 5
+	}
+	mkdir -p "$PANEL_DIR"
+
+	local id_g id_l novos=""
+	if id_g=$(painel_id_genmon); then
+		echo "genmon da vigília já no painel (plugin-$id_g)"
+		painel_escrever_rc_genmon "$id_g" # normaliza Command/Font mesmo se já existir
+	else
+		id_g=$(painel_id_livre)
+		xfconf-query -c xfce4-panel -p "/plugins/plugin-$id_g" -n -t string -s genmon >/dev/null
+		painel_escrever_rc_genmon "$id_g"
+		novos="$novos $id_g"
+		echo "genmon criado como plugin-$id_g"
+	fi
+
+	if id_l=$(painel_id_launcher); then
+		echo "lançador de apagar a tela já no painel (plugin-$id_l)"
+		painel_escrever_launcher "$id_l"
+	else
+		# o id livre muda depois de criar o genmon: recalcula
+		id_l=$(painel_id_livre)
+		[ "$id_l" = "$id_g" ] && id_l=$((id_g + 1))
+		xfconf-query -c xfce4-panel -p "/plugins/plugin-$id_l" -n -t string -s launcher >/dev/null
+		painel_escrever_launcher "$id_l"
+		xfconf-query -c xfce4-panel -p "/plugins/plugin-$id_l/items" -n -a \
+			-t string -s vigilia-apagar-tela.desktop >/dev/null
+		novos="$novos $id_l"
+		echo "lançador criado como plugin-$id_l"
+	fi
+
+	# ids que existem mas caíram do array do painel entram de volta
+	for id in "$id_g" "$id_l"; do
+		case " $(painel_ids | tr '\n' ' ') " in
+		*" $id "*) ;;
+		*)
+			novos="$novos $id"
+			echo "plugin-$id estava fora do painel: recolocado"
+			;;
+		esac
+	done
+
+	# shellcheck disable=SC2086
+	[ -n "${novos// /}" ] && painel_por_no_fim $novos
+
+	# Painel caído (crash, `xfce4-panel -q` de alguém) é o caso em que o dono mais
+	# precisa deste subcomando: sem isto ele dizia "já está no painel" e ia embora
+	# deixando a tela sem painel nenhum.
+	if ! pgrep -x xfce4-panel >/dev/null 2>&1; then
+		echo "painel não estava rodando: subindo"
+		(setsid xfce4-panel >/dev/null 2>&1 9>&- &)
+		return 0
+	fi
+
+	# O plugin recém-instalado só carrega em processo NOVO do painel: `-r` não
+	# varre .so novo. E o painel precisa ser relançado com o SESSION_MANAGER do
+	# ambiente, senão o logout salva uma sessão SEM painel.
+	if [ -n "${novos// /}" ]; then
+		echo "reiniciando o painel para carregar o que mudou…"
+		xfce4-panel -q >/dev/null 2>&1
+		# `9>&-` FECHA o descritor do flock no filho. Sem isso o painel herda o
+		# lock e o segura pela vida inteira do processo: medido em 2026-09-10, o
+		# `vigilia painel` seguinte esperou 10 s e caiu no "seguindo sem ele" —
+		# e todo clique no botão passaria a pagar esse pedágio.
+		(setsid xfce4-panel >/dev/null 2>&1 9>&- &)
+		echo "confira o rótulo 'vigília' no painel; se não aparecer, rode: xfce4-panel -q && xfce4-panel &"
+	fi
+	return 0
+}
+
+case "${1:-status}" in
+on | ligar) com_lock ligar ;;
+off | desligar) com_lock desligar ;;
+toggle | alternar) com_lock alternar ;;
+status) status ;;
+guardas) guardas ;;
+tela) apagar_tela ;;
+aplicar) com_lock aplicar ;;
+genmon) genmon ;;
+painel) com_lock instalar_painel ;;
+*)
+	sed -n '/^# Uso:/,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+	;;
+esac

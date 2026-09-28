@@ -1,0 +1,832 @@
+#!/usr/bin/python3
+# INTERPRETADOR DO SISTEMA, NAO O DO PATH (2026-09-24). O drop-in
+# 20-python.conf poe /opt/wiki/.venv-tools311/bin na frente do PATH de toda unit
+# wikijuridica-*, e na torre (Ubuntu 26.04) aquele venv e o CPython 3.11.15
+# standalone do uv, compilado SEM os.pidfd_open e signal.pidfd_send_signal
+# (medido: False False). Com `env python3` este guardiao abortava com
+# "pidfd signal support is required" (exit 125) e todo job pesado da torre
+# falhava -- wikijuridica-datajud-fila foi o primeiro. Ele so usa a biblioteca
+# padrao; o /usr/bin/python3 tem pidfd nas duas maquinas (3.11.2 no Debian 12,
+# 3.14.4 no Ubuntu 26.04). Mesmo padrao de check-go-index-compile-closure.
+"""Bounded Linux process-tree supervisor.
+
+An outer guardian and an inner supervisor both become child subreapers before
+the command is forked.  If either layer dies alone, the other adopts, terminates
+and reaps the command tree.  Process identities are pinned with pidfds and
+checked as ``(pid, start_ticks)`` before a signal is sent, so a recycled PID is
+never intentionally targeted.
+
+Exit status follows the command leader (using the shell convention 128+signal)
+after successful cleanup.  A signal sent to the supervisor takes precedence.
+Status 125 is reserved for a supervisor/setup/cleanup failure, 126 for a child
+setup failure, and 127 for a missing executable.
+
+Extra descriptors are closed in the command by default; ``--pass-fd`` is the
+only opt-in allowlist.  One-shot factory wrappers must also pass
+``--fail-on-descendant-cleanup`` so a leader that returns zero while abandoning
+background work cannot produce a false green.  A descendant that dies on its
+own within ``--teardown-race-grace-seconds`` (no signal is sent during the
+grace) is a nested-wrapper teardown race, not abandonment, and keeps the
+leader's exit status.
+
+This is deliberately Linux-only.  One isolated SIGKILL is covered by the two
+subreaper layers and PR_SET_PDEATHSIG.  Simultaneous SIGKILL of both layers,
+kernel OOM termination of both, or hostile pid-namespace/cgroup intervention
+cannot be recovered by userspace; a delegated cgroup is required for that
+stronger guarantee.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import os
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+SCHEMA = "process-tree-supervisor/v2"
+PR_SET_PDEATHSIG = 1
+PR_SET_CHILD_SUBREAPER = 36
+SUPERVISOR_ERROR = 125
+CHILD_SETUP_ERROR = 126
+COMMAND_NOT_FOUND = 127
+COMMAND_TIMEOUT = 124
+POLL_SECONDS = 0.01
+MAX_GRACE_SECONDS = 300.0
+MAX_TIMEOUT_SECONDS = 86_400.0
+MAX_PROC_ENTRIES = 4_194_304
+PROC_ROOT = Path("/proc")
+MANAGED_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+
+
+class SupervisorError(RuntimeError):
+    """Raised when the process tree cannot be supervised safely."""
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    ppid: int
+    start_ticks: int
+    state: str
+
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.prctl.argtypes = [
+    ctypes.c_int,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+]
+_libc.prctl.restype = ctypes.c_int
+
+
+def _prctl(option: int, argument: int) -> None:
+    if _libc.prctl(option, argument, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _read_process(pid: int) -> ProcessIdentity | None:
+    try:
+        # Linux permits arbitrary bytes in comm. Replacement is safe here:
+        # only the ASCII numeric fields after the final ')' are interpreted.
+        payload = (PROC_ROOT / str(pid) / "stat").read_text(errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as exc:
+        raise SupervisorError(f"cannot read /proc/{pid}/stat: {exc}") from exc
+
+    # The comm field is parenthesized and may itself contain ')' characters.
+    close_paren = payload.rfind(")")
+    if close_paren < 0:
+        raise SupervisorError(f"malformed /proc/{pid}/stat")
+    fields = payload[close_paren + 2 :].split()
+    if len(fields) <= 19:
+        raise SupervisorError(f"malformed /proc/{pid}/stat")
+    try:
+        return ProcessIdentity(
+            pid=pid,
+            ppid=int(fields[1]),
+            start_ticks=int(fields[19]),
+            state=fields[0],
+        )
+    except (IndexError, ValueError) as exc:
+        raise SupervisorError(f"malformed /proc/{pid}/stat") from exc
+
+
+def _scan_processes() -> dict[int, ProcessIdentity]:
+    processes: dict[int, ProcessIdentity] = {}
+    try:
+        entries = os.scandir(PROC_ROOT)
+    except OSError as exc:
+        raise SupervisorError(f"cannot scan {PROC_ROOT}: {exc}") from exc
+
+    with entries:
+        seen = 0
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            seen += 1
+            if seen > MAX_PROC_ENTRIES:
+                raise SupervisorError("procfs process count exceeds safety bound")
+            try:
+                process = _read_process(int(entry.name))
+            except SupervisorError:
+                # A process can disappear or become unreadable between scandir
+                # and open.  Only the supervisor's own identity is mandatory.
+                continue
+            if process is not None:
+                processes[process.pid] = process
+    return processes
+
+
+def _descendants(supervisor_pid: int) -> tuple[ProcessIdentity, ...]:
+    processes = _scan_processes()
+    supervisor = processes.get(supervisor_pid)
+    if supervisor is None:
+        raise SupervisorError("supervisor identity disappeared from procfs")
+
+    children: dict[int, list[ProcessIdentity]] = {}
+    for process in processes.values():
+        children.setdefault(process.ppid, []).append(process)
+
+    selected: dict[int, ProcessIdentity] = {}
+    pending = [supervisor_pid]
+    while pending:
+        parent_pid = pending.pop()
+        parent_identity = processes.get(parent_pid)
+        if parent_identity is None:
+            continue
+        current_parent = _read_process(parent_pid)
+        if (
+            current_parent is None
+            or current_parent.start_ticks != parent_identity.start_ticks
+        ):
+            # The snapshot crossed a parent exit/PID-reuse boundary.  Its
+            # children will be adopted and discovered on the next scan.
+            continue
+        for child in children.get(parent_pid, ()):
+            if child.pid == supervisor_pid or child.pid in selected:
+                continue
+            selected[child.pid] = child
+            pending.append(child.pid)
+    return tuple(sorted(selected.values(), key=lambda process: process.pid))
+
+
+def _signal_identity(identity: ProcessIdentity, signal_number: int) -> bool:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise SupervisorError("pidfd signal support is required to prevent PID reuse")
+    try:
+        pidfd = os.pidfd_open(identity.pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        # Opening a pidfd first pins the process object.  Re-reading start_ticks
+        # then proves that the pinned object is the identity selected by the
+        # tree snapshot; pidfd_send_signal cannot hit a later PID reuse.
+        current = _read_process(identity.pid)
+        if current is None or current.start_ticks != identity.start_ticks:
+            return False
+        try:
+            signal.pidfd_send_signal(pidfd, signal_number, None, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise SupervisorError(
+                f"permission denied signalling descendant {identity.pid}"
+            ) from exc
+        return True
+    finally:
+        os.close(pidfd)
+
+
+def _decode_wait_status(status: int) -> int:
+    code = os.waitstatus_to_exitcode(status)
+    return 128 + (-code) if code < 0 else code
+
+
+def _reap_available(
+    leader_pid: int, leader_exit: int | None
+) -> tuple[int | None, bool]:
+    """Reap all currently waitable children and report whether ECHILD holds."""
+
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return leader_exit, True
+        except InterruptedError:
+            continue
+        if pid == 0:
+            return leader_exit, False
+        if pid == leader_pid and leader_exit is None:
+            leader_exit = _decode_wait_status(status)
+
+
+def _sleep_until(deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(POLL_SECONDS, remaining))
+
+
+def _terminate_and_reap(
+    supervisor_pid: int,
+    leader_pid: int,
+    leader_exit: int | None,
+    term_grace_seconds: float,
+    kill_grace_seconds: float,
+) -> tuple[bool, int | None, tuple[ProcessIdentity, ...]]:
+    """Terminate every descendant and wait until waitpid reports ECHILD."""
+
+    term_deadline = time.monotonic() + term_grace_seconds
+    term_signalled: set[tuple[int, int]] = set()
+    last_descendants: tuple[ProcessIdentity, ...] = ()
+
+    while True:
+        leader_exit, no_children = _reap_available(leader_pid, leader_exit)
+        if no_children:
+            return True, leader_exit, ()
+        last_descendants = _descendants(supervisor_pid)
+        for process in last_descendants:
+            identity = (process.pid, process.start_ticks)
+            if identity not in term_signalled:
+                _signal_identity(process, signal.SIGTERM)
+                term_signalled.add(identity)
+        if time.monotonic() >= term_deadline:
+            break
+        _sleep_until(term_deadline)
+
+    kill_deadline = time.monotonic() + kill_grace_seconds
+    while True:
+        leader_exit, no_children = _reap_available(leader_pid, leader_exit)
+        if no_children:
+            return True, leader_exit, ()
+        last_descendants = _descendants(supervisor_pid)
+        for process in last_descendants:
+            _signal_identity(process, signal.SIGKILL)
+        if time.monotonic() >= kill_deadline:
+            break
+        _sleep_until(kill_deadline)
+
+    leader_exit, no_children = _reap_available(leader_pid, leader_exit)
+    if no_children:
+        return True, leader_exit, ()
+    try:
+        last_descendants = _descendants(supervisor_pid)
+    except SupervisorError:
+        pass
+    return False, leader_exit, last_descendants
+
+
+def _child_error(message: str, exit_status: int) -> None:
+    payload = f"supervise-process-tree: {message}\n".encode(
+        "utf-8", errors="backslashreplace"
+    )
+    try:
+        os.write(2, payload[:4096])
+    finally:
+        os._exit(exit_status)
+
+
+def _exec_child(
+    command: list[str],
+    supervisor_pid: int,
+    pass_fds: frozenset[int],
+    inherited_signal_mask: set[signal.Signals],
+) -> None:
+    try:
+        for signal_number in (*MANAGED_SIGNALS, signal.SIGPIPE, signal.SIGCHLD):
+            signal.signal(signal_number, signal.SIG_DFL)
+        os.setsid()
+        try:
+            inherited_fds = tuple(
+                int(name) for name in os.listdir("/proc/self/fd") if name.isdigit()
+            )
+        except OSError as exc:
+            raise SupervisorError(f"cannot enumerate inherited descriptors: {exc}") from exc
+        for descriptor in inherited_fds:
+            if descriptor <= 2 or descriptor in pass_fds:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+        for descriptor in pass_fds:
+            os.set_inheritable(descriptor, True)
+        signal.pthread_sigmask(signal.SIG_SETMASK, inherited_signal_mask)
+
+        # Keep this immediately before exec.  The parent check closes the
+        # fork-to-prctl race if the supervisor died while this branch started.
+        _prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        if os.getppid() != supervisor_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+        os.execvp(command[0], command)
+    except FileNotFoundError:
+        _child_error(f"command not found: {command[0]}", COMMAND_NOT_FOUND)
+    except BaseException as exc:
+        _child_error(f"child setup/exec failed: {exc}", CHILD_SETUP_ERROR)
+
+
+def _parse_nonnegative_seconds(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
+    if (
+        value < 0
+        or value == float("inf")
+        or value != value
+        or value > MAX_GRACE_SECONDS
+    ):
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_GRACE_SECONDS:g} seconds"
+        )
+    return value
+
+
+def _parse_timeout_seconds(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
+    if value < 0 or value == float("inf") or value != value or value > MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_TIMEOUT_SECONDS:g} seconds"
+        )
+    return value
+
+
+def _parse_fd(raw: str) -> int:
+    try:
+        descriptor = int(raw, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer descriptor >= 3") from exc
+    if descriptor < 3:
+        raise argparse.ArgumentTypeError("must be an integer descriptor >= 3")
+    return descriptor
+
+
+def _parse_arguments(arguments: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="supervise-process-tree",
+        description=(
+            "run COMMAND under a Linux subreaper and leave no surviving descendants"
+        ),
+    )
+    parser.add_argument("--version", action="version", version=SCHEMA)
+    parser.add_argument(
+        "--term-grace-seconds",
+        type=_parse_nonnegative_seconds,
+        default=1.0,
+        metavar="SECONDS",
+    )
+    parser.add_argument(
+        "--kill-grace-seconds",
+        type=_parse_nonnegative_seconds,
+        default=1.0,
+        metavar="SECONDS",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=_parse_timeout_seconds,
+        default=0.0,
+        metavar="SECONDS",
+        help="total command deadline; 0 disables the command deadline",
+    )
+    parser.add_argument(
+        "--kill-after-seconds",
+        type=_parse_nonnegative_seconds,
+        default=5.0,
+        metavar="SECONDS",
+        help="guardian grace after timeout or forwarded termination before SIGKILL",
+    )
+    parser.add_argument(
+        "--pass-fd",
+        action="append",
+        type=_parse_fd,
+        default=[],
+        metavar="FD",
+        help="descriptor >=3 to retain in the command; repeat for multiple descriptors",
+    )
+    parser.add_argument(
+        "--close-fd8",
+        action="store_true",
+        help="compatibility assertion that descriptor 8 must not be passed",
+    )
+    parser.add_argument(
+        "--fail-on-descendant-cleanup",
+        action="store_true",
+        help=(
+            "return 125 if a normally exited leader left descendants; required "
+            "for one-shot factory wrappers"
+        ),
+    )
+    parser.add_argument(
+        "--teardown-race-grace-seconds",
+        type=_parse_nonnegative_seconds,
+        default=1.5,
+        metavar="SECONDS",
+        help=(
+            "when a normally exited leader leaves descendants, wait up to this "
+            "long for them to die on their own before ruling abandonment; no "
+            "signal is sent during the grace, so an abandoned daemon still "
+            "fails; 0 restores immediate strict failure"
+        ),
+    )
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    parsed = parser.parse_args(list(arguments))
+    if parsed.command[:1] == ["--"]:
+        parsed.command = parsed.command[1:]
+    if not parsed.command:
+        parser.error("COMMAND is required after --")
+    parsed.pass_fds = frozenset(parsed.pass_fd)
+    if parsed.close_fd8 and 8 in parsed.pass_fds:
+        parser.error("--close-fd8 conflicts with --pass-fd 8")
+    return parsed
+
+
+def _report_supervisor_failure(role: str, error: BaseException) -> None:
+    payload = f"supervise-process-tree: {role} failure: {error}\n".encode(
+        "utf-8", errors="backslashreplace"
+    )
+    try:
+        os.write(2, payload[:4096])
+    except OSError:
+        # Diagnostics must never prevent process-tree cleanup.
+        pass
+
+
+def _verify_self_in_procfs(process_id: int, role: str) -> None:
+    identity = _read_process(process_id)
+    if identity is None or identity.pid != process_id:
+        raise SupervisorError(f"cannot verify {role} identity in procfs")
+    _scan_processes()
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise SupervisorError("pidfd signal support is required to prevent PID reuse")
+    try:
+        pidfd = os.pidfd_open(process_id, 0)
+    except OSError as exc:
+        raise SupervisorError(f"pidfd is unavailable for {role}: {exc}") from exc
+    else:
+        os.close(pidfd)
+
+
+def _drain_managed_signal(preserved: int | None) -> int | None:
+    while True:
+        pending = signal.sigtimedwait(MANAGED_SIGNALS, 0)
+        if pending is None:
+            return preserved
+        if preserved is None:
+            preserved = pending.si_signo
+
+
+def _run_command_supervisor(
+    parsed: argparse.Namespace,
+    guardian_pid: int,
+    inherited_signal_mask: set[signal.Signals],
+    waited_signals: set[signal.Signals],
+) -> int:
+    supervisor_pid = os.getpid()
+    received_signal: int | None = None
+    leader_pid = -1
+    leader_exit: int | None = None
+    no_children_after_leader_reap = False
+    try:
+        os.setsid()
+        _prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        if os.getppid() != guardian_pid:
+            return 128 + signal.SIGTERM
+        _prctl(PR_SET_CHILD_SUBREAPER, 1)
+        _verify_self_in_procfs(supervisor_pid, "supervisor")
+
+        received_signal = _drain_managed_signal(received_signal)
+        if received_signal is not None:
+            return 128 + received_signal
+
+        leader_pid = os.fork()
+        if leader_pid == 0:
+            _exec_child(
+                parsed.command,
+                supervisor_pid,
+                parsed.pass_fds,
+                inherited_signal_mask,
+            )
+            os._exit(CHILD_SETUP_ERROR)
+
+        while leader_exit is None and received_signal is None:
+            leader_exit, no_children_after_leader_reap = _reap_available(
+                leader_pid, leader_exit
+            )
+            if no_children_after_leader_reap and leader_exit is None:
+                raise SupervisorError("command leader disappeared without wait status")
+            if leader_exit is None and received_signal is None:
+                received = signal.sigwait(waited_signals)
+                if received != signal.SIGCHLD:
+                    received_signal = received
+
+        normal_exit_descendants: tuple[ProcessIdentity, ...] = ()
+        normal_exit_had_descendants = False
+        if received_signal is None:
+            # waitpid is authoritative even if a concurrent fork/adoption
+            # crosses the following procfs snapshot.  A live child after the
+            # leader status was reaped means cleanup occurred and a strict
+            # one-shot factory command must not become green merely because
+            # that first /proc scan raced the descendant.
+            normal_exit_had_descendants = not no_children_after_leader_reap
+            normal_exit_descendants = _descendants(supervisor_pid)
+            if (
+                (normal_exit_had_descendants or normal_exit_descendants)
+                and parsed.fail_on_descendant_cleanup
+                and parsed.teardown_race_grace_seconds > 0
+            ):
+                # Nested-wrapper teardown race: a utility child of the leader
+                # (e.g. an inner heartbeat sleep) can be adopted by this
+                # subreaper for the few hundred milliseconds it takes to die
+                # on its own.  Only SPONTANEOUS death within the grace
+                # requalifies the exit — nothing is signalled here, so an
+                # abandoned daemon never becomes green.
+                grace_deadline = (
+                    time.monotonic() + parsed.teardown_race_grace_seconds
+                )
+                while time.monotonic() < grace_deadline:
+                    leader_exit, all_reaped = _reap_available(
+                        leader_pid, leader_exit
+                    )
+                    if all_reaped and not _descendants(supervisor_pid):
+                        event = (
+                            f"supervise-process-tree: {SCHEMA} "
+                            "event=descendant_teardown_race_resolved "
+                            f"grace_seconds={parsed.teardown_race_grace_seconds:g}\n"
+                        )
+                        os.write(
+                            2,
+                            event.encode("utf-8", errors="backslashreplace")[
+                                :4096
+                            ],
+                        )
+                        normal_exit_had_descendants = False
+                        normal_exit_descendants = ()
+                        break
+                    time.sleep(0.05)
+                else:
+                    # Última chance no limite do deadline: uma morte espontânea
+                    # entre o último poll e o vencimento do grace não pode
+                    # repor o falso 125 numa janela de 50ms.
+                    leader_exit, all_reaped = _reap_available(
+                        leader_pid, leader_exit
+                    )
+                    normal_exit_descendants = _descendants(supervisor_pid)
+                    if all_reaped and not normal_exit_descendants:
+                        event = (
+                            f"supervise-process-tree: {SCHEMA} "
+                            "event=descendant_teardown_race_resolved "
+                            f"grace_seconds={parsed.teardown_race_grace_seconds:g}\n"
+                        )
+                        os.write(
+                            2,
+                            event.encode("utf-8", errors="backslashreplace")[
+                                :4096
+                            ],
+                        )
+                        normal_exit_had_descendants = False
+        cleaned, leader_exit, survivors = _terminate_and_reap(
+            supervisor_pid,
+            leader_pid,
+            leader_exit,
+            parsed.term_grace_seconds,
+            parsed.kill_grace_seconds,
+        )
+        if not cleaned:
+            identities = ",".join(
+                f"{process.pid}:{process.start_ticks}" for process in survivors[:16]
+            )
+            raise SupervisorError(
+                "descendants survived bounded SIGKILL cleanup"
+                + (f": {identities}" if identities else "")
+            )
+        received_signal = _drain_managed_signal(received_signal)
+        if received_signal is not None:
+            return 128 + received_signal
+        if normal_exit_had_descendants or normal_exit_descendants:
+            identities = ",".join(
+                f"{process.pid}:{process.start_ticks}"
+                for process in normal_exit_descendants[:16]
+            )
+            event = (
+                f"supervise-process-tree: {SCHEMA} "
+                "event=descendant_cleanup_after_leader_exit "
+                f"count={max(1, len(normal_exit_descendants))} "
+                f"identities={identities or 'observed_by_waitpid'}\n"
+            )
+            os.write(2, event.encode("utf-8", errors="backslashreplace")[:4096])
+            if parsed.fail_on_descendant_cleanup:
+                return SUPERVISOR_ERROR
+        if leader_exit is None:
+            raise SupervisorError("command leader exited without a captured status")
+        return leader_exit
+    except (OSError, SupervisorError) as exc:
+        _report_supervisor_failure("supervisor", exc)
+        if leader_pid > 0:
+            try:
+                _terminate_and_reap(
+                    supervisor_pid,
+                    leader_pid,
+                    leader_exit,
+                    0.0,
+                    parsed.kill_grace_seconds,
+                )
+            except (OSError, SupervisorError):
+                pass
+        return SUPERVISOR_ERROR
+
+
+def _remaining_until(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _run_guardian(
+    parsed: argparse.Namespace,
+    invoker_pid: int,
+    inherited_signal_mask: set[signal.Signals],
+    waited_signals: set[signal.Signals],
+) -> int:
+    guardian_pid = os.getpid()
+    supervisor_pid = -1
+    supervisor_exit: int | None = None
+    forwarded_signal: int | None = None
+    timed_out = False
+    command_deadline = (
+        time.monotonic() + parsed.timeout_seconds
+        if parsed.timeout_seconds > 0
+        else None
+    )
+    shutdown_deadline: float | None = None
+    try:
+        _prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        if os.getppid() != invoker_pid:
+            return 128 + signal.SIGTERM
+        _prctl(PR_SET_CHILD_SUBREAPER, 1)
+        _verify_self_in_procfs(guardian_pid, "guardian")
+
+        pending_signal = _drain_managed_signal(None)
+        if pending_signal is not None:
+            return 128 + pending_signal
+
+        supervisor_pid = os.fork()
+        if supervisor_pid == 0:
+            status = _run_command_supervisor(
+                parsed,
+                guardian_pid,
+                inherited_signal_mask,
+                waited_signals,
+            )
+            os._exit(status)
+
+        while supervisor_exit is None:
+            supervisor_exit, no_children = _reap_available(
+                supervisor_pid, supervisor_exit
+            )
+            if supervisor_exit is not None:
+                break
+            if no_children:
+                raise SupervisorError(
+                    "internal supervisor disappeared without wait status"
+                )
+
+            now = time.monotonic()
+            if shutdown_deadline is not None and now >= shutdown_deadline:
+                break
+            if forwarded_signal is None and command_deadline is not None:
+                if now >= command_deadline:
+                    timed_out = True
+                    forwarded_signal = signal.SIGTERM
+                    shutdown_deadline = now + parsed.kill_after_seconds
+                    identity = _read_process(supervisor_pid)
+                    if identity is not None:
+                        _signal_identity(identity, signal.SIGTERM)
+                    continue
+
+            next_deadline = (
+                shutdown_deadline
+                if shutdown_deadline is not None
+                else command_deadline
+            )
+            remaining = _remaining_until(next_deadline)
+            if remaining is None:
+                pending_signal = signal.sigwait(waited_signals)
+            else:
+                pending = signal.sigtimedwait(waited_signals, remaining)
+                if pending is None:
+                    continue
+                pending_signal = pending.si_signo
+            if pending_signal == signal.SIGCHLD:
+                continue
+            if forwarded_signal is None:
+                forwarded_signal = pending_signal
+                shutdown_deadline = time.monotonic() + parsed.kill_after_seconds
+                identity = _read_process(supervisor_pid)
+                if identity is not None:
+                    _signal_identity(identity, forwarded_signal)
+
+        cleanup_term_grace = (
+            0.0 if shutdown_deadline is not None else parsed.term_grace_seconds
+        )
+        cleaned, supervisor_exit, survivors = _terminate_and_reap(
+            guardian_pid,
+            supervisor_pid,
+            supervisor_exit,
+            cleanup_term_grace,
+            parsed.kill_grace_seconds,
+        )
+        if not cleaned:
+            identities = ",".join(
+                f"{process.pid}:{process.start_ticks}" for process in survivors[:16]
+            )
+            raise SupervisorError(
+                "guardian descendants survived bounded SIGKILL cleanup"
+                + (f": {identities}" if identities else "")
+            )
+
+        pending_signal = _drain_managed_signal(None)
+        if forwarded_signal is None and pending_signal is not None:
+            forwarded_signal = pending_signal
+        if timed_out:
+            return COMMAND_TIMEOUT
+        if forwarded_signal is not None:
+            return 128 + forwarded_signal
+        if supervisor_exit is None:
+            raise SupervisorError("internal supervisor exited without captured status")
+        return supervisor_exit
+    except (OSError, SupervisorError) as exc:
+        _report_supervisor_failure("guardian", exc)
+        if supervisor_pid > 0:
+            try:
+                _terminate_and_reap(
+                    guardian_pid,
+                    supervisor_pid,
+                    supervisor_exit,
+                    0.0,
+                    parsed.kill_grace_seconds,
+                )
+            except (OSError, SupervisorError):
+                pass
+        return SUPERVISOR_ERROR
+
+
+def run(arguments: Iterable[str]) -> int:
+    if sys.platform != "linux":
+        print("supervise-process-tree: Linux is required", file=sys.stderr)
+        return SUPERVISOR_ERROR
+
+    parsed = _parse_arguments(arguments)
+    invoker_pid = os.getppid()
+    waited_signals = {*MANAGED_SIGNALS, signal.SIGCHLD}
+    old_handlers = {
+        signal_number: signal.getsignal(signal_number)
+        for signal_number in waited_signals
+    }
+    # SIG_IGN/SA_NOCLDWAIT survives exec and would make the kernel discard the
+    # child statuses.  Normalize it before fork, then restore on return.
+    for signal_number in waited_signals:
+        signal.signal(signal_number, signal.SIG_DFL)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, waited_signals)
+    try:
+        for descriptor in parsed.pass_fds:
+            try:
+                os.fstat(descriptor)
+            except OSError as exc:
+                raise SupervisorError(
+                    f"--pass-fd {descriptor} is not open in the guardian"
+                ) from exc
+        return _run_guardian(parsed, invoker_pid, old_mask, waited_signals)
+    except SupervisorError as exc:
+        _report_supervisor_failure("setup", exc)
+        return SUPERVISOR_ERROR
+    finally:
+        # Restore dispositions while the signals are still blocked.  Reversing
+        # this order creates a window where an inherited default action can run.
+        for signal_number, old_handler in old_handlers.items():
+            signal.signal(signal_number, old_handler)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        except OSError:
+            pass
+
+
+def main() -> None:
+    raise SystemExit(run(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()

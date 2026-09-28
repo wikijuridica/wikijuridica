@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""generate-edge-telemetry-quarantine — registra, sem apagar, a linha da borda
+cujo numero e fisicamente impossivel.
+
+POR QUE EXISTE: `data/ops/edge_bot_agents_daily.jsonl` e append-only, e a regra
+do repositorio proibe apagar linha, reescrever historico ou reverter estado. Em
+2026-08-12 a auditoria achou 10 linhas forjadas nele — a pior com
+1.000.000.000.000 de requisicoes do YandexBot num dia, sobre 9.835 URLs. Elas
+NAO podem ser deletadas e NAO podem continuar valendo como medicao.
+
+A saida e o meio-termo honesto: a linha ruim fica onde esta, visivel e
+auditavel, e este ledger paralelo registra por que ela nao entra em nenhuma
+conta. Neutralizar declarando e diferente de sumir com a evidencia — quem abrir
+o repo daqui a um ano ve as duas coisas: que o numero falso existiu e que foi
+reconhecido.
+
+POR QUE E UM `generate-*` E NAO PARTE DO CHECK: em tools/, `check-*` e
+read-only e `generate-*` escreve — misturar os dois papeis e bug. E, mais
+importante, colocar a quarentena dentro do gate deixaria o gate se
+auto-absolver: ele acharia o numero impossivel e no mesmo passo se daria
+permissao de ignora-lo. Quarentenar e ato deliberado de quem revisou as linhas,
+nao efeito colateral de rodar um check.
+
+IDENTIDADE POR HASH, NAO POR LINHA: o ledger recebe escrita de um timer a cada
+30 minutos (foi de 4.321 para 4.495 linhas entre o commit a4c48ea8 e a
+auditoria). Numero de linha apontaria para outro registro em horas; o sha256 do
+conteudo da linha e estavel para sempre. Duas linhas byte-identicas compartilham
+o hash de proposito — uma entrada neutraliza as duas.
+
+O QUE A QUARENTENA NAO FAZ: nao e um "ignore tudo que for grande". Só a linha
+com hash registrado aqui deixa de reprovar. Qualquer linha impossivel NOVA, que
+ninguem revisou, continua reprovando o check-bot-telemetry-honesty — que e
+exatamente o ponto de o gate existir.
+
+Uso:
+    tools/generate-edge-telemetry-quarantine --dry-run     # so mostra
+    tools/generate-edge-telemetry-quarantine --motivo "..." # grava
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import edgetelemetry  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SERIE = os.path.join(ROOT, "data/ops/edge_bot_agents_daily.jsonl")
+
+SCHEMA = "edge_bot_agents_daily_quarantine_v1"
+
+MOTIVO_PADRAO = (
+    "numero fisicamente impossivel para o acervo do portal; linha nao produzida "
+    "pelo coletor tools/generate-bot-agents-daily"
+)
+
+
+def coletar(acervo):
+    """As linhas implausiveis do ledger, agrupadas por hash de conteudo."""
+    por_hash = {}
+    if not os.path.isfile(SERIE):
+        return por_hash
+    with open(SERIE, encoding="utf-8") as handle:
+        for numero, bruto in enumerate(handle, start=1):
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registro = json.loads(bruto)
+            except json.JSONDecodeError:
+                # JSON quebrado e outro defeito, com dono proprio no check de
+                # honestidade. Aqui nao se quarentena o que nao se conseguiu ler.
+                continue
+            motivos = edgetelemetry.avaliar_linha(registro, acervo)
+            if not motivos:
+                continue
+            chave = edgetelemetry.sha_linha(bruto)
+            entrada = por_hash.setdefault(chave, {
+                "schema_version": SCHEMA,
+                "line_sha256": chave,
+                "date": registro.get("date"),
+                "agent_key": registro.get("agent_key"),
+                "source_schema_version": registro.get("schema_version"),
+                "requests_estimated": registro.get("requests_estimated"),
+                "requests_sampled": registro.get("requests_sampled"),
+                "window_end": registro.get("window_end"),
+                "reasons": motivos,
+                "occurrences": [],
+            })
+            entrada["occurrences"].append(numero)
+    return por_hash
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true",
+                        help="mostra o que seria quarentenado, sem gravar")
+    parser.add_argument("--motivo", default=MOTIVO_PADRAO,
+                        help="justificativa humana gravada em cada entrada")
+    parser.add_argument("--revisor", default="",
+                        help="quem revisou as linhas (fica no registro)")
+    args = parser.parse_args()
+
+    acervo = edgetelemetry.acervo_urls(ROOT)
+    if acervo <= edgetelemetry.ACERVO_DESCONHECIDO:
+        # Sem acervo legivel os tetos de volume nao existem, e quarentenar com
+        # criterio parcial gravaria um julgamento que nao foi feito por inteiro.
+        print("generate-edge-telemetry-quarantine: acervo publico ilegivel "
+              "(sem public/sitemaps/ nem published_manifest) — rode o build "
+              "publico antes de quarentenar", file=sys.stderr)
+        return 2
+
+    ja = edgetelemetry.carregar_quarentena(ROOT)
+    achadas = coletar(acervo)
+    novas = {h: e for h, e in achadas.items() if h not in ja}
+
+    teto = edgetelemetry.teto_requisicoes_dia(acervo)
+    print("acervo=%d URLs | teto=%d requisicoes/bot/dia | fator maximo=%.0fx"
+          % (acervo, teto, edgetelemetry.MAX_FATOR_EXTRAPOLACAO))
+    print("linhas implausiveis no ledger: %d (%d hash(es) distinto(s))"
+          % (sum(len(e["occurrences"]) for e in achadas.values()), len(achadas)))
+    print("ja em quarentena: %d | a registrar agora: %d" % (len(ja), len(novas)))
+
+    if not novas:
+        print("\nnada novo a quarentenar.")
+        return 0
+
+    print()
+    for chave, entrada in sorted(novas.items(), key=lambda kv: -(kv[1]["requests_estimated"] or 0)):
+        print("  %s %-12s est=%-14s smp=%-8s linha(s)=%s"
+              % (entrada["date"], entrada["agent_key"], entrada["requests_estimated"],
+                 entrada["requests_sampled"],
+                 ",".join(str(n) for n in entrada["occurrences"])))
+        print("      sha256=%s" % chave)
+        for motivo in entrada["reasons"]:
+            print("      -> %s" % motivo)
+
+    if args.dry_run:
+        print("\n--dry-run: nada foi gravado.")
+        return 0
+
+    agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    caminho = edgetelemetry.caminho_quarentena(ROOT)
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    # Append-only, igual ao ledger que ele descreve: a quarentena tambem e
+    # historico, e retirar uma entrada tem que ser um ato visivel no git.
+    with open(caminho, "a", encoding="utf-8") as handle:
+        for chave, entrada in sorted(novas.items()):
+            entrada["quarantined_at"] = agora
+            entrada["justification"] = args.motivo
+            entrada["reviewer"] = args.revisor
+            handle.write(json.dumps(entrada, ensure_ascii=False, sort_keys=True) + "\n")
+
+    print("\nquarentena gravada em %s (%d entrada(s))"
+          % (os.path.relpath(caminho, ROOT), len(novas)))
+    print("o ledger original NAO foi tocado — nenhuma linha apagada ou reescrita.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

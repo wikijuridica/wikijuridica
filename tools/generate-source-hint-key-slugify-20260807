@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""generate-source-hint-key-slugify-20260807 — a CHAVE do hint precisa ser slug, e 636 não eram.
+
+O DEFEITO. `ops/relaunch-writing.sh` — que monta a fila de escrita de páginas
+novas — aborta com:
+
+  relaunch-writing: AVISO: 657 resolucao(oes) de source_hint nao canonica(s)
+  relaunch-writing: projecao de fontes reprovada em portfolio_v2/seguros.jsonl:
+                    catálogo contém source_hint inválido
+
+Com a fila não montada, NENHUMA página nova é escrita. Havia 324 intents de
+portfólio sem página, 102 deles com brief pronto e fonte resolvida.
+
+A CAUSA não é a URL. `canonical_official_source` (ops/relaunch-writing.sh:199)
+exige que o NOME do hint seja kebab-slug ASCII:
+
+    not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', hint)
+
+E 636 chaves do catálogo estavam em texto livre: "CC Lei 10.406/2002 art. 1.147",
+"EC 103/2019 art. 26", "CTB Lei 9.503/1997 art. 261". Todas as 636 têm URL de
+host oficial, estrutura de campos correta e `source_kind` válido — só a chave
+estava fora do formato.
+
+O GATE ESTÁ CERTO e não se afrouxa. Chave de resolução com espaço, acento e
+caixa produz variantes que apontam para a mesma fonte, e isso quebra tanto a
+deduplicação quanto a identidade CAS do catálogo. A correção é normalizar a
+chave, não relaxar a regra.
+
+A MENSAGEM do gate estava errada, e isso custa tempo de quem a lê: mandava rodar
+`tools/generate-catalog-url-repair --apply`, que troca URL de `normas.leg.br` por
+URL documental do Planalto — defeito diferente, que não toca na chave. Quem
+seguisse a orientação veria "nada a reparar" e concluiria que o gate mente.
+Corrigido no mesmo commit.
+
+O QUE ESTE GERADOR FAZ, nos DOIS lados e de forma atômica:
+  1. renomeia as chaves não-slug de `data/editorial/v2_source_hint_catalog.json`;
+  2. reescreve as referências em `data/editorial/portfolio_v2/*.jsonl`
+     (896 referências em 767 intents).
+
+Renomear só o catálogo quebraria as referências; só o portfólio, idem. É por isso
+que as duas escritas acontecem sob o mesmo lease.
+
+MEDIDO ANTES DE ESCREVER (é o que autoriza a operação):
+  - 0 slugs gerados inválidos;
+  - 0 colisões com chave já existente que tivesse URL DIFERENTE;
+  - 1 colisão entre os novos (`ctn-art-151-vi`, dois hints), e os dois apontam
+    para a MESMA URL — fusão segura, não perda de informação.
+
+Se qualquer uma dessas condições mudar, o preflight aborta. Fundir chaves que
+apontam para fontes diferentes seria trocar a fonte de uma página em silêncio.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, escrita atômica com fsync,
+idempotente. NÃO commita.
+
+Uso:
+    tools/generate-source-hint-key-slugify-20260807 --dry-run
+    tools/generate-source-hint-key-slugify-20260807
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.source-hint-key-slugify-20260807.lock"
+CATALOGO = ROOT / "data/editorial/v2_source_hint_catalog.json"
+PORTFOLIO = ROOT / "data/editorial/portfolio_v2"
+
+SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def slugify(valor: str) -> str:
+    """Mesma normalização que o resto do repositório usa para slug ASCII."""
+    dobrado = unicodedata.normalize("NFKD", valor)
+    dobrado = "".join(c for c in dobrado if not unicodedata.combining(c))
+    dobrado = re.sub(r"[^A-Za-z0-9]+", "-", dobrado).strip("-").lower()
+    return re.sub(r"-{2,}", "-", dobrado)
+
+
+def planejar(catalogo: dict) -> dict:
+    hints = catalogo["source_hints"]
+    plano = {}
+    for chave in hints:
+        if SLUG_RE.fullmatch(chave):
+            continue
+        plano[chave] = slugify(chave)
+    return plano
+
+
+def preflight(catalogo: dict, plano: dict) -> None:
+    hints = catalogo["source_hints"]
+    problemas = []
+
+    for antigo, novo in sorted(plano.items()):
+        if not novo or not SLUG_RE.fullmatch(novo):
+            problemas.append(f"{antigo!r} produz slug inválido: {novo!r}")
+
+    # Colisão com chave que JÁ existe e aponta para outra fonte.
+    for antigo, novo in sorted(plano.items()):
+        if novo in hints and novo not in plano:
+            if hints[novo].get("url") != hints[antigo].get("url"):
+                problemas.append(
+                    f"{antigo!r} -> {novo!r} colide com chave existente de URL "
+                    f"DIFERENTE ({hints[novo].get('url')!r} vs "
+                    f"{hints[antigo].get('url')!r})")
+
+    # Colisão entre os renomeados apontando para fontes diferentes.
+    por_destino = collections.defaultdict(list)
+    for antigo, novo in plano.items():
+        por_destino[novo].append(antigo)
+    for novo, antigos in sorted(por_destino.items()):
+        if len(antigos) < 2:
+            continue
+        urls = {hints[a].get("url") for a in antigos}
+        if len(urls) > 1:
+            problemas.append(
+                f"{len(antigos)} hints viram {novo!r} apontando para "
+                f"{len(urls)} URLs diferentes: {sorted(antigos)}")
+
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+
+    fusoes = sum(1 for novo, antigos in por_destino.items() if len(antigos) > 1)
+    print(f"preflight ok: {len(plano)} chaves a normalizar, {fusoes} fusão(ões) "
+          f"de chaves que apontam para a mesma URL, 0 conflito de fonte")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    with open(CATALOGO, encoding="utf-8") as handle:
+        catalogo = json.load(handle)
+    plano = planejar(catalogo)
+    if not plano:
+        print("catálogo já está normalizado: nada a fazer.")
+        return 0
+    preflight(catalogo, plano)
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                # 1. catálogo
+                hints = catalogo["source_hints"]
+                novos = {}
+                for chave, valor in hints.items():
+                    destino = plano.get(chave, chave)
+                    if destino in novos and novos[destino] != valor:
+                        # Preflight garante mesma URL; mantém a primeira e segue.
+                        continue
+                    novos[destino] = valor
+                catalogo["source_hints"] = dict(sorted(novos.items()))
+                print(f"  catálogo: {len(hints)} -> {len(novos)} hints")
+
+                # 2. referências no portfólio
+                tocados = 0
+                referencias = 0
+                for caminho in sorted(glob.glob(os.fspath(PORTFOLIO / "*.jsonl"))):
+                    linhas = Path(caminho).read_bytes().decode("utf-8").split("\n")
+                    fim_com_newline = bool(linhas) and linhas[-1] == ""
+                    if fim_com_newline:
+                        linhas = linhas[:-1]
+                    saida = []
+                    mudou = False
+                    for raw in linhas:
+                        if not raw.strip():
+                            saida.append(raw)
+                            continue
+                        registro = json.loads(raw)
+                        atuais = registro.get("source_hints") or []
+                        if not any(h in plano for h in atuais):
+                            saida.append(raw)
+                            continue
+                        vistos = []
+                        for h in atuais:
+                            destino = plano.get(h, h)
+                            if destino not in vistos:
+                                vistos.append(destino)
+                            if h in plano:
+                                referencias += 1
+                        registro["source_hints"] = vistos
+                        saida.append(json.dumps(registro, ensure_ascii=False,
+                                                sort_keys=True))
+                        mudou = True
+                    if mudou:
+                        tocados += 1
+                        if not args.dry_run:
+                            payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+                            atomic_write(Path(caminho), payload.encode("utf-8"))
+                print(f"  portfólio: {referencias} referência(s) em {tocados} arquivo(s)")
+
+                if not args.dry_run:
+                    payload = json.dumps(catalogo, ensure_ascii=False, indent=1,
+                                         sort_keys=True) + "\n"
+                    atomic_write(CATALOGO, payload.encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+    else:
+        print("\nCatálogo e portfólio normalizados. Rode ops/relaunch-writing.sh.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""check-cerebro-vivo — o cerebro esta processando, ou esta reiniciando em laco?
+
+READ-ONLY. Nao grava nada, nem com flag: a derivada sai do journal, que ja e um
+ledger, e nao de um arquivo de estado ao lado (precedente BUG-236 — check-* que
+grava artefato rastreado e falha de ferramenta; e `portal_health_state.json`,
+que E rastreado, e o caso que este aqui nao repete).
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTE DETECTOR EXISTE — o alarme que NUNCA podia disparar
+
+`ops/systemd/wikijuridica-cerebro.service` declara, na linha 42:
+
+    OnFailure=wikijuridica-alerta@%N.service
+
+e essa linha NUNCA dispara. O motivo nao esta escrito em lugar nenhum da unit,
+e por isso nenhuma leitura anterior o pegou — quem procurar o literal
+`StartLimit` no arquivo nao acha nada, porque a unit nao declara nenhum:
+
+    RestartSec=15                      (wikijuridica-cerebro.service)
+    Restart=always                     (idem)
+    DefaultStartLimitIntervalUSec=10s  (default do MANAGER, medido em 2026-09-16)
+    DefaultStartLimitBurst=5           (idem)
+
+Para a unit entrar em `failed` por laco de restart, o systemd precisa contar 5
+partidas DENTRO de 10 segundos. Com 15 s entre partidas, cinco delas levam no
+minimo 60 s — seis vezes a janela. O burst nunca e atingido, a unit nunca entra
+em `failed`, e o `OnFailure` e decoracao.
+
+E A CORRECAO NAO E MEXER NO `StartLimit`. Poderia-se alargar a janela para que
+o burst fosse alcancado, mas isso deixaria o cerebro PARADO ate alguem mandar
+`systemctl reset-failed` — e `wikijuridica-social.service:84-96` ja analisou
+exatamente essa troca e escolheu o contrario, com a medicao ao lado. Para um
+daemon, a resposta certa e DETECTOR NOMEADO, nao `failed`. Este e o detector.
+
+O cerebro PROCESSA, nao SERVE rota publica: se ele estiver reiniciando em laco,
+nenhuma pagina cai — o que cai e a fila, em silencio, e a unica evidencia e um
+contador que ninguem consulta.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE POR CRESCIMENTO, E NAO POR NIVEL
+
+`NRestarts` e cumulativo e so zera com `reset-failed` ou com o boot. Reprovar
+por NIVEL ("mais que N restarts desde sempre") cria um gate que, uma vez
+vermelho, fica vermelho para sempre sem que nada o drene — e um gate que nada
+drena deixa de ser lido em uma semana (precedente
+`gate-vermelho-por-estoque-que-nada-drena`: reprove por FLUXO e por entrada
+nova; o nivel vira linha datada, nao veredito).
+
+Entao: o veredito sai dos restarts DENTRO DA JANELA, lidos do journal. O nivel
+acumulado entra na linha de saida como contexto datado, e nunca reprova.
+
+────────────────────────────────────────────────────────────────────────────
+O PISO DE RUIDO, MEDIDO — e nao arbitrado
+
+Medido em 2026-09-16 neste host:
+
+    systemctl show wikijuridica-cerebro.service -p NRestarts  ->  1  (acumulado)
+    ExecMainStartTimestamp                                    ->  2026-09-14 04:40:57
+    restarts na janela retida do journal (2026-09-15 15:41 -> 2026-09-16 08:47)
+                                                              ->  0
+
+Ou seja: UM restart em toda a vida da unit, e ZERO na janela retida — o mesmo
+PID (926445) atravessa o journal inteiro. O piso de ruido medido e ZERO por
+janela de 24 h.
+
+O limiar default e 2, e nao 0, de proposito: um restart isolado e' operacao
+normal (troca de binario, `daemon-reload`, o dono reiniciando a mao) e alertar
+nele treinaria o leitor a ignorar o canal. Com `RestartSec=15`, um laco de
+verdade nao produz 1 nem 2 restarts por janela: produz dezenas. A distancia
+entre o piso medido (0) e o limiar (2) e a folga de operacao; a distancia entre
+o limiar e um laco real e uma ordem de grandeza.
+
+────────────────────────────────────────────────────────────────────────────
+CODIGOS
+  0  mediu, e o cerebro nao esta reiniciando em laco
+  1  mediu, e o crescimento de restarts na janela passou do limiar  (VEREDITO)
+  2  NAO mediu — `systemctl show` ilegivel ou journal inacessivel. Nao medir
+     nunca e sucesso, e aqui nao ha veredito a dar.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+# A unit alvo, escrita por extenso. Um detector que nao NOMEIA o que vigia nao e
+# detector: tools/check-units-alarme confere este literal para aceitar esta
+# ferramenta como a cobertura do OnFailure inalcancavel da unit.
+UNIT = "wikijuridica-cerebro.service"
+
+# Piso medido em 2026-09-16: 0 restarts na janela retida. Ver o docstring.
+PISO_DE_RUIDO_MEDIDO = 0
+LIMIAR_PADRAO = 2
+
+# ESTABILIDADE: o que separa "esta em laco" de "esteve em laco e foi consertado".
+#
+# Sem isto o gate reprova por NIVEL acumulado numa janela que inclui o passado JA
+# CORRIGIDO -- e fica vermelho pelas 24 h seguintes a qualquer conserto, que e o
+# "vermelho permanente que se aprende a ignorar" que esta familia de correcoes
+# existe para eliminar. Medido em 2026-09-16, no laco real das 12:09 as 12:18:
+#
+#   21 intervalos entre partidas DENTRO do laco: 17 a 273 s (mediana 21 s)
+#   RestartSec=15, logo um laco se apresenta como partida a cada ~20 s
+#   depois do conserto (SQLITE_BUSY virou pausa classificada): 3 h 45 estavel
+#
+# 1800 s e 6,6x o maior intervalo medido dentro do laco e 120x o RestartSec. Um
+# laco ativo NUNCA fica 30 min sem reiniciar; um sistema consertado sempre fica.
+#
+# PONTO CEGO, declarado: laco de periodo LONGO -- crash a cada 35 min, digamos --
+# le como "ja consertado" na maioria das passadas, e o WatchdogSec=1200 nao cobre
+# (ele pega processo TRAVADO, nao processo que morre devagar). A correcao NAO e'
+# subir este numero: subir reintroduz o falso positivo que o 18.4 de
+# docs/DADOS_CONFIAVEIS_E_ARMADILHAS.md acabou de matar. Se a patologia aparecer,
+# o conserto e' uma segunda janela curta (restarts nos ultimos 120 min > 0), que
+# e' um TERCEIRO eixo -- nao um limiar maior no segundo.
+ESTABILIDADE_SEGUNDOS = 1800
+
+# O systemd anuncia cada reinicio com esta frase. O numero e o contador da vez.
+PADRAO_RESTART = re.compile(r"Scheduled restart job, restart counter is at (\d+)")
+
+
+def systemd_propriedade(nome):
+    """Devolve (valor, erro). Erro != None significa NAO MEDI, nunca 'zero'."""
+    try:
+        saida = subprocess.run(
+            ["systemctl", "show", UNIT, "-p", nome, "--value"],
+            capture_output=True, text=True, timeout=15)
+    except Exception as erro:
+        return "", "systemctl show %s -p %s: %s" % (UNIT, nome, erro)
+    if saida.returncode != 0:
+        return "", "systemctl show %s -p %s: rc=%d %s" % (
+            UNIT, nome, saida.returncode, saida.stderr.strip()[:120])
+    return saida.stdout.strip(), None
+
+
+def segundos_desde_a_partida():
+    """Devolve (segundos, erro). Monotonic do systemd contra /proc/uptime.
+
+    NAO usa ExecMainStartTimestamp: o formato dele ("Wed 2026-09-16 17:02:36
+    -03") nao casa com `%a %Y-%m-%d %H:%M:%S %z` no strptime, e um parse
+    dependente de locale falharia em silencio -- devolvendo "0 s desde a
+    partida", que aqui significaria EM LACO. Erro se reporta, nunca se assume.
+    """
+    bruto, erro = systemd_propriedade("ExecMainStartTimestampMonotonic")
+    if erro:
+        return None, erro
+    try:
+        inicio = int(bruto or 0) / 1e6
+    except ValueError:
+        return None, "ExecMainStartTimestampMonotonic nao e inteiro (%r)" % bruto
+    if inicio <= 0:
+        return None, "ExecMainStartTimestampMonotonic vazio: a unit nunca partiu"
+    try:
+        with open("/proc/uptime", encoding="utf-8") as fh:
+            agora = float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError) as erro:
+        return None, "/proc/uptime: %s" % erro
+    return max(0.0, agora - inicio), None
+
+
+def texto_do_journal(horas):
+    """Devolve (texto, erro). `--journal-de` substitui isto no teste."""
+    try:
+        saida = subprocess.run(
+            ["journalctl", "-u", UNIT, "--since", "-%dh" % horas, "--no-pager"],
+            capture_output=True, text=True, timeout=60)
+    except Exception as erro:
+        return "", "journalctl -u %s: %s" % (UNIT, erro)
+    if saida.returncode != 0:
+        return "", "journalctl -u %s: rc=%d %s" % (
+            UNIT, saida.returncode, saida.stderr.strip()[:120])
+    return saida.stdout, None
+
+
+def conta_restarts(texto):
+    """Reinicios anunciados no texto, e o maior contador visto.
+
+    Conta OCORRENCIAS, e nao o maior contador menos o menor: o contador zera em
+    `reset-failed`, e uma subtracao sobre contador zerado devolveria negativo
+    justamente no caso em que alguem acabou de mexer na unit.
+    """
+    achados = PADRAO_RESTART.findall(texto)
+    return len(achados), (max(int(a) for a in achados) if achados else None)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--janela-horas", type=int, default=24,
+                    help="janela do journal para a derivada (padrao: 24)")
+    ap.add_argument("--limiar", type=int, default=LIMIAR_PADRAO,
+                    help="restarts na janela acima dos quais reprova (padrao: %d)" % LIMIAR_PADRAO)
+    ap.add_argument("--estabilidade", type=int, default=ESTABILIDADE_SEGUNDOS,
+                    help="segundos de unit de pe que provam que o laco NAO esta "
+                         "ativo (padrao: %d; ver o docstring da constante)" % ESTABILIDADE_SEGUNDOS)
+    ap.add_argument("--estavel-ha", type=float, default=None,
+                    help="segundos desde a ultima partida, em vez de medir a unit "
+                         "(controle do eixo de FLUXO, usado por tools/test_cerebro_vivo.sh: "
+                         "sem isto a fixture de laco seria julgada contra a estabilidade "
+                         "REAL da maquina, e o controle positivo passaria por acidente)")
+    ap.add_argument("--journal-de", default="",
+                    help="le o journal de um arquivo em vez do journalctl "
+                         "(controle positivo do parser, usado por tools/test_cerebro_vivo.sh)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    acumulado_bruto, erro_n = systemd_propriedade("NRestarts")
+    ativo, erro_a = systemd_propriedade("ActiveState")
+    desde, _ = systemd_propriedade("ExecMainStartTimestamp")
+
+    if args.journal_de:
+        try:
+            with open(args.journal_de, encoding="utf-8", errors="replace") as fh:
+                texto, erro_j = fh.read(), None
+        except OSError as erro:
+            texto, erro_j = "", "nao consegui ler %s: %s" % (args.journal_de, erro)
+    else:
+        texto, erro_j = texto_do_journal(args.janela_horas)
+
+    # ---- NAO MEDI (2) antes de qualquer veredito.
+    #
+    # Sem systemctl nao ha nivel, e sem journal nao ha derivada. Devolver 0 aqui
+    # seria afirmar saude sobre o que este processo nao conseguiu olhar, que e a
+    # forma exata do defeito que esta familia de correcoes veio eliminar.
+    erros = [e for e in (erro_n, erro_a, erro_j) if e]
+    if erros:
+        print("NAO MEDIDO: %s" % "; ".join(erros), file=sys.stderr)
+        print("  Sem estas leituras nao ha nem nivel nem derivada de restart, e o laco", file=sys.stderr)
+        print("  de reinicio do cerebro nao tem outro instrumento: o OnFailure da unit", file=sys.stderr)
+        print("  nunca dispara (burst 5 em 10 s contra RestartSec=15).", file=sys.stderr)
+        return 2
+
+    try:
+        acumulado = int(acumulado_bruto or 0)
+    except ValueError:
+        print("NAO MEDIDO: NRestarts nao e inteiro (%r)" % acumulado_bruto, file=sys.stderr)
+        return 2
+
+    na_janela, maior_contador = conta_restarts(texto)
+    passou_do_limiar = na_janela > args.limiar
+
+    # O limiar sozinho nao decide: ele mede NIVEL numa janela que inclui o
+    # passado ja corrigido. Quem decide e o FLUXO -- a unit continua reiniciando
+    # AGORA? Um laco ativo reinicia a cada ~20 s (medido); um laco consertado
+    # deixa a unit de pe por horas com a mesma contagem na janela.
+    if args.estavel_ha is not None:
+        estavel_ha, erro_e = args.estavel_ha, None
+    else:
+        estavel_ha, erro_e = segundos_desde_a_partida()
+    if erro_e:
+        print("NAO MEDIDO: %s" % erro_e, file=sys.stderr)
+        print("  Sem o tempo desde a ultima partida nao se distingue laco ATIVO de", file=sys.stderr)
+        print("  laco JA CONSERTADO, e o gate reprovaria as 24 h seguintes a qualquer", file=sys.stderr)
+        print("  conserto. Nao se adivinha: 2 = nao medi.", file=sys.stderr)
+        return 2
+
+    em_laco = passou_do_limiar and estavel_ha < args.estabilidade
+    laco_historico = passou_do_limiar and not em_laco
+
+    registro = {
+        "gate": "check-cerebro-vivo",
+        "unit": UNIT,
+        "veredito": "FAIL" if em_laco else "OK",
+        "laco_historico": laco_historico,
+        "estavel_ha_segundos": round(estavel_ha),
+        "estabilidade_exigida_segundos": args.estabilidade,
+        "restarts_na_janela": na_janela,
+        "janela_horas": args.janela_horas,
+        "limiar": args.limiar,
+        "piso_de_ruido_medido": PISO_DE_RUIDO_MEDIDO,
+        # Contexto datado, que NUNCA reprova sozinho: e cumulativo.
+        "nrestarts_acumulado": acumulado,
+        "maior_contador_na_janela": maior_contador,
+        "active_state": ativo,
+        "desde": desde,
+    }
+
+    if args.json:
+        print(json.dumps(registro, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if em_laco else 0
+
+    print("%s: %s | restarts na janela de %dh: %d (limiar %d, piso medido %d) | "
+          "acumulado=%d ativo=%s desde=%s"
+          % (UNIT,
+             "EM LACO" if em_laco else ("laco ja consertado" if laco_historico else "estavel"),
+             args.janela_horas, na_janela,
+             args.limiar, PISO_DE_RUIDO_MEDIDO, acumulado, ativo or "?", desde or "?"))
+    print("   estavel ha %.0f s (%.1f h); laco ativo exige menos de %d s"
+          % (estavel_ha, estavel_ha / 3600.0, args.estabilidade))
+
+    if em_laco:
+        print("\ncheck-cerebro-vivo: FAIL")
+        print("  O cerebro reiniciou %d vez(es) em %dh. Com Restart=always e RestartSec=15"
+              % (na_janela, args.janela_horas))
+        print("  a unit NAO entra em `failed` (burst 5 em 10 s nunca e atingido), entao o")
+        print("  OnFailure dela nao vai avisar ninguem — este gate e o aviso.")
+        print("  A fila para de drenar em silencio: nenhuma pagina cai, e por isso nenhum")
+        print("  outro instrumento do portal enxerga isto.")
+        return 1
+
+    if laco_historico:
+        # Passa, e AVISA: o laco existiu e a causa pode voltar. Reprovar aqui
+        # seria vermelho por divida ja paga -- o gate reprova o que esta
+        # acontecendo, e nomeia o que aconteceu.
+        print("\ncheck-cerebro-vivo: OK com AVISO — laco ja consertado")
+        print("  Houve %d reinicios na janela de %dh, mas a unit esta de pe ha %.1f h."
+              % (na_janela, args.janela_horas, estavel_ha / 3600.0))
+        print("  Um laco ativo reinicia a cada ~20 s e nunca fica %d s sem reiniciar,"
+              % args.estabilidade)
+        print("  entao o que a janela mostra e historico, nao estado. A causa fica")
+        print("  nomeada para quem investigar: leia o journal do intervalo dos")
+        print("  reinicios, nao o estado de agora.")
+        return 0
+
+    print("\ncheck-cerebro-vivo: OK (nenhum laco de reinicio na janela)")
+    return 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2: sem ela uma excecao nao tratada sairia 1, que aqui e o
+    # codigo de "medi e o cerebro esta em laco". Ver tools/lib/saida_de_medidor.py.
+    import os.path
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

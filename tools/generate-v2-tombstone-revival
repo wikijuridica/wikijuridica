@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""generate-v2-tombstone-revival — reabre slots tombstoned por DEFEITO DE SISTEMA.
+
+CAUSA-RAIZ (censo 2026-07-29, 83 tombstones em data/editorial/v2_pages):
+o contrato de fontes força tombstone quando o catálogo não resolve os
+source_hints do intent — generate_v2_review_queue.py:1733-1738: intent com
+hint não resolvido vira strict SEM override e "o verificador só aceita
+tombstone". O redator NÃO tem alternativa legal: o pulo é artefato do
+catálogo, não juízo editorial. Só que o tombstone conta como slot preenchido
+(classify_batch_completion, generate_v2_review_queue.py:2932-2939 →
+filled.add; ops/relaunch-writing.sh:13-14 e :901 → lote 'pronto') e o intent
+JAMAIS volta à fila — perda silenciosa: corrigir o catálogo depois não
+reabre nada sozinho.
+
+Esta ferramenta é a rota de revivescência: remove o tombstone (e SÓ ele,
+byte a byte nas demais linhas) do shard sob CAS, reabrindo o slot para o
+ops/relaunch-writing.sh re-enfileirar com reuse das páginas vizinhas.
+
+INVARIANTES (fail-closed; violar qualquer um = recusa, nunca "ajuste"):
+  1. NUNCA revive tombstone legítimo. Estruturalmente: só candidata linha
+     com schema fechado {intent_id, skipped, skip_reason}; tombstones
+     DEC-020 (superseded_by/…/supersession_archive — evidência OBRIGATÓRIA
+     da cadeia, classify_batch_completion:2944-2958) e órfãos (flags de
+     política) têm chaves extras e são recusados pela FORMA, além do
+     denylist exato de skip_reason.
+  2. Só revive com a causa COMPROVADAMENTE corrigida no dado VIVO: a prova
+     é o próprio preflight do redator — producer.derive_writing_source_
+     resolution (zero reimplementação, mesma cura de 2026-07-22 do
+     relaunch) precisa materializar override exato para TODOS os hints do
+     intent no catálogo vivo. Texto do skip_reason NUNCA é prova.
+  3. Operação por gerador, com ledger (linha removida preservada íntegra em
+     data/ops/v2_tombstone_revival_ledger.jsonl) e reversível (--revert
+     reinsere a linha exata sob CAS).
+
+Uso:
+    tools/generate-v2-tombstone-revival                # censo + dry-run
+    tools/generate-v2-tombstone-revival --apply        # aplica aprovados
+    tools/generate-v2-tombstone-revival --intent ID --apply   # um intent
+    tools/generate-v2-tombstone-revival --revert ID    # desfaz revivescência
+
+O lote é por ITEM: recusa de um aprovado (shard fora do contrato, CAS
+perdido) é registrada com o motivo e o lote segue para o próximo — só
+anomalia DEPOIS de uma escrita interrompe tudo. Saída: 0 tudo aplicado,
+1 houve recusa observável, 2 lote interrompido por anomalia pós-escrita.
+
+Escreve dado (data/editorial/v2_pages/*.jsonl, data/ops/*.jsonl) — por isso
+é generate-*, não check-*. Depois de aplicar, rode ops/relaunch-writing.sh:
+o lote do shard volta como 'queued' com reuse e o redator autora só o slot
+reaberto.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from tools import audit_v2_pages as auditor  # noqa: E402
+from tools import generate_v2_review_queue as producer  # noqa: E402
+
+STOCK_DIR = "data/editorial/v2_pages"
+CATALOG_REL_PATH = "data/editorial/v2_source_hint_catalog.json"
+PORTFOLIO_DIR = "data/editorial/portfolio_v2"
+LEDGER_REL_PATH = "data/ops/v2_tombstone_revival_ledger.jsonl"
+CENSUS_REL_PATH = "data/ops/v2_tombstone_revival_census.jsonl"
+RECOVERED_DRAFTS_REL_PATH = (
+    "data/editorial/v2_recovered_drafts_20260728/recovered_pages.jsonl")
+# Mesmo lock do par produtor (ops/relaunch-writing.sh e
+# generate-v2-shard-slice-reorder): remover linha de shard no meio de uma
+# geração de fila invalidaria os snapshots dela.
+PAIR_LOCK_PATH = "/tmp/opt-wiki-relaunch-writing-pair.lock"
+
+SCHEMA_VERSION = "v2_tombstone_revival_v1"
+_INTENT_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+# Schema fechado do tombstone simples. Qualquer chave a mais (DEC-020,
+# flags de política de órfão) prova que a linha carrega evidência de cadeia
+# e NUNCA pode ser removida por esta rota.
+_CLOSED_TOMBSTONE_KEYS = frozenset({"intent_id", "skipped", "skip_reason"})
+# Denylist EXATA de razões legítimas (segunda trava, além da estrutural).
+_LEGITIMATE_EXACT = frozenset({"duplicate_intent_consolidated"})
+_LEGITIMATE_PREFIX = ("orphan_no_portfolio_join",)
+
+
+class RevivalRefused(RuntimeError):
+    """Qualquer condição fora do defeito-de-sistema comprovadamente curado.
+
+    Recusa é SEMPRE por item e SEMPRE antes de qualquer escrita: o lote segue
+    para o próximo aprovado (ver apply_approved). Um shard fora do contrato
+    não pode confiscar a revivescência dos outros.
+    """
+
+
+class RevivalHalt(RuntimeError):
+    """Anomalia detectada DEPOIS de uma escrita bem-sucedida.
+
+    Diferente de RevivalRefused: aqui o disco já mudou de forma que não bate
+    com o esperado, então continuar escrevendo em cima seria irresponsável —
+    o lote para na hora, com o ledger já contendo a linha removida.
+    """
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def finalized_shards(root: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(
+        path for path in (root / STOCK_DIR).glob("*.jsonl")
+        if auditor.is_finalized_v2_path(path.as_posix()))
+
+
+def scan_stock(root: pathlib.Path):
+    """Varre o estoque congelando snapshots; devolve tombstones + ocorrências.
+
+    A varredura é o ÚNICO parse tolerante: linha ilegível não vira decisão
+    (nem revive nem conta ocorrência) — shard com framing quebrado pertence à
+    raw-recovery do relaunch, não a esta rota; o CAS na aplicação garante que
+    nada decidido sobre snapshot stale chega ao disco.
+    """
+    snapshots: dict[str, object] = {}
+    tombstones: list[dict] = []
+    occurrences: dict[str, int] = {}
+    for path in finalized_shards(root):
+        rel_path = path.relative_to(root).as_posix()
+        snapshot = producer.read_regular_file_snapshot(
+            path, max_bytes=64 * 1024 * 1024)
+        snapshots[rel_path] = snapshot
+        payload = snapshot.payload
+        if not payload or not payload.endswith(b"\n") or b"\r" in payload:
+            continue
+        for line_index, raw_line in enumerate(payload[:-1].split(b"\n"), 1):
+            if not raw_line:
+                continue
+            try:
+                record = producer.decode_json_no_duplicate_keys(
+                    raw_line, f"{rel_path}:{line_index}")
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            intent_id = record.get("intent_id")
+            if not isinstance(intent_id, str) or not intent_id.strip():
+                continue
+            occurrences[intent_id] = occurrences.get(intent_id, 0) + 1
+            if record.get("skipped") is True:
+                tombstones.append({
+                    "shard_rel_path": rel_path,
+                    "line_index": line_index,
+                    "raw_line": raw_line,
+                    "record": record,
+                    "intent_id": intent_id,
+                })
+    return snapshots, tombstones, occurrences
+
+
+def load_portfolio_join(root: pathlib.Path):
+    """intent_id -> [(rel_path, snapshot_digest, record)] dos portfólios vivos."""
+    join: dict[str, list[tuple[str, str, dict]]] = {}
+    digests: dict[str, str] = {}
+    for path in sorted((root / PORTFOLIO_DIR).glob("*.jsonl")):
+        rel_path = path.relative_to(root).as_posix()
+        snapshot = producer.read_regular_file_snapshot(
+            path, max_bytes=64 * 1024 * 1024)
+        digests[rel_path] = snapshot.digest
+        for line_number, raw_line in enumerate(
+                snapshot.payload.splitlines(), 1):
+            try:
+                record = producer.decode_json_no_duplicate_keys(
+                    raw_line, f"{rel_path}:{line_number}")
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            intent_id = record.get("intent_id")
+            if isinstance(intent_id, str) and intent_id:
+                join.setdefault(intent_id, []).append(
+                    (rel_path, snapshot.digest, record))
+    return join, digests
+
+
+def load_recovered_draft_intents(root: pathlib.Path) -> set[str]:
+    path = root / RECOVERED_DRAFTS_REL_PATH
+    if not path.exists():
+        return set()
+    intents: set[str] = set()
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(record, dict) and record.get("sections") and
+                    isinstance(record.get("intent_id"), str)):
+                intents.add(record["intent_id"])
+    return intents
+
+
+def classify_reason(reason: str) -> str:
+    """Rótulo de FAMÍLIA para o censo (relatório). A DECISÃO nunca usa isto —
+    ela usa forma fechada + denylist exata + prova viva de resolução."""
+    lowered = reason.lower()
+    if reason == "duplicate_intent_consolidated":
+        return "legitimo-consolidacao-dec020"
+    if reason.startswith("orphan_no_portfolio_join"):
+        return "legitimo-orfao-semantico"
+    if "fora do allowlist" in lowered:
+        return "politica-allowlist"
+    if any(marker in lowered for marker in (
+            "catalogo", "catálogo", "sem resolucao exata",
+            "sem resolução exata", "override materializ",
+            "sem entrada exata", "sem slug materializado", "strict_source",
+            "nao resolvida no catalogo", "não resolvida no catálogo",
+            "nao resolvidos no", "não resolvidos no")):
+        return "defeito-catalogo-resolvedor"
+    if any(marker in lowered for marker in (
+            "waf", "curl", "tls", "conexao", "conexão", "inacessive",
+            "inacessíve", "nesta janela", "nesta sessao", "nesta sessão")):
+        return "ambiente-rede-transitorio"
+    return "editorial-sem-fonte"
+
+
+def decide(tomb: dict, occurrences: dict[str, int],
+           portfolio_join: dict, catalog_digest: str,
+           catalog_hint_keys: frozenset[str],
+           semantic_unresolved: frozenset[str], root: pathlib.Path) -> dict:
+    """Decisão fail-closed por tombstone. Acumula TODAS as recusas."""
+    record = tomb["record"]
+    intent_id = tomb["intent_id"]
+    reason = record.get("skip_reason")
+    refusals: list[str] = []
+    evidence: dict = {}
+
+    if not isinstance(reason, str) or not reason.strip():
+        refusals.append("skip_reason_ausente_ou_vazio")
+        reason = "" if not isinstance(reason, str) else reason
+    if set(record) != _CLOSED_TOMBSTONE_KEYS:
+        # Chave extra = evidência de cadeia (DEC-020/órfão) que precisa
+        # sobreviver byte a byte à recomposição do slice.
+        refusals.append("tombstone_carrega_evidencia_de_cadeia_schema_aberto")
+    stripped = reason.strip()
+    if stripped in _LEGITIMATE_EXACT:
+        refusals.append("tombstone_legitimo_consolidacao_dec020")
+    if stripped.startswith(_LEGITIMATE_PREFIX):
+        refusals.append("tombstone_legitimo_orfao_semantico")
+    if _INTENT_ID.fullmatch(intent_id) is None:
+        refusals.append("intent_id_nao_canonico")
+    if occurrences.get(intent_id, 0) != 1:
+        refusals.append(
+            f"intent_ocorre_{occurrences.get(intent_id, 0)}x_no_estoque")
+    if intent_id in semantic_unresolved:
+        # Reabrir slot que o contrato semântico bloqueia criaria vaga que
+        # nenhum redator pode preencher legalmente.
+        refusals.append("requisito_semantico_pendente")
+
+    joins = portfolio_join.get(intent_id, [])
+    if len(joins) != 1:
+        refusals.append(f"portfolio_join_nao_unico_{len(joins)}")
+    else:
+        portfolio_rel, portfolio_digest, portfolio_record = joins[0]
+        family = portfolio_record.get("family")
+        hints = portfolio_record.get("source_hints")
+        evidence["portfolio_rel_path"] = portfolio_rel
+        evidence["portfolio_sha256"] = portfolio_digest
+        evidence["source_hints"] = hints if isinstance(hints, list) else None
+        if (not isinstance(family, str) or
+                not isinstance(hints, list) or not hints):
+            refusals.append("portfolio_sem_family_ou_hints")
+        else:
+            # PROVA VIVA: o MESMO preflight do redator, escopado ao intent.
+            # Sucesso exige overrides materializados para TODOS os hints —
+            # exatamente a condição que elimina o ramo tombstone-only de
+            # generate_v2_review_queue.py:1733-1738.
+            try:
+                resolution = producer.derive_writing_source_resolution(
+                    root, portfolio_rel, portfolio_digest,
+                    CATALOG_REL_PATH, catalog_digest,
+                    [family], 0, 0, 1, [intent_id])
+            except (ValueError, producer.CASMismatch) as error:
+                refusals.append(f"causa_nao_corrigida_preflight: {error}")
+            else:
+                overrides = resolution.source_overrides.get(intent_id)
+                if not overrides or any(
+                        hint not in overrides for hint in hints):
+                    # Evidência honesta: nomeia SÓ os hints de fato ausentes
+                    # do catálogo vivo (o produtor zera overrides inteiros no
+                    # ramo strict-sem-override; listar hints já resolvidos
+                    # como faltantes mentiria sobre o que falta curar).
+                    truly_unresolved = [
+                        hint for hint in hints
+                        if hint not in catalog_hint_keys]
+                    refusals.append(
+                        "causa_nao_corrigida_hints_sem_override: " +
+                        ",".join(truly_unresolved or
+                                 ["<projecao sem override>"]))
+                else:
+                    evidence["resolved_overrides"] = overrides
+                    evidence["strict_source_intent"] = (
+                        intent_id in resolution.strict_source_intents)
+
+    return {
+        "intent_id": intent_id,
+        "shard_rel_path": tomb["shard_rel_path"],
+        "line_index": tomb["line_index"],
+        "skip_reason": stripped,
+        "reason_family": classify_reason(stripped),
+        "approved": not refusals,
+        "refusal_codes": refusals,
+        "evidence": evidence,
+    }
+
+
+def write_census(root: pathlib.Path, decisions: list[dict],
+                 catalog_digest: str,
+                 recovered_intents: set[str]) -> pathlib.Path:
+    census_path = root / CENSUS_REL_PATH
+    census_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [{
+        "schema_version": SCHEMA_VERSION,
+        "kind": "census_meta",
+        "generated_at": _utc_now(),
+        "catalog_sha256": catalog_digest,
+        "total_tombstones": len(decisions),
+        "approved_now": sum(1 for d in decisions if d["approved"]),
+    }]
+    for decision in sorted(
+            decisions,
+            key=lambda d: (d["shard_rel_path"], d["line_index"])):
+        row = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "tombstone",
+            "intent_id": decision["intent_id"],
+            "shard_rel_path": decision["shard_rel_path"],
+            "line_index": decision["line_index"],
+            "reason_family": decision["reason_family"],
+            "skip_reason": decision["skip_reason"],
+            "approved_for_revival": decision["approved"],
+            "refusal_codes": decision["refusal_codes"],
+            "recovered_draft_available": (
+                decision["intent_id"] in recovered_intents),
+        }
+        if decision["evidence"].get("resolved_overrides"):
+            row["resolved_overrides"] = decision["evidence"][
+                "resolved_overrides"]
+        rows.append(row)
+    payload = "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+        for row in rows).encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(census_path.parent), prefix=".census-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        os.replace(tmp_name, census_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return census_path
+
+
+def append_ledger(root: pathlib.Path, entry: dict) -> None:
+    ledger_path = root / LEDGER_REL_PATH
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(ledger_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True))
+        handle.write("\n")
+
+
+def apply_revival(root: pathlib.Path, decision: dict, snapshots: dict) -> dict:
+    """Remove UM tombstone sob CAS, relendo o shard imediatamente antes.
+
+    ``snapshots`` é a expectativa VIVA do lote, não uma fotografia morta: ela
+    nasce do censo e é reescrita a cada aplicação bem-sucedida. Assim o CAS
+    continua significando exatamente o que sempre significou — "alguém de fora
+    mexeu no shard, recuse" — sem que a remoção que ESTE lote acabou de fazer
+    seja lida como evolução alheia. Antes, dois aprovados no mesmo shard
+    aplicavam só o primeiro; o segundo morria com "shard evoluiu depois do
+    censo" (medido em sucessoes2-09 e aereo-18).
+    """
+    rel_path = decision["shard_rel_path"]
+    expected = snapshots[rel_path]
+    snapshot = producer.read_regular_file_snapshot(
+        root / rel_path, max_bytes=64 * 1024 * 1024)
+    if snapshot.digest != expected.digest:
+        raise RevivalRefused(
+            f"{rel_path}: shard evoluiu depois do censo ({snapshot.digest} != "
+            f"{expected.digest}) — rode de novo")
+    if (not snapshot.payload.endswith(b"\n") or
+            b"\r" in snapshot.payload):
+        raise RevivalRefused(
+            f"{rel_path}: enquadramento não canônico (LF/CR) — pertence à "
+            "raw-recovery do relaunch, não a esta rota")
+    raw_lines = snapshot.payload[:-1].split(b"\n")
+    if any(not line for line in raw_lines):
+        raise RevivalRefused(
+            f"{rel_path}: shard contém linha vazia — pertence à "
+            "raw-recovery do relaunch, não a esta rota")
+    # O line_index do censo é POSICIONAL e envelhece assim que outra linha do
+    # mesmo shard sai antes dele. A âncora estável é o intent_id, que a
+    # decisão já provou ocorrer uma única vez no estoque; aqui a unicidade é
+    # reconferida no shard vivo antes de qualquer escrita.
+    matches: list[tuple[int, dict]] = []
+    for index, raw_line in enumerate(raw_lines):
+        try:
+            record = producer.decode_json_no_duplicate_keys(
+                raw_line, f"{rel_path}:{index + 1}")
+        except ValueError:
+            # Linha ilegível nunca é candidata (o censo também a ignora);
+            # shard com framing quebrado é da raw-recovery do relaunch.
+            continue
+        if (isinstance(record, dict) and
+                record.get("intent_id") == decision["intent_id"]):
+            matches.append((index, record))
+    if len(matches) != 1:
+        raise RevivalRefused(
+            f"{rel_path}: intent {decision['intent_id']} aparece "
+            f"{len(matches)}x no shard vivo — abortando")
+    target_index, removed_record = matches[0]
+    removed_line = raw_lines[target_index]
+    if (removed_record.get("skipped") is not True or
+            set(removed_record) != _CLOSED_TOMBSTONE_KEYS):
+        raise RevivalRefused(
+            f"{rel_path}: linha alvo não é o tombstone decidido — abortando")
+    kept = raw_lines[:target_index] + raw_lines[target_index + 1:]
+    if not kept:
+        # Esvaziar é IRREVERSÍVEL pela rota sancionada: shard finalizado vazio
+        # é reprovado por check-v2-finalized-commit:1368-1369 e remover o
+        # arquivo exige recibo de quarentena (removed_finalized:625-634 +
+        # validação :779-823) que só internal/v2pageshardquarantine emite.
+        raise RevivalRefused(
+            f"{rel_path}: remoção esvaziaria o shard — fora do contrato")
+    new_payload = b"\n".join(kept) + b"\n"
+    # Pós-condição por construção: new_payload é o payload antigo menos
+    # EXATAMENTE a linha do tombstone; toda outra linha segue byte a byte.
+    if _sha256_bytes(
+            b"\n".join(
+                kept[:target_index] + [removed_line] + kept[target_index:]
+            ) + b"\n") != snapshot.digest:
+        raise RevivalRefused(
+            f"{rel_path}: reconstrução da preimagem divergiu — abortando")
+    new_digest = _sha256_bytes(new_payload)
+    producer.atomic_replace_cas(root / rel_path, new_payload, snapshot.digest)
+    entry = {
+        "schema_version": SCHEMA_VERSION,
+        "action": "revive",
+        "ts": _utc_now(),
+        "intent_id": decision["intent_id"],
+        "shard_rel_path": rel_path,
+        # Índice RESOLVIDO no shard vivo — é ele que o --revert usa para
+        # reinserir a linha na posição exata. Gravar o índice do censo aqui
+        # devolveria o tombstone ao lugar errado depois de uma remoção
+        # anterior no mesmo shard.
+        "line_index": target_index + 1,
+        "census_line_index": decision["line_index"],
+        "removed_line": removed_line.decode("utf-8"),
+        "shard_sha256_before": snapshot.digest,
+        "shard_sha256_after": new_digest,
+        "skip_reason": decision["skip_reason"],
+        "reason_family": decision["reason_family"],
+        "evidence": decision["evidence"],
+    }
+    # Ledger ANTES da conferência pós-escrita: o CAS já provou a remoção, e
+    # uma anomalia depois dela não pode deixar mutação sem linha de reversão.
+    append_ledger(root, entry)
+    final = producer.read_regular_file_snapshot(
+        root / rel_path, max_bytes=64 * 1024 * 1024)
+    if final.digest != new_digest:
+        raise RevivalHalt(
+            f"{rel_path}: digest final {final.digest} != esperado "
+            f"{new_digest} após CAS — investigar antes de nova escrita")
+    snapshots[rel_path] = final
+    return entry
+
+
+def apply_approved(root: pathlib.Path, approved: list[dict],
+                   snapshots: dict) -> tuple[list[dict], list[dict], str]:
+    """Aplica cada aprovado ISOLADAMENTE; recusa de um não derruba os outros.
+
+    Antes, a primeira RevivalRefused subia do laço de main e matava o lote
+    inteiro: bastava um shard de linha única aparecer primeiro na ordem
+    alfabética (aereo-11) para o --apply gravar zero revivescência tendo doze
+    shards perfeitamente aplicáveis. Recusa é dado de relatório, não aborto.
+    """
+    applied: list[dict] = []
+    refused: list[dict] = []
+    halt = ""
+    for decision in approved:
+        try:
+            entry = apply_revival(root, decision, snapshots)
+        except (RevivalRefused, producer.CASMismatch) as error:
+            refused.append({
+                "intent_id": decision["intent_id"],
+                "shard_rel_path": decision["shard_rel_path"],
+                "refusal": str(error),
+            })
+            print(f"recusado {decision['intent_id']}: {error}")
+            continue
+        except RevivalHalt as error:
+            halt = str(error)
+            print(f"INTERROMPIDO no {decision['intent_id']}: {error}")
+            break
+        applied.append(entry)
+        print(f"revivido {entry['intent_id']}: "
+              f"{entry['shard_rel_path']} "
+              f"{entry['shard_sha256_before'][:12]} -> "
+              f"{entry['shard_sha256_after'][:12]}")
+    return applied, refused, halt
+
+
+def revert_revival(root: pathlib.Path, intent_id: str) -> dict:
+    ledger_path = root / LEDGER_REL_PATH
+    if not ledger_path.exists():
+        raise SystemExit(
+            "generate-v2-tombstone-revival: ledger ausente — nada a reverter")
+    last: dict | None = None
+    with open(ledger_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            if entry.get("intent_id") == intent_id:
+                last = entry
+    if last is None:
+        raise SystemExit(
+            f"generate-v2-tombstone-revival: intent {intent_id} sem registro "
+            "no ledger")
+    if last.get("action") != "revive":
+        raise SystemExit(
+            f"generate-v2-tombstone-revival: última ação de {intent_id} é "
+            f"{last.get('action')!r} — nada a reverter")
+    rel_path = last["shard_rel_path"]
+    snapshot = producer.read_regular_file_snapshot(
+        root / rel_path, max_bytes=64 * 1024 * 1024)
+    if snapshot.digest != last["shard_sha256_after"]:
+        raise SystemExit(
+            f"generate-v2-tombstone-revival: {rel_path} evoluiu desde a "
+            f"revivescência ({snapshot.digest} != "
+            f"{last['shard_sha256_after']}) — reversão manual via git")
+    if not snapshot.payload or not snapshot.payload.endswith(b"\n"):
+        raise SystemExit(
+            f"generate-v2-tombstone-revival: {rel_path} sem LF terminal — "
+            "reversão manual via git")
+    raw_lines = snapshot.payload[:-1].split(b"\n")
+    index = last["line_index"] - 1
+    if index < 0 or index > len(raw_lines):
+        raise SystemExit(
+            "generate-v2-tombstone-revival: índice de reversão fora do shard")
+    restored = (raw_lines[:index] +
+                [last["removed_line"].encode("utf-8")] +
+                raw_lines[index:])
+    new_payload = b"\n".join(restored) + b"\n"
+    if _sha256_bytes(new_payload) != last["shard_sha256_before"]:
+        raise SystemExit(
+            "generate-v2-tombstone-revival: reversão não reconstrói a "
+            "preimagem exata — abortando")
+    producer.atomic_replace_cas(root / rel_path, new_payload, snapshot.digest)
+    entry = {
+        "schema_version": SCHEMA_VERSION,
+        "action": "revert",
+        "ts": _utc_now(),
+        "intent_id": intent_id,
+        "shard_rel_path": rel_path,
+        "line_index": last["line_index"],
+        "shard_sha256_before": snapshot.digest,
+        "shard_sha256_after": last["shard_sha256_before"],
+    }
+    append_ledger(root, entry)
+    return entry
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="generate-v2-tombstone-revival",
+        description=(
+            "Reabre slots tombstoned por defeito de sistema quando a causa "
+            "está comprovadamente corrigida no catálogo vivo."),
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="aplica as revivescências aprovadas (default: censo dry-run)")
+    parser.add_argument(
+        "--intent", action="append", default=[],
+        help="restringe aos intent_ids dados (repetível)")
+    parser.add_argument(
+        "--revert", metavar="INTENT_ID",
+        help="reinsere o tombstone exato removido antes (CAS sobre o ledger)")
+    args = parser.parse_args(argv)
+
+    if args.revert:
+        if args.apply or args.intent:
+            raise SystemExit(
+                "generate-v2-tombstone-revival: --revert é exclusivo")
+        lock_handle = open(PAIR_LOCK_PATH, "w")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(
+                "generate-v2-tombstone-revival: lock do par produtor ocupado "
+                f"({PAIR_LOCK_PATH}) — tentar depois") from None
+        try:
+            entry = revert_revival(ROOT, args.revert)
+        finally:
+            lock_handle.close()
+        print(f"revertido {entry['intent_id']}: {entry['shard_rel_path']} "
+              f"{entry['shard_sha256_before'][:12]} -> "
+              f"{entry['shard_sha256_after'][:12]}")
+        return 0
+
+    catalog_snapshot = producer.read_regular_file_snapshot(
+        ROOT / CATALOG_REL_PATH, max_bytes=8 * 1024 * 1024)
+    try:
+        catalog_value = producer.decode_json_no_duplicate_keys(
+            catalog_snapshot.payload, "catalogo source_hint")
+    except ValueError as error:
+        raise SystemExit(
+            f"generate-v2-tombstone-revival: catalogo invalido: {error}")
+    if (not isinstance(catalog_value, dict) or
+            not isinstance(catalog_value.get("source_hints"), dict)):
+        raise SystemExit(
+            "generate-v2-tombstone-revival: catalogo sem source_hints")
+    # Só para EVIDÊNCIA de recusa (nomear os hints de fato ausentes); a
+    # decisão usa exclusivamente o preflight do produtor sobre o snapshot.
+    catalog_hint_keys = frozenset(catalog_value["source_hints"])
+    try:
+        semantic_contract = producer.load_writing_semantic_contract(ROOT)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SystemExit(
+            f"generate-v2-tombstone-revival: contrato semantico invalido: "
+            f"{error}")
+    snapshots, tombstones, occurrences = scan_stock(ROOT)
+    portfolio_join, _ = load_portfolio_join(ROOT)
+    recovered_intents = load_recovered_draft_intents(ROOT)
+
+    decisions = [
+        decide(tomb, occurrences, portfolio_join, catalog_snapshot.digest,
+               catalog_hint_keys, semantic_contract.unresolved_intents, ROOT)
+        for tomb in tombstones
+    ]
+    census_path = write_census(
+        ROOT, decisions, catalog_snapshot.digest, recovered_intents)
+
+    if args.intent:
+        wanted = set(args.intent)
+        known = {decision["intent_id"] for decision in decisions}
+        missing = wanted - known
+        if missing:
+            raise SystemExit(
+                "generate-v2-tombstone-revival: intent(s) sem tombstone no "
+                "estoque: " + ", ".join(sorted(missing)))
+        decisions = [
+            decision for decision in decisions
+            if decision["intent_id"] in wanted]
+
+    approved = [d for d in decisions if d["approved"]]
+    refused = [d for d in decisions if not d["approved"]]
+    for decision in decisions:
+        verdict = "APROVADO" if decision["approved"] else "RECUSADO"
+        detail = (
+            "overrides=" + ",".join(
+                sorted(decision["evidence"].get("resolved_overrides", {})))
+            if decision["approved"]
+            else ";".join(decision["refusal_codes"])[:200])
+        draft = (" [rascunho recuperado disponivel]"
+                 if decision["intent_id"] in recovered_intents else "")
+        print(f"{verdict} {decision['intent_id']} "
+              f"({decision['shard_rel_path']}:{decision['line_index']}) "
+              f"familia={decision['reason_family']} {detail}{draft}")
+
+    applied_entries: list[dict] = []
+    apply_refusals: list[dict] = []
+    halt = ""
+    if args.apply and approved:
+        lock_handle = open(PAIR_LOCK_PATH, "w")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(
+                "generate-v2-tombstone-revival: lock do par produtor ocupado "
+                f"({PAIR_LOCK_PATH}) — relaunch-writing rodando; tentar "
+                "depois") from None
+        try:
+            applied_entries, apply_refusals, halt = apply_approved(
+                ROOT, approved, snapshots)
+        finally:
+            lock_handle.close()
+
+    mode = "apply" if args.apply else "dry-run"
+    print(f"generate-v2-tombstone-revival [{mode}]: "
+          f"{len(decisions)} tombstone(s) avaliado(s), "
+          f"{len(approved)} aprovado(s) no censo, "
+          f"{len(refused)} recusado(s) no censo, "
+          f"{len(applied_entries)} aplicado(s), "
+          f"{len(apply_refusals)} recusado(s) na aplicacao; "
+          f"censo={census_path}")
+    for refusal in apply_refusals:
+        print(f"generate-v2-tombstone-revival: nao aplicado "
+              f"{refusal['intent_id']} ({refusal['shard_rel_path']}): "
+              f"{refusal['refusal']}")
+    if halt:
+        print(f"generate-v2-tombstone-revival: lote INTERROMPIDO — {halt}")
+    if applied_entries:
+        print("generate-v2-tombstone-revival: rode ops/relaunch-writing.sh "
+              "para re-enfileirar os slots reabertos (lote volta como "
+              "'queued' com reuse das paginas vizinhas)")
+    if halt:
+        # Anomalia pós-escrita: o operador precisa investigar ANTES de mandar
+        # outro lote. Código próprio para não se confundir com recusa.
+        return 2
+    if args.intent and refused:
+        # Seleção explícita de tombstone recusado sai com erro: é o controle
+        # negativo executável — a recusa precisa ser observável, nunca surda.
+        return 1
+    if apply_refusals:
+        # Recusa na aplicação também é observável: o lote seguiu (os outros
+        # aprovados foram gravados), mas houve item fora do contrato.
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

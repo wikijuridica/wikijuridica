@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""check-served-vs-manifest — o HTML que o visitante recebe e o mesmo que foi auditado?
+
+POR QUE EXISTE: toda a cadeia de integridade do repo compara DISCO com DISCO.
+publishedmanifest.Validate (internal/publishedmanifest/publishedmanifest.go:139-186)
+confere o html_sha256 do manifesto contra o arquivo em public/ — os dois coerentes
+entre si — e derruba o boot se divergirem. Nenhum gate confere o que sai na
+RESPOSTA HTTP.
+
+Em 2026-08-06 essa lacuna virou defeito real: 19 de 25 paginas amostradas eram
+servidas com HTML diferente do auditado. A causa era a malha de links internos
+resolvida por dois caminhos distintos (internal/ondemand/mesh.go:99 sobrescreve
+RelatedContent com o artefato internallinkmesh; cmd/publish-v2-direct/main.go:160
+gravava outra malha via internal/v2publish/relatedlinks.go). O manifesto certificava
+bytes que ninguem recebia, e todos os checks estavam verdes.
+
+O QUE ELE SEPARA (a distincao que torna o diagnostico util):
+  ok                 servido == public == manifesto
+  render_de_servico  public == manifesto, mas o servidor emite outra coisa
+                     -> o defeito esta no caminho de SERVICO (ondemand/render)
+  disco_incoerente   public != manifesto
+                     -> o defeito esta no artefato publicado; o boot ja reprovaria
+  http               a URL nao respondeu 200
+
+TRAFEGO: cada requisicao vai com User-Agent proprio e X-Warming-Request: true, e
+por isso e gravada com warming=true pelo access_log (internal/httpserver/access_log.go:73)
+FORA da contagem de trafego real. Medir o proprio portal nunca pode inflar a
+metrica dele — ver a secao anti-fraude do CLAUDE.md.
+
+Read-only: nao escreve nada, nao corrige nada.
+
+Uso:
+    tools/check-served-vs-manifest                     # amostra estratificada (padrao)
+    tools/check-served-vs-manifest --completo          # as 9.400, sem teto de cobertura
+    tools/check-served-vs-manifest --amostra 200
+    tools/check-served-vs-manifest --host https://wikijuridica.com.br
+    tools/check-served-vs-manifest --listar 50         # mostra mais divergentes
+"""
+import argparse
+import collections
+import concurrent.futures
+import hashlib
+import json
+import os
+import random
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+MANIFEST = os.path.join(ROOT, "data/editorial/published_manifest.jsonl")
+PUBLIC = os.path.join(ROOT, "public")
+
+# Origem local do nginx (ops/nginx/wikijuridica.conf). O Host precisa ser enviado
+# porque o server_name decide o vhost; sem ele o nginx cai no default.
+DEFAULT_HOST = "http://127.0.0.1:8088"
+DEFAULT_SNI = "wikijuridica.com.br"
+USER_AGENT = "wikijuridica-check-served-vs-manifest/1.0 (+interno; nao-indexar)"
+
+# O nginx limita 120r/m por IP na pista generica, com burst 60 nodelay
+# (ops/nginx/wikijuridica.conf:59,109). Conferir o proprio portal nao pode
+# atropelar a protecao que existe contra abuso: o check se auto-limita abaixo do
+# teto e trata 429 como "preciso desacelerar", nunca como divergencia de
+# conteudo — confundir os dois transformaria protecao de infra em falso defeito.
+TAXA_PADRAO = 1.8
+
+
+class Limitador:
+    """Espaca as requisicoes no tempo, compartilhado por todas as threads."""
+
+    def __init__(self, por_segundo):
+        self._intervalo = 1.0 / por_segundo if por_segundo > 0 else 0.0
+        self._proximo = 0.0
+        self._trava = threading.Lock()
+
+    def aguardar(self):
+        if self._intervalo <= 0:
+            return
+        with self._trava:
+            agora = time.monotonic()
+            partida = max(agora, self._proximo)
+            self._proximo = partida + self._intervalo
+        espera = partida - agora
+        if espera > 0:
+            time.sleep(espera)
+
+
+def carregar_manifesto():
+    """Devolve [(path, html_sha256)] do manifesto publicado."""
+    registros = []
+    with open(MANIFEST, encoding="utf-8") as handle:
+        for numero, linha in enumerate(handle, 1):
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError as erro:
+                print("linha %d do manifesto ilegivel: %s" % (numero, erro), file=sys.stderr)
+                continue
+            caminho = registro.get("path", "")
+            sha = registro.get("html_sha256", "")
+            if caminho and sha:
+                registros.append((caminho, sha))
+    return registros
+
+
+def sha_do_disco(caminho):
+    """SHA-256 do artefato publicado em public/<caminho>/index.html."""
+    arquivo = os.path.join(PUBLIC, caminho.strip("/"), "index.html")
+    try:
+        with open(arquivo, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def buscar(host, sni, caminho, timeout, limitador, tentativas=4):
+    """GET na URL real. Devolve (sha, status, erro).
+
+    Accept-Encoding: identity e obrigatorio — resposta comprimida produziria um
+    SHA de bytes comprimidos, que nunca bateria com o arquivo em disco.
+
+    429 nao e veredito: e o limitador do nginx pedindo calma. Recuar e tentar de
+    novo; so vira falha depois de esgotadas as tentativas.
+    """
+    url = host.rstrip("/") + caminho
+    pedido = urllib.request.Request(url, headers={
+        "Host": sni,
+        "User-Agent": USER_AGENT,
+        "X-Warming-Request": "true",
+        "Accept-Encoding": "identity",
+    })
+    for tentativa in range(tentativas):
+        limitador.aguardar()
+        try:
+            with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+                corpo = resposta.read()
+                return hashlib.sha256(corpo).hexdigest(), resposta.status, ""
+        except urllib.error.HTTPError as erro:
+            if erro.code == 429 and tentativa < tentativas - 1:
+                time.sleep(2.0 * (tentativa + 1))
+                continue
+            return "", erro.code, ""
+        except Exception as erro:  # rede, timeout, DNS: e resultado do check, nao crash
+            if tentativa < tentativas - 1:
+                time.sleep(1.0 * (tentativa + 1))
+                continue
+            return "", 0, str(erro)[:120]
+    return "", 0, "tentativas esgotadas"
+
+
+def area_de(caminho):
+    partes = [p for p in caminho.split("/") if p]
+    return partes[0] if partes else "(raiz)"
+
+
+def amostra_estratificada(registros, quantidade, semente):
+    """Pelo menos uma pagina por area, resto proporcional ao tamanho da area.
+
+    Amostra concentrada numa area so mediria um caminho de render e daria falso
+    verde para os outros.
+    """
+    if quantidade >= len(registros):
+        return list(registros)
+    por_area = collections.defaultdict(list)
+    for item in registros:
+        por_area[area_de(item[0])].append(item)
+    sorteador = random.Random(semente)
+    escolhidos = []
+    for area in sorted(por_area):
+        itens = sorted(por_area[area])
+        sorteador.shuffle(itens)
+        escolhidos.append(itens.pop())  # piso: 1 por area
+        por_area[area] = itens
+    restante = quantidade - len(escolhidos)
+    if restante > 0:
+        sobra = [item for area in sorted(por_area) for item in por_area[area]]
+        sorteador.shuffle(sobra)
+        escolhidos.extend(sobra[:restante])
+    return escolhidos
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=DEFAULT_HOST,
+                        help="origem a medir (default: %s)" % DEFAULT_HOST)
+    parser.add_argument("--sni", default=DEFAULT_SNI, help="cabecalho Host enviado")
+    parser.add_argument("--amostra", type=int, default=120,
+                        help="tamanho da amostra estratificada (default: 120)")
+    parser.add_argument("--completo", action="store_true",
+                        help="varre TODAS as paginas do manifesto, sem teto de cobertura")
+    parser.add_argument("--paralelas", type=int, default=4)
+    parser.add_argument("--taxa", type=float, default=TAXA_PADRAO,
+                        help="requisicoes por segundo (default: %.1f, abaixo do limite do nginx)" % TAXA_PADRAO)
+    parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--listar", type=int, default=15, help="quantos divergentes listar")
+    parser.add_argument("--semente", type=int, default=20260806)
+    args = parser.parse_args()
+
+    if not os.path.exists(MANIFEST):
+        print("manifesto ausente: %s" % MANIFEST, file=sys.stderr)
+        return 2
+    registros = carregar_manifesto()
+    if not registros:
+        # ASSIMETRIA CORRIGIDA (2026-08-29, BUG-069 da caça).
+        #
+        # Manifesto AUSENTE reprovava com exit 2, e está certo. Manifesto
+        # PRESENTE E VAZIO aprovava com exit 0 — e a coerência de artefato é
+        # declarada INEGOCIÁVEL no contrato do projeto. Um gate que aprova
+        # justamente no estado em que nada pode ser conferido é uma porta dos
+        # fundos: bastaria o manifesto ser truncado para o portal inteiro passar
+        # a ser "coerente por vacuidade".
+        #
+        # E não é hipótese. O BUG-002 deste repositório registra o dia em que um
+        # gate truncou o manifesto de 8.263 registros para ZERO — se o
+        # verificador de coerência tivesse reprovado ali, a perda teria sido
+        # vista na hora.
+        #
+        # A regra agora compara os DOIS LADOS: manifesto vazio só é aceitável se
+        # também não houver página servida. Havendo HTML em public/ sem uma
+        # linha sequer de manifesto, isso é o estado mais grave possível — o
+        # portal serve o que não consegue provar — e sai com exit 2.
+        servidas = 0
+        raiz_public = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public")
+        for _, _, arquivos in os.walk(raiz_public):
+            servidas += sum(1 for a in arquivos if a == "index.html")
+            if servidas:
+                break
+        if servidas:
+            print(
+                "published_manifest.jsonl VAZIO com %d+ pagina(s) servida(s) em public/ — "
+                "o portal serve o que nao consegue provar. Coerencia de artefato quebrada."
+                % servidas,
+                file=sys.stderr,
+            )
+            return 2
+        print("published_manifest.jsonl vazio e public/ sem paginas — nada publicado, nada a conferir.")
+        return 0
+
+    if args.completo:
+        alvo = list(registros)
+        pulados = 0
+    else:
+        alvo = amostra_estratificada(registros, args.amostra, args.semente)
+        pulados = len(registros) - len(alvo)
+
+    limitador = Limitador(args.taxa)
+    minutos = (len(alvo) / args.taxa) / 60.0 if args.taxa > 0 else 0.0
+
+    print("=== SERVIDO vs AUDITADO ===")
+    print("origem                : %s (Host: %s)" % (args.host, args.sni))
+    print("manifesto             : %d paginas" % len(registros))
+    print("conferindo            : %d" % len(alvo))
+    print("taxa                  : %.1f req/s (~%.0f min)" % (args.taxa, minutos))
+    if pulados:
+        # Teto de cobertura NUNCA e silencioso: amostra que nao se declara vira
+        # "esta tudo certo" quando so significa "nao olhei".
+        print("NAO conferidas        : %d (amostra; use --completo para varrer todas)" % pulados)
+    print()
+
+    veredito = {}
+    detalhe = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.paralelas) as executor:
+        futuros = {
+            executor.submit(buscar, args.host, args.sni, caminho, args.timeout, limitador): (caminho, sha)
+            for caminho, sha in alvo
+        }
+        for futuro in concurrent.futures.as_completed(futuros):
+            caminho, sha_manifesto = futuros[futuro]
+            sha_servido, status, erro = futuro.result()
+            if status != 200 or not sha_servido:
+                veredito[caminho] = "http"
+                detalhe[caminho] = "status=%s %s" % (status, erro)
+                continue
+            sha_disco = sha_do_disco(caminho)
+            if sha_servido == sha_manifesto:
+                veredito[caminho] = "ok" if sha_disco == sha_manifesto else "disco_incoerente"
+                if veredito[caminho] == "disco_incoerente":
+                    detalhe[caminho] = "public=%s manifesto=%s (servido bate)" % (
+                        sha_disco[:12] or "(ausente)", sha_manifesto[:12])
+                continue
+            if sha_disco == sha_manifesto:
+                veredito[caminho] = "render_de_servico"
+                detalhe[caminho] = "servido=%s public=manifesto=%s" % (
+                    sha_servido[:12], sha_manifesto[:12])
+            else:
+                veredito[caminho] = "disco_incoerente"
+                detalhe[caminho] = "servido=%s public=%s manifesto=%s" % (
+                    sha_servido[:12], sha_disco[:12] or "(ausente)", sha_manifesto[:12])
+
+    contagem = collections.Counter(veredito.values())
+    total = len(veredito)
+    rotulo = {
+        "ok": "identicos (servido == public == manifesto)",
+        "render_de_servico": "DIVERGENTES no caminho de servico",
+        "disco_incoerente": "DIVERGENTES no artefato de disco",
+        "http": "sem resposta 200",
+    }
+    for chave in ("ok", "render_de_servico", "disco_incoerente", "http"):
+        if contagem.get(chave):
+            print("  %-44s %5d  (%4.1f%%)" % (
+                rotulo[chave], contagem[chave], 100.0 * contagem[chave] / total))
+
+    divergentes = [c for c, v in veredito.items() if v != "ok"]
+    if divergentes:
+        print("\n--- divergentes por area ---")
+        for area, quantidade in collections.Counter(area_de(c) for c in divergentes).most_common(12):
+            print("  %5d  %s" % (quantidade, area))
+        print("\n--- amostra dos divergentes ---")
+        for caminho in sorted(divergentes)[:args.listar]:
+            print("  [%s] %s" % (veredito[caminho], caminho))
+            if detalhe.get(caminho):
+                print("        %s" % detalhe[caminho])
+        if len(divergentes) > args.listar:
+            print("  ... e mais %d (use --listar N)" % (len(divergentes) - args.listar))
+        print("\nREPROVADO: %d de %d paginas conferidas nao entregam o HTML auditado."
+              % (len(divergentes), total))
+        return 1
+
+    print("\nOK: as %d paginas conferidas entregam exatamente o HTML do manifesto." % total)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

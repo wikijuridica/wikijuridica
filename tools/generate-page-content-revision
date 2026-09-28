@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""generate-page-content-revision — a data de cada página vem do conteúdo dela.
+
+O DEFEITO (2026-08-07, apontado pelo dono). `cmd/publish-v2-direct` traz
+`-published-at` e `-reviewed-at` com o default cravado `2026-08-06` e aplica a
+MESMA data às 9.622 páginas. Esse valor único alimenta, ao mesmo tempo:
+
+  sitemap.xml <lastmod>          (internal/sitemap/sitemap.go:366,469,519)
+  <meta property="article:modified_time">   (internal/seo/seo.go:76)
+  header Last-Modified            (internal/httpserver/httpserver.go:420)
+  o texto visível "revisado em"   (internal/render/render.go:504)
+
+Um sitemap em que 9.622 URLs mudaram no mesmo segundo não informa nada: o
+buscador aprende que o campo é ruído e passa a ignorá-lo. E depois de corrigir a
+citação legal de 20 páginas hoje, elas continuavam anunciando a data de ontem —
+o sinal exatamente invertido, dizendo ao crawler para não voltar.
+
+O QUE ESTA FERRAMENTA FAZ. Mantém `data/ops/page_content_revision.jsonl`, um
+registro append-only de UMA linha por rota:
+
+    {"path": "/familia/...", "content_sha256": "...", "revised_on": "AAAA-MM-DDThh:mm:ssZ"}
+
+O carimbo tem DUAS formas canônicas: o instante em UTC (o que este gerador grava
+desde 2026-08-12) e o dia puro (a forma histórica das 9.658 páginas já
+publicadas, e a forma do --baseline, porque de uma publicação antiga não se sabe
+a hora). As duas convivem por linha, e o acervo histórico não é reescrito.
+
+A data de uma rota só muda quando o hash do CONTEÚDO dela muda. Página que não
+foi tocada mantém a data antiga — que é o que `lastmod` quer dizer.
+
+O hash cobre só o que um autor escreve (título, meta, H1, abertura, seções,
+FAQ) e ignora deliberadamente as datas. Usar o `html_sha256` do manifesto seria
+o caminho óbvio e criaria um laço: a data é renderizada dentro do HTML
+(article:modified_time), então datar mudaria o hash, que pediria data nova, e o
+acervo passaria a se redatar sozinho a cada publicação.
+
+SEMEADURA HONESTA. Na primeira execução todas as rotas são "novas". Carimbar
+todas com hoje reproduziria o defeito com outra constante. Por isso o baseline
+usa `--baseline`, a data em que aquele acervo foi de fato publicado, e só as
+mudanças POSTERIORES ganham data nova. As páginas corrigidas hoje entram pelo
+`--revisadas-hoje`, que lê o arquivo de dados de um gerador de reparo e carimba
+exatamente as rotas que ele tocou — não um palpite.
+
+E SERVE À PURGA. O mesmo diff que decide a data decide o que precisa sair do
+cache de borda: `--purge-targets` imprime as rotas que mudaram, uma por linha,
+para `tools/purge-edge-cache --url`. Duas comparações independentes acabariam
+divergindo; aqui é uma só.
+
+Uso:
+    tools/generate-page-content-revision --baseline 2026-08-06 \
+        --revisadas-hoje tools/generate-v2-citation-attribution-repair-20260807.data.json
+    tools/generate-page-content-revision --purge-targets
+    tools/generate-page-content-revision --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import inspect
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFESTO = ROOT / "data/editorial/published_manifest.jsonl"
+PAGES_JSON = ROOT / "content/pages.json"
+LEDGER = ROOT / "data/ops/page_content_revision.jsonl"
+# ASSINATURA DA FORMULA do served_sha256, gravada ao lado do ledger.
+#
+# POR QUE EXISTE: mudar o que `conteudo_servido` neutraliza muda o hash de TODAS
+# as rotas -- nao porque o conteudo mudou, mas porque a regua mudou. Sem guarda,
+# a proxima execucao le isso como "10.102 paginas tem conteudo novo", carimba a
+# data de hoje em todas e reanuncia o sitemap inteiro ao Googlebot. E o mesmo
+# frescor fabricado que este arquivo existe para combater, entrando pela porta
+# dos fundos.
+#
+# A flag --ressemear ja resolvia isso -- para quem SOUBESSE que precisa dela.
+# `tools/deploy-publico` chama este gerador sem flag nenhuma, e qualquer sessao
+# que rode um deploy depois de a formula mudar dispara o estrago sem perceber.
+# Aconteceu de faltar por pouco em 2026-08-27, com duas sessoes trabalhando no
+# mesmo repositorio: uma mudou a formula, a outra estava publicando.
+#
+# Com a assinatura, a guarda deixa de depender de alguem lembrar.
+ASSINATURA_FORMULA = ROOT / "data/ops/page_content_revision_formula.txt"
+# As DUAS formas canônicas do carimbo de revisão (a mesma regra que
+# internal/content.ValidRevisionStamp aplica no lado Go). O dia puro é a forma
+# histórica das 9.658 páginas já publicadas; o instante é o que este gerador
+# passa a gravar.
+DATA = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CARIMBO = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}Z)?$")
+
+
+# LOTE CARIMBA O DIA; MUDANCA INDIVIDUAL CARIMBA O INSTANTE.
+#
+# O defeito, medido em 2026-08-27 e criado por mim no dia anterior: depois de
+# rodar --desde-commit, 10.070 das 10.941 entradas do sitemap ficaram com
+# `lastmod` IDENTICO AO SEGUNDO -- 2026-08-26T23:19:47Z. A data estava certa (os
+# bytes servidos mudaram mesmo, 10.059 de 10.059 rotas), mas a PRECISAO era
+# falsa: dez mil paginas nao mudam no mesmo segundo.
+#
+# E o mesmo defeito da data unica que este arquivo existe para corrigir, com
+# outra roupa. Antes eram 9.622 URLs afirmando o mesmo instante porque ninguem
+# datava; agora seriam 10.070 afirmando o mesmo instante porque alguem datou
+# todas de uma vez. Sitemap implausivel e sitemap que o buscador aprende a
+# desconsiderar -- e o campo perde valor justamente quando ha novidade real.
+#
+# A regra: quando a mesma execucao carimba mais de LOTE_MINIMO rotas, ela grava
+# o DIA (AAAA-MM-DD), que e verdade sem fingir precisao; abaixo disso grava o
+# instante em UTC, que e util para a pagina que mudou sozinha. As duas formas ja
+# convivem no ledger por desenho, e o protocolo de sitemap aceita as duas.
+LOTE_MINIMO = 50
+
+# TETO DE CHURN — a barreira que faltava, e que em 2026-08-28 foi HUMANA.
+#
+# Medido no proprio ledger, par a par entre versoes commitadas: em 72 h o acervo
+# inteiro teve a data de revisao reescrita QUATRO vezes, e uma delas foi
+# ida-e-volta de 8.245 URLs (2026-08-26 -> 2026-08-28 -> 2026-08-26 em 1h03),
+# disparada por uma <meta name="wj-pagina"> de analytics (commit 6ec8fdb8) --
+# markup, zero texto editorial. Nenhum gate reprovou: quem desfez foi uma pessoa
+# que reparou. O `check-lastmod-por-evento` nao podia apanhar, porque compara o
+# lastmod com o mtime que `gravaDatado` escreve A PARTIR do lastmod.
+#
+# Se aquela ida tivesse sido publicada, 8.245 URLs anunciariam lastmod avancado e
+# depois REGREDIDO -- o padrao que faz um buscador descartar o campo --, contra um
+# orcamento medido de 13,9 paginas/dia do Googlebot.
+#
+# O teto NAO engessa (ordem do dono: "nao e para engessar a plataforma"). Mudanca
+# editorial real em massa passa, declarando o motivo em --redatacao-em-massa, que
+# fica GRAVADO no ledger. O que ele impede e a re-datacao em massa ACIDENTAL e
+# SILENCIOSA, que e o "mudar a toa que confunde os bots".
+TETO_CHURN_FRACAO = 0.05
+
+
+def hoje_dia() -> str:
+    """O dia em UTC, para carimbo de lote."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def hoje() -> str:
+    """O INSTANTE da revisão, em UTC, e não mais o dia.
+
+    POR QUE MUDOU: o `<lastmod>` do sitemap só podia emitir data pura porque o
+    dado de origem não tinha hora — e inventar `T00:00:00Z` seria fabricar
+    precisão, que é o que internal/sitemap/index_lastmod.go condena por escrito.
+    A saída não era desistir do sinal: era CRIAR o dado. Daqui em diante o
+    carimbo registra quando a revisão de fato aconteceu.
+
+    O Bing pede isso em letras — "use standard ISO 8601 date formatting for
+    lastmod values, including both the date and time" (blogs.bing.com/webmaster,
+    jul/2025). O Google fala em "date and time" mas não exige precisão de hora
+    nem a menciona: ganho explícito num, neutro no outro.
+
+    UM INSTANTE POR EXECUÇÃO, e não um por página: `data_de_hoje` é capturado uma
+    vez no `main`, então uma onda inteira compartilha o carimbo. É o que mantém a
+    coorte de shards coesa — e, de quebra, torna impossível uma onda "atravessar"
+    a virada de 00:00 UTC no meio.
+
+    O acervo histórico NÃO é reescrito: entradas já existentes no ledger são
+    copiadas verbatim, então as duas formas convivem por linha.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def escrita_atomica(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporario = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporario, path)
+    finally:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+
+
+# Campos que compõem o conteúdo da página. Datas, identidade e proveniência
+# ficam DE FORA de propósito — ver conteudo_atual().
+CAMPOS_DE_CONTEUDO = ("title", "meta_description", "heading", "summary",
+                      "body_sections", "faq")
+
+
+def conteudo_atual() -> dict[str, str]:
+    """rota -> sha256 do CONTEÚDO publicado, independente de data.
+
+    Por que não o `html_sha256` do manifesto, que seria o caminho óbvio: a data
+    de revisão é renderizada DENTRO do HTML (article:modified_time, e o texto
+    "revisado em"). Datar pelo hash do HTML criaria um laço — mudar a data muda
+    o HTML, que muda o hash, que pede data nova — e o acervo inteiro passaria a
+    se redatar a cada publicação, reproduzindo o defeito da data única com um
+    valor que anda sozinho.
+
+    O hash aqui cobre só o que um autor escreve: título, meta, H1, abertura,
+    seções e FAQ. Trocar a data não mexe nele; corrigir uma citação mexe. É
+    exatamente a pergunta que <lastmod> faz.
+    """
+    if not PAGES_JSON.is_file():
+        raise SystemExit("content/pages.json ausente: publique antes de datar")
+    with open(PAGES_JSON, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+    atual: dict[str, str] = {}
+    for pagina in paginas:
+        caminho = pagina.get("path")
+        if not caminho or not pagina.get("unique_intent_id"):
+            continue  # institucional: não entra na contagem do acervo
+        conteudo = {campo: pagina.get(campo) for campo in CAMPOS_DE_CONTEUDO}
+        bruto = json.dumps(conteudo, ensure_ascii=False, sort_keys=True)
+        atual[caminho] = hashlib.sha256(bruto.encode("utf-8")).hexdigest()
+    return atual
+
+
+# A SUPERFICIE SERVIDA, e por que o hash de texto autoral nao bastava.
+#
+# CAMPOS_DE_CONTEUDO cobre o que um AUTOR escreve. Isso resolveu o defeito de
+# 2026-08-07 (data unica para 9.622 URLs) e continua certo para o que ele mede.
+# Mas deixa de fora tudo que o portal serve a uma MAQUINA e que nao e texto:
+# og:image, os nos Legislation do JSON-LD, a credencial OAB estruturada, o
+# fragmento do dispositivo nos links internos, o front matter do Markdown.
+#
+# MEDIDO EM 2026-08-26, e e por isso que esta funcao existe: entre o manifesto
+# de 2026-08-20 e o de hoje, 10.059 de 10.059 rotas mudaram `html_sha256` --
+# 100% do acervo passou a servir bytes diferentes. Nenhuma dessas mudancas toca
+# titulo, meta, H1, abertura, secoes ou FAQ, entao o hash de conteudo nao viu
+# nada, e 9.585 URLs seguiram anunciando 2026-08-06. Uma pagina enriquecida que
+# declara data de vinte dias atras nao e so um dado errado: ela diz ao crawler
+# que nao vale a pena voltar, exatamente onde havia novidade.
+#
+# O LACO CONTINUA FECHADO, e e essa a parte delicada. Hashear o HTML cru seria
+# o caminho obvio e criaria a realimentacao que conteudo_atual() documenta: a
+# data e renderizada DENTRO do HTML, entao datar mudaria o hash, que pediria
+# data nova. A saida e neutralizar a data ANTES de hashear.
+#
+# NEUTRALIZA-SE SO O FORMATO ISO, e isso e cirurgico por medicao, nao por sorte:
+# o HTML de uma pagina de acervo tem 7 ocorrencias de AAAA-MM-DD e todas as 7
+# sao metadado de data (article:modified_time, dateModified, datePublished e os
+# <time datetime>). O texto visivel em PT-BR escreve "24 de julho de 2026", que
+# NAO casa com o padrao -- de modo que uma data citada no corpo continua
+# contando como conteudo, que e o que se quer.
+DATA_ISO_NO_HTML = re.compile(r"\d{4}-\d{2}-\d{2}(?:T[0-9:+-]{2,14}Z?)?")
+
+# NAVEGACAO NAO REDATA A PAGINA, e sem esta exclusao o mecanismo se auto-destrui.
+#
+# `related_content` e DADO MATERIALIZADO em content/pages.json (10.059 de 10.069
+# paginas), produzido por internal/internallinkmesh -- nao e computado no render.
+# A malha e recalculada quando o acervo muda, entao publicar UMA pagina nova
+# altera o bloco de relacionados de muitas paginas antigas.
+#
+# Sem excluir isso, o hash servido faria exatamente o que este arquivo existe
+# para impedir: uma publicacao de uma pagina redataria centenas de outras que
+# ninguem tocou, e o <lastmod> voltaria a ser ruido -- so que ruido em cascata,
+# que e pior que a data unica porque parece movimento real.
+#
+# A regra que separa os dois casos: o que o leitor VEIO LER conta; o que o leva
+# a OUTRA pagina, nao. Titulo, texto, citacao, og:image, JSON-LD e fragmento de
+# dispositivo sao a pagina. A lista de vizinhos e o corredor.
+MESES = ("janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+         "agosto", "setembro", "outubro", "novembro", "dezembro")
+
+
+def neutraliza_datas(bruto: str) -> str:
+    """Apaga do hash TODA forma em que a data DESTE documento aparece.
+
+    A ISO cobre `article:modified_time`, `dateModified`, `datePublished` e os
+    `<time datetime>`. Ela NAO cobre a mesma data escrita por extenso -- e essa
+    lacuna reabriu o laco que este arquivo inteiro existe para fechar.
+
+    Medido em 2026-08-27: depois de eu datar o acervo, o `served_sha256` de
+    10.102 rotas mudou e o mecanismo quis redatar tudo de novo. A causa era
+    "27 de agosto de 2026" no HTML, duas vezes por pagina: o rodape que imprime
+    a data de revisao em PT-BR. Datar mudava esse texto, que mudava o hash, que
+    pedia data nova. Realimentacao completa, por um formato que a primeira
+    versao nao previu.
+
+    A NEUTRALIZACAO E CIRURGICA, e tem de ser: data por extenso no CORPO e
+    conteudo ("a decisao de 24 de julho de 2026"), e apaga-la seria destruir o
+    sinal que o hash existe para detectar. Entao so se apaga a forma extensa das
+    datas que o PROPRIO documento declara em ISO -- ou seja, a data de revisao,
+    publicacao ou modificacao renderizada em portugues. Uma data citada no texto
+    que por acaso coincida com a do documento tambem cai, e esse falso positivo e
+    aceitavel: ele custa uma redatacao a menos, nunca uma a mais.
+    """
+    neutro = DATA_ISO_NO_HTML.sub("@DATA@", bruto)
+    for iso in set(DATA_ISO_NO_HTML.findall(bruto)):
+        try:
+            ano, mes, dia = iso[:10].split("-")
+            extenso = "%d de %s de %s" % (int(dia), MESES[int(mes) - 1], ano)
+        except (ValueError, IndexError):
+            continue
+        # FRONTEIRA DE PALAVRA E OBRIGATORIA AQUI, e a falta dela corrompia.
+        #
+        # Uma pagina que declara 2026-08-07 produz o extenso "7 de agosto de
+        # 2026". Sem fronteira, esse texto casa DENTRO de "27 de agosto de
+        # 2026" e deixa o "2" orfao: o hash passa a depender de qual das duas
+        # datas foi substituida primeiro, e a pagina volta a divergir sozinha.
+        # Medido em 1 de 120 paginas antes da correcao.
+        neutro = re.sub(r"\b" + re.escape(extenso) + r"\b", "@DATA@", neutro)
+        # A mesma data em dd/mm/aaaa, que o rodape e a proveniencia usam.
+        neutro = re.sub(r"\b" + re.escape("%s/%s/%s" % (dia, mes, ano)) + r"\b",
+                        "@DATA@", neutro)
+    return neutro
+
+
+BLOCOS_DE_NAVEGACAO = (
+    re.compile(r'<section aria-labelledby="conteudos-relacionados".*?</section>', re.S),
+    re.compile(r'<section aria-labelledby="temas-relacionados".*?</section>', re.S),
+    # O BLOCO DE PERFIS OFICIAIS DO RODAPE (2026-09-09).
+    #
+    # Ele leva o leitor para FORA da pagina -- LinkedIn do responsavel tecnico,
+    # Instagram e Facebook da marca -- e cai na regua que este arquivo escreve
+    # logo acima: o que o leitor VEIO LER conta; o que o leva a OUTRA pagina,
+    # nao. E identico nas ~10 mil rotas e nao muda uma palavra do conteudo
+    # juridico.
+    #
+    # SEM ESTA LINHA, o bloco entraria no `served_sha256` de todo o acervo e a
+    # PRIMEIRA publicacao seguinte sem --ressemear redataria as ~10 mil rotas de
+    # uma vez -- a data fabricada que `check-lastmod-causalidade` reprova e que,
+    # em pagina assinada por advogado, e problema de etica antes de ser de SEO.
+    # E a mesma armadilha que o script inline abriu em 2026-08-27, aqui evitada
+    # antes de acontecer.
+    #
+    # O QUE ISTO CEGA, dito e nao escondido: trocar um perfil oficial declarado
+    # em content/site.json deixa de redatar a pagina. E aceitavel pelo mesmo
+    # motivo do script -- ninguem revisa juridicamente uma pagina porque o
+    # endereco de um perfil mudou -- e a cobertura em si continua guardada por
+    # tools/check-perfis-oficiais-em-todas.
+    re.compile(r'<nav class="perfis-oficiais".*?</nav>', re.S),
+    # O SCRIPT INLINE DA PAGINA, e a fronteira desta regex e o que a torna segura.
+    #
+    # `<script>` SEM ATRIBUTO casa so o script proprio do portal (registro de
+    # ferramentas WebMCP + carregador de medicao de audiencia). O dado
+    # estruturado sai como `<script type="application/ld+json">` e tem atributo,
+    # entao NAO casa -- e ele e conteudo juridico, cuja mudanca DEVE redatar a
+    # pagina. Verificado em public/index.html: os tres blocos ld+json ficam nos
+    # offsets 1915-3102 e o script puro em 24850, sempre o ultimo do documento
+    # (render.go fecha com webmcp.Tag + "</body>"). O Go escapa "<" dentro do
+    # JSON-LD, entao nenhum "</script>" prematuro corta a regex no lugar errado.
+    #
+    # POR QUE NEUTRALIZAR: o script nao e conteudo juridico e nao muda uma
+    # palavra do que o leitor le. Sem esta linha, acrescentar ~1,3 KB de
+    # carregador redataria as 10.102 rotas e reanunciaria o sitemap inteiro ao
+    # Googlebot -- exatamente o frescor fabricado que este arquivo combate.
+    #
+    # O QUE ISTO CEGA, dito e nao escondido: mudanca futura no proprio script
+    # (inclusive nas ferramentas WebMCP) deixa de redatar a pagina. E o preco
+    # aceito, registrado em docs/goal/DECISIONS.md.
+    #
+    # TROCAR ESTA TUPLA MUDA A FORMULA DO served_sha256: rodar com --ressemear
+    # na mesma passada, senao a troca de formula e lida como conteudo novo.
+    re.compile(r'<script>.*?</script>', re.S),
+)
+
+# O HTML publicado de cada rota. `public/<rota>/index.html`, como o nginx serve.
+PUBLIC = ROOT / "public"
+
+
+def conteudo_servido() -> dict[str, str]:
+    """rota -> sha256 do HTML SERVIDO, com toda data ISO neutralizada.
+
+    Devolve dicionario vazio quando public/ nao existe -- o gerador continua
+    funcionando so com o hash de texto autoral, que era o comportamento ate
+    2026-08-26. Ausencia de artefato nunca vira veredito aqui.
+    """
+    if not PUBLIC.is_dir():
+        return {}
+    servido: dict[str, str] = {}
+    for arquivo in PUBLIC.rglob("index.html"):
+        rota = "/" + str(arquivo.parent.relative_to(PUBLIC)).replace(os.sep, "/") + "/"
+        if rota == "/./":
+            rota = "/"
+        try:
+            bruto = arquivo.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        neutro = neutraliza_datas(bruto)
+        for bloco in BLOCOS_DE_NAVEGACAO:
+            neutro = bloco.sub("@NAV@", neutro)
+        servido[rota] = hashlib.sha256(neutro.encode("utf-8")).hexdigest()
+    return servido
+
+
+def assinatura_da_formula() -> str:
+    """sha256 do que a formula do served_sha256 neutraliza, hoje.
+
+    Deterministico entre processos: hashlib, nunca hash() do Python, que e
+    randomizado por processo e daria uma assinatura diferente a cada execucao.
+    """
+    # ★ A ASSINATURA COBRIA SO METADE DA FORMULA, e a metade de fora era a que
+    #   mais mudou. Ate 2026-09-01 este hash somava apenas os `.pattern` de
+    #   BLOCOS_DE_NAVEGACAO — `neutraliza_datas`, que e a outra metade do
+    #   served_sha256, ficava INVISIVEL. Consequencia medida: a mudanca de
+    #   neutralizacao de 2026-08-27 (passar a cobrir a data por extenso) entrou
+    #   sem disparar o RECUSADO, porque nao tocou nenhum pattern. A guarda existia
+    #   e nao guardava o caminho por onde a formula de fato muda.
+    #
+    #   Agora entra o FONTE de neutraliza_datas. Qualquer alteracao nela — inclusive
+    #   uma regex nova no meio da funcao — muda a assinatura e obriga a cerimonia
+    #   de --ressemear, que e exatamente o ponto: trocar a regua do frescor nao pode
+    #   ser um efeito colateral silencioso de um commit sobre outra coisa.
+    partes = [bloco.pattern for bloco in BLOCOS_DE_NAVEGACAO]
+    try:
+        partes.append(inspect.getsource(neutraliza_datas))
+    except (OSError, TypeError):
+        # Sem fonte (execucao a partir de bytecode), a assinatura degrada para a
+        # cobertura antiga em vez de explodir — mas nao mente sobre isso.
+        partes.append("neutraliza_datas: fonte indisponivel")
+    return hashlib.sha256("\n".join(partes).encode("utf-8")).hexdigest()
+
+
+def confere_formula(ressemear: bool) -> None:
+    """Para o gerador quando a formula mudou e ninguem pediu ressemeadura."""
+    atual = assinatura_da_formula()
+    gravada = ""
+    if ASSINATURA_FORMULA.is_file():
+        gravada = ASSINATURA_FORMULA.read_text(encoding="utf-8").strip()
+    if gravada and gravada != atual and not ressemear:
+        raise SystemExit(
+            "RECUSADO: a formula do served_sha256 mudou desde a ultima execucao.\n"
+            f"  gravada: {gravada[:16]}...\n"
+            f"  atual:   {atual[:16]}...\n"
+            "  Rodar assim carimbaria a data de HOJE em todas as rotas -- nao porque\n"
+            "  o conteudo mudou, mas porque a regua mudou -- e reanunciaria o sitemap\n"
+            "  inteiro ao Googlebot.\n"
+            "  O certo e regravar a linha de base sem avancar data nenhuma:\n"
+            "      ./tools/generate-page-content-revision --ressemear\n"
+            "  (e NAO usar --desde-commit na mesma passada: ele compara o\n"
+            "   html_sha256 do manifesto, que nao passa pela neutralizacao)")
+
+
+def grava_assinatura() -> None:
+    ASSINATURA_FORMULA.parent.mkdir(parents=True, exist_ok=True)
+    ASSINATURA_FORMULA.write_text(assinatura_da_formula() + "\n", encoding="utf-8")
+
+
+def rotas_com_bytes_novos(ref_git: str) -> set[str]:
+    """Rotas cujo `html_sha256` difere do manifesto naquele commit.
+
+    EVIDENCIA VERSIONADA, nao palpite: o published_manifest esta no git, entao
+    "estas rotas passaram a servir bytes diferentes desde <ref>" e uma afirmacao
+    que qualquer um reproduz com `git show`. E o mesmo papel que
+    --revisadas-hoje ja cumpre para um gerador de reparo, aplicado a uma
+    publicacao inteira.
+    """
+    import subprocess
+    saida = subprocess.run(
+        ["git", "show", "%s:data/editorial/published_manifest.jsonl" % ref_git],
+        capture_output=True, text=True, cwd=str(ROOT))
+    if saida.returncode != 0:
+        raise SystemExit("nao consegui ler o manifesto em %s: %s"
+                         % (ref_git, (saida.stderr or "").strip()[:160]))
+
+    def indexa(texto: str) -> dict[str, str]:
+        # O manifesto e append-only: a ULTIMA linha de cada rota e a vigente.
+        # Ler a primeira devolveria a versao aposentada e inverteria o veredito.
+        fora: dict[str, str] = {}
+        for linha in texto.splitlines():
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            rota = registro.get("public_path") or registro.get("path")
+            digest = registro.get("html_sha256")
+            if rota and digest:
+                fora[rota] = digest
+        return fora
+
+    antes = indexa(saida.stdout)
+    with open(MANIFESTO, encoding="utf-8") as handle:
+        agora = indexa(handle.read())
+    return {rota for rota in set(antes) & set(agora) if antes[rota] != agora[rota]}
+
+
+def ledger_atual() -> dict[str, dict]:
+    registro: dict[str, dict] = {}
+    if not LEDGER.is_file():
+        return registro
+    with open(LEDGER, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            entrada = json.loads(linha)
+            # O CARIMBO LIDO É CONFERIDO NA ENTRADA, e não só na saída.
+            #
+            # Este ledger é a memória de "quando cada rota mudou pela última
+            # vez", e o valor dele é copiado verbatim para content/pages.json e
+            # daí para o <lastmod>. Uma linha corrompida — edição à mão, merge
+            # torto, formato de uma versão futura — atravessaria em silêncio e só
+            # apareceria no BOOT do servidor, onde o particionador de shards
+            # reprova e o processo não sobe. Recusar aqui transforma laço de
+            # reinício em erro legível, no lugar certo.
+            revisada = entrada.get("revised_on") or ""
+            if revisada and not CARIMBO.fullmatch(revisada):
+                raise SystemExit(
+                    "ledger corrompido em %s: carimbo %r da rota %s não é "
+                    "AAAA-MM-DD nem AAAA-MM-DDThh:mm:ssZ"
+                    % (LEDGER, revisada, entrada.get("path"))
+                )
+            registro[entrada["path"]] = entrada
+    return registro
+
+
+def rotas_revisadas(caminho_dados: str) -> set[str]:
+    """Rotas tocadas por um gerador de reparo, lidas do arquivo de dados dele."""
+    with open(caminho_dados, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    intents = {c["intent_id"] for c in dados.get("correcoes") or []}
+    if not intents:
+        return set()
+    with open(PAGES_JSON, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+    return {p["path"] for p in paginas
+            if p.get("unique_intent_id") in intents and p.get("path")}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--baseline", default="",
+                        help="data honesta do acervo já publicado (AAAA-MM-DD); "
+                             "obrigatória na primeira execução")
+    parser.add_argument("--revisadas-hoje", action="append", default=[],
+                        help="arquivo .data.json de gerador de reparo cujas rotas "
+                             "receberam conteúdo novo hoje")
+    parser.add_argument("--desde-commit", default="",
+                        help="ref git cujo published_manifest serve de base: rotas com "
+                             "html_sha256 diferente contam como conteudo novo. Evidencia "
+                             "versionada, reproduzivel com git show")
+    parser.add_argument("--ressemear", action="store_true",
+                        help="regrava served_sha256 com a formula atual SEM avancar "
+                             "nenhuma data: usar quando a formula do hash mudar, "
+                             "senao a troca de formula seria lida como conteudo novo")
+    parser.add_argument("--purge-targets", action="store_true",
+                        help="imprime só as rotas que mudaram, para a purga de borda")
+    parser.add_argument("--redatacao-em-massa", default="",
+                        help="MOTIVO da re-datacao em massa. Exigido quando a fracao de "
+                             "rotas re-datadas passa de TETO_CHURN_FRACAO sem --ressemear. "
+                             "O motivo fica gravado no ledger: re-datar o acervo inteiro "
+                             "deixa de ser possivel por acidente e passa a exigir uma frase "
+                             "que alguem assina.")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    # ANTES DE QUALQUER LEITURA: se a formula mudou e ninguem pediu
+    # ressemeadura, parar aqui e mais barato que descobrir depois, no diff do
+    # sitemap, que 10.102 rotas foram redatadas.
+    confere_formula(args.ressemear)
+
+    if args.baseline and not DATA.fullmatch(args.baseline):
+        raise SystemExit("--baseline precisa ser AAAA-MM-DD")
+
+    atual = conteudo_atual()
+    servido = conteudo_servido()
+    anterior = ledger_atual()
+
+    # DUAS PASSADAS, porque a forma do carimbo depende do TAMANHO do lote e o
+    # tamanho só se conhece depois de comparar tudo. Contar primeiro e decidir
+    # depois é o que evita gravar 10 mil instantes idênticos ao segundo — ver
+    # LOTE_MINIMO. A contagem aqui é a mesma comparação que o laço principal
+    # faz; ela não decide nada sozinha, só dimensiona.
+    # DOIS CONTADORES, e a diferenca entre eles e' o que o teto de churn mede.
+    #
+    # `quantas_mudam` = ESTREIA + RE-DATACAO. E o que dimensiona a FORMA do
+    # carimbo (`em_lote` abaixo): um lote grande, seja de estreia ou de revisao,
+    # merece carimbo por DIA em vez de 10 mil instantes identicos ao segundo.
+    #
+    # `quantas_redatam` = SO RE-DATACAO, isto e', rota que JA ESTAVA no ledger e
+    # cujo conteudo ou bytes servidos mudaram. E o que alimenta o TETO DE CHURN.
+    quantas_mudam = 0
+    quantas_redatam = 0
+    for caminho, digest in atual.items():
+        entrada = anterior.get(caminho)
+        if entrada is None:
+            # ★ ROTA NOVA NAO E RE-DATACAO (2026-09-16)
+            #
+            # Ate esta data a estreia entrava no numerador do teto de churn, e
+            # o efeito estava medido: o deploy das 7.538 paginas de acordao
+            # publicou, purgou 60.782 URLs, aqueceu 37.570 objetos, anunciou
+            # 7.708 ao IndexNow -- e SO ENTAO recusou com
+            #
+            #   rotas que seriam re-datadas: 7708 de 18699 (41.2%), teto 5.0%
+            #
+            # As 7.708 eram as paginas NOVAS. Rota que nasce hoje tem `lastmod`
+            # de hoje POR DEFINICAO; ela nao "reanuncia tudo ao crawler", que e
+            # o dano que este teto existe para impedir -- ela e anunciada pela
+            # PRIMEIRA vez. Contar estreia como churn faz a guarda reprovar
+            # exatamente o caso que a fabrica existe para produzir, e reprovar
+            # DEPOIS de o acervo estar no ar, em todo deploy seguinte.
+            #
+            # O teto continua inteiro para o que ele mira: re-datar em massa
+            # rota que JA estava publicada.
+            quantas_mudam += 1
+            continue
+        servido_antes = entrada.get("served_sha256")
+        servido_agora = servido.get(caminho)
+        if entrada.get("content_sha256") != digest or (
+                servido_antes is not None and servido_agora is not None
+                and servido_antes != servido_agora):
+            quantas_mudam += 1
+            quantas_redatam += 1
+    em_lote = quantas_mudam >= LOTE_MINIMO
+    data_de_hoje = hoje_dia() if em_lote else hoje()
+
+    # ★ TETO DE CHURN. Ver TETO_CHURN_FRACAO. `--ressemear` esta isento por
+    # construcao: ele existe justamente para regravar a linha de base SEM
+    # carimbar data nova, entao nao re-data ninguem.
+    # O DENOMINADOR TAMBEM EXCLUI A ESTREIA: a pergunta do teto e "que fatia do
+    # acervo JA PUBLICADO esta sendo re-datada?", e por isso a base e o que
+    # estava no ledger, nao o acervo depois do lote. Com estreia no
+    # denominador, publicar muito mascararia re-datacao em massa -- o erro na
+    # direcao oposta, que e' o que esta guarda nao pode permitir.
+    total_rotas = len(atual)
+    base_publicada = sum(1 for caminho in atual if caminho in anterior)
+    fracao = (quantas_redatam / base_publicada) if base_publicada else 0.0
+    # `--purge-targets` tambem esta isento: ele so LISTA as rotas cujo conteudo
+    # ou bytes servidos mudaram e nao grava linha nenhuma, entao nao re-data
+    # ninguem. Medido em 2026-09-08, no deploy --ressemear que levou o JSON-LD
+    # do LexML a 4.259 rotas (42% do acervo): o teto barrou a listagem com
+    # exit 1, o deploy leu "registro de revisao indisponivel" e purgou a borda
+    # inteira — depois de a publicacao ja ter purgado as 4.058 paginas por tag.
+    # Uma purga que joga fora o aquecimento e um diagnostico falso, os dois
+    # nascidos de uma guarda aplicada a um comando que nao muda estado.
+    if not args.ressemear and not args.purge_targets and fracao > TETO_CHURN_FRACAO:
+        motivo = args.redatacao_em_massa.strip()
+        if not motivo:
+            print("RECUSADO: o teto de churn barrou uma re-datacao em massa.")
+            print("  rotas que seriam re-datadas: %d de %d ja publicadas (%.1f%%), teto %.1f%%"
+                  % (quantas_redatam, base_publicada, 100 * fracao, 100 * TETO_CHURN_FRACAO))
+            print("  (estreias no lote: %d — elas NAO contam, porque rota nova nao e re-datacao)"
+                  % (quantas_mudam - quantas_redatam))
+            print("  Re-datar o acervo em massa reanuncia tudo ao crawler. Se a mudanca")
+            print("  e de MARKUP e o texto editorial nao mudou, o certo e --ressemear.")
+            print("  Se a mudanca editorial e real, declare o porque:")
+            print("    --redatacao-em-massa='o que mudou no texto, e por que alcanca tantas rotas'")
+            return 1
+        print("re-datacao em massa AUTORIZADA: %d de %d rotas ja publicadas (%.1f%%) — motivo: %s"
+              % (quantas_redatam, base_publicada, 100 * fracao, motivo))
+
+    forcadas: set[str] = set()
+    for arquivo in args.revisadas_hoje:
+        forcadas |= rotas_revisadas(arquivo)
+    if args.desde_commit:
+        novas_por_bytes = rotas_com_bytes_novos(args.desde_commit)
+        forcadas |= novas_por_bytes
+        print("rotas com bytes novos desde %s: %d" % (args.desde_commit, len(novas_por_bytes)))
+        # Evidência de manifesto é lote por definição: a publicação tocou todas
+        # de uma vez, e afirmar o segundo para cada uma seria precisão inventada.
+        if len(novas_por_bytes) >= LOTE_MINIMO:
+            em_lote = True
+            data_de_hoje = hoje_dia()
+
+    primeira_vez = not anterior
+    if primeira_vez and not args.baseline and not args.purge_targets:
+        raise SystemExit(
+            "primeira execução: informe --baseline com a data real em que este "
+            "acervo foi publicado. Carimbar tudo com hoje repetiria o defeito da "
+            "data única, só que com outra constante.")
+
+    # Quantas rotas compartilham exatamente o mesmo instante: e o que distingue
+    # carimbo de lote (precisao falsa) de revisao individual (precisao util).
+    instantes_repetidos: dict[str, int] = {}
+    for entrada in anterior.values():
+        marca = str(entrada.get("revised_on") or "")
+        if "T" in marca:
+            instantes_repetidos[marca] = instantes_repetidos.get(marca, 0) + 1
+
+    if not args.purge_targets:
+        # Em --purge-targets o stdout e a LISTA de rotas que o deploy-publico
+        # conta com `wc -l` e prefixa com a URL do site para o IndexNow. Uma
+        # linha de diagnostico aqui viraria uma rota a purgar e uma URL falsa
+        # submetida (medido em 2026-09-08 pelo teste de listagem).
+        print("carimbo  : %s (%d rota(s) mudam; lote a partir de %d)"
+              % ("DIA, porque é lote" if em_lote else "instante UTC", quantas_mudam, LOTE_MINIMO))
+
+    novas: list[str] = []
+    mudadas: list[str] = []
+    saida: list[dict] = []
+    for caminho in sorted(atual):
+        digest = atual[caminho]
+        entrada = anterior.get(caminho)
+        if entrada is None:
+            data = args.baseline if primeira_vez else data_de_hoje
+            if caminho in forcadas:
+                data = data_de_hoje
+            (novas if not primeira_vez else mudadas).append(caminho)
+            if primeira_vez:
+                mudadas.pop()
+            registro = {"path": caminho, "content_sha256": digest, "revised_on": data}
+            if servido.get(caminho):
+                registro["served_sha256"] = servido[caminho]
+            saida.append(registro)
+            continue
+        servido_agora = servido.get(caminho)
+        servido_antes = entrada.get("served_sha256")
+
+        # DUAS PERGUNTAS, e a segunda so vale quando ja houve semeadura.
+        #
+        # content_sha256 responde "o autor reescreveu?"; served_sha256 responde
+        # "o que chega ao consumidor mudou?" -- e e esta que enxerga og:image,
+        # JSON-LD, credencial estruturada e fragmento de dispositivo, que sao
+        # conteudo para a maquina e nao aparecem em nenhum campo de texto.
+        #
+        # Na primeira execucao com o campo novo, `servido_antes` e None em todo
+        # o acervo. Carimbar tudo com hoje ali seria fabricar frescor para 10 mil
+        # URLs de uma vez -- exatamente o defeito da data unica, com outra
+        # constante. Entao a semeadura apenas GRAVA o hash, e so as mudancas
+        # POSTERIORES contam. Para o acervo que ja mudou antes da semeadura
+        # existir, a evidencia e --desde-commit, que compara manifestos no git.
+        mudou_o_texto = entrada.get("content_sha256") != digest
+        mudou_o_servido = (servido_antes is not None and servido_agora is not None
+                           and servido_antes != servido_agora)
+        if args.ressemear:
+            # RESSEMEADURA: a formula do served_sha256 mudou, entao o hash antigo
+            # e incomparavel com o novo. Tratar essa diferenca como "conteudo
+            # mudou" carimbaria o acervo inteiro por uma troca de FORMULA, que e
+            # precisamente o frescor fabricado que este arquivo combate.
+            #
+            # Aconteceu em 2026-08-27: a neutralizacao passou a cobrir a data por
+            # extenso ("27 de agosto de 2026"), que reabria o laco, e sem este
+            # modo as 10.102 rotas seriam redatadas de novo por causa disso.
+            mudou_o_servido = False
+        if mudou_o_texto or mudou_o_servido:
+            mudadas.append(caminho)
+            registro = {"path": caminho, "content_sha256": digest,
+                        "revised_on": data_de_hoje}
+            if servido_agora:
+                registro["served_sha256"] = servido_agora
+            saida.append(registro)
+            continue
+        data = entrada.get("revised_on")
+        if args.ressemear and data and CARIMBO.fullmatch(str(data)) and "T" in str(data):
+            # PRECISAO FALSA VIRA DIA. Um instante ao segundo repetido em
+            # milhares de rotas nao e informacao: e carimbo de lote fingindo
+            # granularidade que nao tem. Medido em 2026-08-27: 10.070 das 10.941
+            # entradas do sitemap traziam 2026-08-26T23:19:47Z, o mesmo segundo.
+            # A data continua a mesma -- so a precisao inventada cai.
+            #
+            # A DEMOCAO MORA AQUI, depois de `data` receber o carimbo do ledger,
+            # e nao antes: na posicao original ela lia `data` uma iteracao cedo
+            # demais e o gerador morria com UnboundLocalError na primeira rota
+            # (medido em 2026-08-27, `--dry-run --ressemear` saindo com exit 1).
+            # Aqui ela tambem fica no ramo certo por construcao — o da rota que
+            # NAO mudou. Rota que mudou recebe `data_de_hoje` acima e nunca
+            # chega neste ponto, entao nao ha carimbo para rebaixar.
+            if instantes_repetidos.get(str(data), 0) >= LOTE_MINIMO:
+                data = str(data)[:10]
+        if caminho in forcadas and data != data_de_hoje:
+            # O conteúdo mudou antes de existir ledger: o hash já é o novo, então
+            # a comparação acima não detecta. O arquivo de reparo é a evidência.
+            data = data_de_hoje
+            mudadas.append(caminho)
+        registro = {"path": caminho, "content_sha256": digest, "revised_on": data}
+        if servido.get(caminho):
+            registro["served_sha256"] = servido[caminho]
+        saida.append(registro)
+
+    removidas = sorted(set(anterior) - set(atual))
+
+    if args.purge_targets:
+        # A GEMEA MARKDOWN E OUTRO OBJETO NA BORDA (2026-09-02). `/x/index.md` tem
+        # chave de cache propria (caminho distinto) e a variante negociada por
+        # `Accept: text/markdown` vive sob a URL canonica (a Cache Rule normaliza o
+        # Vary) — purgar a canonica alcanca a segunda; a primeira so sai daqui.
+        # Sem esta linha a gemea ficava ate s-maxage servindo texto velho depois de
+        # uma correcao editorial: era o motivo de ela viver com s-maxage=3600 e de
+        # a passada Markdown do aquecedor revalidar 98,7 % das URLs a cada ciclo.
+        for caminho in sorted(set(novas) | set(mudadas)):
+            print(caminho)
+            if caminho.endswith("/"):
+                print(caminho + "index.md")
+        return 0
+
+    print("=== DATA DE REVISÃO POR CONTEÚDO ===")
+    print("rotas publicadas    : %d" % len(atual))
+    print("rotas no registro   : %d" % len(anterior))
+    if primeira_vez:
+        print("semeadura           : baseline %s para %d rota(s)%s"
+              % (args.baseline, len(saida) - len(forcadas & set(atual)),
+                 (", e hoje (%s) para %d corrigida(s)"
+                  % (data_de_hoje, len(forcadas & set(atual)))) if forcadas else ""))
+    else:
+        print("novas               : %d" % len(novas))
+        print("conteúdo mudou      : %d" % len(mudadas))
+        print("saíram do manifesto : %d" % len(removidas))
+
+    distribuicao: dict[str, int] = {}
+    for entrada in saida:
+        distribuicao[entrada["revised_on"]] = distribuicao.get(entrada["revised_on"], 0) + 1
+    print("\ndatas distintas no acervo: %d" % len(distribuicao))
+    for data in sorted(distribuicao, reverse=True)[:8]:
+        print("  %s  %d rota(s)" % (data, distribuicao[data]))
+
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+        return 0
+
+    payload = "".join(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n"
+                      for e in saida)
+    escrita_atomica(LEDGER, payload)
+    # A ASSINATURA SO E GRAVADA JUNTO COM O LEDGER, nunca antes: se a escrita do
+    # ledger falhar, a assinatura nova mentiria sobre um estado que nao existe, e
+    # a proxima execucao passaria batido pela guarda justamente quando ela era
+    # mais necessaria.
+    grava_assinatura()
+    print("\ngravado: %s (%d linhas)" % (os.path.relpath(LEDGER, ROOT), len(saida)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

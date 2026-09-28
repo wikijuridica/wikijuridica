@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""check-nginx-config-alcancavel — config de nginx que ninguém carrega é armadilha.
+
+READ-ONLY. Sai != 0 quando existe `.conf` sob `ops/nginx/` que a instância em
+produção não alcança e que não está declarado como legado.
+
+POR QUE EXISTE. Medido em 2026-08-26: dois arquivos sob `ops/nginx/standalone/`
+não são incluídos por nada —
+
+    ops/nginx/standalone/bot-policy.conf   94 linhas   incluído por 0 arquivos
+    ops/nginx/standalone/server.conf      228 linhas   incluído por 0 arquivos
+
+O primeiro chama-se POLÍTICA DE BOTS. É exatamente onde uma sessão futura iria
+mexer para ajustar tratamento de crawler — e o ajuste sumiria em silêncio, sem
+erro, sem gate, sem nada. O segundo declara `listen 127.0.0.1:8090`, porta que
+não é a do ingress (8088): é config de outra época que sobreviveu.
+
+O custo dessa classe de defeito já foi pago neste repositório em outra forma: o
+commit `f8a25fd9` (2026-08-20) editou o vhost com 29 linhas de capacidade de
+relato do A2A, e a mudança **nunca chegou ao ar** porque o gerador não rodou. Um
+arquivo que parece vivo e não é produz trabalho perdido e conclusão errada.
+
+────────────────────────────────────────────────────────────────────────────
+COMO A ALCANÇABILIDADE É DECIDIDA — pelo que a unit REALMENTE carrega
+
+Não por convenção de nome nem por suposição de diretório. O gate lê o
+`ExecStart` da unit para descobrir o `-c`, e a partir dali segue os `include`.
+É a mesma disciplina da `ARQUITETURA_FIEL`: ler a camada que o artefato tem, não
+a que se supôs.
+
+Precedente que obriga isso: até 2026-08-13 o gate de disponibilidade lia
+`journalctl -u nginx` — e quando o wiki ganhou instância dedicada, passou a
+vigiar um serviço que não servia mais o site, ficando VERDE para sempre.
+
+────────────────────────────────────────────────────────────────────────────
+LEGADO DECLARADO NÃO REPROVA
+
+Arquivo pode ser legítimo e inerte: o vhost `ops/nginx/wikijuridica.conf` é a
+origem do gerador e não é carregado por ninguém. Para esses, a saída é DECLARAR
+— um marcador no cabeçalho — em vez de fingir que estão vivos. O gate aceita o
+marcador e cobra a declaração de quem não a tem.
+"""
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+RAIZ = Path(os.environ.get("WIKI_ROOT", "/opt/wiki"))
+DIR_NGINX = RAIZ / "ops" / "nginx"
+UNIT = "wikijuridica-nginx"
+
+# Marcador que declara um .conf como inerte de propósito. Fica no cabeçalho do
+# próprio arquivo, onde quem for edita-lo lê antes de perder tempo.
+MARCADOR_LEGADO = "NAO-CARREGADO-EM-PRODUCAO"
+
+
+def roda(cmd: list[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return r.stdout or ""
+    except Exception:
+        return ""
+
+
+def conf_da_unit() -> Path | None:
+    """O `-c` que a unit passa ao nginx — a única fonte de verdade sobre qual
+    arquivo está no ar."""
+    saida = roda(["systemctl", "cat", UNIT])
+    for linha in saida.split("\n"):
+        if linha.strip().startswith("ExecStart="):
+            m = re.search(r"-c\s+(\S+)", linha)
+            if m:
+                return Path(m.group(1))
+    return None
+
+
+def alcancados(raiz_conf: Path) -> set[Path]:
+    """Fecho transitivo dos `include` a partir do arquivo da unit."""
+    vistos: set[Path] = set()
+    fila = [raiz_conf]
+    while fila:
+        atual = fila.pop()
+        if atual in vistos or not atual.is_file():
+            continue
+        vistos.add(atual)
+        try:
+            texto = atual.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"^\s*include\s+([^;]+);", texto, re.M):
+            alvo = m.group(1).strip().strip('"\'')
+            # include aceita glob; resolvemos relativo ao arquivo e à raiz.
+            for base in (atual.parent, RAIZ):
+                caminho = (base / alvo) if not alvo.startswith("/") else Path(alvo)
+                if any(c in alvo for c in "*?["):
+                    fila.extend(sorted(caminho.parent.glob(caminho.name)))
+                elif caminho.is_file():
+                    fila.append(caminho)
+    return vistos
+
+
+def main() -> int:
+    raiz_conf = conf_da_unit()
+    if raiz_conf is None:
+        print(f"check-nginx-config-alcancavel: FAIL\n"
+              f"  - nao consegui ler o ExecStart de {UNIT} — a unit existe?")
+        return 1
+    if not raiz_conf.is_file():
+        print(f"check-nginx-config-alcancavel: FAIL\n"
+              f"  - a unit aponta para {raiz_conf}, que NAO existe em disco")
+        return 1
+
+    vivos = alcancados(raiz_conf)
+    todos = sorted(DIR_NGINX.rglob("*.conf"))
+    orfaos, legados = [], []
+    for c in todos:
+        if c.resolve() in {v.resolve() for v in vivos}:
+            continue
+        try:
+            cabecalho = "\n".join(c.read_text(encoding="utf-8", errors="replace").split("\n")[:40])
+        except OSError:
+            cabecalho = ""
+        (legados if MARCADOR_LEGADO in cabecalho else orfaos).append(c)
+
+    print(f"unit {UNIT} carrega: {raiz_conf}")
+    print(f"alcancados pelo fecho de include: {len(vivos)} | "
+          f".conf em ops/nginx: {len(todos)} | legado declarado: {len(legados)}")
+    for l in legados:
+        print(f"  legado: {l.relative_to(RAIZ)} (marcado {MARCADOR_LEGADO})")
+
+    if orfaos:
+        print("check-nginx-config-alcancavel: FAIL")
+        print(f"  - {len(orfaos)} arquivo(s) .conf que producao NAO carrega e que nao se")
+        print("    declaram legado. Editar qualquer um deles nao muda nada, em silencio:")
+        for o in orfaos:
+            linhas = sum(1 for _ in o.open(encoding="utf-8", errors="replace"))
+            print(f"      {o.relative_to(RAIZ)}  ({linhas} linhas)")
+        print(f"  Resolva de uma das duas formas, nunca deixando ambiguo:")
+        print(f"    (a) inclua o arquivo a partir de {raiz_conf.name}, se ele deve valer;")
+        print(f"    (b) escreva {MARCADOR_LEGADO} no cabecalho, dizendo POR QUE ele existe")
+        print("        e o que o substituiu.")
+        return 1
+
+    print("check-nginx-config-alcancavel: OK (todo .conf ou e carregado ou se declara legado)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

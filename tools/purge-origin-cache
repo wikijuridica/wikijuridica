@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Invalida entradas do cache de ORIGEM do nginx (zona wj_dyn), por rota.
+
+POR QUE ESTA FERRAMENTA EXISTE (2026-09-05)
+--------------------------------------------
+O nginx do wiki guarda a última resposta boa das rotas dinâmicas — gêmea
+Markdown, /api/v1/*, descritores, openapi.json — na zona `wj_dyn`. Isso não é
+otimização: é a rede que mantém o canal de máquina de pé quando o Go cai, via
+`proxy_cache_use_stale`. O contrato do projeto registra que sem ela o `use_stale`
+não tem o que servir.
+
+O preço aparece quando o BINÁRIO muda sem que o conteúdo mude. Em 2026-09-05 o
+servidor passou a emitir `same_as`, `legal_name` e `publisher` no front matter da
+gêmea; o restart entrou, o Go passou a servir o campo novo em 127.0.0.1:8089 —
+e o nginx continuou entregando a versão anterior. O `Cache-Control` que o Go
+manda para essas rotas é `s-maxage=604800`: SETE DIAS de cache de origem. Sem
+invalidar, uma correção de renderização levaria uma semana para aparecer, e
+`Cache-Control: no-cache` do cliente não muda nada — quem decide é o servidor.
+
+O DEFEITO QUE ESTA VERSÃO CONSERTA (2026-09-16)
+------------------------------------------------
+Até hoje a ferramenta DERIVAVA o nome do objeto de um palpite: montava a
+`proxy_cache_key` a partir de uma lista fixa de hosts, esquemas e valores de
+`$wj_markdown` e tomava `md5(chave)` como o arquivo. Isso ignora o mecanismo de
+VARIANTE do nginx. Medido na zona viva em 2026-09-16, lendo o cabeçalho `KEY:`
+dos 24.933 objetos:
+
+    chaves distintas: 13.738 · objetos por chave: {1: 2.549, 2: 11.186, 3: 2, 6: 1}
+    chaves com MAIS DE UM objeto: 11.189
+
+Quando a resposta traz `Vary: Accept-Encoding` — e a gêmea traz, por
+`more_set_headers 'Vary: Accept-Encoding, Accept'` no `location @fallback` — o
+nginx guarda UM ARQUIVO POR VALOR do cabeçalho. O arquivo de `md5(chave)` é só
+o primeiro; os demais têm nome
+
+    md5( md5_bruto(chave) + b"accept-encoding:" + valor + b"\\r\\n" )
+
+(reproduzido byte a byte em 2026-09-16 contra
+`fb:httpwikijuridica.com.br/noticias/cjf-20260820/index.md:0`, cujo segundo
+objeto é exatamente a variante de `Accept-Encoding: ""`). O nome da variante NÃO
+é derivável da chave sozinha: depende do valor que o cliente mandou. Por isso a
+enumeração não alcança, e a ferramenta apagava 1 de 2 ou 3 e saía 0.
+
+Consequência medida na produção: `/noticias/stf-20260914/index.md` tinha 3
+objetos (principal, variante `""` e variante `identity`), os dois valores que a
+borda pede devolviam o corpo ANTIGO, e o ledger de purga registrava uma linha —
+uma só — por rota. A série de `data/ops/edge_frescor_daily.jsonl` mostra o efeito
+todo dia desde 2026-09-11: `pos_purga_velhas` repete `origem_cache_velha_total`
+(794≈796, 297=297, 48=48, 8=8, 6=6), ou seja, a invalidação da origem nunca
+surtiu efeito e o `wikijuridica-edge-frescor` saía 2 e alertava o dono.
+
+A enumeração também era letra morta em dois terços: `$host` do nginx NÃO carrega
+porta, e das 13.738 chaves vivas nenhuma tinha `:8088` e nenhuma tinha `https` —
+22.434 objetos sob `http` + `wikijuridica.com.br` e 2 sob `http` + `127.0.0.1`
+(host sem porta, que a lista fixa nunca montava).
+
+COMO ELA ACHA A ENTRADA AGORA
+------------------------------
+Ela NÃO adivinha: OBSERVA. Todo objeto do nginx carrega, logo depois do
+cabeçalho binário, a linha `\\nKEY: <proxy_cache_key>\\n` — a chave literal com
+que foi gravado, variante inclusive. A ferramenta varre a zona uma vez, lê 512
+bytes de cada arquivo, indexa por chave e remove TODOS os objetos cuja URI bate
+com a rota pedida, seja qual for o prefixo (`md:` do @markdown, `fb:` do
+@fallback), o host, o esquema ou a variante. Custo medido em 2026-09-16:
+1,35 s para 24.933 arquivos (a varredura é uma só, para todas as rotas da
+chamada).
+
+E ela VERIFICA: depois de remover, confere que o arquivo sumiu. Objeto que
+continua no disco é `restantes` e sai com exit 2 — "invalidei" sem conferir é a
+afirmação que custou os cinco dias acima. Objeto que reaparece com mtime
+posterior ao início da purga não é falha: é o nginx recriando a entrada fresca,
+e conta como `recriados`.
+
+    tools/purge-origin-cache --rota /autonomos/x/index.md
+    tools/purge-origin-cache --rota /sobre/index.md --rota /api/v1/lote
+    tools/purge-origin-cache --gemeas-de-area          # todos os /{area}/index.md
+    tools/purge-origin-cache --de-arquivo -            # uma rota por linha, na entrada
+    tools/purge-origin-cache --rota / --seco
+    tools/purge-origin-cache --rota /x/index.md --json # JSON no stdout, humano no stderr
+
+A zona da rede social (`wj_social`, /opt/wiki/var/nginx/cache-social, chaves
+`fbs:`) é outra: aponte `--cache` para ela quando for o caso.
+
+EXIT
+  0  varredura completa; o que existia para as rotas foi removido e conferido
+  2  rota ausente, zona inexistente, objeto que resistiu à remoção (`restantes`)
+     ou objeto que a fórmula acha no disco e a varredura não indexou
+     (`principal_fora_do_indice`: o parser da chave quebrou)
+
+Testes: python3 tools/test_purge_origin_cache.py
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+CACHE = RAIZ / "var" / "nginx" / "cache"
+LEDGER = RAIZ / "data" / "ops" / "origin_cache_purge.jsonl"
+
+# A linha que o nginx escreve entre o cabeçalho binário e o cabeçalho HTTP.
+# É a chave literal, e é a ÚNICA fonte que não depende de adivinhar o que o
+# cliente mandou (ngx_http_file_cache_set_header, src/http/ngx_http_file_cache.c).
+MARCA_CHAVE = re.compile(rb"\nKEY: ([^\n]*)\n")
+# Quanto ler de cada objeto para alcançar a linha KEY. O cabeçalho binário do
+# nginx 1.22.1 tem 336 bytes; 512 cobre chave de até ~170 bytes, e a maior chave
+# viva em 2026-09-16 tem 78. Chave maior não é silenciada: entra em `sem_chave`.
+PREFIXO_LIDO = 512
+# Os prefixos que as locations do vhost declaram em proxy_cache_key. Chave com
+# outro prefixo é contada e listada — nunca ignorada em silêncio, porque
+# location nova com prefixo novo é exatamente o que envelhece esta ferramenta.
+# O prefixo VAZIO é a forma da zona da rede social (`$scheme://$proxy_host$request_uri`,
+# wj_social): sem esta entrada, apontar --cache para cache-social devolveria
+# "nenhum objeto" com a zona cheia — o mesmo silêncio que esta versão conserta.
+PREFIXOS_CONHECIDOS = ("md:", "fb:", "fbs:", "")
+# Duas formas vivas, ambas declaradas no vhost:
+#   <prefixo>:<esquema><host><request_uri>[:<$wj_markdown>]   (wj_dyn: md:, fb:, fbs:)
+#   <esquema>://<host><request_uri>                           (wj_social)
+# O host não tem barra; a URI começa na primeira barra. A query faz parte do
+# $request_uri (há objeto vivo com `?wjdiag=`) e não entra na comparação de rota.
+CHAVE = re.compile(r"^(?:(?P<prefixo>[a-z]+):)?(?P<esquema>https?)(?::?//)?(?P<host>[^/]*)(?P<uri>/[^\s]*)$")
+
+
+def caminho_do_objeto(chave: str, cache: pathlib.Path = CACHE) -> pathlib.Path:
+    """O caminho que o nginx daria ao objeto PRINCIPAL desta chave (levels=1:2).
+
+    Continua aqui por uma razão: é o teste de autoconsistência da varredura. Se a
+    fórmula acha no disco um arquivo que o índice não listou, o parser de chave
+    quebrou — e é melhor saber disso do que apagar menos em silêncio. Ela NÃO é
+    mais a forma de encontrar o que remover: não alcança as variantes de Vary.
+    """
+    h = hashlib.md5(chave.encode()).hexdigest()  # noqa: S324 - o nginx usa MD5; não é uso criptográfico
+    return cache / h[-1] / h[-3:-1] / h
+
+
+def caminho_da_variante(chave: str, accept_encoding: str, cache: pathlib.Path = CACHE) -> pathlib.Path:
+    """O caminho do objeto de VARIANTE que o nginx daria a esta chave e este
+    `Accept-Encoding` (ngx_http_file_cache_vary).
+
+    Reproduzido contra a zona viva em 2026-09-16. Serve ao teste e ao
+    diagnóstico; a remoção é decidida pela varredura, que não depende de saber
+    quais valores o cliente mandou.
+    """
+    bruto = hashlib.md5(chave.encode()).digest()  # noqa: S324
+    variante = hashlib.md5(bruto + b"accept-encoding:" + accept_encoding.encode() + b"\r\n").hexdigest()  # noqa: S324
+    return cache / variante[-1] / variante[-3:-1] / variante
+
+
+def uri_da_chave(chave: str):
+    """(prefixo, uri sem query) da chave do nginx, ou (None, None) se não casar."""
+    casou = CHAVE.match(chave)
+    if not casou:
+        return None, None
+    uri = casou.group("uri")
+    # O sufixo `:$wj_markdown` do @fallback vem depois da URI; a query vem antes
+    # dele. Cortar no último ':' só quando ele estiver depois da última barra.
+    corte = uri.rfind(":")
+    if corte > uri.rfind("/"):
+        uri = uri[:corte]
+    prefixo = casou.group("prefixo")
+    return (prefixo + ":") if prefixo else "", uri.split("?", 1)[0]
+
+
+def indexa_zona(cache: pathlib.Path):
+    """Lê a zona inteira e devolve (índice por rota, diagnóstico).
+
+    O índice é {uri: [(chave, caminho), ...]} — uma rota pode ter objetos de
+    mais de uma chave (o @markdown e o @fallback servem a MESMA URI com chaves
+    distintas, de propósito) e cada chave pode ter mais de um objeto (Vary).
+    """
+    indice, diag = {}, {"arquivos": 0, "sem_chave": [], "prefixo_desconhecido": {}}
+    for pasta, _, arquivos in os.walk(cache):
+        for nome in arquivos:
+            caminho = os.path.join(pasta, nome)
+            diag["arquivos"] += 1
+            try:
+                with open(caminho, "rb") as fh:
+                    cabecalho = fh.read(PREFIXO_LIDO)
+            except FileNotFoundError:
+                # O nginx removeu o objeto entre o walk e a leitura (expiração,
+                # eviction). Não é defeito: some do índice e pronto.
+                diag["arquivos"] -= 1
+                continue
+            achou = MARCA_CHAVE.search(cabecalho)
+            if not achou:
+                diag["sem_chave"].append(caminho)
+                continue
+            chave = achou.group(1).decode("utf-8", "replace")
+            prefixo, uri = uri_da_chave(chave)
+            if uri is None:
+                diag["sem_chave"].append(caminho)
+                continue
+            if prefixo not in PREFIXOS_CONHECIDOS:
+                diag["prefixo_desconhecido"][prefixo] = diag["prefixo_desconhecido"].get(prefixo, 0) + 1
+            indice.setdefault(uri, []).append((chave, caminho))
+    return indice, diag
+
+
+def rotas_de_area(raiz: pathlib.Path = RAIZ) -> list:
+    """Os /{area}/index.md, derivados do acervo — nunca de lista fixa."""
+    pages = raiz / "content" / "pages.json"
+    if not pages.exists():
+        return []
+    areas = set()
+    for pagina in json.loads(pages.read_text(encoding="utf-8")):
+        caminho = (pagina.get("path") or "").strip("/")
+        if "/" in caminho:
+            areas.add(caminho.split("/", 1)[0])
+    return sorted("/%s/index.md" % a for a in areas if a)
+
+
+def invalida(rotas, cache: pathlib.Path = CACHE, seco: bool = False, agora=None):
+    """Remove todo objeto das rotas e CONFERE a ausência. Devolve o relatório."""
+    agora = agora or (lambda: dt.datetime.now(dt.timezone.utc))
+    indice, diag = indexa_zona(cache)
+    inicio = agora()
+    marca = inicio.timestamp()
+    relatorio = {
+        "schema_version": "origin_cache_purge_v2",
+        "zona": str(cache),
+        "arquivos_na_zona": diag["arquivos"],
+        "rotas": [],
+        "objetos_antes": 0, "removidos": 0, "restantes": 0, "recriados": 0,
+        "objetos_sem_chave": len(diag["sem_chave"]),
+        "prefixo_desconhecido": diag["prefixo_desconhecido"],
+        "principal_fora_do_indice": [],
+        "seco": bool(seco),
+        "purged_at": inicio.isoformat(),
+    }
+    removidos_detalhe = []
+    for rota in rotas:
+        achados = indice.get(rota, [])
+        por_rota = {"rota": rota, "objetos": len(achados), "removidos": 0, "restantes": 0,
+                    "recriados": 0, "chaves": sorted({c for c, _ in achados})}
+        for chave, caminho in achados:
+            relatorio["objetos_antes"] += 1
+            if seco:
+                continue
+            try:
+                os.remove(caminho)
+            except FileNotFoundError:
+                # Sumiu sozinho entre o índice e a remoção: o objetivo está
+                # cumprido — o que não pode é continuar lá.
+                pass
+            if os.path.exists(caminho):
+                if os.path.getmtime(caminho) >= marca:
+                    por_rota["recriados"] += 1
+                    relatorio["recriados"] += 1
+                else:
+                    por_rota["restantes"] += 1
+                    relatorio["restantes"] += 1
+                    continue
+            por_rota["removidos"] += 1
+            relatorio["removidos"] += 1
+            removidos_detalhe.append({"rota": rota, "chave": chave,
+                                      "objeto": os.path.basename(caminho),
+                                      "principal": os.path.basename(caminho) ==
+                                                   caminho_do_objeto(chave, cache).name})
+        # AUTOCONSISTÊNCIA: a fórmula do objeto PRINCIPAL é a única parte do nome
+        # que se deriva da chave. Se ela acha no disco um arquivo que a varredura
+        # não indexou para esta rota, o parser da chave quebrou — e apagar menos
+        # em silêncio é justamente o defeito que esta versão conserta. Vale nos
+        # dois modos: em `--seco` o principal existe E está no índice; depois da
+        # remoção ele não existe mais, e o que o nginx recriar entra pelo mesmo
+        # caminho já indexado.
+        indexados = {caminho for _, caminho in achados}
+        for chave in por_rota["chaves"]:
+            principal = caminho_do_objeto(chave, cache)
+            if principal.exists() and str(principal) not in indexados:
+                relatorio["principal_fora_do_indice"].append(str(principal))
+        relatorio["rotas"].append(por_rota)
+    relatorio["detalhe"] = removidos_detalhe
+    return relatorio
+
+
+def grava_ledger(relatorio, ledger: pathlib.Path = LEDGER):
+    """Uma linha por OBJETO removido, com a variante — não uma por rota.
+
+    A linha por rota foi o que escondeu o defeito: o ledger tinha exatamente 6
+    linhas para 6 rotas em 2026-09-16T09:40:04, e a zona tinha 2 a 3 objetos
+    para cada uma.
+    """
+    if not relatorio["detalhe"]:
+        return 0
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as fh:
+        for item in relatorio["detalhe"]:
+            fh.write(json.dumps({
+                "schema_version": "origin_cache_purge_v2",
+                "rota": item["rota"], "chave": item["chave"],
+                "objeto": item["objeto"], "objeto_principal": item["principal"],
+                "zona": "wj_dyn", "purged_at": relatorio["purged_at"],
+            }, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(relatorio["detalhe"])
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--rota", action="append", default=[], help="rota a invalidar (repetível)")
+    ap.add_argument("--de-arquivo", default="", help="arquivo com uma rota por linha ('-' lê a entrada padrão)")
+    ap.add_argument("--gemeas-de-area", action="store_true", help="todos os /{area}/index.md do acervo")
+    ap.add_argument("--cache", default=str(CACHE), help="zona a varrer (padrão: a wj_dyn deste repo)")
+    ap.add_argument("--ledger", default=str(LEDGER), help="ledger a acrescentar")
+    ap.add_argument("--json", action="store_true", help="relatório em JSON no stdout; o texto vai para o stderr")
+    ap.add_argument("--seco", action="store_true", help="mostra o que faria, sem remover")
+    args = ap.parse_args(argv)
+
+    cache = pathlib.Path(args.cache)
+    humano = sys.stderr if args.json else sys.stdout
+    if not cache.is_dir():
+        print("ABORTADO: a zona de cache não existe em %s. O nginx roda com "
+              "-p /opt/wiki/var/nginx/; confira se o caminho mudou antes de forçar." % cache,
+              file=sys.stderr)
+        return 2
+
+    rotas = list(args.rota)
+    if args.de_arquivo:
+        fonte = sys.stdin if args.de_arquivo == "-" else open(args.de_arquivo, encoding="utf-8")
+        try:
+            rotas.extend(linha.strip() for linha in fonte if linha.strip())
+        finally:
+            if fonte is not sys.stdin:
+                fonte.close()
+    if args.gemeas_de_area:
+        rotas.extend(rotas_de_area())
+    rotas = list(dict.fromkeys(rotas))
+    if not rotas:
+        print("ABORTADO: nenhuma rota. Use --rota, --de-arquivo ou --gemeas-de-area. Esta ferramenta "
+              "NÃO tem modo 'apagar tudo': varrer a zona inteira destrói o use_stale de "
+              "todas as rotas dinâmicas de uma vez, e o que se quer é invalidar o que mudou.",
+              file=sys.stderr)
+        return 2
+
+    relatorio = invalida(rotas, cache=cache, seco=args.seco)
+
+    for por_rota in relatorio["rotas"]:
+        if not por_rota["objetos"]:
+            continue
+        print("  %sinvalidada  %s  objetos=%d removidos=%d restantes=%d recriados=%d  chaves=%d"
+              % ("(seco) " if args.seco else "", por_rota["rota"], por_rota["objetos"],
+                 por_rota["removidos"], por_rota["restantes"], por_rota["recriados"],
+                 len(por_rota["chaves"])), file=humano)
+    print("\n%d rota(s), %d arquivo(s) na zona, %d objeto(s) %s, %d restante(s), %d recriado(s)"
+          % (len(rotas), relatorio["arquivos_na_zona"], relatorio["objetos_antes"] if args.seco
+             else relatorio["removidos"],
+             "que seriam removidos" if args.seco else "removidos",
+             relatorio["restantes"], relatorio["recriados"]), file=humano)
+    if relatorio["prefixo_desconhecido"]:
+        print("AVISO: prefixo de chave fora do vhost conhecido: %s — location nova sem "
+              "a ferramenta saber." % relatorio["prefixo_desconhecido"], file=sys.stderr)
+    if relatorio["objetos_sem_chave"]:
+        print("AVISO: %d objeto(s) sem linha KEY legível nos primeiros %d bytes."
+              % (relatorio["objetos_sem_chave"], PREFIXO_LIDO), file=sys.stderr)
+
+    if not args.seco:
+        gravadas = grava_ledger(relatorio, pathlib.Path(args.ledger))
+        if gravadas:
+            print("registrado em %s (%d linha(s), uma por objeto)"
+                  % (args.ledger, gravadas), file=humano)
+
+    if not relatorio["objetos_antes"]:
+        print("Nada a invalidar: ou a rota nunca foi cacheada, ou já expirou. "
+              "Não é erro — mas se você esperava invalidar algo, confira a rota exata "
+              "(o caminho explícito da gêmea é /x/index.md, com barra antes).", file=humano)
+
+    if args.json:
+        json.dump(relatorio, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+
+    if relatorio["restantes"]:
+        print("FALHA: %d objeto(s) continuam na zona depois da remoção. A borda vai "
+              "buscar o velho no próximo MISS." % relatorio["restantes"], file=sys.stderr)
+        return 2
+    if relatorio["principal_fora_do_indice"]:
+        print("FALHA: a fórmula acha no disco objeto que a varredura não indexou (%s). "
+              "O parser da chave quebrou — não confie no que foi removido."
+              % ", ".join(relatorio["principal_fora_do_indice"][:3]), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

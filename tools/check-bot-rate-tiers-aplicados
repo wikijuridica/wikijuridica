@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""check-bot-rate-tiers-aplicados — tier declarado que ninguém aplica é mentira medível.
+
+READ-ONLY. Sai != 0 quando `content/crawl_policy.json` declara um tier de rate
+limit que o nginx não materializa e a divergência não está declarada aqui, com
+motivo e data.
+
+O PROBLEMA, MEDIDO EM 2026-08-26.
+
+    registry (content/crawl_policy.json -> rate_tiers)
+      ads_validation_tier_standard    30 r/m  burst 15
+      training_tier_standard          60 r/m  burst 30
+      training_tier_strict            20 r/m  burst 10
+      unknown_guard_rate_limit       120 r/m  burst 60
+
+    nginx (ops/nginx/wikijuridica.conf)
+      limit_req_zone $wj_generic_key zone=wj_generic:10m rate=3000r/m;
+      limit_req zone=wj_generic burst=600 nodelay;
+
+**UMA zona genérica para todo mundo, 3.000 r/m** — 25× o guard declarado, 50× a
+faixa de treinamento e 100× a de validação de anúncio. E `ValidatePolicy`
+REPROVA bot de treinamento sem `requests_per_minute`: exige-se um número que
+nunca é aplicado. Registry decorativo é pior que registry ausente, porque mente
+para quem o lê.
+
+E ESTE GATE NÃO DECIDE QUAL DOS DOIS LADOS ESTÁ ERRADO — de propósito.
+
+Há evidência medida dos DOIS lados, e ela está no próprio vhost: de 12.975
+respostas 429 servidas por este host, **100% foram para ferramentas desta casa** —
+o limitador nunca barrou tráfego de fora. Ou seja, o que ele protege é
+hipotético, e o que ele arrisca é concreto: um crawler de citação ainda fora da
+allowlist cairia na pista genérica e levaria 429 em silêncio, que é o modo de
+perder um canal de citação sem nunca saber. Foi por isso que 600 r/m virou 3.000
+em 2026-08-12, com razão declarada.
+
+Então há duas correções honestas, e são opostas:
+
+  (a) MATERIALIZAR os tiers — uma `limit_req_zone` por tier não-ilimitado,
+      derivada de `crawl.DefaultRateTiers()`, com a chave escolhendo a zona pela
+      classe do agente; ou
+  (b) RECONCILIAR o registry — se a decisão medida é que a pista única de 3.000
+      r/m é a certa, os números 20/30/60/120 saem do registry e param de mentir.
+
+O que é PROIBIDO é o estado atual: declarar um número, exigi-lo em validação e
+não aplicá-lo em lugar nenhum. Este gate transforma esse estado silencioso em
+vermelho, e obriga quem quiser mantê-lo a escrever aqui por quê.
+
+ESCOPO: criar as zonas mexe em `limit_req_zone`/`limit_req` do vhost em
+produção, fora do bloco `map $wj_bot_allow`. Este arquivo é a medição e o
+requisito; a aplicação é da frente que opera o nginx.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+POLITICA = os.path.join(RAIZ, "content", "crawl_policy.json")
+VHOSTS = (
+    os.path.join(RAIZ, "ops", "nginx", "wikijuridica.conf"),
+    os.path.join(RAIZ, "ops", "nginx", "standalone", "nginx.conf"),
+)
+
+# tier -> (data, motivo). Divergência que alguém conferiu e decidiu manter.
+DIVERGENCIA_CONHECIDA = {
+    "unknown_guard_rate_limit": (
+        "2026-08-26",
+        "o vhost aplica 3.000 r/m por decisao MEDIDA (100% dos 12.975 429 do historico "
+        "foram para ferramentas desta casa; 429 em crawler de citacao fora da allowlist "
+        "e o risco concreto). Reconciliar o numero do registry, nao apertar o nginx."),
+    "ads_validation_tier_standard": (
+        "2026-08-26",
+        "sem zona propria; o unico bot da classe com trafego seria o AdsBot-Google, e o "
+        "log vivo registra zero requisicao dos dois da classe"),
+    "training_tier_standard": (
+        "2026-08-26",
+        "sem zona propria: aplicar exige limit_req_zone por tier no vhost, fora do escopo "
+        "do bloco de allowlist"),
+    "training_tier_strict": (
+        "2026-08-26",
+        "nenhum bot usa este tier hoje; zona vazia seria custo sem efeito"),
+}
+
+
+def zonas_do_vhost(caminho):
+    with open(caminho, encoding="utf-8") as handle:
+        conteudo = handle.read()
+    zonas = {}
+    for chave, nome, _tam, taxa in re.findall(
+            r"limit_req_zone\s+(\S+)\s+zone=(\w+):(\S+)\s+rate=(\S+);", conteudo):
+        zonas[nome] = {"chave": chave, "taxa": taxa, "burst": None}
+    for nome, burst in re.findall(r"limit_req\s+zone=(\w+)\s+burst=(\d+)", conteudo):
+        if nome in zonas:
+            zonas[nome]["burst"] = int(burst)
+    return zonas
+
+
+def taxa_em_rpm(taxa):
+    casou = re.fullmatch(r"(\d+)r/(m|s)", taxa)
+    if not casou:
+        return None
+    valor = int(casou.group(1))
+    return valor if casou.group(2) == "m" else valor * 60
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    with open(POLITICA, encoding="utf-8") as handle:
+        politica = json.load(handle)
+
+    # Tiers que AFIRMAM um limite HTTP. `unlimited` não pede zona (a chave vazia
+    # do map já o tira de toda zona) e o tier de controle de uso de produto não
+    # tem User-Agent HTTP para limitar.
+    exigem_zona = [t for t in politica["rate_tiers"]
+                   if not t.get("unlimited") and t.get("requests_per_minute", 0) > 0]
+
+    problemas = []
+    relatorio = {}
+    for caminho in VHOSTS:
+        zonas = zonas_do_vhost(caminho)
+        taxas = {taxa_em_rpm(z["taxa"]) for z in zonas.values()}
+        relatorio[os.path.relpath(caminho, RAIZ)] = {
+            nome: "%s burst=%s" % (z["taxa"], z["burst"]) for nome, z in zonas.items()}
+        print("%s: %d zona(s) -> %s" % (
+            os.path.relpath(caminho, RAIZ), len(zonas),
+            ", ".join("%s=%s burst=%s" % (n, z["taxa"], z["burst"]) for n, z in sorted(zonas.items()))))
+        for tier in exigem_zona:
+            if tier["requests_per_minute"] in taxas:
+                continue
+            declarada = DIVERGENCIA_CONHECIDA.get(tier["name"])
+            if declarada:
+                print("  declarada  %-32s %d r/m nao materializado (%s) %s"
+                      % (tier["name"], tier["requests_per_minute"], declarada[0], declarada[1][:80]))
+                continue
+            problemas.append(("tier_declarado_sem_zona_no_nginx", tier["name"],
+                              "%d r/m burst %d exigido pela politica e aplicado por ninguem"
+                              % (tier["requests_per_minute"], tier.get("burst", 0))))
+
+    for nome in sorted(DIVERGENCIA_CONHECIDA):
+        if not any(t["name"] == nome for t in exigem_zona):
+            problemas.append(("divergencia_declarada_para_tier_inexistente", nome,
+                              "o tier saiu da politica ou deixou de exigir limite; remova daqui"))
+
+    for tipo, alvo, detalhe in problemas:
+        print("  - %-44s %-32s %s" % (tipo, alvo, detalhe))
+    if args.json:
+        print(json.dumps({"zonas": relatorio,
+                          "tiers_que_exigem_zona": [t["name"] for t in exigem_zona],
+                          "problemas": problemas}, ensure_ascii=False, indent=2))
+    if problemas:
+        print("check-bot-rate-tiers-aplicados: FAIL")
+        return 1
+    print("check-bot-rate-tiers-aplicados: OK — nenhum tier novo declarado sem aplicacao")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Reconstrói a data de PRIMEIRA publicação de cada página a partir do histórico
+do published_manifest, e a preserva daí em diante.
+
+POR QUE ISTO EXISTE (medido em 2026-08-20).
+
+`approved_at` é reescrito a cada republicação — `cmd/publish-v2-direct/main.go:2507`
+grava `opts.publishedAt`, cujo default é `time.Now()` (`main.go:131`). O efeito
+medido: o acervo inteiro NUNCA tem mais de UMA data distinta. Em 06/08 eram 9.400
+linhas todas com "2026-08-06"; em 19/08, 9.710 todas com "2026-08-13"; hoje, 9.710
+todas com "2026-08-20". A data em que cada página entrou no ar não existia em lugar
+nenhum do repositório.
+
+Sem ela, `time-to-first-crawl` — a métrica que diz quanto tempo o crawler leva para
+buscar uma URL nova — é incalculável, e o efeito de qualquer trabalho de frescor
+fica sem linha de base.
+
+O DADO NÃO ESTAVA PERDIDO, ESTAVA NO GIT. Cada commit que tocou o manifesto é um
+retrato datado de quem já estava publicado. Percorrendo os commits do mais antigo
+para o mais novo e anotando em qual deles cada `unique_intent_id` aparece pela
+PRIMEIRA vez, recupera-se a data real de estreia. Medido: 9.710 de 9.710 páginas
+recuperadas — 9.467 em 06/08, 155 em 07/08, 6 em 12/08, 62 em 13/08, 20 em 19/08.
+
+A data do COMMIT é usada, e não `approved_at` daquele commit, justamente porque
+`approved_at` já era o carimbo mentiroso; o commit é o fato externo e verificável.
+
+IDEMPOTÊNCIA, E O ÚNICO SENTIDO EM QUE ELA CEDE (P1b, 2026-09-16). Uma entrada já
+registrada nunca é empurrada para FRENTE — estreia é o começo, e nada que se saiba
+depois pode atrasá-la. Ela cede para TRÁS quando aparece evidência datada mais
+antiga, porque aí a entrada anterior era, comprovadamente, tarde demais.
+
+A SEGUNDA EVIDÊNCIA: `data/ops/page_content_revision.jsonl`. O commit do manifesto
+é evidência boa e é TARDE por construção — ele acontece depois da publicação, e
+quando a onda deixa de commitar (defeito N13, medido: 6 dias sem commit) ele não
+acontece nunca. O registro de revisão de conteúdo hasheia `content/pages.json`, que
+só existe DEPOIS de publicar: rota datada ali já estava no ar naquele dia. Ele é,
+portanto, um TETO para a estreia — nunca um piso —, e a estreia é o mínimo entre
+os dois.
+
+Sem isso, medido em 2026-09-16: 75 rotas do manifesto sem evidência nenhuma no git
+(a onda não commitava o manifesto desde 09-10) entrariam no registro com a data do
+PRIMEIRO commit futuro, entre 3 e 6 dias depois da estreia real — e "primeiro
+vence" as congelaria assim para sempre. Dessas, 67 têm revisão de conteúdo e são
+fechadas aqui, com a data verdadeira: /leis/ 38, /diarios/ 18, /noticias/ 15,
+/jurisprudencia/ 4.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+
+MANIFESTO = "data/editorial/published_manifest.jsonl"
+REVISOES = "data/ops/page_content_revision.jsonl"
+SAIDA = "data/editorial/first_published_at.json"
+
+
+def raiz_do_repo() -> str:
+    saida = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+    )
+    return saida.stdout.strip()
+
+
+def commits_do_manifesto(raiz: str):
+    """Commits que tocaram o manifesto, do mais ANTIGO para o mais novo."""
+    saida = subprocess.run(
+        ["git", "log", "--reverse", "--format=%H %ad", "--date=short", "--", MANIFESTO],
+        capture_output=True, text=True, cwd=raiz, check=True,
+    ).stdout
+    for linha in saida.splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        sha, _, data = linha.partition(" ")
+        if sha and data:
+            yield sha, data.strip()
+
+
+def intents_no_commit(raiz: str, sha: str):
+    """unique_intent_id presentes no manifesto naquele commit.
+
+    Blob ilegível ou linha corrompida são PULADOS, não fatais: um commit
+    intermediário quebrado não pode impedir a recuperação dos demais.
+    """
+    try:
+        blob = subprocess.run(
+            ["git", "show", f"{sha}:{MANIFESTO}"],
+            capture_output=True, text=True, cwd=raiz, check=True,
+        ).stdout
+    except subprocess.CalledProcessError:
+        return
+    for linha in blob.splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            registro = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        uid = registro.get("unique_intent_id")
+        if uid:
+            # A ROTA vem junto porque a segunda evidência é indexada por rota, e
+            # derivá-la do uid seria uma segunda fórmula para o mesmo endereço.
+            yield uid, (registro.get("path") or "").strip()
+
+
+def revisoes_por_rota(raiz: str) -> dict:
+    """Dia da revisão de conteúdo de cada rota, que é o TETO da estreia.
+
+    O carimbo tem duas formas no ledger — instante em UTC (desde 2026-08-12) e
+    dia puro (o acervo histórico) —, e as duas reduzem ao dia: a estreia do
+    acervo é um dia, e hora não decide nada aqui.
+
+    Linha ilegível é PULADA e não fatal, pela mesma razão que um commit quebrado
+    não impede a recuperação dos demais: teto ausente devolve o comportamento
+    anterior, que é a data do commit.
+    """
+    caminho = os.path.join(raiz, REVISOES)
+    revisoes = {}
+    if not os.path.exists(caminho):
+        return revisoes
+    with open(caminho, encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            rota = (registro.get("path") or "").strip()
+            carimbo = str(registro.get("revised_on") or "").strip()
+            if rota and len(carimbo) >= 10:
+                revisoes[rota] = carimbo[:10]
+    return revisoes
+
+
+def rotas_do_manifesto_em_disco(raiz: str) -> dict:
+    """unique_intent_id -> rota, do manifesto que está no DISCO agora.
+
+    É o que alcança a rota publicada que nenhum commit registrou ainda — o caso
+    das 75 de 2026-09-16, e o caso normal de qualquer página do dia.
+    """
+    caminho = os.path.join(raiz, MANIFESTO)
+    rotas = {}
+    if not os.path.exists(caminho):
+        return rotas
+    with open(caminho, encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            uid = registro.get("unique_intent_id")
+            rota = (registro.get("path") or "").strip()
+            if uid and rota:
+                rotas[uid] = rota
+    return rotas
+
+
+def carrega_existente(caminho: str) -> dict:
+    if not os.path.exists(caminho):
+        return {}
+    with open(caminho, encoding="utf-8") as arquivo:
+        dados = json.load(arquivo)
+    return dados.get("first_published_at", {})
+
+
+def escreve_atomico(caminho: str, conteudo: str) -> None:
+    diretorio = os.path.dirname(caminho) or "."
+    os.makedirs(diretorio, exist_ok=True)
+    descritor, temporario = tempfile.mkstemp(dir=diretorio, prefix=".first-published-")
+    try:
+        with os.fdopen(descritor, "w", encoding="utf-8") as arquivo:
+            arquivo.write(conteudo)
+            arquivo.flush()
+            os.fsync(arquivo.fileno())
+        os.replace(temporario, caminho)
+    except BaseException:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--saida", default=SAIDA, help=f"arquivo de saída (default: {SAIDA})")
+    parser.add_argument("--dry-run", action="store_true", help="mede e relata, sem gravar")
+    args = parser.parse_args()
+
+    raiz = raiz_do_repo()
+    saida = os.path.join(raiz, args.saida)
+
+    primeira = carrega_existente(saida)
+    ja_conhecidos = len(primeira)
+    commits = list(commits_do_manifesto(raiz))
+    if not commits:
+        print("nenhum commit tocou o manifesto — nada a recuperar", file=sys.stderr)
+        return 1
+
+    rotas = rotas_do_manifesto_em_disco(raiz)
+    for sha, data in commits:
+        for uid, rota in intents_no_commit(raiz, sha):
+            # Idempotente por construção: a PRIMEIRA vez vence, sempre.
+            primeira.setdefault(uid, data)
+            rotas.setdefault(uid, rota)
+
+    recuperados_do_git = len(primeira) - ja_conhecidos
+
+    # O TETO DA REVISÃO DE CONTEÚDO, aplicado depois do git e nos dois sentidos
+    # de uso: fecha quem o git não alcança e corrige para trás quem o git datou
+    # tarde. Nunca para frente — `min` não tem esse sentido, e é essa a garantia
+    # que impede o registro de virar o novo carimbo mentiroso.
+    revisoes = revisoes_por_rota(raiz)
+    fechados_pela_revisao = 0
+    corrigidos_para_tras = 0
+    for uid, rota in rotas.items():
+        teto = revisoes.get(rota)
+        if not teto:
+            continue
+        atual = primeira.get(uid)
+        if atual is None:
+            primeira[uid] = teto
+            fechados_pela_revisao += 1
+        elif teto < atual:
+            primeira[uid] = teto
+            corrigidos_para_tras += 1
+
+    distribuicao = Counter(primeira.values())
+    print(f"commits percorridos      : {len(commits)}")
+    print(f"intents já conhecidos    : {ja_conhecidos}")
+    print(f"recuperados do histórico git: {recuperados_do_git}")
+    print(f"fechados pela revisão de conteúdo: {fechados_pela_revisao}")
+    print(f"corrigidos para trás (registro era tarde): {corrigidos_para_tras}")
+    print(f"intents com data recuperada: {len(primeira)}")
+    print("distribuição por data de estreia:")
+    for data, quantos in sorted(distribuicao.items()):
+        print(f"   {data}: {quantos}")
+
+    if args.dry_run:
+        print("\n--dry-run: nada gravado")
+        return 0
+
+    documento = {
+        "schema_version": "first_published_at_v1",
+        "gerado_por": "tools/generate-first-published-at",
+        "fonte": ("evidência datada mais antiga de que a rota já era pública: "
+                  "histórico git do published_manifest (data do commit, não approved_at) "
+                  "e o teto do registro de revisão de conteúdo"),
+        "commits_percorridos": len(commits),
+        "total": len(primeira),
+        "first_published_at": dict(sorted(primeira.items())),
+    }
+    escreve_atomico(saida, json.dumps(documento, ensure_ascii=False, indent=1, sort_keys=False) + "\n")
+    print(f"\ngravado: {args.saida} ({len(primeira)} entradas)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

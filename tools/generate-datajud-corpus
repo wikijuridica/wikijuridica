@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""generate-datajud-corpus — baixa a demanda judicial real de TODOS os tribunais.
+
+POR QUE EXISTE. O portal decide o que escrever sem dado de conversão e sem
+Search Console. O Datajud/CNJ resolve isso por um ângulo melhor que volume de
+busca: ele diz quantos PROCESSOS existem sobre cada assunto. Quem entra na
+Justiça já passou do estágio da dúvida — é demanda comprovada.
+
+O QUE ESTA FERRAMENTA CORRIGE. `tools/measure-judicial-demand` consultava UM
+tribunal (TJSP) e 40 assuntos. A API pública cobre **22 tribunais e 283 milhões
+de processos** — a limitação era do nosso código, não da fonte.
+
+Aqui se coleta, por tribunal:
+  - assuntos (o tema do processo) com volume
+  - classes processuais com volume
+  - grau (primeiro/segundo/superior)
+  - o total de processos, para dar denominador a tudo
+
+E se consolida um ranking nacional por assunto, somando os tribunais — que é o
+que responde "onde há mais gente com esse problema no Brasil".
+
+FONTE E LICENÇA. API Pública do Datajud, chave divulgada pelo próprio CNJ em
+datajud-wiki.cnj.jus.br/api-publica/acesso. Não é credencial privada. A coleta é
+**metadata-only e agregada**: a API entrega `assuntos`, `classe`,
+`orgaoJulgador`, `movimentos` e `nivelSigilo` — NÃO entrega partes, peças nem
+conteúdo de decisão. Esta ferramenta agrega e descarta; não guarda processo
+nenhum, e por isso não toca dado pessoal.
+
+EDUCAÇÃO COM A API: uma requisição por agregação, com pausa, e retomada do que
+já foi baixado (`--apenas` e o cache em disco evitam refazer trabalho).
+
+O QUE ELE GRAVA: `data/research/datajud/<tribunal>.json` com as agregações e a
+proveniência (data da coleta, total de processos, endpoint), mais
+`data/research/datajud/ranking_nacional.json` com o consolidado.
+
+Uso:
+    tools/generate-datajud-corpus --dry-run
+    tools/generate-datajud-corpus
+    tools/generate-datajud-corpus --apenas tjsp,tjrj --top 200
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DESTINO = ROOT / "data/research/datajud"
+PAGES = ROOT / "content/pages.json"
+
+API = "https://api-publica.datajud.cnj.jus.br/api_publica_%s/_search"
+CHAVE_PUBLICA = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
+
+# A identidade de saída é UMA só (CLAUDE.md §11, e o pacote Go
+# internal/wikijuridicabot): quando o portal sai para a rede, ele se apresenta
+# como WikijuridicaBot, com a URL que documenta o agente e o propósito da
+# coleta. O prefixo "Mozilla/5.0 (compatible;" não é disfarce — é o que os WAF
+# de gov.br exigem e o que Googlebot e bingbot usam; o nome real vem dentro do
+# parêntese, que é onde o operador do site olha.
+#
+# MEDIDO em 2026-09-05 contra api-publica.datajud.cnj.jus.br (POST _search,
+# size 0, com a chave pública do CNJ): este User-Agent devolveu HTTP 200 e 191
+# bytes — exatamente o mesmo que o antigo "wikijuridica-demanda/1.0". A troca
+# não custou acesso.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; observacao-de-demanda)")
+
+# Os 22 tribunais que responderam na verificação de 2026-08-07, com o volume
+# medido. A lista é explícita para que a cobertura seja auditável — e para que
+# um tribunal que pare de responder apareça como falha, não como silêncio.
+TRIBUNAIS = [
+    "tjsp", "tjmg", "tjrj", "tjba", "tjrs", "tjpr", "tjsc", "tjgo", "tjpe",
+    "tjce", "trf3", "trf4", "trf1", "trf5", "trf6", "trf2", "trt2", "trt15",
+    "tst", "stj", "tse", "stm",
+]
+
+# Assunto genérico demais para orientar conteúdo: "DIREITO CIVIL" é um ramo
+# inteiro, não um tema de página.
+GENERICOS = {
+    "direito civil", "direito penal", "direito tributario", "direito do trabalho",
+    "direito processual civil", "direito processual penal", "direito administrativo",
+    "direito previdenciario", "direito do consumidor", "assunto principal",
+    "objetos de cartas precatorias civeis/de ordem", "outros",
+    "direito civil", "obrigacoes", "especies de contratos",
+}
+
+
+def normalizar(texto: str) -> str:
+    sem = "".join(c for c in unicodedata.normalize("NFKD", texto or "")
+                  if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9 ]+", " ", sem.lower()).strip()
+
+
+def consultar(tribunal: str, corpo: dict, timeout: float = 60.0) -> dict:
+    pedido = urllib.request.Request(
+        API % tribunal, data=json.dumps(corpo).encode(), method="POST",
+        headers={
+            "Authorization": "APIKey " + CHAVE_PUBLICA,
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        })
+    with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+        return json.loads(resposta.read().decode("utf-8"))
+
+
+def baldes(dados: dict, nome: str) -> list:
+    agregacao = (dados.get("aggregations") or {}).get(nome) or {}
+    return agregacao.get("buckets") or []
+
+
+def coletar(tribunal: str, top: int, pausa: float) -> dict | None:
+    """Total + assuntos + classes + graus, numa requisição por dimensão."""
+    try:
+        total = consultar(tribunal, {
+            "size": 0, "track_total_hits": True, "query": {"match_all": {}},
+        })
+    except (urllib.error.URLError, OSError, ValueError) as erro:
+        print("  %-6s ERRO no total: %s" % (tribunal, str(erro)[:60]), file=sys.stderr)
+        return None
+    processos = ((total.get("hits") or {}).get("total") or {}).get("value", 0)
+    time.sleep(pausa)
+
+    registro = {"tribunal": tribunal, "processos": processos}
+    for chave, campo in (("assuntos", "assuntos.nome.keyword"),
+                         ("classes", "classe.nome.keyword"),
+                         ("graus", "grau.keyword")):
+        tamanho = top if chave == "assuntos" else min(top, 60)
+        try:
+            dados = consultar(tribunal, {
+                "size": 0,
+                "aggs": {chave: {"terms": {"field": campo, "size": tamanho}}},
+            })
+            registro[chave] = [{"nome": b["key"], "processos": b["doc_count"]}
+                               for b in baldes(dados, chave)]
+        except (urllib.error.URLError, OSError, ValueError) as erro:
+            registro[chave] = []
+            registro.setdefault("falhas", []).append(
+                {"dimensao": chave, "erro": str(erro)[:120]})
+        time.sleep(pausa)
+    return registro
+
+
+def vocabulario_das_paginas() -> list:
+    if not PAGES.exists():
+        return []
+    with open(PAGES, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+    itens = []
+    for pagina in paginas:
+        if not pagina.get("unique_intent_id"):
+            continue
+        texto = normalizar(" ".join([
+            pagina.get("title") or "", pagina.get("heading") or "",
+            (pagina.get("path") or "").replace("-", " ").replace("/", " "),
+        ]))
+        itens.append((pagina.get("path"), {p for p in texto.split() if len(p) > 3}))
+    return itens
+
+
+VAGOS = {"imposto", "sobre", "servicos", "contrato", "contratos", "acao",
+         "civel", "civeis", "ordem", "demais", "outros", "geral", "direito",
+         "processo", "processual", "pena", "danos", "dano", "pedido", "parte"}
+
+
+def cobertura(assunto: str, paginas: list) -> list:
+    """Páginas do acervo que tratam do assunto, pelo termo DISTINTIVO.
+
+    Exigir a maioria dos termos do rótulo mede a burocracia, não o tema: o nome
+    oficial "IPTU/ Imposto Predial e Territorial Urbano" fez a primeira versão
+    reportar "IPTU: zero páginas" havendo 39.
+    """
+    termos = {p for p in normalizar(assunto).split() if len(p) > 3}
+    distintivos = termos - VAGOS or termos
+    return [caminho for caminho, vocab in paginas if distintivos & vocab]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--apenas", default="", help="lista de tribunais separada por vírgula")
+    parser.add_argument("--top", type=int, default=150, help="assuntos por tribunal")
+    parser.add_argument("--pausa", type=float, default=0.3)
+    args = parser.parse_args()
+
+    alvos = [t.strip() for t in args.apenas.split(",") if t.strip()] or TRIBUNAIS
+    print("=== CORPUS DATAJUD/CNJ ===")
+    print("fonte    : API Pública do Datajud, chave divulgada pelo CNJ")
+    print("escopo   : metadados AGREGADOS — sem partes, sem peças, sem decisão")
+    print("tribunais: %d" % len(alvos))
+    if args.dry_run:
+        for tribunal in alvos:
+            print("  %s -> %s" % (tribunal, API % tribunal))
+        return 0
+
+    DESTINO.mkdir(parents=True, exist_ok=True)
+    agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    coletados = []
+    for indice, tribunal in enumerate(alvos, 1):
+        registro = coletar(tribunal, args.top, args.pausa)
+        if not registro:
+            continue
+        registro.update({
+            "schema_version": "datajud_corpus_v1",
+            "collected_at": agora,
+            "endpoint": API % tribunal,
+            "scope": "metadados_agregados_sem_dado_pessoal",
+        })
+        caminho = DESTINO / ("%s.json" % tribunal)
+        with open(caminho, "w", encoding="utf-8") as handle:
+            json.dump(registro, handle, ensure_ascii=False, indent=1, sort_keys=True)
+        coletados.append(registro)
+        print("  [%2d/%d] %-6s %11d processos | %3d assuntos | %3d classes"
+              % (indice, len(alvos), tribunal, registro["processos"],
+                 len(registro.get("assuntos") or []), len(registro.get("classes") or [])))
+
+    if not coletados:
+        print("nenhum tribunal respondeu.", file=sys.stderr)
+        return 1
+
+    # Consolidado nacional: soma o mesmo assunto entre tribunais.
+    nacional = collections.Counter()
+    onde = collections.defaultdict(set)
+    for registro in coletados:
+        for item in registro.get("assuntos") or []:
+            if normalizar(item["nome"]) in GENERICOS:
+                continue
+            nacional[item["nome"]] += item["processos"]
+            onde[item["nome"]].add(registro["tribunal"])
+
+    paginas = vocabulario_das_paginas()
+    linhas = []
+    for assunto, processos in nacional.most_common(400):
+        cobre = cobertura(assunto, paginas)
+        linhas.append({
+            "assunto": assunto,
+            "processos": processos,
+            "tribunais": sorted(onde[assunto]),
+            "paginas_no_acervo": len(cobre),
+            "exemplos": sorted(cobre)[:3],
+        })
+
+    ranking = {
+        "schema_version": "datajud_ranking_nacional_v1",
+        "collected_at": agora,
+        "tribunais_consultados": [r["tribunal"] for r in coletados],
+        "processos_totais": sum(r["processos"] for r in coletados),
+        "assuntos": linhas,
+    }
+    with open(DESTINO / "ranking_nacional.json", "w", encoding="utf-8") as handle:
+        json.dump(ranking, handle, ensure_ascii=False, indent=1, sort_keys=True)
+
+    print("\n=== DEMANDA NACIONAL x COBERTURA DO ACERVO ===")
+    print("processos somados: %d em %d tribunais"
+          % (ranking["processos_totais"], len(coletados)))
+    print("\n%-54s %13s %8s" % ("ASSUNTO", "PROCESSOS", "PÁGINAS"))
+    for linha in linhas[:30]:
+        marca = ""
+        if linha["processos"] >= 1_000_000 and linha["paginas_no_acervo"] < 5:
+            marca = "  <-- LACUNA"
+        print("%-54s %13d %8d%s" % (linha["assunto"][:54], linha["processos"],
+                                    linha["paginas_no_acervo"], marca))
+
+    lacunas = [l for l in linhas
+               if l["processos"] >= 500_000 and l["paginas_no_acervo"] < 5]
+    print("\n--- maiores lacunas (>= 500 mil processos, < 5 páginas): %d ---" % len(lacunas))
+    for linha in lacunas[:25]:
+        print("  %11d  %-46s %d pág." % (linha["processos"], linha["assunto"][:46],
+                                         linha["paginas_no_acervo"]))
+    print("\nevidência: %s" % os.path.relpath(DESTINO, ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

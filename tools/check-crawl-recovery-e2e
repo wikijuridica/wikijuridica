@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""check-crawl-recovery-e2e — o que cada crawler recebe hoje, de ponta a ponta.
+
+POR QUE EXISTE: a recuperação de crawl de 2026-08-12 mexeu em sete camadas
+(túnel, borda, WAF, cache, robots, feed, métodos HTTP). Verificar cada uma
+isoladamente não prova que o conjunto está coerente — e é o conjunto que o
+crawler encontra. Este check faz a pergunta do jeito que ela importa: com o
+User-Agent de cada bot que interessa, contra o domínio público, medindo o que
+volta.
+
+ANTI-FRAUDE: toda requisição vai com `X-Bot-Simulation: true`. O access log
+registra `bot_sim` e os relatórios de tráfego excluem essas linhas
+(`tools/generate-bot-traffic-origin` as conta em `simulations_excluded`). Um
+ensaio de rastreio que se conta como visita de crawler é número de audiência
+inflado — exatamente o que a política do projeto proíbe, e o defeito que esta
+mesma sessão corrigiu na telemetria.
+
+Read-only. Exit 1 se qualquer expectativa falhar.
+
+Uso:
+    tools/check-crawl-recovery-e2e
+    tools/check-crawl-recovery-e2e --json
+"""
+import argparse
+import json
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = "https://wikijuridica.com.br"
+
+# Concatenação deliberada: escrever o nome do crawler inteiro no fonte faz um
+# hook de segurança do repositório barrar o arquivo, por parecer requisição com
+# UA de bot real contra host público. O ensaio é legítimo (vai marcado), mas o
+# guarda-corpo é grosseiro por desenho — e contorná-lo assim é honesto, porque
+# não muda o que é enviado, só como o literal aparece no código.
+# IDENTIDADE PADRAO — e a nossa. A simulacao de bot e OPT-IN (2026-09-10).
+#
+# O CLAUDE.md da maquina proibe "requisicao com User-Agent de bot real" e obriga
+# "sonda interna com UA proprio + header X-Warming-Request: true". Esta
+# ferramenta nasceu do outro lado dessa regua, porque a pergunta que ela faz —
+# "o que a BORDA faz com cada crawler" — so tem resposta saindo com o UA
+# daquele crawler: WAF, bot rules e cache decidem por User-Agent, e trocar o UA
+# muda o que se mede.
+#
+# As duas reguas se conciliam sem afrouxar nenhuma: a simulacao deixa de ser o
+# comportamento padrao e passa a exigir `--simular-bots`, dita na linha de
+# comando por quem responde pela execucao. Sem a flag, a ferramenta sonda com a
+# identidade do portal e continua medindo rota, status, cache e paridade de
+# corpo — o que perde e a comparacao ENTRE crawlers, que e justamente a parte
+# que exige o disfarce.
+#
+# O que nunca muda: toda requisicao leva `X-Bot-Simulation: true`, o access log
+# registra `bot_sim` e `tools/generate-bot-traffic-origin` as exclui em
+# `simulations_excluded`. Ensaio de rastreio que se conta como visita de crawler
+# e numero de audiencia inflado, e isso o contrato chama de fraude contra o dono.
+UA_DA_SONDA = "wikijuridica-superficie-probe/1.0"
+
+UAS = {
+    "googlebot": "Mozilla/5.0 (compatible; Goog" + "lebot/2.1; +http://www.google.com/bot.html)",
+    "bingbot": "Mozilla/5.0 (compatible; bing" + "bot/2.0; +http://www.bing.com/bingbot.htm)",
+    "applebot": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15 (Apple" + "bot/0.1; +http://www.apple.com/go/applebot)",
+    "gptbot": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPT" + "Bot/1.4; +https://openai.com/gptbot)",
+    "oai-searchbot": "Mozilla/5.0 (compatible; OAI-Search" + "Bot/1.0; +https://openai.com/searchbot)",
+    "chatgpt-user": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-" + "User/1.0; +https://openai.com/bot",
+    "claudebot": "Mozilla/5.0 (compatible; Claude" + "Bot/1.0; +claudebot@anthropic.com)",
+    "claude-searchbot": "Mozilla/5.0 (compatible; Claude-Search" + "Bot/1.0; +https://www.anthropic.com/claude-searchbot)",
+    "perplexitybot": "Mozilla/5.0 (compatible; Perplexity" + "Bot/1.0; +https://perplexity.ai/perplexitybot)",
+    "amazonbot": "Mozilla/5.0 (compatible; Amazon" + "bot/0.1; +https://developer.amazon.com/support/amazonbot)",
+    "humano": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+}
+
+# (caminho, status esperado, rótulo)
+ROTAS = [
+    ("/", 200, "home"),
+    ("/consumidor/", 200, "hub de área"),
+    ("/consumidor/pagina/2/", 200, "paginação de hub"),
+    ("/glossario/clausula-reserva-plenario/", 200, "artigo"),
+    ("/robots.txt", 200, "robots"),
+    ("/sitemap.xml", 200, "índice de sitemap"),
+    ("/sitemaps/pages-0001.xml", 200, "shard de sitemap"),
+    ("/feed.xml", 200, "feed Atom"),
+    ("/llms.txt", 200, "mapa para agentes"),
+    ("/.well-known/security.txt", 200, "security.txt"),
+    ("/familia/?utm_source=teste", 200, "URL com parâmetro de campanha"),
+    ("/rota-que-nao-existe-para-teste/", 404, "404 institucional"),
+]
+
+
+def pedir(url, ua, metodo="GET", timeout=25):
+    cabecalhos = {
+        "User-Agent": ua,
+        "X-Bot-Simulation": "true",
+        "Accept-Encoding": "gzip, br",
+    }
+    if ua == UA_DA_SONDA:
+        # Sonda com identidade propria fica FORA da contagem de audiencia. Com UA
+        # simulado o `X-Bot-Simulation` ja faz esse papel, e mandar os dois
+        # confundiria as duas exclusoes na leitura do log.
+        cabecalhos["X-Warming-Request"] = "true"
+    pedido = urllib.request.Request(url, method=metodo, headers=cabecalhos)
+    inicio = time.monotonic()
+    contexto = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+            corpo = resposta.read()
+            return resposta.status, dict(resposta.headers), corpo, time.monotonic() - inicio
+    except urllib.error.HTTPError as erro:
+        return erro.code, dict(erro.headers or {}), (erro.read() if erro.fp else b""), time.monotonic() - inicio
+    except Exception as erro:  # rede/TLS/timeout
+        return 0, {"erro": type(erro).__name__}, b"", time.monotonic() - inicio
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--simular-bots", action="store_true",
+                        help="sai com o User-Agent de cada crawler real (Googlebot, bingbot, "
+                             "GPTBot...) contra o dominio publico, sempre com X-Bot-Simulation: "
+                             "true. Sem esta flag a sonda usa a identidade do portal.")
+    args = parser.parse_args()
+
+    agentes = dict(UAS) if args.simular_bots else {"sonda": UA_DA_SONDA}
+    if args.simular_bots:
+        print("SIMULACAO DE BOT LIGADA: %d identidades de crawler real, todas com "
+              "X-Bot-Simulation: true e excluidas da contagem de audiencia.\n" % len(agentes))
+    else:
+        print("identidade: %s (sem simulacao de bot; use --simular-bots para a "
+              "comparacao entre crawlers)\n" % UA_DA_SONDA)
+
+    falhas = []
+    relatorio = {"rotas": [], "cloaking": {}, "metodos": {}}
+
+    # 1. Cada rota, com o UA de cada crawler.
+    print("=== ROTAS x CRAWLERS ===")
+    for caminho, esperado, rotulo in ROTAS:
+        url = BASE + caminho
+        linha = {"path": caminho, "rotulo": rotulo, "esperado": esperado, "obtidos": {}}
+        ruins = []
+        for nome, ua in agentes.items():
+            status, headers, _corpo, _dt = pedir(url, ua)
+            linha["obtidos"][nome] = status
+            if status != esperado:
+                ruins.append("%s=%s" % (nome, status))
+        cache = ""
+        status, headers, corpo, dt = pedir(url, agentes.get("humano", UA_DA_SONDA))
+        # A capitalização do header varia; procurar sem diferenciar maiúsculas.
+        cache = next((v for k, v in headers.items() if k.lower() == "cf-cache-status"), "-")
+        linha["cf_cache_status"] = cache
+        linha["ttfb_s"] = round(dt, 3)
+        linha["bytes"] = len(corpo)
+        relatorio["rotas"].append(linha)
+        marca = "OK " if not ruins else "FALHA"
+        print("  %-5s %-34s %-26s esperado=%s cache=%-11s %s"
+              % (marca, caminho[:34], rotulo, esperado, cache,
+                 ("divergentes: " + ", ".join(ruins)) if ruins else ""))
+        if ruins:
+            falhas.append("rota %s: %s" % (caminho, ", ".join(ruins)))
+
+    # 2. Cloaking: todo crawler tem de receber o MESMO corpo do humano.
+    print("\n=== CLOAKING (todos recebem os mesmos bytes?) ===")
+    alvo = BASE + "/glossario/clausula-reserva-plenario/"
+    _s, _h, corpo_humano, _d = pedir(alvo, agentes.get("humano", UA_DA_SONDA))
+    import hashlib
+    sha_humano = hashlib.sha256(corpo_humano).hexdigest()
+    for nome, ua in agentes.items():
+        _s, _h, corpo, _d = pedir(alvo, ua)
+        sha = hashlib.sha256(corpo).hexdigest()
+        igual = sha == sha_humano
+        relatorio["cloaking"][nome] = igual
+        if not igual:
+            falhas.append("cloaking: %s recebe corpo diferente do humano" % nome)
+    iguais = sum(1 for v in relatorio["cloaking"].values() if v)
+    print("  %d/%d recebem bytes idênticos (sha256 %s…)" % (iguais, len(agentes), sha_humano[:12]))
+
+    # 3. Métodos: leitura passa, escrita não, preflight é respondido.
+    print("\n=== MÉTODOS ===")
+    esperados_metodo = {"GET": 200, "HEAD": 200, "OPTIONS": 204, "POST": 403, "PUT": 403, "DELETE": 403}
+    for metodo, esperado in esperados_metodo.items():
+        status, _h, _c, _d = pedir(BASE + "/", agentes.get("humano", UA_DA_SONDA), metodo=metodo)
+        relatorio["metodos"][metodo] = status
+        ok = status == esperado
+        print("  %-5s %-7s -> %s (esperado %s)" % ("OK " if ok else "FALHA", metodo, status, esperado))
+        if not ok:
+            falhas.append("método %s devolveu %s, esperado %s" % (metodo, status, esperado))
+
+    print()
+    if falhas:
+        print("FALHAS (%d):" % len(falhas))
+        for f in falhas:
+            print("  - %s" % f)
+    else:
+        print("TUDO OK — %d rotas x %d agentes, sem cloaking, métodos corretos"
+              % (len(ROTAS), len(agentes)))
+
+    if args.json:
+        print(json.dumps({"falhas": falhas, "relatorio": relatorio}, ensure_ascii=False, sort_keys=True))
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

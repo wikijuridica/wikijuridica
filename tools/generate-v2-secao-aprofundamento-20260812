@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""generate-v2-secao-aprofundamento-20260812 — acrescenta a seção que faltava às páginas curtas.
+
+O DEFEITO. Auditoria de 2026-08-12 apontou "45 páginas com ZERO seção de corpo".
+A medição foi refeita e o achado NÃO se confirmou: as 45 têm corpo, no HTML e no
+estoque; o extrator da auditoria localizava o corpo por `<section class="sec">`,
+classe que o render só emite quando a página tem três seções ou mais
+(internal/render/render.go:471 e :943), de modo que toda página de duas seções
+lhe parecia vazia — e o que sobrava para contar era, palavra por palavra,
+resumo + FAQ. O gate `tools/check-public-body-sections` foi criado no mesmo dia
+para que esse falso positivo não se repita.
+
+O QUE SOBROU DE DEFEITO REAL. Dessas 45, dezesseis ficam entre 250 e 400
+palavras pela fórmula oficial (bodyWordCount, internal/v2ingest/validate.go:984),
+faixa que a própria política de severidade classifica como MÉDIO —
+"corpo_entre_250_e_400_palavras", tools/generate-v2-publication-severity:651 —,
+isto é, publica e refina depois. Este gerador é o "depois": acrescenta a cada
+uma UMA seção de aprofundamento autoral, com o ângulo prático que as duas seções
+existentes não cobriam (o passo processual, o prazo, o documento, o órgão
+competente), levando a página acima do piso de contrato de 400 palavras.
+
+O QUE ELE NÃO FAZ. Não reescreve, não substitui e não descarta uma linha do que
+já estava escrito: só ACRESCENTA ao fim de `sections`. O texto anterior das
+dezesseis páginas está preservado em
+`.agents/runtime/backup-paginas-20260812-secao-aprofundamento/registros-antes.jsonl`.
+
+CONTRATO DE ESCRITA (o mesmo de generate-v2-atribuicao-dispositivo-repair-20260812,
+caminho sancionado para correção pontual): lease de época do estoque canônico,
+lock exclusivo próprio, CAS pelo sha256 da LINHA viva relida do disco,
+idempotência por heading (reexecutar não duplica seção), word_count recalculado
+pela fórmula do ingest, forma de serialização da linha preservada, escrita
+atômica com fsync. NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-secao-aprofundamento-20260812 --dry-run
+    tools/generate-v2-secao-aprofundamento-20260812
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.secao-aprofundamento-20260812.lock"
+DADOS = Path(__file__).with_suffix(".data.json")
+PAGES = ROOT / "data/editorial/v2_pages"
+BACKUP = ".agents/runtime/backup-paginas-20260812-secao-aprofundamento/"
+
+# Piso de contrato: abaixo de 400 palavras a página segue em faixa MÉDIA, e a
+# seção nova não terá cumprido o que veio fazer.
+PISO_CONTRATO = 400
+MIN_PALAVRAS_SECAO = 150
+MAX_PALAVRAS_SECAO = 260
+
+# Promessa de resultado e afirmação mais forte do que a fonte sustenta
+# (Provimento OAB 205/2021 e a regra de nunca inventar).
+TEXTOS_PROIBIDOS = (
+    "jurisprudência pacífica", "entendimento pacificado", "com certeza",
+    "sempre ganha", "garantimos", "asseguramos o êxito", "êxito garantido",
+    "garantia de êxito", "resultado garantido", "certamente conseguirá",
+    "sem risco", "100% de", "melhor advogado",
+)
+# Canais OFICIAIS aceitos como conferência de texto legal. `data/legal-corpus/`
+# entra porque é o espelho do Planalto baixado pelo próprio repo, com
+# `source_url`, `fetched_at` e `document_sha256` — proveniência conferível.
+DOMINIOS_OFICIAIS = (
+    "planalto.gov.br", "legis.senado.leg.br", "senado.leg.br",
+    "camara.leg.br", "lexml.gov.br", "in.gov.br", "gov.br",
+    "jus.br", "data/legal-corpus/",
+)
+# Vocabulário interno do pipeline vazando para texto público.
+VOCABULARIO_INTERNO = (
+    "rascunho", "seed", "lane ", "release gate", "pipeline", "shard",
+    "word_count", "intent_id", "gate ", "template",
+)
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def word_count(record: dict) -> int:
+    """Reproduz bodyWordCount de internal/v2ingest/validate.go.
+
+    Declarar sem recalcular derruba a página no ingest
+    (declared_word_count_incoherent).
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def dump_como_a_linha(record: dict, linha_viva: str) -> str:
+    """Reemite o registro na MESMA forma de serialização da linha viva."""
+    original = json.loads(linha_viva)
+    for separadores in ((", ", ": "), (",", ":")):
+        if json.dumps(original, ensure_ascii=False,
+                      separators=separadores) == linha_viva:
+            return json.dumps(record, ensure_ascii=False,
+                              separators=separadores)
+    print(f"  aviso: forma de serialização não reconhecida em "
+          f"{record.get('intent_id')}; reemitindo na forma padrão",
+          file=sys.stderr)
+    return json.dumps(record, ensure_ascii=False)
+
+
+def _normalizar(texto: str) -> list[str]:
+    folded = unicodedata.normalize("NFKD", (texto or "").lower())
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return [t for t in re.split(r"[^0-9a-z]+", folded) if t]
+
+
+def _ngramas(tokens: list[str], n: int) -> set[str]:
+    return {" ".join(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def carregar_secoes() -> list[dict]:
+    if not DADOS.is_file():
+        raise SystemExit(f"arquivo de dados ausente: {DADOS}")
+    with open(DADOS, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    secoes = dados.get("secoes")
+    if not isinstance(secoes, list) or not secoes:
+        raise SystemExit(f"{DADOS.name}: 'secoes' vazio ou ausente")
+    return secoes
+
+
+def indexar_shards() -> tuple[dict[str, str], dict[str, dict]]:
+    """intent_id -> shard e intent_id -> registro, lidos do acervo VIVO.
+
+    O shard vem do disco, nunca do arquivo de dados: se um agente errar o
+    caminho, a seção iria para a página errada.
+    """
+    onde: dict[str, str] = {}
+    registros: dict[str, dict] = {}
+    for shard in sorted(PAGES.glob("*.jsonl")):
+        for linha in shard.read_text(encoding="utf-8").splitlines():
+            if not linha.strip():
+                continue
+            registro = json.loads(linha)
+            intent = registro.get("intent_id")
+            if intent:
+                onde[intent] = os.path.relpath(shard, ROOT)
+                registros[intent] = registro
+    return onde, registros
+
+
+def preflight(secoes: list[dict], onde: dict[str, str],
+              registros: dict[str, dict]) -> dict[str, list[dict]]:
+    """Reprova ANTES de escrever: conteúdo, fonte, anti-template e efeito.
+
+    O anti-template é medido aqui, entre os textos novos do próprio lote e
+    contra o texto já publicado da mesma página — 16 seções escritas na mesma
+    leva são exatamente a situação em que um molde nasce.
+    """
+    problemas: list[str] = []
+    por_shard: dict[str, list[dict]] = {}
+    vistos: set[str] = set()
+    tokens_por_intent: dict[str, list[str]] = {}
+
+    for secao in secoes:
+        intent = secao.get("intent_id") or ""
+        heading = (secao.get("heading") or "").strip()
+        texto = (secao.get("text") or "").strip()
+        rotulo = f"{intent}/{heading[:40]}"
+        if not intent:
+            problemas.append("seção sem intent_id")
+            continue
+        if intent not in onde:
+            problemas.append(f"{rotulo}: intent não existe no acervo vivo")
+            continue
+        if intent in vistos:
+            problemas.append(f"{rotulo}: duas seções para a mesma página")
+            continue
+        vistos.add(intent)
+        if not heading or not texto:
+            problemas.append(f"{rotulo}: heading ou texto vazio")
+            continue
+        if not secao.get("dispositivo"):
+            problemas.append(f"{rotulo}: sem dispositivo nomeado")
+        if not secao.get("porque"):
+            problemas.append(f"{rotulo}: sem razão declarada")
+        conferencia = secao.get("conferencia") or {}
+        if not conferencia.get("url") or not conferencia.get("trecho_oficial"):
+            problemas.append(f"{rotulo}: sem conferência de fonte oficial "
+                             "(url + trecho literal)")
+        elif not any(dominio in conferencia["url"]
+                     for dominio in DOMINIOS_OFICIAIS):
+            # Agregador jurídico privado não é fonte oficial. O primeiro lote
+            # deste gerador veio com três conferências apontando para um site
+            # comercial porque planalto.gov.br estava fora do ar na máquina —
+            # a resposta certa é trocar de canal OFICIAL (Senado, Câmara,
+            # LexML, DOU), não baixar a régua da fonte.
+            problemas.append(f"{rotulo}: conferência em fonte não oficial "
+                             f"({conferencia['url'][:60]})")
+
+        palavras = _words(texto)
+        if not (MIN_PALAVRAS_SECAO <= palavras <= MAX_PALAVRAS_SECAO):
+            problemas.append(f"{rotulo}: {palavras} palavras, fora da faixa "
+                             f"{MIN_PALAVRAS_SECAO}-{MAX_PALAVRAS_SECAO}")
+
+        baixo = (heading + " " + texto).lower()
+        for proibido in TEXTOS_PROIBIDOS:
+            if proibido in baixo:
+                problemas.append(f"{rotulo}: promessa/afirmação proibida "
+                                 f"({proibido!r})")
+        for interno in VOCABULARIO_INTERNO:
+            if interno in baixo:
+                problemas.append(f"{rotulo}: vocabulário interno vazando "
+                                 f"({interno!r})")
+        if not re.search(r"[áàâãéêíóôõúüç]", baixo):
+            problemas.append(f"{rotulo}: texto sem acentuação — não é PT-BR")
+
+        registro = registros[intent]
+        existentes = {(s.get("heading") or "").strip().lower()
+                      for s in (registro.get("sections") or [])}
+        if heading.lower() in existentes:
+            # Não é erro: é o caminho idempotente. Marcado para pular.
+            secao["_ja_aplicada"] = True
+        else:
+            # A seção nova não pode repetir o que a página já diz.
+            novos = _ngramas(_normalizar(texto), 8)
+            atuais: set[str] = set()
+            for existente in (registro.get("sections") or []):
+                atuais |= _ngramas(_normalizar(existente.get("text")), 8)
+            atuais |= _ngramas(_normalizar(registro.get("opening")), 8)
+            repetidos = novos & atuais
+            if repetidos:
+                problemas.append(
+                    f"{rotulo}: repete trecho já publicado na própria página "
+                    f"({sorted(repetidos)[0]!r})")
+
+        # Efeito: a seção tem de tirar a página da faixa média. Se já foi
+        # aplicada, o número real é o que está no registro — simular outro
+        # append contaria a mesma seção duas vezes e gravaria na evidência um
+        # total que a página nunca teve.
+        if secao.get("_ja_aplicada"):
+            depois = word_count(registro)
+        else:
+            simulado = json.loads(json.dumps(registro))
+            simulado.setdefault("sections", []).append(
+                {"heading": heading, "text": texto})
+            depois = word_count(simulado)
+            if depois < PISO_CONTRATO:
+                problemas.append(f"{rotulo}: página ficaria com {depois} "
+                                 f"palavras, abaixo do piso de {PISO_CONTRATO}")
+        secao["_word_count_previsto"] = depois
+
+        tokens_por_intent[intent] = _normalizar(texto)
+        por_shard.setdefault(onde[intent], []).append(secao)
+
+    # Anti-template ENTRE as seções novas: n-grama de 6 palavras repetido em
+    # duas páginas diferentes é a assinatura de molde que internal/quality
+    # persegue (repeatedPhraseMechanicalMinWords = 6, quality.go:733).
+    intents = sorted(tokens_por_intent)
+    for i, esquerda in enumerate(intents):
+        for direita in intents[i + 1:]:
+            comuns = (_ngramas(tokens_por_intent[esquerda], 6) &
+                      _ngramas(tokens_por_intent[direita], 6))
+            if comuns:
+                problemas.append(
+                    f"MOLDE entre {esquerda} e {direita}: "
+                    f"{sorted(comuns)[0]!r}")
+
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+
+    pendentes = [s for s in secoes if not s.get("_ja_aplicada")]
+    print(f"preflight ok: {len(secoes)} seção(ões) em {len(por_shard)} shard(s); "
+          f"{len(pendentes)} a aplicar, {len(secoes) - len(pendentes)} já "
+          f"aplicada(s). Toda seção nomeia dispositivo, razão e conferência; "
+          f"nenhum n-grama de 6 palavras se repete entre elas.")
+    return por_shard
+
+
+def aplicar(shard_rel: str, secoes: list[dict], dry_run: bool) -> tuple[int, int]:
+    path = ROOT / shard_rel
+    bruto = path.read_bytes().decode("utf-8")
+    linhas = bruto.split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    por_intent = {s["intent_id"]: s for s in secoes}
+    saida: list[str] = []
+    alterados = 0
+    ja_feitos = 0
+
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard_rel}: linha em branco {numero}")
+        registro = json.loads(raw)
+        intent = registro.get("intent_id")
+        secao = por_intent.get(intent)
+        if secao is None:
+            saida.append(raw)
+            continue
+
+        heading = secao["heading"].strip()
+        texto = secao["text"].strip()
+        existentes = [(s.get("heading") or "").strip().lower()
+                      for s in (registro.get("sections") or [])]
+        if heading.lower() in existentes:
+            ja_feitos += 1
+            saida.append(raw)
+            print(f"  {intent}: seção já presente, nada a fazer")
+            continue
+
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+
+        nova_secao = {"heading": heading, "text": texto}
+        registro.setdefault("sections", []).append(nova_secao)
+
+        fonte_nova = secao.get("fonte_nova")
+        if fonte_nova and fonte_nova.get("url"):
+            urls = {(f.get("url") or "")
+                    for f in (registro.get("official_sources") or [])}
+            if fonte_nova["url"] not in urls:
+                # http_status vem do arquivo de dados, NUNCA fixo no código:
+                # gravar 200 sem ter feito a requisição é afirmar evidência que
+                # não se produziu — a fraude que o contrato do repositório
+                # proíbe. Sem status conferido, o campo simplesmente não entra.
+                fonte = {
+                    "url": fonte_nova["url"],
+                    "name": fonte_nova["name"],
+                    "anchor_claim": fonte_nova["anchor_claim"],
+                    "verified_at": (secao.get("conferencia") or {}).get(
+                        "data", "2026-08-12"),
+                }
+                if fonte_nova.get("http_status") is not None:
+                    fonte["http_status"] = fonte_nova["http_status"]
+                registro.setdefault("official_sources", []).append(fonte)
+
+        antes_wc = registro.get("word_count")
+        registro["word_count"] = word_count(registro)
+        nova_linha = dump_como_a_linha(registro, raw)
+
+        atual = hashlib.sha256(
+            path.read_bytes().decode("utf-8").split("\n")[numero - 1]
+            .strip().encode("utf-8")).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {shard_rel}:{numero} ({intent}): "
+                f"outra frente tocou este registro durante a execução. "
+                f"Reler o conteúdo vivo antes de reaplicar.")
+
+        saida.append(nova_linha)
+        alterados += 1
+        print(f"  {intent}: +1 seção ({secao.get('dispositivo')}), "
+              f"word_count {antes_wc} -> {registro['word_count']}")
+
+    if alterados and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(path, payload.encode("utf-8"))
+    return alterados, ja_feitos
+
+
+def escrever_evidencia(secoes: list[dict], onde: dict[str, str]) -> None:
+    """Evidência auditável em data/, uma linha por seção acrescentada."""
+    destino = ROOT / "data/editorial/v2_secao_aprofundamento_evidence_20260812.jsonl"
+    linhas: list[str] = []
+    for secao in sorted(secoes, key=lambda s: s["intent_id"]):
+        conferencia = secao.get("conferencia") or {}
+        linhas.append(json.dumps({
+            "gerador": Path(__file__).name,
+            "gerado_em": "2026-08-12",
+            "intent_id": secao["intent_id"],
+            "rota": secao.get("route", ""),
+            "shard": onde.get(secao["intent_id"], ""),
+            "heading": secao["heading"],
+            "dispositivo": secao.get("dispositivo", ""),
+            "porque": secao.get("porque", ""),
+            "palavras_da_secao": _words(secao.get("text")),
+            "word_count_previsto": secao.get("_word_count_previsto"),
+            "fonte_oficial_url": conferencia.get("url", ""),
+            "fonte_consultada_em": conferencia.get("data", ""),
+            "fonte_texto_literal": conferencia.get("trecho_oficial", ""),
+            # Quando a conferência saiu do espelho do Planalto guardado no repo,
+            # o hash do documento vai junto: quem quiser refazer a conferência
+            # compara o sha256 em vez de acreditar na palavra de quem escreveu.
+            "fonte_corpus": conferencia.get("corpus", ""),
+            "fonte_corpus_sha256": conferencia.get("corpus_sha256", ""),
+            "fonte_nova_registrada": bool((secao.get("fonte_nova") or {}).get("url")),
+            "texto_anterior_preservado_em": BACKUP,
+        }, ensure_ascii=False))
+    atomic_write(destino, ("\n".join(linhas) + "\n").encode("utf-8"))
+    print(f"evidência: {len(linhas)} registro(s) em "
+          f"{os.path.relpath(destino, ROOT)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    secoes = carregar_secoes()
+    onde, registros = indexar_shards()
+    por_shard = preflight(secoes, onde, registros)
+
+    total_alterados = 0
+    total_ja = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for shard in sorted(por_shard):
+                    print(f"\n{shard}")
+                    alterados, ja = aplicar(shard, por_shard[shard], args.dry_run)
+                    total_alterados += alterados
+                    total_ja += ja
+                # A evidência deriva do arquivo de dados, não do que mudou
+                # nesta execução: reescrevê-la sempre mantém o artefato
+                # completo e determinístico mesmo quando o lote já foi
+                # aplicado (o gerador é idempotente, a evidência também).
+                if not args.dry_run:
+                    escrever_evidencia(secoes, onde)
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}",
+              file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print(f"\n--dry-run: {total_alterados} página(s) receberia(m) seção, "
+              f"{total_ja} já aplicada(s). Nada escrito.")
+        return 0
+    print(f"\n{total_alterados} página(s) com seção nova, "
+          f"{total_ja} já estava(m) aplicada(s).")
+    if total_alterados:
+        print("Reingerir o estoque e republicar para o espelho refletir a seção.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

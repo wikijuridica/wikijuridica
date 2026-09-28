@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# ai-process-reaper — mata processos codex/claude ÓRFÃOS deixados pelo ai-terminal
+# quando a sessão tmux morre e o processo reparenta para o init (PPID 1).
+# Complementa ai-terminal-gc (que só limpa CODEX_HOME em disco, NÃO processos).
+#
+# SEGURANÇA (nunca mata a sessão viva):
+#   - Protege a árvore de cada `claude daemon run` que ainda serve alguém — mas
+#     NÃO o daemon órfão (PPID==1 com criador comprovadamente morto), que era o
+#     buraco por onde 1.242 MB sobreviveram à sessão que os criou.
+#   - Protege processos em panes de sessões tmux VIVAS + o próprio tmux server.
+#   - Só considera órfão o que reparentou para o init (PPID==1) E é mais velho que
+#     --min-age-minutes (default 30) — reparent-para-init = o launcher/tmux morreu.
+#   - Dry-run por padrão; só age com --apply.
+set -uo pipefail
+
+APPLY=0
+MIN_AGE_MIN=30
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--apply) APPLY=1 ;;
+	--min-age-minutes)
+		shift
+		MIN_AGE_MIN="${1:-30}"
+		;;
+	--min-age-minutes=*) MIN_AGE_MIN="${1#*=}" ;;
+	-h | --help)
+		grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
+		exit 0
+		;;
+	*)
+		echo "arg desconhecido: $1" >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+min_age_s=$((MIN_AGE_MIN * 60))
+
+# --- conjunto PROTEGIDO: sessão(ões) claude viva(s) + tmux vivo ---
+protected=" "
+add_tree() {
+	local pid="$1"
+	[ -n "$pid" ] && [ -d "/proc/$pid" ] || return 0
+	case "$protected" in *" $pid "*) return 0 ;; esac
+	protected="$protected$pid "
+	local c
+	for c in $(pgrep -P "$pid" 2>/dev/null); do add_tree "$c"; done
+}
+# Daemon claude e seus descendentes — mas SÓ enquanto ele serve alguém.
+#
+# Isto protegia TODA árvore de `claude daemon run` incondicionalmente, e foi como
+# um daemon com 50 descendentes e 1.242 MB sobreviveu à sessão que o criou em
+# 2026-08-19: reparentou para o init e este reaper continuou tratando-o como
+# intocável. O cmdline carrega o pid do criador em JSON
+# (`--spawned-by {"label":...,"pid":692624}`); se esse processo morreu e o daemon
+# está com PPID==1, ele não serve mais ninguém e passa a ser alvo legítimo.
+#
+# Falha FECHADO: sem `--spawned-by` legível não há prova de orfandade, e a árvore
+# segue protegida. Mesma regra do `ai-session-reaper`, para os dois não
+# divergirem sobre o que é um daemon abandonado.
+# ★ O COMENTARIO ACIMA DIZIA "mesma regra do ai-session-reaper" E ERA FALSO
+# (medido em 2026-08-30).
+#
+# O irmao foi ancorado no EXECUTAVEL depois de o red-team tropecar duas vezes na
+# forma solta — "um pgrep devolveu o proprio shell dele, e um pkill analogo matou
+# o shell com exit 144" (tools/env/AVISO-ai-session-reaper.md). Aqui a regra
+# continuou sendo substring em qualquer lugar da linha: um `bash -c` que apenas
+# MENCIONE "claude daemon run" entrava no laco.
+#
+# Aqui o efeito e proteger demais, nao matar demais — `add_tree` protege —, mas
+# a divergencia e real e o comentario que a nega e o que a torna invisivel. E ha
+# um caminho estreito de dano: um processo casado por engano, com PPID==1 e um
+# `"pid":N` morto na linha, cai no `continue` e sai da protecao.
+#
+# Agora e a MESMA regra dos dois: primeiro token e o executavel do Claude e o
+# segundo e literalmente `daemon`.
+for d in $(pgrep -f 'daemon run' 2>/dev/null); do
+	dcmd=$(tr '\0' ' ' <"/proc/$d/cmdline" 2>/dev/null)
+	_dexe="${dcmd%% *}"
+	_dresto="${dcmd#* }"
+	_darg1="${_dresto%% *}"
+	case "$_dexe" in claude | */claude | */share/claude/versions/*) : ;; *) continue ;; esac
+	[ "$_darg1" = "daemon" ] || continue
+	case "$dcmd" in *'daemon run'*) : ;; *) continue ;; esac
+	dppid=$(awk '/^PPid:/{print $2}' "/proc/$d/status" 2>/dev/null)
+	dspawner=$(printf '%s' "$dcmd" | grep -o '"pid":[0-9]*' | head -1 | cut -d: -f2)
+	if [ "${dppid:-0}" = "1" ] && [ -n "$dspawner" ] && [ ! -d "/proc/$dspawner" ]; then
+		continue # órfão comprovado: não protege
+	fi
+	add_tree "$d"
+done
+# Processos em panes de sessões tmux.
+#
+# "Sessão viva" aqui nunca distinguiu ATTACHED de DETACHED — e é essa a diferença
+# entre "o dono está nela" e "o dono fechou a janela e foi embora". Em 2026-08-19
+# quatro sessões Claude detached ficaram protegidas por esta regra somando ~4 GB,
+# enquanto este script reportava "nenhum órfão".
+#
+# A proteção continua valendo para TODAS as sessões, porque este reaper só mata o
+# que tem PPID==1 e um processo em pane nunca está nessa condição — remover a
+# regra não mudaria nada aqui e só criaria risco. Quem cuida da sessão detached e
+# parada é o `ai-session-reaper`, com série de observações e carência; os dois
+# cobrem populações disjuntas, de propósito.
+if command -v tmux >/dev/null 2>&1; then
+	for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+		for p in $(tmux list-panes -s -t "$s" -F '#{pane_pid}' 2>/dev/null); do add_tree "$p"; done
+	done
+fi
+# tmux server(es) e client(es).
+# `pgrep -x tmux` NUNCA casava: o tmux renomeia o proprio comm para "tmux: server"
+# e "tmux: client" (medido 2026-07-28: `pgrep -x tmux` -> 0 pids, com servidor
+# vivo). A camada de protecao estava morta. `-f '^tmux'` casa a linha de comando
+# dos dois papeis. Hoje o kill_list so contem padroes codex/claude, entao o bug
+# era latente — mas a protecao precisa valer de fato antes de alguem ampliar o scan.
+for t in $(pgrep -f '^tmux' 2>/dev/null); do protected="$protected$t "; done
+is_protected() { case "$protected" in *" $1 "*) return 0 ;; *) return 1 ;; esac }
+
+# --- alvos: codex/claude reparented ao init (PPID==1), fora do protegido, velhos ---
+kill_list=""
+scan() {
+	local pid ppid age
+	for pid in "$@"; do
+		[ -d "/proc/$pid" ] || continue
+		is_protected "$pid" && continue
+		ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+		[ "$ppid" = "1" ] || continue # só órfão reparentado ao init
+		age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+		[ -n "$age" ] && [ "$age" -ge "$min_age_s" ] 2>/dev/null || continue
+		kill_list="$kill_list $pid"
+	done
+}
+scan $(pgrep -f 'node_modules/@openai/codex' 2>/dev/null)
+scan $(pgrep -f 'share/claude/versions|/\.local/bin/claude' 2>/dev/null)
+
+if [ -z "${kill_list// /}" ]; then
+	echo "ai-process-reaper: nenhum órfão (PPID=1, idade>=${MIN_AGE_MIN}min) encontrado."
+	exit 0
+fi
+
+for pid in $kill_list; do
+	info=$(ps -o pid=,user=,etimes=,rss=,comm= -p "$pid" 2>/dev/null | tr -s ' ')
+	if [ "$APPLY" -eq 1 ]; then
+		if kill -TERM "$pid" 2>/dev/null || sudo -n kill -TERM "$pid" 2>/dev/null; then
+			echo "REAPED(TERM) $info"
+		fi
+	else
+		echo "DRY-RUN órfão a reapear:$info"
+	fi
+done
+[ "$APPLY" -eq 1 ] && echo "ai-process-reaper: aplicado." || echo "ai-process-reaper: dry-run (use --apply para matar)."
+exit 0

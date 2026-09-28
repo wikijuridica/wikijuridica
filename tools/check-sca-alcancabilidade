@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""check-sca-alcancabilidade — cruza as excecoes de CVE registradas com a
+ANALISE DE ALCANCABILIDADE, e diz quais delas o repositorio ainda precisa.
+
+★ POR QUE ESTE GATE EXISTE (pergunta do dono, 2026-08-29).
+
+    "Mas por que tem prazo? Sendo que o repo tem que ser consistente?"
+
+A pergunta esta certa, e a resposta e que havia DOIS motivos diferentes
+empilhados numa excecao so:
+
+  (a) "nao existe versao corrigida upstream" — isso MUDA com o tempo. Um dia sai
+      a release, e sem prazo ninguem volta para conferir. Aqui o prazo e correto.
+
+  (b) "o codigo vulneravel nao e alcancado pelo nosso uso" — isso NAO muda com o
+      tempo. Renovar a mao, a cada expiracao, e trabalho recorrente que nao
+      produz informacao nova. Aqui o prazo e so cerimonia.
+
+O que faltava era o instrumento que PROVA (b) automaticamente. Sem ele, a unica
+forma de sustentar a excecao era a palavra de quem a escreveu, e palavra
+envelhece — por isso o prazo.
+
+## O que este gate mede, e por que o osv-scanner sozinho nao basta
+
+Medido em 2026-08-29, sobre o mesmo repositorio, no mesmo minuto:
+
+    govulncheck ./internal/... ./cmd/...
+      -> "Your code is affected by 0 vulnerabilities."
+         "... 1 vulnerability in modules you require, but your code doesn't
+          appear to call these vulnerabilities."
+
+    osv-scanner scan source --lockfile go.mod
+      -> reporta a mesma CVE como achado
+
+Dois instrumentos, dois vereditos opostos, e nenhum dos dois esta errado: eles
+respondem a PERGUNTAS DIFERENTES.
+
+  osv-scanner --lockfile  = INVENTARIO do grafo de modulos ("isto consta")
+  govulncheck             = RISCO ("isto e chamado")
+
+E medi tambem que o flag `--no-call-analysis=go` do gate NAO e a causa disso: com
+e sem ele, o resultado do `scan source --lockfile` e identico (4 CVEs de
+moby/buildkit nos dois casos). Nesse modo o scanner le o go.mod, nao o codigo —
+o flag e inocuo ali. A hipotese de que bastava tira-lo foi REFUTADA por medicao.
+
+## A regra que este gate aplica
+
+Excecao cuja CVE o govulncheck classifica como NAO ALCANCAVEL nao precisa de
+prazo: ela e sustentada por medicao reprodutivel, nao por promessa. O gate a
+aceita sem `ignoreUntil`.
+
+Excecao cuja CVE nao pode ser classificada — porque o modulo e de FERRAMENTA e o
+govulncheck nao alcanca modulo `tool` sem pacote proprio — continua exigindo
+prazo, porque ali a sustentacao ainda e argumento, e argumento envelhece.
+
+E o inverso, que e o que de fato protege: se uma CVE hoje ignorada passar a ser
+ALCANCAVEL, o gate reprova imediatamente, sem esperar o prazo vencer. Excecao
+que vira risco real nao pode ter meses de carencia.
+
+READ-ONLY.
+"""
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TOMLS = ["tools/sca/osv-scanner.toml", "tools/sca/osv-scanner-root.toml"]
+EVIDENCIA = "data/ops/sca_govulncheck_evidence.jsonl"
+
+
+def excecoes():
+    """Le os IgnoredVulns dos toml, com id, reason e ignoreUntil."""
+    fora = {}
+    for rel in TOMLS:
+        caminho = os.path.join(RAIZ, rel)
+        if not os.path.isfile(caminho):
+            continue
+        texto = io.open(caminho, encoding="utf-8").read()
+        for bloco in texto.split("[[IgnoredVulns]]")[1:]:
+            corpo = bloco.split("[[")[0]
+            mid = re.search(r'id\s*=\s*"([^"]+)"', corpo)
+            if not mid:
+                continue
+            mrz = re.search(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"', corpo)
+            mun = re.search(r'ignoreUntil\s*=\s*"([^"]+)"', corpo)
+            fora[mid.group(1)] = {
+                "arquivo": rel,
+                "reason": (mrz.group(1) if mrz else ""),
+                "ignoreUntil": (mun.group(1) if mun else ""),
+            }
+    return fora
+
+
+def veredito_de_alcancabilidade():
+    """Le a evidencia de govulncheck ja gravada pelo pipeline sancionado.
+
+    Nao invoca o govulncheck: ele custa minutos e o repositorio ja o roda pelo
+    generate-sca-govulncheck-evidence. Gate que refaz o trabalho do gerador vira
+    o comando pesado que o contrato proibe.
+    """
+    caminho = os.path.join(RAIZ, EVIDENCIA)
+    if not os.path.isfile(caminho):
+        return None, "evidencia ausente: " + EVIDENCIA
+    ultimo = None
+    for linha in io.open(caminho, encoding="utf-8", errors="replace"):
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            ultimo = json.loads(linha)
+        except ValueError:
+            continue
+    if ultimo is None:
+        return None, "evidencia vazia: " + EVIDENCIA
+    alcancaveis = set()
+    apenas_grafo = {}
+    for achado in (ultimo.get("reachable_findings") or []):
+        osv = achado.get("osv") or achado.get("id")
+        if osv:
+            alcancaveis.add(osv)
+    for achado in (ultimo.get("module_graph_only_findings") or []):
+        osv = achado.get("osv") or achado.get("id")
+        if osv:
+            apenas_grafo[osv] = achado
+    return {"alcancaveis": alcancaveis, "apenas_grafo": apenas_grafo, "registro": ultimo}, ""
+
+
+def main():
+    registradas = excecoes()
+    if not registradas:
+        print("check-sca-alcancabilidade: nenhuma excecao registrada")
+        return 0
+    dados, erro = veredito_de_alcancabilidade()
+    if dados is None:
+        print("sca_alcancabilidade_evidencia_indisponivel: " + erro, file=sys.stderr)
+        print("Conserto: ./tools/generate-sca-govulncheck-evidence", file=sys.stderr)
+        return 1
+
+    problemas = []
+    sem_prazo_ok = []
+    for osv, info in sorted(registradas.items()):
+        if osv in dados["alcancaveis"]:
+            problemas.append(
+                "%s: IGNORADA mas ALCANCAVEL pelo codigo (%s) — excecao que virou risco real "
+                "nao espera prazo vencer" % (osv, info["arquivo"])
+            )
+            continue
+        if osv in dados["apenas_grafo"]:
+            # Sustentada por medicao: nao precisa de prazo.
+            sem_prazo_ok.append(osv)
+            continue
+        # Nao classificada pelo govulncheck (tipicamente modulo de ferramenta):
+        # a sustentacao ainda e argumento, entao o prazo permanece obrigatorio.
+        if not info["ignoreUntil"]:
+            problemas.append(
+                "%s: excecao SEM prazo e SEM medicao de alcancabilidade (%s) — "
+                "sustentacao por argumento exige ignoreUntil" % (osv, info["arquivo"])
+            )
+
+    if problemas:
+        print("sca_alcancabilidade_divergente total=%d" % len(problemas), file=sys.stderr)
+        for p in problemas:
+            print("  " + p, file=sys.stderr)
+        return 1
+
+    print(
+        "check-sca-alcancabilidade: pass — %d excecao(oes), %d sustentada(s) por medicao "
+        "de nao-alcancabilidade, 0 alcancavel" % (len(registradas), len(sem_prazo_ok))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

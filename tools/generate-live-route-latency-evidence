@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# generate-live-route-latency-evidence -- mede a latencia das rotas QUE EXISTEM
+# NO AR, por classe de rota, com o Vegeta que ja esta integrado.
+#
+# Por que existe (medido em 2026-08-26). O Vegeta ja estava integrado
+# (tools/perf/go.mod, v12.13.0, MIT) e a UNICA evidencia commitada,
+# data/ops/http_load_vegeta_evidence.jsonl, e de 2026-07-01: 100 requisicoes em
+# 1 segundo, e a rota "representativa" era
+# `/rehearsal/direito-do-consumidor-cobranca-indevida` -- uma rota de ENSAIO,
+# anterior a publicacao. Ela mede p95 = 1,27 ms e nao diz nada sobre o acervo,
+# que so foi ao ar em 13/08. A cauda de latencia relatada (mediana 261 ms, com
+# hubs entre 0,7 s e 1,1 s) nunca foi reproduzida por instrumento nenhum.
+#
+# ANTI-FRAUDE, e nao e detalhe:
+#   - alvo e SEMPRE 127.0.0.1 (o nginx do wiki, 8088). Nunca a borda publica:
+#     bater no Cloudflare contaminaria a analitica de borda e a exclusao de
+#     trafego proprio que entrou em producao hoje;
+#   - User-Agent PROPRIO (`wiki-latency-probe/1.0`), jamais UA de bot real;
+#   - cabecalho `X-Warming-Request: true`, que o access log grava como
+#     warming=true e mantem FORA da contagem de trafego real
+#     (internal/httpserver/access_log.go:25 e :81).
+#
+# Mede por CLASSE de rota, porque a pergunta nao e "qual o p95 do site" e sim
+# "onde mora a cauda": home, hub de area, artigo de acervo, paginacao,
+# artefato de agente (llms.txt, .md) e sitemap tem custos diferentes.
+set -euo pipefail
+ROOT="$(
+	unset CDPATH
+	cd -- "$(dirname -- "$0")/.." && pwd
+)"
+PATH="$ROOT/tools:$PATH"
+export PATH
+cd "$ROOT"
+export GOCACHE="${GOCACHE:-$HOME/.cache/go-build}"
+
+ORIGEM="${WIKI_LATENCY_ORIGIN:-http://127.0.0.1:8088}"
+case "$ORIGEM" in
+http://127.0.0.1:* | http://localhost:*) ;;
+*)
+	printf 'generate-live-route-latency-evidence: origem %q recusada; so 127.0.0.1 (ver ANTI-FRAUDE no cabecalho)\n' "$ORIGEM" >&2
+	exit 64
+	;;
+esac
+
+UA="${WIKI_LATENCY_UA:-wiki-latency-probe/1.0}"
+DURACAO="${WIKI_LATENCY_DURATION:-5s}"
+TAXA="${WIKI_LATENCY_RATE:-20}"
+EVIDENCIA="data/ops/live_route_latency_evidence.jsonl"
+
+# Uma classe por linha: nome|caminho. Os caminhos sao verificados antes do
+# ataque; classe cujo caminho nao responde 200 e registrada como ausente, nunca
+# omitida em silencio.
+CLASSES=$(
+	cat <<'EOF'
+home|/
+hub_area|/consumidor/
+hub_area_2|/trabalhista/
+hub_area_3|/previdenciario/
+artigo_acervo|/procedimentos/carta-de-sentenca/
+artigo_acervo_2|/consumidor/entrega-fracionada-pedido-com-varios-itens/
+jurisprudencia|/jurisprudencia/stj-tema-21/
+sumula|/sumulas/stj-502/
+glossario|/glossario/
+llms_txt|/llms.txt
+sitemap|/sitemap.xml
+robots|/robots.txt
+feed|/feed.xml
+EOF
+)
+
+mkdir -p data/ops
+RESULTADOS="$(mktemp -d -t wiki-latency-XXXXXX)"
+trap 'rm -rf "$RESULTADOS"' EXIT
+
+printf 'origem=%s ua=%s duracao=%s taxa=%s/s\n' "$ORIGEM" "$UA" "$DURACAO" "$TAXA"
+
+while IFS='|' read -r classe caminho; do
+	[ -n "$classe" ] || continue
+	alvo="${ORIGEM}${caminho}"
+	status="$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -H 'X-Warming-Request: true' "$alvo" || echo 000)"
+	if [ "$status" != "200" ]; then
+		printf '  %-16s %-58s status=%s ATAQUE PULADO\n' "$classe" "$caminho" "$status"
+		printf '{"class":"%s","path":"%s","status":%s,"attacked":false}\n' "$classe" "$caminho" "$status" >>"$RESULTADOS/linhas.jsonl"
+		continue
+	fi
+	printf 'GET %s\nUser-Agent: %s\nX-Warming-Request: true\n\n' "$alvo" "$UA" >"$RESULTADOS/alvo.txt"
+	relatorio="$(
+		go-modern tool -modfile=tools/perf/go.mod vegeta attack \
+			-duration="$DURACAO" -rate="$TAXA" -targets="$RESULTADOS/alvo.txt" |
+			go-modern tool -modfile=tools/perf/go.mod vegeta report -type=json
+	)"
+	printf '%s' "$relatorio" >"$RESULTADOS/relatorio.json"
+	nice -n 19 python3 - "$classe" "$caminho" "$RESULTADOS/relatorio.json" "$RESULTADOS/linhas.jsonl" <<'PY'
+import json, sys
+classe, caminho, relatorio_path, saida = sys.argv[1:5]
+r = json.load(open(relatorio_path, encoding="utf-8"))
+lat = r.get("latencies", {})
+ms = lambda ns: round((ns or 0) / 1_000_000, 3)
+linha = {
+    "class": classe,
+    "path": caminho,
+    "attacked": True,
+    "requests": r.get("requests"),
+    "rate_actual": round(r.get("rate", 0), 2),
+    "success_ratio": r.get("success"),
+    "status_codes": r.get("status_codes"),
+    "bytes_in_mean": (r.get("bytes_in") or {}).get("mean"),
+    "latency_mean_ms": ms(lat.get("mean")),
+    "latency_p50_ms": ms(lat.get("50th")),
+    "latency_p95_ms": ms(lat.get("95th")),
+    "latency_p99_ms": ms(lat.get("99th")),
+    "latency_max_ms": ms(lat.get("max")),
+    "errors": r.get("errors") or [],
+}
+with open(saida, "a", encoding="utf-8") as h:
+    h.write(json.dumps(linha, ensure_ascii=False) + "\n")
+print("  %-16s %-58s p50=%-8s p95=%-8s max=%-8s bytes=%s" % (
+    classe, caminho, linha["latency_p50_ms"], linha["latency_p95_ms"],
+    linha["latency_max_ms"], linha["bytes_in_mean"]))
+PY
+done <<<"$CLASSES"
+
+nice -n 19 python3 - "$RESULTADOS/linhas.jsonl" "$EVIDENCIA" "$ORIGEM" "$UA" "$DURACAO" "$TAXA" <<'PY'
+import json, os, subprocess, sys
+from datetime import datetime, timezone
+
+linhas_path, evidencia, origem, ua, duracao, taxa = sys.argv[1:7]
+linhas = [json.loads(l) for l in open(linhas_path, encoding="utf-8") if l.strip()]
+atacadas = [l for l in linhas if l.get("attacked")]
+
+versao = ""
+try:
+    mod = open("tools/perf/go.mod", encoding="utf-8").read()
+    for linha in mod.splitlines():
+        if "tsenart/vegeta" in linha and " v" in linha:
+            versao = linha.split()[1]
+            break
+except OSError:
+    pass
+
+agora = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+piores = sorted(atacadas, key=lambda l: -(l.get("latency_p95_ms") or 0))[:5]
+registro = {
+    "evidence_id": "live-route-latency-" + agora,
+    "record_status": "live_route_latency_evidence_blocked_no_publication",
+    "producer": "tools/generate-live-route-latency-evidence",
+    "tool_module_path": "github.com/tsenart/vegeta/v12",
+    "tool_version_pinned": versao,
+    "tool_mod_path": "tools/perf/go.mod",
+    "origin": origem,
+    "local_only": True,
+    "user_agent": ua,
+    "warming_header_sent": True,
+    "counted_as_real_traffic": False,
+    "attack_duration": duracao,
+    "attack_rate_per_second": int(taxa),
+    "route_classes_total": len(linhas),
+    "route_classes_attacked": len(atacadas),
+    "route_classes_unavailable": [l["path"] for l in linhas if not l.get("attacked")],
+    "routes": linhas,
+    "worst_p95_classes": [{"class": l["class"], "path": l["path"], "p95_ms": l["latency_p95_ms"]} for l in piores],
+    "executed_live": True,
+    "publication_allowed": False,
+    "render_allowed": False,
+    "sitemap_allowed": False,
+    "approval": False,
+    "public_path": "",
+    "index_policy": "noindex",
+    "checked_at": agora,
+}
+os.makedirs(os.path.dirname(evidencia), exist_ok=True)
+with open(evidencia, "a", encoding="utf-8") as h:
+    h.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+print("evidencia: %s (%d classes atacadas, %d indisponiveis)" % (
+    evidencia, len(atacadas), len(linhas) - len(atacadas)))
+if piores:
+    print("piores p95: " + ", ".join("%s=%sms" % (p["class"], p["latency_p95_ms"]) for p in piores))
+PY

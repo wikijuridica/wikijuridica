@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""generate-v2-article-citation-granularity-repair-20260804.
+
+Corrige `public_source_label_missing_article_granularity` na fila
+`data/ops/source_label_article_granularity_queue_20260804.jsonl` (escopo:
+todas as areas EXCETO imobiliario e familia, cuidadas por outras frentes).
+
+## Diagnostico
+
+A grande maioria dos 73 registros "authorial_citation_missing" do escopo
+JA CITA o artigo pinado no corpo da pagina — o detector
+(`officialSourceGranularityCodesFromNormalizedText`,
+internal/publicproselanguagepatterns/patterns.go:4957) e que falha em
+reconhecer a citacao quando o numero do artigo do Codigo Civil tem 4 digitos
+e o texto o escreve sem o separador de milhar ("art. 1210" em vez de
+"art. 1.210"). `officialSourceArticleNumber` (patterns.go:5104) monta o
+numero esperado com espaco ("1 210") a partir da URL ancorada; `normalizedText`
+(patterns.go:5195) faz qualquer pontuacao virar separador de token — logo
+"1.210" normaliza para os tokens "1" "210" (bate), mas "1210" normaliza para
+o token unico "1210" (nao bate). "Art. 1.210" e, alias, a formatacao CORRETA
+de citacao juridica brasileira para artigo de 4+ digitos — nao e so o
+detector, e a norma culta.
+
+Confirmado registro a registro (script de diagnostico, nao commitado) que:
+  - 35 paginas do cluster leis (`lei-cc-art-*`) e 1 de procedimentos
+    (`proc-enotariado-escritura-compra-venda`) sao exclusivamente esse bug
+    de formatacao — o artigo pinado e o TEMA da pagina, citado varias vezes.
+  - 36 dos 75 registros do escopo ja tinham sido corrigidos por outra frente
+    entre a geracao da fila (2026-08-04) e agora — fila estava desatualizada.
+  - 3 registros sao debito REAL: o corpo discute o efeito juridico do artigo
+    pinado sem nomea-lo. Corrigidos por integracao pontual da citacao
+    (PHRASE_REPAIRS), verificada contra o texto oficial do artigo no
+    corpus local (`data/source-snapshots/`, canal
+    normas_leg_br_api_publica_texto / senado_legis_dados_abertos_json).
+
+## Como gerador, e nao edicao manual
+
+Mesmo padrao de `generate-v2-oab-phrase-repair-20260805`: lease de epoca,
+lock exclusivo, CAS pelo sha256 da LINHA atual, escrita atomica com fsync,
+idempotente, word_count recalculado pela formula de
+internal/v2ingest/validate.go:984. NAO committa.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.article-citation-granularity-repair-20260804.lock"
+
+# Campos que alimentam o detector oficial (publicTextValues,
+# patterns.go:2597): title, meta_description, h1, opening (summary) e
+# heading/text de cada secao. FAQ e official_sources ficam de fora do
+# detector e sao deixados intocados aqui (menor superficie de edicao).
+TEXT_FIELDS = ("title", "meta_description", "h1", "opening")
+
+# intent_id -> (shard, [digitos do artigo sem separador, ex. "1210"])
+# Aplica separador de milhar (art. 1210 -> art. 1.210) SOMENTE nesses
+# digitos, em qualquer um dos TEXT_FIELDS ou section.heading/section.text.
+FORMAT_REPAIRS: dict[str, tuple[str, list[str]]] = {
+    "lei-cc-art-1210": ("data/editorial/v2_pages/leis-07.jsonl", ["1210"]),
+    "lei-cc-art-1228": ("data/editorial/v2_pages/leis-07.jsonl", ["1228"]),
+    "lei-cc-art-1238": ("data/editorial/v2_pages/leis-07.jsonl", ["1238"]),
+    "lei-cc-art-1242": ("data/editorial/v2_pages/leis-07.jsonl", ["1242", "1243"]),
+    "lei-cc-art-1277": ("data/editorial/v2_pages/leis-07.jsonl", ["1277", "1279"]),
+    "lei-cc-art-1297": ("data/editorial/v2_pages/leis-07.jsonl", ["1297", "1298"]),
+    "lei-cc-art-1331": ("data/editorial/v2_pages/leis-07.jsonl", ["1331", "1332"]),
+    "lei-cc-art-1336": ("data/editorial/v2_pages/leis-07.jsonl", ["1336"]),
+    "lei-cc-art-1337": ("data/editorial/v2_pages/leis-07.jsonl", ["1336", "1337"]),
+    "lei-cc-art-1571": ("data/editorial/v2_pages/leis-05.jsonl", ["1571"]),
+    "lei-cc-art-1583": ("data/editorial/v2_pages/leis-05.jsonl", ["1583", "1584"]),
+    "lei-cc-art-1584": ("data/editorial/v2_pages/leis-05.jsonl", ["1583", "1584"]),
+    "lei-cc-art-1589": ("data/editorial/v2_pages/leis-05.jsonl", ["1583", "1589"]),
+    "lei-cc-art-1597": ("data/editorial/v2_pages/leis-05.jsonl", ["1597", "1601"]),
+    "lei-cc-art-1609": ("data/editorial/v2_pages/leis-05.jsonl", ["1609", "1610"]),
+    "lei-cc-art-1638": ("data/editorial/v2_pages/leis-05.jsonl", ["1637", "1638"]),
+    "lei-cc-art-1639": ("data/editorial/v2_pages/leis-06.jsonl", ["1639", "1640"]),
+    "lei-cc-art-1641": ("data/editorial/v2_pages/leis-06.jsonl", ["1523", "1641"]),
+    "lei-cc-art-1658": ("data/editorial/v2_pages/leis-06.jsonl", ["1658", "1659"]),
+    "lei-cc-art-1659": ("data/editorial/v2_pages/leis-06.jsonl", ["1658", "1659"]),
+    "lei-cc-art-1694": ("data/editorial/v2_pages/leis-06.jsonl", ["1694", "1695"]),
+    "lei-cc-art-1695": ("data/editorial/v2_pages/leis-06.jsonl", ["1694", "1695"]),
+    "lei-cc-art-1699": ("data/editorial/v2_pages/leis-06.jsonl", ["1694", "1699"]),
+    "lei-cc-art-1708": ("data/editorial/v2_pages/leis-06.jsonl", ["1708", "1709"]),
+    "lei-cc-art-1723": ("data/editorial/v2_pages/leis-06.jsonl", ["1723"]),
+    "lei-cc-art-1789": ("data/editorial/v2_pages/leis-06.jsonl", ["1789", "1846"]),
+    "lei-cc-art-1814": ("data/editorial/v2_pages/leis-06.jsonl", ["1814", "1815"]),
+    "lei-cc-art-1829": ("data/editorial/v2_pages/leis-06.jsonl", ["1829", "1832"]),
+    "lei-cc-art-1831": ("data/editorial/v2_pages/leis-06.jsonl", ["1829", "1831"]),
+    "lei-cc-art-1832": ("data/editorial/v2_pages/leis-06.jsonl", ["1829", "1832"]),
+    "lei-cc-art-1845": ("data/editorial/v2_pages/leis-06.jsonl", ["1845", "1846"]),
+    "lei-cc-art-1846": ("data/editorial/v2_pages/leis-06.jsonl", ["1846", "1847"]),
+    "lei-cc-art-1961": ("data/editorial/v2_pages/leis-06.jsonl", ["1961", "1962"]),
+    "lei-cc-art-1997": ("data/editorial/v2_pages/leis-06.jsonl", ["1792", "1997"]),
+    "lei-cc-art-2002": ("data/editorial/v2_pages/leis-06.jsonl", ["2002", "2003"]),
+    "proc-enotariado-escritura-compra-venda": (
+        "data/editorial/v2_pages/procedimentos-17.jsonl",
+        ["1245"],
+    ),
+}
+
+# intent_id -> (shard, sha256 da linha esperada, trecho atual, trecho novo)
+# Debito real: o corpo explica o efeito do artigo sem nomea-lo. Teor
+# conferido no corpus local (data/source-snapshots) antes de escrever.
+PHRASE_REPAIRS: dict[str, tuple[str, str, str, str]] = {
+    "cons-creche-bercario-cobranca-taxa-rescisao": (
+        "data/editorial/v2_pages/consumidor-r10.jsonl",
+        "2875ed07089b093abe1bde9caf01a735254ba5e25e7fd8aafe3fd873aefb734c",
+        (
+            "O Código de Defesa do Consumidor exige informação clara, proíbe "
+            "vantagem manifestamente excessiva e permite controlar cláusula "
+            "que imponha desvantagem exagerada."
+        ),
+        (
+            "O Código de Defesa do Consumidor exige informação clara, veda "
+            "ao fornecedor exigir do consumidor vantagem manifestamente "
+            "excessiva (art. 39 do CDC) e permite controlar cláusula que "
+            "imponha desvantagem exagerada."
+        ),
+    ),
+    "emp-holding-patrimonial-protecao-bens": (
+        "data/editorial/v2_pages/empresarial-15.jsonl",
+        "97b625397588b4e5568c66fc1e234e73d91a5abd6d77cffea801849d903d2536",
+        (
+            "Integralizado o imóvel, ele pertence à pessoa jurídica, não ao "
+            "sócio. Em execução de dívida pessoal, o caminho ordinário é "
+            "atingir as quotas do devedor, procedimento regulado pelo "
+            "artigo 861 do CPC"
+        ),
+        (
+            "Integralizado o imóvel, ele pertence à pessoa jurídica, não ao "
+            "sócio: o art. 1.052 do Código Civil restringe a "
+            "responsabilidade de cada sócio da limitada ao valor de suas "
+            "quotas, e é essa separação que torna o imóvel um bem da "
+            "sociedade, não do patrimônio pessoal. Em execução de dívida "
+            "pessoal, o caminho ordinário é atingir as quotas do devedor, "
+            "procedimento regulado pelo artigo 861 do CPC"
+        ),
+    ),
+    "emp-meta-vendas-nao-batida-justa-causa-rescisao-representante": (
+        "data/editorial/v2_pages/empresarial-w3-06.jsonl",
+        "7102f9e4c8f7c04c9b10d06eb5cf7929e95b09e47a64fc697d94872f9851d6da",
+        (
+            "O Código Civil reforça essa prioridade da lei especial: suas "
+            "regras sobre agência e distribuição só valem para a "
+            "representação comercial de forma subsidiária, quando a Lei nº "
+            "4.886/1965 for omissa"
+        ),
+        (
+            "O art. 721 do Código Civil reforça essa prioridade da lei "
+            "especial: suas regras sobre agência e distribuição só valem "
+            "para a representação comercial de forma subsidiária, quando a "
+            "Lei nº 4.886/1965 for omissa"
+        ),
+    ),
+}
+
+# A periodizacao do numero do artigo (art. 1708 -> art. 1.708) acrescenta 1
+# caractere. Em 2 paginas isso estourou o teto de 160 caracteres da meta
+# description (161). Ajuste minimo, sem perda de teor juridico -- conferido
+# contra o texto oficial do art. 1.708 (data/source-snapshots): a lei fala
+# em "casamento", nao em "novo casamento"; remover o qualificador aproxima
+# o resumo do texto legal. No art. 1.829, troca de "primeiro" por "antes"
+# preserva o sentido (ordem de vocacao) com 1 palavra mais curta.
+META_TRIM: dict[str, tuple[str, str]] = {
+    "lei-cc-art-1708": (
+        "Civil: novo casamento, união estável ou concubinato",
+        "Civil: casamento, união estável ou concubinato",
+    ),
+    "lei-cc-art-1829": (
+        "quem herda primeiro entre",
+        "quem herda antes entre",
+    ),
+}
+
+FORBIDDEN = (
+    "garante o resultado",
+    "garantia de resultado",
+    "resultado garantido",
+    "êxito garantido",
+    "exito garantido",
+    "resultado certo",
+    "causa ganha",
+)
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def word_count(record: dict) -> int:
+    """Reproduz `bodyWordCount` de internal/v2ingest/validate.go:984."""
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def _periodize(digits: str) -> str:
+    return digits[:-3] + "." + digits[-3:]
+
+
+def apply_format_repairs_to_record(record: dict, digit_targets: list[str]) -> int:
+    """Aplica separador de milhar aos digitos alvo nos campos publicos.
+
+    Retorna quantas substituicoes efetivas ocorreram (0 se ja aplicado).
+    """
+    changed = 0
+    for digits in digit_targets:
+        pattern = re.compile(r"(?<!\d)" + re.escape(digits) + r"(?!\d)")
+        replacement = _periodize(digits)
+
+        for field in TEXT_FIELDS:
+            value = record.get(field)
+            if not value or not isinstance(value, str):
+                continue
+            new_value, count = pattern.subn(replacement, value)
+            if count:
+                record[field] = new_value
+                changed += count
+
+        for section in record.get("sections") or []:
+            for field in ("heading", "text"):
+                value = section.get(field)
+                if not value or not isinstance(value, str):
+                    continue
+                new_value, count = pattern.subn(replacement, value)
+                if count:
+                    section[field] = new_value
+                    changed += count
+    return changed
+
+
+def preflight() -> None:
+    problems: list[str] = []
+    for intent, (_shard, _digest, before, after) in sorted(PHRASE_REPAIRS.items()):
+        lowered = after.lower()
+        for term in FORBIDDEN:
+            if term in lowered:
+                problems.append(f"{intent}: texto novo reintroduz {term!r}")
+        if before == after:
+            problems.append(f"{intent}: texto novo identico ao atual")
+        if len(after.split()) < 15:
+            problems.append(f"{intent}: texto novo curto demais ({len(after.split())} palavras)")
+    if problems:
+        for problem in problems:
+            print(f"PREFLIGHT FALHOU: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    print(
+        f"preflight ok: {len(FORMAT_REPAIRS)} pagina(s) formatacao, "
+        f"{len(PHRASE_REPAIRS)} pagina(s) frase, sem vocabulario de promessa"
+    )
+
+
+def apply_shard(
+    shard: str,
+    format_intents: dict[str, list[str]],
+    phrase_intents: dict[str, tuple[str, str, str]],
+) -> int:
+    path = ROOT / shard
+    lines = path.read_bytes().decode("utf-8").split("\n")
+    trailing_newline = lines and lines[-1] == ""
+    if trailing_newline:
+        lines = lines[:-1]
+
+    output: list[str] = []
+    total_changed = 0
+    seen: set[str] = set()
+
+    for number, raw in enumerate(lines, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard}: linha em branco {number}")
+        record = json.loads(raw)
+        intent = record.get("intent_id")
+
+        if intent in format_intents:
+            seen.add(intent)
+            digit_targets = format_intents[intent]
+            changed = apply_format_repairs_to_record(record, digit_targets)
+
+            meta_changed = False
+            if intent in META_TRIM:
+                before_meta, after_meta = META_TRIM[intent]
+                meta = record.get("meta_description") or ""
+                if before_meta in meta:
+                    record["meta_description"] = meta.replace(before_meta, after_meta)
+                    meta_changed = True
+                elif after_meta not in meta:
+                    raise SystemExit(
+                        f"{shard} ({intent}): META_TRIM nao encontrou nem o trecho "
+                        "antigo nem o novo na meta_description atual."
+                    )
+
+            expected_wc = word_count(record)
+            if changed == 0 and not meta_changed and record.get("word_count") == expected_wc:
+                output.append(raw)
+                continue
+            record["word_count"] = expected_wc
+            output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            if changed or meta_changed:
+                total_changed += 1
+                print(
+                    f"  [formato] {intent}: {changed} ocorrencia(s) periodizada(s)"
+                    + (" + meta_description ajustada" if meta_changed else "")
+                )
+            else:
+                print(f"  [formato] {intent}: word_count corrigido -> {expected_wc}")
+            continue
+
+        if intent in phrase_intents:
+            seen.add(intent)
+            digest, before, after = phrase_intents[intent]
+            full_body = json.dumps(
+                [record.get("opening")] + (record.get("sections") or []),
+                ensure_ascii=False,
+            )
+            if after in full_body:
+                expected = word_count(record)
+                if record.get("word_count") != expected:
+                    record["word_count"] = expected
+                    output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                    total_changed += 1
+                    print(f"  [frase] word_count corrigido: {intent} -> {expected}")
+                    continue
+                output.append(raw)
+                continue
+
+            current = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+            if current != digest:
+                raise SystemExit(
+                    f"CAS FALHOU em {shard}:{number} ({intent}): linha atual nao e a esperada.\n"
+                    f"  esperado: {digest}\n  atual:    {current}\n"
+                    "Outra frente tocou este registro. Reler o conteudo vivo antes de reaplicar."
+                )
+
+            # Procura o trecho no opening e em cada secao (heading/text nunca
+            # e onde a frase alvo mora nestes 3 casos, mas cobrimos por
+            # generalidade e seguranca).
+            hit_fields: list[tuple[str, dict | None, str]] = []
+            opening = record.get("opening") or ""
+            if before in opening:
+                hit_fields.append(("opening", None, opening))
+            for section in record.get("sections") or []:
+                text = section.get("text") or ""
+                if before in text:
+                    hit_fields.append(("section_text", section, text))
+                heading = section.get("heading") or ""
+                if before in heading:
+                    hit_fields.append(("section_heading", section, heading))
+
+            if len(hit_fields) != 1:
+                raise SystemExit(
+                    f"{shard}:{number} ({intent}): trecho esperado aparece "
+                    f"{len(hit_fields)}x (deveria ser 1). Abortado sem escrever."
+                )
+
+            field_kind, section_ref, _value = hit_fields[0]
+            if field_kind == "opening":
+                record["opening"] = opening.replace(before, after)
+            elif field_kind == "section_text":
+                section_ref["text"] = section_ref["text"].replace(before, after)
+            elif field_kind == "section_heading":
+                section_ref["heading"] = section_ref["heading"].replace(before, after)
+
+            record["word_count"] = word_count(record)
+            output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            total_changed += 1
+            print(f"  [frase] {intent}: citacao integrada ({field_kind})")
+            continue
+
+        output.append(raw)
+
+    missing = (set(format_intents) | set(phrase_intents)) - seen
+    if missing:
+        raise SystemExit(f"{shard}: intents nao encontrados: {sorted(missing)}")
+
+    if total_changed:
+        payload = "\n".join(output)
+        if trailing_newline:
+            payload += "\n"
+        atomic_write(path, payload.encode("utf-8"))
+
+    print(f"{shard}: reescritos={total_changed}")
+    return total_changed
+
+
+def main() -> int:
+    preflight()
+
+    by_shard_format: dict[str, dict[str, list[str]]] = {}
+    for intent, (shard, digits) in FORMAT_REPAIRS.items():
+        by_shard_format.setdefault(shard, {})[intent] = digits
+
+    by_shard_phrase: dict[str, dict[str, tuple[str, str, str]]] = {}
+    for intent, (shard, digest, before, after) in PHRASE_REPAIRS.items():
+        by_shard_phrase.setdefault(shard, {})[intent] = (digest, before, after)
+
+    shards = sorted(set(by_shard_format) | set(by_shard_phrase))
+
+    total = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for shard in shards:
+                    total += apply_shard(
+                        shard,
+                        by_shard_format.get(shard, {}),
+                        by_shard_phrase.get(shard, {}),
+                    )
+    except StockEpochBusy as error:
+        print(
+            f"generate-v2-article-citation-granularity-repair-20260804: estoque ocupado: {error}",
+            file=sys.stderr,
+        )
+        return 75
+
+    if total:
+        print("OK. Reingerir o estoque para o espelho refletir a correcao.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

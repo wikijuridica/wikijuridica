@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""generate-edge-bot-status-daily — a serie de borda que faltava: bot verificado
+x status HTTP x cacheStatus x colo, por dia UTC FECHADO.
+
+POR QUE EXISTE, medido em 2026-08-28
+------------------------------------
+O repositorio ja persiste `data/ops/edge_bot_agents_daily.jsonl` — 3.558 linhas,
+25 datas, de 2026-08-04 a 2026-08-28. Mas as chaves gravadas la sao:
+
+    agent_key, authenticity, countries, countries_unverified_ua, date, function,
+    query_truncated, requests_estimated, requests_estimated_unverified_ua,
+    requests_local_verification, requests_sampled, requests_sampled_unverified_ua,
+    sampled_dataset, schema_version, user_agent_samples, verified_bot_categories,
+    window_end, window_start
+
+Nao ha status HTTP, nao ha cacheStatus, nao ha coloCode. Ou seja: sabe-se QUANTO
+cada bot pediu e de que PAIS ele chegou, e nao se sabe o que ele RECEBEU. As tres
+perguntas do plano de rastreio ficam sem instrumento:
+
+  1. quanto do que o Googlebot pede sai da borda sem tocar a origem (cacheStatus
+     hit/revalidated) e quanto erra o cache (miss/dynamic/none);
+  2. quanto do que ele recebe e 200, quanto e 301/304 e quanto e erro (404, 5xx)
+     — a serie de volume sozinha nao distingue rastreio saudavel de rastreio que
+     bate em parede;
+  3. por qual colo o operador entra, que e o que permite ler uma queda como
+     "mudou de PoP" em vez de "parou de rastrear".
+
+A janela do colapso de rastreio de 11/08 evaporou por falta exatamente desta
+captura: o dataset `httpRequestsAdaptiveGroups` retem 8 dias e aceita no maximo
+1 dia por consulta, entao dia nao capturado e dia perdido para sempre. Medido
+contra a API em 2026-08-28 23:10 UTC: 2026-08-21 responde, 2026-08-20 devolve
+`cannot request data older than 1w1d`. Por isso este produtor nasce com --dias e
+foi rodado retroativamente ate o limite da retencao na primeira execucao.
+
+O QUE ELE NAO REPETE DOS ERROS JA PAGOS AQUI
+--------------------------------------------
+1) AMOSTRAGEM. O dataset e amostrado. `tools/generate-bot-agents-daily`:114 pede
+   `avg { sampleInterval }` e multiplica; `tools/measure-crawl-coverage` nao
+   pedia, e por isso duas series do MESMO repositorio contaram em unidades
+   diferentes. Aqui grava-se `requests_sampled` (o que a amostra viu) E
+   `requests_estimated` (amostra x sampleInterval), nomeados, nunca um so.
+
+2) DIA FECHADO. O timer de crawl-coverage roda 04:10 UTC e as chegadas do
+   Googlebot comecam por volta das 06:04 UTC — a linha do dia corrente cobria
+   4h10 e era lida como o dia inteiro. Este produtor mede ONTEM por padrao,
+   RECUSA o dia corrente e grava `window_start`, `window_end` e
+   `window_complete` em toda linha.
+
+3) IDEMPOTENCIA POR CHAVE. `data/ops/crawl_coverage_daily.jsonl` acumulou 1.395
+   linhas para 240 chaves (date, crawler) — as 240 duplicadas — e o detector de
+   estagnacao passou a ler o replay de um run so. Aqui a gravacao SUBSTITUI as
+   linhas da data remedida (nunca as duplica) e preserva byte a byte as linhas
+   das datas que esta execucao nao mediu. Substituicao e por DATA, e nao pela
+   combinacao inteira, de proposito: uma remedicao pode devolver um CONJUNTO
+   diferente de combinacoes, e casar chave a chave deixaria sobreviver a
+   combinacao velha que sumiu, inflando o dia.
+
+4) FALHA NAO APAGA. So a data cuja coleta teve SUCESSO perde as linhas antigas.
+   Janela que falhou deixa o que ja havia no disco intacto.
+
+5) VERIFICADO SEM TABELA NAO SOME. Bot que a Cloudflare autenticou mas que
+   `botagents.agente_de` ainda nao conhece cai no balde `verificado-sem-tabela`,
+   com a categoria e a amostra de User-Agent na propria linha. Descarte
+   silencioso e a origem da proxima medicao enganosa — foi assim que
+   meta-webindexer e slackbot-linkexpanding ficaram invisiveis ate 2026-08-26.
+
+6) JANELA VAZIA E DADO. Dia medido sem nenhum bot verificado grava uma linha
+   `record_type: "empty_window"`. Sem ela, "ausencia de linha" ficaria
+   indistinguivel de "dia nunca medido", que e a armadilha classica deste
+   ledger.
+
+CODIGO DE SAIDA (regra da casa, auditada em 2026-08-28)
+-------------------------------------------------------
+Isto e um COLETOR: nao ha veredito, entao NAO existe exit 1 aqui. exit 0 = mediu
+todas as janelas pedidas; exit 2 = NAO conseguiu medir alguma (credencial
+ausente, zona nao encontrada, API fora, quota de retencao) — e nesse caso as
+janelas que deram certo ja foram gravadas antes de sair.
+
+Credencial: `.env.local`, o mesmo caminho de `generate-bot-agents-daily`
+(CLOUDFLARE_ZONE_TOKEN escopado quando existe; senao a Global API Key com
+X-Auth-Email/X-Auth-Key). Nenhuma credencial nova.
+
+Uso:
+    tools/generate-edge-bot-status-daily              # ontem
+    tools/generate-edge-bot-status-daily --dias 7     # retroativo ate a retencao
+    tools/generate-edge-bot-status-daily --autoteste  # prova a fusao idempotente
+    tools/generate-edge-bot-status-daily --json
+"""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+import cloudflare_auth  # noqa: E402  (idem)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ENV = os.path.join(ROOT, ".env.local")
+SITE = os.path.join(ROOT, "content/site.json")
+SERIE = os.path.join(ROOT, "data/ops/edge_bot_status_daily.jsonl")
+API = "https://api.cloudflare.com/client/v4"
+
+SCHEMA = "edge_bot_status_daily_v1"
+
+# Balde do bot que a borda autenticou e a tabela de identidade ainda nao conhece.
+# NAO se usa o User-Agent cru como chave: isso explodiria a cardinalidade da
+# serie a cada troca de versao do crawler e quebraria qualquer agregacao.
+CHAVE_SEM_TABELA = "verificado-sem-tabela"
+
+# Retencao do dataset adaptativo. Medida contra a API em 2026-08-28 23:10 UTC:
+# a janela de 2026-08-21T00:00Z (7d23h atras) responde e a de 2026-08-20T00:00Z
+# (8d23h atras) devolve `cannot request data older than 1w1d`. Como este produtor
+# comeca em ONTEM (nunca no dia corrente), o teto de janelas retroativas e 7 — a
+# mais antiga fica sempre a menos de 8 dias, em qualquer hora do dia. Pedir 8
+# faria a janela mais velha estourar a quota e transformaria o backfill num exit
+# 2 espurio.
+RETENCAO_JANELAS = 7
+
+# Teto de grupos por consulta. Cardinalidade real medida em 2026-08-28 com o
+# filtro `verifiedBotCategory_neq: ""` aplicado no servidor: 83 grupos em 08-25,
+# 175 em 08-26 e 161 em 08-27. A folga ate 5.000 e de mais de 28x — mas
+# `query_truncated` continua sendo gravado, porque cardinalidade e coisa que
+# cresce sozinha quando o acervo cresce.
+LIMITE_GRUPOS = 5000
+
+# O filtro `verifiedBotCategory_neq: ""` roda NO SERVIDOR e e o que mantem a
+# consulta em ~175 grupos em vez de milhares: sem ele viria o trafego humano
+# inteiro cruzado com status x cache x colo, e o teto de 5.000 seria atingido
+# todo dia. Contar bot pela STRING do User-Agent foi o erro corrigido no schema
+# v3 de generate-bot-agents-daily (medido em 2026-08-12: Googlebot "por UA" 194
+# contra 30 verificados em 08-06 — o resto era a sonda desta casa, cujo cabecalho
+# X-Bot-Simulation so chega ao nginx e nunca a borda).
+CONSULTA = """
+query($zone: String!, $since: Time!, $until: Time!, $limite: Int!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $limite,
+        filter: {datetime_geq: $since, datetime_leq: $until,
+                 verifiedBotCategory_neq: ""},
+        orderBy: [count_DESC]) {
+      count
+      avg { sampleInterval }
+      dimensions {
+        userAgent
+        verifiedBotCategory
+        edgeResponseStatus
+        cacheStatus
+        coloCode
+      }
+    }
+  } }
+}
+"""
+
+
+def ler_env():
+    return cloudflare_auth.ambiente(ENV)
+
+
+def cabecalhos(env):
+    """Mesma politica de credencial de generate-bot-agents-daily -- ambas
+    delegadas a tools/cloudflare_auth.py (escopo "leitura") desde 2026-09-03.
+
+    Prefere o token de escopo minimo (CLOUDFLARE_ZONE_TOKEN): so le a zona
+    wikijuridica.com.br e tem revogacao granular. A Global API Key continua
+    valida como caminho antigo, mas da poder total sobre a conta e nao deve ser a
+    credencial que a automacao carrega.
+    """
+    cab, _ = cloudflare_auth.cabecalhos("leitura", env=env)
+    return cab
+
+
+def graphql(headers, consulta, variaveis):
+    corpo = json.dumps({"query": consulta, "variables": variaveis}).encode()
+    pedido = urllib.request.Request(API + "/graphql", data=corpo, headers=headers)
+    try:
+        with urllib.request.urlopen(pedido, timeout=120) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+    except urllib.error.HTTPError as erro:
+        return None, "HTTP %s" % erro.code
+    except Exception as erro:
+        return None, str(erro)[:160]
+    if dados.get("errors"):
+        return None, "; ".join(e.get("message", "?") for e in dados["errors"][:2])
+    zonas = (dados.get("data") or {}).get("viewer", {}).get("zones") or []
+    return (zonas[0] if zonas else {}), ""
+
+
+def resolver_zona(headers, dominio):
+    pedido = urllib.request.Request(API + "/zones?name=" + dominio, headers=headers)
+    try:
+        with urllib.request.urlopen(pedido, timeout=30) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+    except Exception as erro:
+        return "", str(erro)[:160]
+    resultado = dados.get("result") or []
+    if not resultado:
+        return "", "zona %s nao encontrada na conta" % dominio
+    return resultado[0]["id"], ""
+
+
+def coletar_dia(headers, zona, dia):
+    """Uma janela de 24h UTC FECHADA. Devolve (registros, erro).
+
+    A convencao de janela (`datetime_geq` 00:00:00 e `datetime_leq` 23:59:59) e a
+    mesma de generate-bot-agents-daily:199 de proposito: duas series que
+    descrevem o mesmo dia com janelas diferentes nao se comparam.
+    """
+    ini = datetime.datetime.combine(dia, datetime.time.min, datetime.timezone.utc)
+    fim = ini + datetime.timedelta(hours=23, minutes=59, seconds=59)
+    janela_inicio = ini.strftime("%Y-%m-%dT%H:%M:%SZ")
+    janela_fim = fim.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    zona_dados, erro = graphql(headers, CONSULTA, {
+        "zone": zona,
+        "since": janela_inicio,
+        "until": janela_fim,
+        "limite": LIMITE_GRUPOS})
+    if erro:
+        return [], erro
+
+    grupos = zona_dados.get("httpRequestsAdaptiveGroups", [])
+    truncado = len(grupos) >= LIMITE_GRUPOS
+
+    # A agregacao e por (agent_key, status, cacheStatus, colo): varios
+    # User-Agents do mesmo operador (versoes diferentes do crawler) colapsam na
+    # mesma identidade, que e o ponto da tabela de botagents.
+    por_chave = {}
+    for grupo in grupos:
+        dimensoes = grupo.get("dimensions") or {}
+        user_agent = dimensoes.get("userAgent") or ""
+        categoria = (dimensoes.get("verifiedBotCategory") or "").strip()
+        if not categoria:
+            # Defesa em profundidade: o filtro ja roda no servidor, mas se a API
+            # deixasse passar uma linha sem categoria ela nao e bot verificado e
+            # nao entra numa serie que se chama "bot verificado".
+            continue
+        chave_agente = botagents.agente_de(user_agent) or CHAVE_SEM_TABELA
+        status = dimensoes.get("edgeResponseStatus")
+        cache = (dimensoes.get("cacheStatus") or "").strip() or "unknown"
+        colo = (dimensoes.get("coloCode") or "").strip() or "unknown"
+
+        amostrado = grupo.get("count", 0)
+        # `or 1` nos dois niveis: sampleInterval ausente e sampleInterval 0 sao
+        # coisas diferentes na API, e as duas destruiriam a estimativa se
+        # multiplicassem — 0 zeraria o dia inteiro em silencio.
+        intervalo = ((grupo.get("avg") or {}).get("sampleInterval") or 1) or 1
+
+        acumulado = por_chave.setdefault(
+            (chave_agente, status, cache, colo),
+            {"requests_sampled": 0, "requests_estimated": 0.0,
+             "categorias": {}, "user_agents": set()})
+        acumulado["requests_sampled"] += amostrado
+        acumulado["requests_estimated"] += amostrado * intervalo
+        acumulado["categorias"][categoria] = \
+            acumulado["categorias"].get(categoria, 0) + amostrado
+        # Amostra de User-Agent so no balde sem tabela: la ela e a UNICA forma de
+        # descobrir quem e o operador novo. Nas demais linhas seria ruido caro —
+        # ~175 linhas/dia x ~200 bytes de UA sao ~12 MB/ano de repeticao, e a
+        # identidade ja esta em `agent_key`.
+        if chave_agente == CHAVE_SEM_TABELA and len(acumulado["user_agents"]) < 4:
+            acumulado["user_agents"].add(user_agent[:160])
+
+    base = {
+        "schema_version": SCHEMA,
+        "date": dia.isoformat(),
+        "window_start": janela_inicio,
+        "window_end": janela_fim,
+        # Sempre True por construcao: este produtor recusa o dia corrente. O
+        # campo existe para que o consumidor nao precise confiar nessa promessa —
+        # e para que uma futura variante de dia parcial seja distinguivel.
+        "window_complete": True,
+        "query_truncated": truncado,
+        "sampled_dataset": True,
+    }
+
+    registros = []
+    for (chave_agente, status, cache, colo), dados in sorted(
+            por_chave.items(), key=lambda item: (item[0][0], str(item[0][1]),
+                                                 item[0][2], item[0][3])):
+        linha = dict(base)
+        linha.update({
+            "record_type": "combination",
+            "agent_key": chave_agente,
+            "function": botagents.FUNCAO.get(chave_agente, "unknown"),
+            "edge_response_status": status,
+            "cache_status": cache,
+            "colo_code": colo,
+            "requests_sampled": dados["requests_sampled"],
+            # Estimativa = amostra x sampleInterval. Arredondada UMA vez, no
+            # fim, para que a soma das linhas nao acumule erro de arredondamento
+            # por linha.
+            "requests_estimated": round(dados["requests_estimated"]),
+            "verified_bot_categories": dict(sorted(dados["categorias"].items())),
+        })
+        if dados["user_agents"]:
+            linha["user_agent_samples"] = sorted(dados["user_agents"])
+        registros.append(linha)
+
+    if not registros:
+        vazia = dict(base)
+        vazia.update({
+            "record_type": "empty_window",
+            "agent_key": None,
+            "function": None,
+            "edge_response_status": None,
+            "cache_status": None,
+            "colo_code": None,
+            "requests_sampled": 0,
+            "requests_estimated": 0,
+            "verified_bot_categories": {},
+        })
+        registros.append(vazia)
+
+    return registros, ""
+
+
+def _serializar(registro):
+    return json.dumps(registro, ensure_ascii=False, sort_keys=True)
+
+
+def fundir_serie(caminho, registros, datas_medidas):
+    """Grava SUBSTITUINDO as datas medidas e preservando o resto byte a byte.
+
+    Por que substituir por DATA e nao pela combinacao inteira: uma remedicao do
+    mesmo dia pode devolver um CONJUNTO diferente de combinacoes (a amostragem
+    muda, um colo aparece, um status some). Casando chave a chave, a combinacao
+    velha que desapareceu SOBREVIVERIA e inflaria o total do dia — que e a
+    versao sutil do defeito de crawl_coverage_daily.jsonl (1.395 linhas para 240
+    chaves).
+
+    Linha ilegivel do arquivo antigo e PRESERVADA como esta, nunca descartada:
+    dado que custou uma janela de borda nao volta, e a borda nao reexpoe o
+    passado.
+
+    Devolve (linhas_preservadas, linhas_substituidas, linhas_escritas).
+    """
+    preservadas = []
+    substituidas = 0
+    if os.path.exists(caminho):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                bruta = linha.rstrip("\n")
+                if not bruta.strip():
+                    continue
+                try:
+                    data = json.loads(bruta).get("date")
+                except (ValueError, AttributeError):
+                    preservadas.append(bruta)
+                    continue
+                if data in datas_medidas:
+                    substituidas += 1
+                    continue
+                preservadas.append(bruta)
+
+    novas = [_serializar(r) for r in registros]
+    # Ordem final deterministica por (date, agent_key, status, cache, colo):
+    # duas execucoes seguidas produzem arquivos identicos byte a byte, o que
+    # torna a idempotencia verificavel por sha256, e nao so por wc -l.
+    saida = preservadas + novas
+
+    def ordenar(bruta):
+        # AttributeError JUNTO com ValueError, e a assimetria custava o timer.
+        #
+        # O laco de fusao acima captura (ValueError, AttributeError) e PRESERVA a
+        # linha ilegivel, como o docstring promete. Mas uma linha que e JSON
+        # VALIDO e nao e objeto -- `[1, 2]`, por exemplo -- passa pela triagem
+        # (json.loads funciona) e so explode aqui, no .get(), com AttributeError
+        # NAO capturado. O processo morre com exit 1.
+        #
+        # Duas quebras de contrato numa linha so: a promessa de preservar vira
+        # "a fusao nunca mais completa enquanto a linha existir", e o codigo de
+        # saida fica na classe ERRADA -- exit 1 e veredito medido; instrumento
+        # que nao consegue ler o proprio ledger tem de sair >= 2.
+        #
+        # Achado por refutacao adversarial em 2026-08-28, com reproducao em copia
+        # isolada: "AttributeError: 'list' object has no attribute 'get'".
+        try:
+            r = json.loads(bruta)
+            if not isinstance(r, dict):
+                return ("", "", "", "", "", bruta)
+        except (ValueError, AttributeError):
+            return ("", "", "", "", "", bruta)
+        return (str(r.get("date") or ""), str(r.get("agent_key") or ""),
+                str(r.get("edge_response_status") if r.get("edge_response_status")
+                    is not None else ""),
+                str(r.get("cache_status") or ""), str(r.get("colo_code") or ""),
+                bruta)
+
+    saida.sort(key=ordenar)
+
+    destino = os.path.dirname(caminho)
+    os.makedirs(destino, exist_ok=True)
+    # tmp no MESMO diretorio + os.replace: a troca e atomica dentro do mesmo
+    # sistema de arquivos, entao um leitor concorrente ve o arquivo velho inteiro
+    # ou o novo inteiro, nunca metade.
+    tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=destino,
+                                      prefix=".edge_bot_status_daily.",
+                                      suffix=".tmp", delete=False)
+    try:
+        with tmp:
+            for bruta in saida:
+                tmp.write(bruta + "\n")
+        os.replace(tmp.name, caminho)
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+    return len(preservadas), substituidas, len(saida)
+
+
+def gravar(registros, datas_medidas):
+    """Fusao sob trava exclusiva.
+
+    A trava e sobre o `.lock` ao lado (nunca sobre o proprio ledger), mesma
+    convencao de generate-bot-agents-daily:414, para que leitor nenhum precise
+    conhece-la. Aqui ela e mais necessaria que la: aquele produtor so faz append,
+    este REESCREVE o arquivo, e duas execucoes simultaneas sem trava perderiam
+    uma das duas fusoes por inteiro.
+    """
+    os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+    with open(SERIE + ".lock", "w", encoding="utf-8") as trava:
+        fcntl.flock(trava, fcntl.LOCK_EX)
+        return fundir_serie(SERIE, registros, datas_medidas)
+
+
+def autoteste():
+    """Prova a fusao contra o caso INOCENTE PARECIDO, num arquivo temporario.
+
+    O risco desta ferramenta nao e acusar de menos: e DESTRUIR dado bom ao
+    remedir. Ja houve detector neste repositorio que acusou 46 paginas sendo que
+    as 46 eram falso positivo; o analogo aqui e a fusao apagar a linha de um dia
+    que ela nem foi medir. Os quatro casos abaixo sao exatamente esses.
+    """
+    casos = []
+    with tempfile.TemporaryDirectory() as pasta:
+        caminho = os.path.join(pasta, "serie.jsonl")
+
+        def linha(data, agente, status, cache="hit", colo="GRU", amostra=10):
+            return {"schema_version": SCHEMA, "record_type": "combination",
+                    "date": data, "agent_key": agente,
+                    "function": botagents.FUNCAO.get(agente, "unknown"),
+                    "edge_response_status": status, "cache_status": cache,
+                    "colo_code": colo, "requests_sampled": amostra,
+                    "requests_estimated": amostra, "verified_bot_categories": {},
+                    "window_start": data + "T00:00:00Z",
+                    "window_end": data + "T23:59:59Z", "window_complete": True,
+                    "query_truncated": False, "sampled_dataset": True}
+
+        antigas = [linha("2026-08-25", "googlebot", 200),
+                   linha("2026-08-25", "googlebot", 404),
+                   linha("2026-08-26", "bingbot", 200)]
+        with open(caminho, "w", encoding="utf-8") as handle:
+            for r in antigas:
+                handle.write(_serializar(r) + "\n")
+
+        # CASO 1 — remedir 08-26 nao pode tocar as linhas de 08-25 (data
+        # inocente, que esta execucao nem foi consultar).
+        fundir_serie(caminho, [linha("2026-08-26", "bingbot", 200, amostra=99)],
+                     {"2026-08-26"})
+        atual = [json.loads(l) for l in open(caminho, encoding="utf-8") if l.strip()]
+        de_25 = [r for r in atual if r["date"] == "2026-08-25"]
+        casos.append(("08-25 preservado ao remedir 08-26", len(de_25) == 2))
+
+        # CASO 2 — a data remedida NAO duplica: uma linha, com o valor novo.
+        de_26 = [r for r in atual if r["date"] == "2026-08-26"]
+        casos.append(("08-26 substituido, nao duplicado",
+                      len(de_26) == 1 and de_26[0]["requests_sampled"] == 99))
+
+        # CASO 3 — combinacao que SUMIU na remedicao nao sobrevive. E o caso que
+        # a substituicao por chave-completa erraria: 08-25 volta so com o 200, e
+        # a linha do 404 tem de ir embora junto com o resto do dia.
+        fundir_serie(caminho, [linha("2026-08-25", "googlebot", 200, amostra=7)],
+                     {"2026-08-25"})
+        atual = [json.loads(l) for l in open(caminho, encoding="utf-8") if l.strip()]
+        de_25 = [r for r in atual if r["date"] == "2026-08-25"]
+        casos.append(("combinacao extinta some com o dia",
+                      len(de_25) == 1 and de_25[0]["edge_response_status"] == 200))
+
+        # CASO 4 — janela que FALHOU (data fora de datas_medidas) nao apaga nada.
+        antes = len(atual)
+        fundir_serie(caminho, [], set())
+        depois = sum(1 for l in open(caminho, encoding="utf-8") if l.strip())
+        casos.append(("janela falha preserva o disco", antes == depois))
+
+        # CASO 5 — idempotencia byte a byte: a mesma fusao repetida devolve o
+        # mesmo arquivo. E o que torna a prova por sha256 possivel.
+        import hashlib
+        nova = [linha("2026-08-27", "gptbot", 200), linha("2026-08-27", "gptbot", 301)]
+        fundir_serie(caminho, nova, {"2026-08-27"})
+        h1 = hashlib.sha256(open(caminho, "rb").read()).hexdigest()
+        fundir_serie(caminho, nova, {"2026-08-27"})
+        h2 = hashlib.sha256(open(caminho, "rb").read()).hexdigest()
+        casos.append(("segunda fusao identica byte a byte", h1 == h2))
+
+    print("autoteste da fusao idempotente (arquivo temporario, serie real intocada)")
+    for nome, passou in casos:
+        print("  [%s] %s" % ("ok" if passou else "FALHOU", nome))
+    if all(p for _, p in casos):
+        print("%d/%d casos ok" % (len(casos), len(casos)))
+        return 0
+    # Autoteste que falha e FERRAMENTA QUEBRADA, nunca veredito: exit 2.
+    return 2
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="serie diaria de bot verificado x status x cacheStatus x colo, na borda")
+    parser.add_argument("--dias", type=int, default=1,
+                        help="janelas de 24h FECHADAS, a partir de ontem "
+                             "(teto de retencao: %d)" % RETENCAO_JANELAS)
+    parser.add_argument("--json", action="store_true",
+                        help="imprime os registros gravados")
+    parser.add_argument("--autoteste", action="store_true",
+                        help="prova a fusao idempotente sem tocar na serie real")
+    args = parser.parse_args()
+
+    if args.autoteste:
+        return autoteste()
+
+    if args.dias < 1:
+        print("generate-edge-bot-status-daily: --dias tem de ser >= 1", file=sys.stderr)
+        return 2
+    if args.dias > RETENCAO_JANELAS:
+        print("generate-edge-bot-status-daily: --dias %d acima da retencao util de %d "
+              "janelas fechadas; a API recusaria a mais antiga com `cannot request "
+              "data older than 1w1d`" % (args.dias, RETENCAO_JANELAS), file=sys.stderr)
+        args.dias = RETENCAO_JANELAS
+
+    env = ler_env()
+    headers = cabecalhos(env)
+    if not headers:
+        print("generate-edge-bot-status-daily: nem CLOUDFLARE_ZONE_TOKEN nem "
+              "CLOUDFLARE_API_TOKEN em .env.local — nao ha como medir", file=sys.stderr)
+        return 2
+
+    try:
+        with open(SITE, encoding="utf-8") as handle:
+            dominio = json.load(handle)["base_url"].rstrip("/").split("//", 1)[-1]
+    except (OSError, ValueError, KeyError) as erro:
+        print("generate-edge-bot-status-daily: content/site.json ilegivel (%s)" % erro,
+              file=sys.stderr)
+        return 2
+
+    zona, erro = resolver_zona(headers, dominio)
+    if erro:
+        print("generate-edge-bot-status-daily: %s" % erro, file=sys.stderr)
+        return 2
+
+    # ONTEM, nunca hoje. O dia corrente esta aberto: gravar 4h de trafego como se
+    # fosse o dia inteiro foi o defeito medido do timer de crawl-coverage (roda
+    # 04:10 UTC; o Googlebot comeca por volta de 06:04 UTC).
+    ontem = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=1)
+
+    registros = []
+    datas_medidas = set()
+    falhas = []
+    truncadas = []
+    for recuo in range(args.dias):
+        dia = ontem - datetime.timedelta(days=recuo)
+        do_dia, erro = coletar_dia(headers, zona, dia)
+        if erro:
+            falhas.append((dia.isoformat(), erro))
+            continue
+        datas_medidas.add(dia.isoformat())
+        registros.extend(do_dia)
+        if do_dia and do_dia[0].get("query_truncated"):
+            truncadas.append(dia.isoformat())
+
+    # GRAVA ANTES DE SAIR, sempre. Janela de borda perdida nao volta: se tres
+    # dias mediram e um falhou, os tres tem de estar no disco quando o exit 2
+    # acontecer.
+    if datas_medidas:
+        preservadas, substituidas, total = gravar(registros, datas_medidas)
+        print("serie: %s" % os.path.relpath(SERIE, ROOT))
+        print("  %d linha(s) nova(s) para %d dia(s) medido(s): %s"
+              % (len(registros), len(datas_medidas), ", ".join(sorted(datas_medidas))))
+        print("  %d linha(s) de outras datas preservada(s); %d substituida(s); "
+              "%d no arquivo" % (preservadas, substituidas, total))
+
+        estimado = sum(r["requests_estimated"] for r in registros)
+        print("\nbot VERIFICADO pela Cloudflare x status x cacheStatus x colo")
+        print("(dataset amostrado; estimado = amostra x sampleInterval)")
+        por_agente = {}
+        for r in registros:
+            if r["record_type"] != "combination":
+                continue
+            alvo = por_agente.setdefault(r["agent_key"], {
+                "estimado": 0, "cache": {}, "status": {}, "colos": set(),
+                "function": r["function"]})
+            alvo["estimado"] += r["requests_estimated"]
+            alvo["cache"][r["cache_status"]] = \
+                alvo["cache"].get(r["cache_status"], 0) + r["requests_estimated"]
+            alvo["status"][r["edge_response_status"]] = \
+                alvo["status"].get(r["edge_response_status"], 0) + r["requests_estimated"]
+            alvo["colos"].add(r["colo_code"])
+        for chave, dados in sorted(por_agente.items(), key=lambda kv: -kv[1]["estimado"])[:12]:
+            total_agente = dados["estimado"] or 1
+            quente = dados["cache"].get("hit", 0) + dados["cache"].get("revalidated", 0)
+            ok = dados["status"].get(200, 0)
+            print("  %-26s %-9s est=%-7d cache_hit=%4.1f%% http200=%4.1f%% colos=%d"
+                  % (chave, dados["function"], dados["estimado"],
+                     100.0 * quente / total_agente, 100.0 * ok / total_agente,
+                     len(dados["colos"])))
+        print("\n  total estimado nas janelas medidas: %d requisicao(oes)" % estimado)
+    else:
+        print("nenhuma janela medida — nada gravado", file=sys.stderr)
+
+    if truncadas:
+        print("  AVISO: consulta no teto de %d grupos em %s — a cauda foi cortada."
+              % (LIMITE_GRUPOS, ", ".join(truncadas)), file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(registros, ensure_ascii=False, indent=2, sort_keys=True))
+
+    if falhas:
+        for dia, erro in falhas:
+            print("  NAO MEDIDO %s: %s" % (dia, erro), file=sys.stderr)
+        # exit 2 = NAO CONSEGUI MEDIR. Este coletor nao emite veredito, entao nao
+        # existe exit 1 aqui: qualquer saida != 0 significa instrumento quebrado,
+        # e e por isso que a unit nao leva SuccessExitStatus.
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

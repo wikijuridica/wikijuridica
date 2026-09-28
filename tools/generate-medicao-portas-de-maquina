@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Mede o CUSTO por porta de maquina — tempo, bytes e revalidacao — na mesma
+chave em que `generate-retorno-por-rota` mede o RETORNO.
+
+POR QUE EXISTE. O portal e AI-first: o produto sao as portas de maquina (MCP,
+A2A, /api/v1, gemea Markdown) ao lado do HTML. Ate 2026-09-08 o repositorio
+media quantas requisicoes cada familia de rota recebia (retorno) e NAO media
+quanto cada uma custa para servir. Sem as duas, nao da para decidir onde
+otimizar: a rota mais chamada pode ser a mais barata, e a mais cara pode nao ter
+usuario. Medido no dia em que este arquivo nasceu, com sonda interna e 5
+repeticoes: `mudancas_desde` custava 50 ms e 37.770 bytes por chamada e era a
+ferramenta MCP mais cara, enquanto `/api/v1/lote` entregava 640.403 bytes em 13
+ms — a mais pesada e a mais eficiente por byte, ao mesmo tempo.
+
+A CHAVE E A MESMA DE PROPOSITO. Este script IMPORTA `FAMILIAS` e `familia()` de
+`tools/generate-retorno-por-rota`, em vez de redeclara-las. Duas listas de
+familia que se parecem sao duas verdades que divergem no primeiro caso de borda
+— foi exatamente isso que fez `mudancas_desde` anunciar 7 URLs que
+`/api/v1/pages/` negava com 404, no mesmo dia.
+
+SONDA SEM FRAUDE (CLAUDE.md §11): toda requisicao sai com
+`wikijuridica-superficie-probe/1.0` e `X-Warming-Request: true`. Sem os dois, a
+medicao entra no ledger de acesso e o portal passa a medir o proprio eco.
+
+Saida: data/ops/custo_por_rota_daily.jsonl, uma linha por (dia, familia).
+"""
+
+import argparse
+import importlib.util
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SAIDA = os.path.join(RAIZ, "data", "ops", "custo_por_rota_daily.jsonl")
+SCHEMA = "custo_por_rota_daily_v1"
+UA = "wikijuridica-superficie-probe/1.0"
+
+# As sondas por familia. Cada uma e (rotulo, metodo, caminho, corpo_json).
+# Caminho relativo a base; corpo None = GET. Os rotulos entram na saida, entao
+# mudar um deles quebra a serie — acrescente em vez de renomear.
+SONDAS = [
+    ("home", "GET", "/", None),
+    ("healthz", "GET", "/healthz", None),
+    ("openapi", "GET", "/openapi.json", None),
+    ("agent-card", "GET", "/.well-known/agent-card.json", None),
+    ("ai-catalog", "GET", "/.well-known/ai-catalog.json", None),
+    ("changes", "GET", "/changes.json", None),
+    ("lote", "GET", "/api/v1/lote", None),
+    ("mcp:tools/list", "POST", "/mcp",
+     {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+]
+
+# Ferramentas MCP medidas por `tools/call`. Os argumentos saem do jsonschema
+# que o proprio `tools/list` publica — nao invente campo aqui.
+FERRAMENTAS_MCP = [
+    ("buscar_paginas", {"consulta": "divórcio consensual"}),
+    ("ler_pagina", None),          # caminho resolvido em tempo de execucao
+    ("mudancas_desde", {"limite": 50}),
+    ("contexto_juridico", {"pergunta": "quem paga as custas do divórcio"}),
+    ("grafo", {"entidade": "urn:lex:br:federal:lei:2002-01-10;10406", "limite": 50}),
+    ("impacto", {"entidade": "urn:lex:br:federal:lei:2002-01-10;10406", "limite": 50}),
+]
+
+
+def familias_do_retorno():
+    """Importa a taxonomia do gerador de retorno. Se ele mudar, esta medicao
+    muda junto — que e o ponto."""
+    caminho = os.path.join(RAIZ, "tools", "generate-retorno-por-rota")
+    spec = importlib.util.spec_from_loader(
+        "retorno_por_rota", loader=None, origin=caminho)
+    modulo = importlib.util.module_from_spec(spec)
+    modulo.__file__ = caminho
+    with open(caminho, encoding="utf-8") as f:
+        fonte = f.read()
+    # O gerador tem um main() com efeito colateral; executamos so as definicoes
+    # de topo, que e onde FAMILIAS e familia() moram.
+    fonte = fonte.split("\nif __name__ ==")[0]
+    exec(compile(fonte, caminho, "exec"), modulo.__dict__)  # noqa: S102
+    return modulo.FAMILIAS, modulo.familia
+
+
+def curl(base, metodo, caminho, corpo, cabecalhos=()):
+    cmd = ["curl", "-s", "-o", "/dev/null", "-D", "-",
+           "-w", "\n%{time_total} %{size_download} %{http_code}\n",
+           "-m", "20", "-A", UA, "-H", "X-Warming-Request: true"]
+    for c in cabecalhos:
+        cmd += ["-H", c]
+    if corpo is not None:
+        cmd += ["-X", metodo, "-H", "Content-Type: application/json",
+                "-d", json.dumps(corpo, ensure_ascii=False)]
+    cmd.append(base.rstrip("/") + caminho)
+    saida = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    linhas = [l for l in saida.stdout.splitlines() if l.strip()]
+    if not linhas:
+        return None
+    tempo, bytes_, codigo = linhas[-1].split()
+    cabecalho = {}
+    for l in linhas[:-1]:
+        if ":" in l:
+            k, _, v = l.partition(":")
+            cabecalho[k.strip().lower()] = v.strip()
+    return {"tempo_s": float(tempo), "bytes": int(bytes_),
+            "codigo": int(codigo), "cabecalho": cabecalho}
+
+
+def mede(base, metodo, caminho, corpo, repeticoes, pausa):
+    tempos, ultima = [], None
+    for _ in range(repeticoes):
+        r = curl(base, metodo, caminho, corpo)
+        if r is None:
+            return None
+        tempos.append(r["tempo_s"])
+        ultima = r
+        time.sleep(pausa)
+    ultima["tempo_ms_mediana"] = round(statistics.median(tempos) * 1000, 2)
+    ultima["tempo_ms_min"] = round(min(tempos) * 1000, 2)
+    ultima["tempo_ms_max"] = round(max(tempos) * 1000, 2)
+    return ultima
+
+
+def revalida(base, caminho, cabecalho):
+    """Um agente que volta amanha deveria pagar 304, nao o corpo inteiro.
+    Devolve o que a rota HONRA, nao o que ela promete."""
+    saida = {"etag": bool(cabecalho.get("etag")),
+             "last_modified": bool(cabecalho.get("last-modified")),
+             "trezentos_e_quatro_por_etag": None,
+             "trezentos_e_quatro_por_data": None}
+    if cabecalho.get("etag"):
+        r = curl(base, "GET", caminho, None,
+                 ["If-None-Match: " + cabecalho["etag"]])
+        saida["trezentos_e_quatro_por_etag"] = bool(r and r["codigo"] == 304)
+    if cabecalho.get("last-modified"):
+        r = curl(base, "GET", caminho, None,
+                 ["If-Modified-Since: " + cabecalho["last-modified"]])
+        saida["trezentos_e_quatro_por_data"] = bool(r and r["codigo"] == 304)
+    return saida
+
+
+def um_caminho_publicado():
+    """Um caminho REAL do manifesto, para ler_pagina e /api/v1/pages nao
+    medirem 404."""
+    caminho = os.path.join(RAIZ, "data", "editorial", "published_manifest.jsonl")
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                p = json.loads(linha).get("path")
+                if p:
+                    return p
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base", default="http://127.0.0.1:8088",
+                    help="origem a sondar (padrao: o nginx do wiki)")
+    ap.add_argument("--repeticoes", type=int, default=5)
+    ap.add_argument("--pausa", type=float, default=0.3,
+                    help="segundos entre requisicoes; o portal e de producao")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="mede e imprime, sem gravar a serie")
+    args = ap.parse_args()
+
+    FAMILIAS, familia = familias_do_retorno()
+    publicado = um_caminho_publicado()
+
+    sondas = list(SONDAS)
+    if publicado:
+        sondas.append(("gemea.md", "GET", publicado.rstrip("/") + "/index.md", None))
+        sondas.append(("api/pages", "GET", "/api/v1/pages" + publicado, None))
+        sondas.append(("pagina", "GET", publicado, None))
+
+    medidas = []
+    for rotulo, metodo, caminho, corpo in sondas:
+        r = mede(args.base, metodo, caminho, corpo, args.repeticoes, args.pausa)
+        if r is None:
+            print("sonda sem resposta: %s" % rotulo, file=sys.stderr)
+            continue
+        linha = {"rotulo": rotulo, "caminho": caminho, "metodo": metodo,
+                 "familia": familia(caminho), "codigo": r["codigo"],
+                 "bytes": r["bytes"], "tempo_ms_mediana": r["tempo_ms_mediana"],
+                 "tempo_ms_min": r["tempo_ms_min"], "tempo_ms_max": r["tempo_ms_max"]}
+        if metodo == "GET":
+            linha["revalidacao"] = revalida(args.base, caminho, r["cabecalho"])
+        medidas.append(linha)
+
+    for nome, argumentos in FERRAMENTAS_MCP:
+        if argumentos is None:
+            if not publicado:
+                continue
+            argumentos = {"caminho": publicado}
+        corpo = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": nome, "arguments": argumentos}}
+        # A CARGA TAMBEM VAI AQUI, e a ausencia dela ja custou uma conclusao
+        # errada: em 2026-09-08 comparei o antes (load ~7-14, com agentes e
+        # build rodando) com o depois (load 1,5) e TODA a tabela caiu junto --
+        # inclusive rotas que ninguem tinha tocado. Sem load por medida nao da
+        # para separar "a otimizacao funcionou" de "a maquina estava livre".
+        carga_antes = carga1()
+        r = mede(args.base, "POST", "/mcp", corpo, args.repeticoes, args.pausa)
+        if r is None:
+            print("ferramenta sem resposta: %s" % nome, file=sys.stderr)
+            continue
+        medidas.append({"rotulo": "mcp:" + nome, "caminho": "/mcp",
+                        "metodo": "POST", "familia": "/mcp",
+                        "codigo": r["codigo"], "bytes": r["bytes"],
+                        "tempo_ms_mediana": r["tempo_ms_mediana"],
+                        "tempo_ms_min": r["tempo_ms_min"],
+                        "tempo_ms_max": r["tempo_ms_max"],
+                        "load1_antes": carga_antes,
+                        "load1_depois": carga1()})
+
+    dia = time.strftime("%Y-%m-%d", time.gmtime())
+    agora = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    linhas = []
+    for f in FAMILIAS:
+        daFamilia = [m for m in medidas if m["familia"] == f]
+        if not daFamilia:
+            # Familia sem sonda entra com null, nao com zero: "nao medido" e
+            # diferente de "custa zero", e a serie nao pode confundir os dois.
+            linhas.append({"schema_version": SCHEMA, "date": dia, "familia": f,
+                           "sondas": 0, "tempo_ms_mediana": None,
+                           "bytes_mediana": None, "medidas": [],
+                           "gerado_em": agora})
+            continue
+        linhas.append({
+            "schema_version": SCHEMA, "date": dia, "familia": f,
+            "sondas": len(daFamilia),
+            "tempo_ms_mediana": round(statistics.median(
+                m["tempo_ms_mediana"] for m in daFamilia), 2),
+            "bytes_mediana": int(statistics.median(m["bytes"] for m in daFamilia)),
+            "medidas": sorted(daFamilia, key=lambda m: -m["tempo_ms_mediana"]),
+            "gerado_em": agora,
+        })
+
+    for m in sorted(medidas, key=lambda m: -m["tempo_ms_mediana"]):
+        print("%-24s %-14s %8.2f ms %10d B  %s" % (
+            m["rotulo"], m["familia"], m["tempo_ms_mediana"], m["bytes"],
+            m["codigo"]))
+
+    if args.dry_run:
+        print("--dry-run: nada gravado", file=sys.stderr)
+        return 0
+    os.makedirs(os.path.dirname(SAIDA), exist_ok=True)
+    tmp = SAIDA + ".tmp"
+    antigas = []
+    if os.path.exists(SAIDA):
+        with open(SAIDA, encoding="utf-8") as f:
+            antigas = [l for l in f if json.loads(l).get("date") != dia]
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(antigas)
+        for l in linhas:
+            f.write(json.dumps(l, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(tmp, SAIDA)
+    print("gravado em %s" % SAIDA)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

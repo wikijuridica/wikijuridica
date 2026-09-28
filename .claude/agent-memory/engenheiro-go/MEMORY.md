@@ -1,0 +1,14 @@
+- [Parar em arquivo concorrente](feedback_parar_em_arquivo_concorrente.md) — hunk alheio na mesma função = lost update silencioso; devolva o patch ao maestro
+- [P3/P8: produtores órfãos e conteúdo parado](project_p3_produtores_orfaos.md) — o que fechou em 2026-09-16, a fila de refino sem consumidor e onde mora o escritor sancionado de v2_pages
+- [Medir com a régua do pacote, não com cópia](feedback_medir_com_a_regua_do_pacote.md) — `_test.go` gated por env no pacote dono da régua; controle positivo antes de aceitar zero
+- [Medir a premissa do briefing](feedback_medir_a_premissa_do_briefing.md) — o mecanismo pedido teria silenciado 3 crashes reais; meça contagem e causa antes de construir
+- [Mutação em diretório atestado](mutacao_em_diretorio_atestado.md) — mutante em arquivo de produção do grafo morre pela atestação e parece flakiness; _test.go está fora do grafo
+- [Snapshot de medição completo](feedback_snapshot_de_medicao_completo.md) — entrada que falta na raiz de ensaio não dá erro, dá número menor: 7.591 candidatos viraram 4.116
+- [Balde None mistura três coisas](feedback_balde_none_mistura_tres_coisas.md) — "57,3% sem agent_key" virou 42,3% de lacuna real: 15 pontos eram pessoas e clientes genéricos
+- [Mutante vivo: o terceiro desfecho](feedback_mutante_vivo_terceiro_desfecho.md) — guarda inobservável hoje se prova com o mutante da regressão futura, não se apaga
+- [Um destino, um produtor](feedback_um_destino_um_produtor.md) — achou destino órfão? procure o produtor existente; se existir, verifique pelo nome e cite arquivo:linha
+- [Harness de script de ops](feedback_harness_de_script_de_ops.md) — `tmp/` do job é compartilhado (outro agente apagou o meu); `unshare -Ur` não protege `/home/$DONO`
+- [Guarda em camadas esvazia o exit](feedback_guarda_em_camadas_esvazia_o_exit.md) — a guarda seguinte recusa igual com o mesmo codigo; asserte a mensagem distintiva e a ausencia da vizinha
+- [sed imprime em ordem de arquivo](feedback_sed_imprime_em_ordem_de_arquivo.md) — `sed -n '372p;334p'` devolve 334 primeiro; sem rótulo de linha, não é medição
+- [Âncora só reprova com deslocamento provado](feedback_ancora_so_reprova_com_deslocamento_provado.md) — detector sobre texto humano tem três desfechos; o terceiro é "não verificável", não reprovação
+- [Oráculo Go em scratch](feedback_oraculo_go_em_scratch.md) — paridade com parser Go se mede com main.go no scratchpad via go-modern; leitor = oráculo, escritor = subconjunto

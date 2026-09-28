@@ -1,0 +1,1250 @@
+#!/usr/bin/env python3
+"""Finalize one authenticated exact-distinctness cohort as a logical wave.
+
+Draft agents never write the live stock.  This process authenticates every
+member and every external peer first, acquires the complete shard lock-set,
+then advances an append-only journal while installing all planned drafts.
+Within the wave a member may be at its declared preimage or declared staged
+hash; any other drift is external and fails closed.  Provenance and the final
+against-stock audits run only after every planned mutation is visible.
+
+The transaction is deliberately roll-forward.  A crash can leave a prefix of
+members installed, but the durable private journal binds that prefix to the
+same queue artifact, wave id and staged hashes.  Re-running the *same* command
+can resume it; no preimage is silently restored and no partial run emits a
+green receipt or publication authority.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import secrets
+import signal
+import stat
+import sys
+from contextlib import ExitStack
+from typing import Any, Iterable, Mapping, NamedTuple
+
+
+INSTALL_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(INSTALL_ROOT) not in sys.path:
+    sys.path.insert(0, str(INSTALL_ROOT))
+
+from tools import generate_v2_review_queue as producer  # noqa: E402
+
+
+def _load_single_finalizer() -> Any:
+    path = INSTALL_ROOT / "tools/finalize-v2-review"
+    loader = importlib.machinery.SourceFileLoader(
+        "v2_review_single_finalizer_for_wave", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError("finalizador single não pôde ser carregado")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+single = _load_single_finalizer()
+
+SHA256 = re.compile(r"[0-9a-f]{64}")
+JOURNAL_SCHEMA = "v2_exact_component_wave_journal_v1"
+RECEIPT_SCHEMA = "v2_exact_component_wave_receipt_v1"
+JOURNAL_NAME = "exact-component-wave-journal.jsonl"
+RECEIPT_NAME = "exact-component-wave-receipt.json"
+MAX_JOURNAL_BYTES = 4 * 1024 * 1024
+MAX_DRAFTS_BYTES = 4 * 1024 * 1024
+WAVE_CONTRACT_FIELDS = frozenset({
+    "schema_version", "mode", "wave_id", "group_id", "cohort_index",
+    "cohort_count", "member_paths", "member_pre_sha256", "component_ids",
+    "preserved_owners", "distinctness_generation_root",
+    "publication_allowed", "index_policy",
+})
+
+
+class WaveError(single.FinalizationError):
+    """The cohort cannot form an authenticated green receipt."""
+
+
+class DraftBinding(NamedTuple):
+    task: dict[str, Any]
+    workspace: Any
+    staged: Any
+    corrections: dict[str, int]
+
+
+class JournalBinding(NamedTuple):
+    descriptor: int
+    path: pathlib.Path
+    last_record_sha256: str
+    records: tuple[dict[str, Any], ...]
+
+
+def _canonical_json(value: Any) -> bytes:
+    return (json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False) + "\n").encode("utf-8")
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _endpoint(value: Any, label: str) -> tuple[str, str]:
+    try:
+        return producer._v3_endpoint(value, label)
+    except (TypeError, ValueError) as error:
+        raise WaveError(f"{label} inválido") from error
+
+
+def _component_contracts(
+    task: Mapping[str, Any],
+) -> tuple[set[str], set[tuple[str, str]]]:
+    component_ids: set[str] = set()
+    owners: set[tuple[str, str]] = set()
+    raw = task.get("componentes_distinctness")
+    if not isinstance(raw, dict) or not raw:
+        raise WaveError("membro exact perdeu componentes distinctness")
+    for defect_class, entries in raw.items():
+        if (defect_class not in producer.V3_EXACT_REVIEW_DEFECT_CLASSES or
+                not isinstance(entries, list) or not entries):
+            raise WaveError("classe/lista exact inválida")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise WaveError("componente exact não é objeto")
+            component_id = entry.get("component_id")
+            if (not isinstance(component_id, str) or
+                    SHA256.fullmatch(component_id) is None):
+                raise WaveError("component_id inválido")
+            component_ids.add(component_id)
+            owners.add(_endpoint(entry.get("preserved_owner"), "wave-owner"))
+    return component_ids, owners
+
+
+def validate_wave_tasks(
+    tasks: Iterable[Mapping[str, Any]], wave_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate completeness and recompute the producer-owned wave id."""
+    if not isinstance(wave_id, str) or SHA256.fullmatch(wave_id) is None:
+        raise WaveError("wave_id inválido")
+    normalized = [single._validate_task(
+        task, allow_exact_component_wave=True) for task in tasks]
+    if not normalized:
+        raise WaveError("wave sem membros")
+    by_path: dict[str, dict[str, Any]] = {}
+    contract: dict[str, Any] | None = None
+    all_components: set[str] = set()
+    all_owners: set[tuple[str, str]] = set()
+    for task in normalized:
+        path = f"data/editorial/v2_pages/{task['slug']}.jsonl"
+        if path in by_path:
+            raise WaveError("wave repete shard")
+        by_path[path] = task
+        raw_contract = task.get("exact_component_wave")
+        if (not isinstance(raw_contract, dict) or
+                set(raw_contract) != WAVE_CONTRACT_FIELDS):
+            raise WaveError("membro perdeu schema exact_component_wave")
+        if contract is None:
+            contract = dict(raw_contract)
+        elif raw_contract != contract:
+            raise WaveError("membros carregam contratos de wave divergentes")
+        components, owners = _component_contracts(task)
+        all_components.update(components)
+        all_owners.update(owners)
+    if contract is None:  # pragma: no cover - narrowed by normalized
+        raise WaveError("wave sem contrato")
+    member_paths = contract.get("member_paths")
+    preimages = contract.get("member_pre_sha256")
+    component_ids = contract.get("component_ids")
+    owners = contract.get("preserved_owners")
+    if (contract.get("schema_version") !=
+            producer.EXACT_COMPONENT_WAVE_SCHEMA or
+            contract.get("mode") != "exact-component-wave" or
+            contract.get("wave_id") != wave_id or
+            not isinstance(contract.get("group_id"), str) or
+            SHA256.fullmatch(contract["group_id"]) is None or
+            type(contract.get("cohort_index")) is not int or
+            type(contract.get("cohort_count")) is not int or
+            not 0 <= contract["cohort_index"] < contract["cohort_count"] or
+            not isinstance(member_paths, list) or not member_paths or
+            len(member_paths) > producer.MAX_EXACT_COMPONENT_WAVE_MEMBERS or
+            member_paths != sorted(set(member_paths)) or
+            set(member_paths) != set(by_path) or
+            not isinstance(preimages, dict) or set(preimages) != set(by_path) or
+            any(not isinstance(digest, str) or SHA256.fullmatch(digest) is None
+                for digest in preimages.values()) or
+            any(by_path[path]["target_sha256"] != preimages[path]
+                for path in member_paths) or
+            not isinstance(component_ids, list) or
+            component_ids != sorted(set(component_ids)) or
+            set(component_ids) != all_components or
+            not isinstance(owners, list) or
+            any(not isinstance(owner, dict) for owner in owners) or
+            sorted(_endpoint(owner, "preserved-owner") for owner in owners) !=
+            sorted(all_owners) or
+            not isinstance(contract.get("distinctness_generation_root"), str) or
+            SHA256.fullmatch(contract["distinctness_generation_root"]) is None or
+            contract.get("publication_allowed") is not False or
+            contract.get("index_policy") != "noindex"):
+        raise WaveError("conteúdo do contrato exact_component_wave inválido")
+    seed = dict(contract)
+    seed.pop("wave_id")
+    if _sha256(json.dumps(
+            seed, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")) != wave_id:
+        raise WaveError("wave_id não autentica o contrato canônico")
+    return [by_path[path] for path in member_paths], contract
+
+
+def _parse_queue_entries(payload: bytes) -> list[Any]:
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise WaveError("fila canônica não é UTF-8") from error
+    rca_prefix = "const REVIEW_QUEUE_OPERATIONAL_RCA = "
+    files_prefix = "const files = "
+    rca_lines = [line[len(rca_prefix):] for line in text.splitlines()
+                 if line.startswith(rca_prefix)]
+    files_lines = [line[len(files_prefix):] for line in text.splitlines()
+                   if line.startswith(files_prefix)]
+    if len(rca_lines) != 1 or len(files_lines) != 1:
+        raise WaveError("fila não possui envelope canônico único")
+    try:
+        rca = producer.decode_json_no_duplicate_keys(
+            rca_lines[0].encode("utf-8"), "queue-rca")
+        entries = producer.decode_json_no_duplicate_keys(
+            files_lines[0].encode("utf-8"), "queue-files")
+    except ValueError as error:
+        raise WaveError("envelope JSON da fila é inválido") from error
+    if rca is not None or not isinstance(entries, list) or not entries:
+        raise WaveError("fila canônica bloqueada ou vazia")
+    return entries
+
+
+def load_queue_wave(
+    queue_path: pathlib.Path, wave_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    expected = (INSTALL_ROOT / "scripts/workflows/writing-review-todo.js").resolve()
+    try:
+        actual = queue_path.resolve(strict=True)
+    except OSError as error:
+        raise WaveError("fila canônica está ausente") from error
+    if actual != expected:
+        raise WaveError(f"queue-file deve ser {expected}")
+    snapshot = producer.read_regular_file_snapshot(
+        actual, max_bytes=64 * 1024 * 1024)
+    entries = _parse_queue_entries(snapshot.payload)
+    matches = [
+        item for item in entries
+        if isinstance(item, dict) and
+        isinstance(item.get("exact_component_wave"), dict) and
+        item["exact_component_wave"].get("wave_id") == wave_id
+    ]
+    tasks, contract = validate_wave_tasks(matches, wave_id)
+    for task in tasks:
+        declared = task.get("queue_item_sha256")
+        if (not isinstance(declared, str) or SHA256.fullmatch(declared) is None or
+                producer.review_queue_item_sha256(task) != declared):
+            raise WaveError("queue_item_sha256 divergente na wave")
+    return tasks, contract, snapshot.digest
+
+
+def _decode_drafts(raw: str) -> Any:
+    if not isinstance(raw, str) or len(raw) > MAX_DRAFTS_BYTES * 2:
+        raise WaveError("drafts-base64 excede limite")
+    try:
+        payload = base64.b64decode(raw, validate=True)
+    except (TypeError, ValueError) as error:
+        raise WaveError("drafts-base64 não é base64 canônico") from error
+    if (not payload or len(payload) > MAX_DRAFTS_BYTES or
+            base64.b64encode(payload).decode("ascii") != raw):
+        raise WaveError("drafts-base64 vazio, grande ou não canônico")
+    try:
+        return producer.decode_json_no_duplicate_keys(payload, "wave-drafts")
+    except ValueError as error:
+        raise WaveError("wave-drafts não é JSON fechado") from error
+
+
+def validate_draft_manifest(
+    value: Any, tasks: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    expected = {task["slug"]: task for task in tasks}
+    if not isinstance(value, list) or len(value) != len(expected):
+        raise WaveError("manifesto de drafts não cobre a wave inteira")
+    by_slug: dict[str, dict[str, Any]] = {}
+    fields = {"slug", "workspace", "staged_sha256", "corrigidos_por_classe"}
+    for raw in value:
+        if (not isinstance(raw, dict) or set(raw) != fields or
+                raw.get("slug") not in expected or raw["slug"] in by_slug or
+                not isinstance(raw.get("workspace"), str) or
+                not isinstance(raw.get("staged_sha256"), str) or
+                SHA256.fullmatch(raw["staged_sha256"]) is None):
+            raise WaveError("entrada de draft ausente, duplicada ou inválida")
+        task = expected[raw["slug"]]
+        single._bounded_corrections(raw["corrigidos_por_classe"], task)
+        by_slug[raw["slug"]] = dict(raw)
+    if set(by_slug) != set(expected):
+        raise WaveError("manifesto de drafts omitiu membro")
+    return by_slug
+
+
+def classify_wave_member_state(
+    pre_sha256: str, staged_sha256: str, observed_sha256: str,
+) -> str:
+    """Only the authenticated preimage and this wave's postimage are valid."""
+    if observed_sha256 == pre_sha256:
+        return "pending"
+    if observed_sha256 == staged_sha256:
+        return "installed"
+    raise WaveError("drift externo: membro não está em preimage nem staged")
+
+
+def classify_wave_states(
+    pre_sha256_by_path: Mapping[str, str],
+    staged_sha256_by_path: Mapping[str, str],
+    observed_sha256_by_path: Mapping[str, str],
+) -> dict[str, str]:
+    paths = set(pre_sha256_by_path)
+    if (not paths or set(staged_sha256_by_path) != paths or
+            set(observed_sha256_by_path) != paths):
+        raise WaveError("mapas de estado da wave não cobrem os mesmos membros")
+    return {
+        path: classify_wave_member_state(
+            pre_sha256_by_path[path], staged_sha256_by_path[path],
+            observed_sha256_by_path[path])
+        for path in sorted(paths)
+    }
+
+
+def _open_child_regular(
+    workspace: Any, name: str, flags: int, mode: int = 0o600,
+) -> int:
+    single._assert_workspace_binding(workspace)
+    descriptor = os.open(
+        name, flags | os.O_CLOEXEC | os.O_NOFOLLOW, mode,
+        dir_fd=workspace.descriptor)
+    info = os.fstat(descriptor)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+            info.st_uid != os.geteuid()):
+        os.close(descriptor)
+        raise WaveError(f"{name} não é arquivo privado regular único")
+    return descriptor
+
+
+def _parse_journal(payload: bytes, plan: Mapping[str, Any]) -> tuple[
+        tuple[dict[str, Any], ...], str]:
+    if (not payload or len(payload) > MAX_JOURNAL_BYTES or
+            not payload.endswith(b"\n")):
+        raise WaveError("journal vazio, grande ou sem LF terminal")
+    records: list[dict[str, Any]] = []
+    previous = "0" * 64
+    installed: set[str] = set()
+    provenance_started: set[str] = set()
+    provenance_completed: set[str] = set()
+    all_installed = False
+    post_audit = False
+    member_paths = set(plan["member_paths"])
+    for index, raw_line in enumerate(payload[:-1].split(b"\n")):
+        if not raw_line:
+            raise WaveError("journal contém linha vazia")
+        try:
+            record = producer.decode_json_no_duplicate_keys(
+                raw_line, f"wave-journal:{index}")
+        except ValueError as error:
+            raise WaveError("journal contém JSON ambíguo") from error
+        if (not isinstance(record, dict) or
+                record.get("schema_version") != JOURNAL_SCHEMA or
+                record.get("sequence") != index or
+                record.get("previous_record_sha256") != previous or
+                record.get("wave_id") != plan["wave_id"] or
+                record.get("publication_allowed") is not False or
+                record.get("index_policy") != "noindex"):
+            raise WaveError("cadeia do journal é inválida")
+        base_fields = {
+            "schema_version", "sequence", "previous_record_sha256",
+            "event", "wave_id", "publication_allowed", "index_policy",
+        }
+        event = record.get("event")
+        if index == 0:
+            if (record.get("event") != "prepared" or
+                    record.get("plan") != plan or
+                    set(record) != base_fields | {"plan"}):
+                raise WaveError("journal pertence a outro plano")
+        elif event == "member_installed":
+            allowed = base_fields | {"member_path", "staged_sha256"}
+            if record.get("recovered_effect") is True:
+                allowed.add("recovered_effect")
+            path = record.get("member_path")
+            if (set(record) != allowed or path not in member_paths or
+                    path in installed or
+                    record.get("staged_sha256") !=
+                    plan["staged_sha256_by_path"].get(path) or all_installed):
+                raise WaveError("journal possui instalação inválida")
+            installed.add(path)
+        elif event == "all_members_installed":
+            if (set(record) != base_fields or all_installed or
+                    installed != member_paths):
+                raise WaveError("journal fechou membros fora de ordem")
+            all_installed = True
+        elif event == "provenance_started":
+            path = record.get("member_path")
+            if (set(record) != base_fields | {"member_path"} or
+                    not all_installed or path not in member_paths or
+                    path in provenance_started or
+                    path in provenance_completed or post_audit):
+                raise WaveError("journal iniciou proveniência inválida")
+            provenance_started.add(path)
+        elif event == "provenance_completed":
+            path = record.get("member_path")
+            evidence = record.get("source_provenance_evidence")
+            if (set(record) != base_fields | {
+                    "member_path", "post_provenance_sha256",
+                    "source_provenance_evidence", "commands"} or
+                    path not in provenance_started or
+                    path in provenance_completed or
+                    SHA256.fullmatch(record.get(
+                        "post_provenance_sha256", "")) is None or
+                    not isinstance(evidence, dict) or
+                    set(evidence) != {"path", "sha256"} or
+                    not isinstance(evidence.get("path"), str) or
+                    SHA256.fullmatch(evidence.get("sha256", "")) is None or
+                    not isinstance(record.get("commands"), list) or
+                    post_audit):
+                raise WaveError("journal concluiu proveniência inválida")
+            provenance_completed.add(path)
+        elif event == "post_wave_audit_passed":
+            posts = record.get("post_sha256_by_path")
+            audits = record.get("audit_report_sha256_by_path")
+            if (set(record) != base_fields | {
+                    "post_sha256_by_path", "audit_report_sha256_by_path"} or
+                    provenance_completed != member_paths or
+                    not isinstance(posts, dict) or set(posts) != member_paths or
+                    not isinstance(audits, dict) or set(audits) != member_paths or
+                    any(not isinstance(value, str) or
+                        SHA256.fullmatch(value) is None
+                        for value in (*posts.values(), *audits.values()))):
+                raise WaveError("journal possui audit final inválido")
+            post_audit = True
+        elif event == "failed":
+            if (set(record) != base_fields | {"error_class", "error"} or
+                    not isinstance(record.get("error_class"), str) or
+                    not record["error_class"] or
+                    not isinstance(record.get("error"), str)):
+                raise WaveError("journal possui falha inválida")
+        else:
+            raise WaveError("journal possui evento desconhecido")
+        previous = _sha256(raw_line)
+        records.append(record)
+    return tuple(records), previous
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise WaveError("escrita do journal não avançou")
+        offset += written
+
+
+def _open_or_create_journal(
+    workspace: Any, plan: Mapping[str, Any],
+) -> JournalBinding:
+    create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = _open_child_regular(
+            workspace, JOURNAL_NAME, create_flags, 0o600)
+    except FileExistsError:
+        descriptor = _open_child_regular(workspace, JOURNAL_NAME, os.O_RDWR)
+    path = workspace.path / JOURNAL_NAME
+    try:
+        info = os.fstat(descriptor)
+        if info.st_size == 0:
+            record = {
+                "schema_version": JOURNAL_SCHEMA,
+                "sequence": 0,
+                "previous_record_sha256": "0" * 64,
+                "event": "prepared",
+                "wave_id": plan["wave_id"],
+                "plan": dict(plan),
+                "publication_allowed": False,
+                "index_policy": "noindex",
+            }
+            payload = _canonical_json(record)
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.fsync(workspace.descriptor)
+        size = os.fstat(descriptor).st_size
+        if not 0 < size <= MAX_JOURNAL_BYTES:
+            raise WaveError("journal excede orçamento")
+        payload = os.pread(descriptor, size + 1, 0)
+        if not payload.endswith(b"\n"):
+            boundary = payload.rfind(b"\n") + 1
+            if boundary == 0:
+                # A gênese é fsyncada antes de qualquer mutação. Portanto uma
+                # gênese parcial não pode autorizar efeito live e pode ser
+                # refeita integralmente sob o lock exclusivo da wave.
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                record = {
+                    "schema_version": JOURNAL_SCHEMA,
+                    "sequence": 0,
+                    "previous_record_sha256": "0" * 64,
+                    "event": "prepared",
+                    "wave_id": plan["wave_id"],
+                    "plan": dict(plan),
+                    "publication_allowed": False,
+                    "index_policy": "noindex",
+                }
+                payload = _canonical_json(record)
+                _write_all(descriptor, payload)
+            else:
+                # Somente o sufixo sem LF de um append interrompido é
+                # descartado; todos os registros fsyncados permanecem.
+                payload = payload[:boundary]
+                os.ftruncate(descriptor, boundary)
+            os.fsync(descriptor)
+            os.fsync(workspace.descriptor)
+        records, previous = _parse_journal(payload, plan)
+        os.lseek(descriptor, 0, os.SEEK_END)
+        return JournalBinding(descriptor, path, previous, records)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _append_journal(
+    binding: JournalBinding, event: str, **fields: Any,
+) -> JournalBinding:
+    if not isinstance(event, str) or not event:
+        raise WaveError("evento vazio no journal")
+    record = {
+        "schema_version": JOURNAL_SCHEMA,
+        "sequence": len(binding.records),
+        "previous_record_sha256": binding.last_record_sha256,
+        "event": event,
+        "wave_id": binding.records[0]["wave_id"],
+        "publication_allowed": False,
+        "index_policy": "noindex",
+        **fields,
+    }
+    payload = _canonical_json(record)
+    current = os.fstat(binding.descriptor).st_size
+    if current + len(payload) > MAX_JOURNAL_BYTES:
+        raise WaveError("journal excederia orçamento")
+    _write_all(binding.descriptor, payload)
+    os.fsync(binding.descriptor)
+    return JournalBinding(
+        binding.descriptor, binding.path, _sha256(payload[:-1]),
+        binding.records + (record,))
+
+
+def _journal_completed(
+    journal: JournalBinding, event: str,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for record in journal.records:
+        if record.get("event") != event:
+            continue
+        path = record.get("member_path")
+        if not isinstance(path, str) or path in result:
+            raise WaveError(f"journal repete/omite identidade em {event}")
+        result[path] = record
+    return result
+
+
+def _journal_payload_sha256(journal: JournalBinding) -> str:
+    size = os.fstat(journal.descriptor).st_size
+    return _sha256(os.pread(journal.descriptor, size + 1, 0))
+
+
+def _verify_unbound_scope(
+    task: Mapping[str, Any], target: pathlib.Path,
+) -> Any:
+    snapshot = producer.read_regular_file_snapshot(
+        target, max_bytes=64 * 1024 * 1024)
+    intents, raw_by_intent = producer._review_jsonl_records(
+        snapshot.payload, "membro vivo da wave")
+    if intents != tuple(task["target_intent_ids"]):
+        raise WaveError("wave alterou ordem/cardinalidade de intent_ids")
+    changed = [
+        intent for intent, digest in task["preserved_record_sha256"].items()
+        if _sha256(raw_by_intent[intent]) != digest
+    ]
+    if changed:
+        raise WaveError(
+            "wave alterou registro preservado: " + ",".join(changed[:8]))
+    return snapshot
+
+
+def _verify_staged_unbound(
+    task: Mapping[str, Any], workspace: Any, staged_sha256: str,
+) -> Any:
+    """Authenticate private staged bytes without requiring a live preimage.
+
+    This is what makes an interrupted wave resumable: the first process may
+    already have installed a prefix.  Authority for accepting that prefix is
+    the pre-existing journal plus the exact staged digest, not a relaxed CAS.
+    """
+    single._assert_workspace_binding(workspace)
+    snapshot = producer._read_snapshot_at(
+        workspace.descriptor, "review.jsonl", missing_ok=False,
+        max_bytes=64 * 1024 * 1024)
+    if (snapshot is None or snapshot.nlink != 1 or
+            snapshot.digest != staged_sha256):
+        raise WaveError("staged privado ausente, trocado ou com hardlink")
+    intents, raw_by_intent = producer._review_jsonl_records(
+        snapshot.payload, "staged privado da wave")
+    if intents != tuple(task["target_intent_ids"]):
+        raise WaveError("staged alterou cardinalidade/ordem dos intent_ids")
+    changed = [
+        intent for intent, digest in task["preserved_record_sha256"].items()
+        if _sha256(raw_by_intent[intent]) != digest
+    ]
+    if changed:
+        raise WaveError(
+            "staged alterou registro fora do escopo: " +
+            ",".join(changed[:8]))
+    return snapshot
+
+
+def _capture_drafts(
+    tasks: list[dict[str, Any]], manifest: Mapping[str, Mapping[str, Any]],
+) -> dict[str, DraftBinding]:
+    bindings: dict[str, DraftBinding] = {}
+    try:
+        for task in tasks:
+            draft = manifest[task["slug"]]
+            workspace = single._open_workspace(task, draft["workspace"])
+            try:
+                staged = _verify_staged_unbound(
+                    task, workspace, draft["staged_sha256"])
+                if staged.digest == task["target_sha256"]:
+                    raise WaveError("draft não altera os bytes do alvo")
+                corrections = single._bounded_corrections(
+                    draft["corrigidos_por_classe"], task)
+                bindings[f"data/editorial/v2_pages/{task['slug']}.jsonl"] = (
+                    DraftBinding(task, workspace, staged, corrections))
+            except Exception:
+                os.close(workspace.descriptor)
+                raise
+        return bindings
+    except Exception:
+        for binding in bindings.values():
+            os.close(binding.workspace.descriptor)
+        raise
+
+
+def _local_audit(binding: DraftBinding) -> tuple[dict[str, list[Any]], dict[str, Any]]:
+    audit_fd = single._immutable_payload_fd(binding.staged.payload)
+    try:
+        with single._resource_lock(single.HEAVY_AUDIT_LOCK):
+            stdout, summary = single._run(
+                ["/usr/bin/nice", "-n", "19", "/usr/bin/python3",
+                 str(INSTALL_ROOT / "tools/audit_v2_pages.py"),
+                 f"/proc/self/fd/{audit_fd}", "--expect-n",
+                 str(binding.task["n"])],
+                timeout_seconds=900, label="wave-staged-local-audit",
+                pass_fds=(audit_fd,), accepted_returncodes=(0, 1))
+    finally:
+        os.close(audit_fd)
+    report = single._parse_audit(
+        stdout, "wave-staged-local-audit", require_ok=False)
+    blockers = single._validate_pre_provenance_audit(
+        report, binding.task, binding.staged.payload)
+    if summary["returncode"] != (1 if blockers else 0):
+        raise WaveError("audit local diverge dos blockers de proveniência")
+    return blockers, summary
+
+
+def _dependency_epoch(
+    bindings: Mapping[str, DraftBinding], queue_sha256: str,
+) -> dict[pathlib.Path, str]:
+    members = set(bindings)
+    dependencies: dict[pathlib.Path, str] = {
+        INSTALL_ROOT / "scripts/workflows/writing-review-todo.js": queue_sha256,
+    }
+    for binding in bindings.values():
+        for path, digest in binding.task["distinctness_dependency_sha256"].items():
+            if path in members:
+                continue
+            absolute = INSTALL_ROOT / path
+            prior = dependencies.get(absolute)
+            if prior is not None and prior != digest:
+                raise WaveError("membros contradizem preimage de peer externo")
+            dependencies[absolute] = digest
+    return dependencies
+
+
+def _lock_wave(bindings: Mapping[str, DraftBinding]) -> ExitStack:
+    all_paths = set(bindings)
+    dependencies: dict[str, str] = {}
+    for binding in bindings.values():
+        dependencies.update(binding.task["distinctness_dependency_sha256"])
+    all_paths.update(dependencies)
+    first = min(all_paths)
+    rest = {path: dependencies.get(path, "0" * 64)
+            for path in all_paths if path != first}
+    # _lock_set consumes only path identities; placeholder hashes are ignored.
+    return single._lock_set(pathlib.PurePosixPath(first).stem, rest)
+
+
+def _lock_wave_journal(wave_id: str) -> ExitStack:
+    """Serialize journal/receipt writers independently of shard locks."""
+    if not isinstance(wave_id, str) or SHA256.fullmatch(wave_id) is None:
+        raise WaveError("wave_id inválido para lock")
+    stack = ExitStack()
+    try:
+        descriptor = single._open_lock(pathlib.Path(
+            f"/tmp/opt-wiki-v2-exact-wave-{wave_id}.lock"))
+        stack.callback(os.close, descriptor)
+        return stack
+    except Exception:
+        stack.close()
+        raise
+
+
+def _assert_member_states(
+    bindings: Mapping[str, DraftBinding],
+    allowed_final: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    states: dict[str, str] = {}
+    finals = dict(allowed_final or {})
+    for path, binding in sorted(bindings.items()):
+        observed = producer.snapshot_sha256(
+            INSTALL_ROOT / path, max_bytes=64 * 1024 * 1024)
+        if path in finals:
+            if observed != finals[path]:
+                raise WaveError(
+                    "drift externo após proveniência autenticada: " + path)
+            states[path] = "post-provenance"
+            continue
+        states[path] = classify_wave_member_state(
+            binding.task["target_sha256"], binding.staged.digest, observed)
+    return states
+
+
+def _write_receipt(workspace: Any, receipt: Mapping[str, Any]) -> tuple[str, str]:
+    payload = _canonical_json(receipt)
+    digest = _sha256(payload)
+    temporary = f".{RECEIPT_NAME}.{secrets.token_hex(8)}.tmp"
+    descriptor = _open_child_regular(
+        workspace, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.link(
+            temporary, RECEIPT_NAME,
+            src_dir_fd=workspace.descriptor,
+            dst_dir_fd=workspace.descriptor,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary, dir_fd=workspace.descriptor)
+        temporary = ""
+        os.fsync(workspace.descriptor)
+    finally:
+        os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=workspace.descriptor)
+            except FileNotFoundError:
+                pass
+    single._assert_workspace_binding(workspace)
+    captured = producer._read_snapshot_at(
+        workspace.descriptor, RECEIPT_NAME, missing_ok=False,
+        max_bytes=MAX_JOURNAL_BYTES)
+    if (captured is None or captured.nlink != 1 or
+            captured.payload != payload or captured.digest != digest):
+        raise WaveError("receipt atômico divergiu depois da publicação")
+    return str(workspace.path / RECEIPT_NAME), digest
+
+
+def _wave_plan(
+    bindings: Mapping[str, DraftBinding], contract: Mapping[str, Any],
+    queue_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": JOURNAL_SCHEMA,
+        "wave_id": contract["wave_id"],
+        "queue_artifact_sha256": queue_sha256,
+        "queue_item_sha256_by_path": {
+            path: binding.task["queue_item_sha256"]
+            for path, binding in bindings.items()
+        },
+        "corrigidos_por_classe_by_path": {
+            path: binding.corrections
+            for path, binding in bindings.items()
+        },
+        "pre_sha256_by_path": {
+            path: binding.task["target_sha256"]
+            for path, binding in bindings.items()
+        },
+        "staged_sha256_by_path": {
+            path: binding.staged.digest for path, binding in bindings.items()
+        },
+        "component_ids": contract["component_ids"],
+        "member_paths": contract["member_paths"],
+        "publication_allowed": False,
+        "index_policy": "noindex",
+    }
+
+
+def _load_existing_green_receipt(
+    workspace: Any,
+    bindings: Mapping[str, DraftBinding],
+    contract: Mapping[str, Any],
+    queue_sha256: str,
+) -> tuple[dict[str, Any], str, str] | None:
+    """Recover a completed wave whose successful stdout was lost."""
+    captured = producer._read_snapshot_at(
+        workspace.descriptor, RECEIPT_NAME, missing_ok=True,
+        max_bytes=MAX_JOURNAL_BYTES)
+    if captured is None:
+        return None
+    if captured.nlink != 1:
+        raise WaveError("receipt existente possui hardlink")
+    try:
+        receipt = producer.decode_json_no_duplicate_keys(
+            captured.payload, "receipt existente da wave")
+    except ValueError as error:
+        raise WaveError("receipt existente é ambíguo") from error
+    if not isinstance(receipt, dict) or _canonical_json(receipt) != captured.payload:
+        raise WaveError("receipt existente não é JSON canônico")
+    paths = sorted(bindings)
+    current = {
+        path: producer.snapshot_sha256(
+            INSTALL_ROOT / path, max_bytes=64 * 1024 * 1024)
+        for path in paths
+    }
+    validate_wave_receipt(
+        receipt, wave_id=contract["wave_id"],
+        queue_artifact_sha256=queue_sha256,
+        current_sha256_by_path=current)
+    expected_pre = {
+        path: bindings[path].task["target_sha256"] for path in paths}
+    expected_staged = {
+        path: bindings[path].staged.digest for path in paths}
+    expected_items = {
+        path: bindings[path].task["queue_item_sha256"] for path in paths}
+    expected_corrections = {
+        path: bindings[path].corrections for path in paths}
+    if (receipt["member_paths"] != contract["member_paths"] or
+            receipt["group_id"] != contract["group_id"] or
+            receipt["cohort_index"] != contract["cohort_index"] or
+            receipt["cohort_count"] != contract["cohort_count"] or
+            receipt["component_ids"] != contract["component_ids"] or
+            receipt["preserved_owners"] != contract["preserved_owners"] or
+            receipt["pre_sha256_by_path"] != expected_pre or
+            receipt["staged_sha256_by_path"] != expected_staged or
+            receipt["queue_item_sha256_by_path"] != expected_items or
+            receipt["corrigidos_por_classe_by_path"] != expected_corrections):
+        raise WaveError("receipt existente diverge da queue/wave")
+    evidence_epoch: dict[pathlib.Path, str] = {}
+    for evidence in receipt["source_provenance_evidence_by_path"].values():
+        if (single.PROVENANCE_EVIDENCE_REL.fullmatch(evidence["path"])
+                is None):
+            raise WaveError("receipt existente aponta sidecar inválido")
+        absolute = INSTALL_ROOT / evidence["path"]
+        prior = evidence_epoch.get(absolute)
+        if prior is not None and prior != evidence["sha256"]:
+            raise WaveError("receipt existente contradiz sidecar compartilhado")
+        evidence_epoch[absolute] = evidence["sha256"]
+    producer._assert_dependency_epoch(evidence_epoch)
+    expected_journal_path = workspace.path / JOURNAL_NAME
+    if receipt["journal_path"] != str(expected_journal_path):
+        raise WaveError("receipt existente aponta journal externo")
+    journal_snapshot = producer.read_regular_file_snapshot(
+        expected_journal_path, max_bytes=MAX_JOURNAL_BYTES)
+    if journal_snapshot.digest != receipt["journal_sha256"]:
+        raise WaveError("journal evoluiu depois do receipt existente")
+    records, _ = _parse_journal(
+        journal_snapshot.payload, _wave_plan(bindings, contract, queue_sha256))
+    audits = [record for record in records
+              if record.get("event") == "post_wave_audit_passed"]
+    if (not audits or
+            audits[-1]["post_sha256_by_path"] !=
+            receipt["post_sha256_by_path"] or
+            audits[-1]["audit_report_sha256_by_path"] !=
+            receipt["audit_report_sha256_by_path"]):
+        raise WaveError("receipt existente não possui audit no journal")
+    return receipt, str(workspace.path / RECEIPT_NAME), captured.digest
+
+
+def validate_wave_receipt(
+    value: Any, *, wave_id: str, queue_artifact_sha256: str,
+    current_sha256_by_path: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Closed receipt validation shared with focused adversarial tests."""
+    fields = {
+        "schema_version", "wave_id", "group_id", "cohort_index",
+        "cohort_count", "member_paths", "component_ids", "preserved_owners",
+        "queue_artifact_sha256", "queue_item_sha256_by_path",
+        "corrigidos_por_classe_by_path",
+        "pre_sha256_by_path", "staged_sha256_by_path", "post_sha256_by_path",
+        "source_provenance_evidence_by_path", "audit_report_sha256_by_path",
+        "distinctness_generation_root_by_path", "journal_path",
+        "journal_sha256", "commands_by_path", "pre_provenance_defects_by_path",
+        "audit_ok", "mutation_applied", "publication_allowed", "index_policy",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise WaveError("receipt da wave perdeu schema fechado")
+    paths = value.get("member_paths")
+    mapping_fields = (
+        "queue_item_sha256_by_path", "pre_sha256_by_path",
+        "corrigidos_por_classe_by_path",
+        "staged_sha256_by_path", "post_sha256_by_path",
+        "source_provenance_evidence_by_path", "audit_report_sha256_by_path",
+        "distinctness_generation_root_by_path", "commands_by_path",
+        "pre_provenance_defects_by_path",
+    )
+    if (value.get("schema_version") != RECEIPT_SCHEMA or
+            value.get("wave_id") != wave_id or
+            value.get("queue_artifact_sha256") != queue_artifact_sha256 or
+            not isinstance(paths, list) or not paths or
+            paths != sorted(set(paths)) or
+            len(paths) > producer.MAX_EXACT_COMPONENT_WAVE_MEMBERS or
+            any(not isinstance(value.get(field), dict) or
+                set(value[field]) != set(paths) for field in mapping_fields) or
+            any(not isinstance(value[field][path], str) or
+                SHA256.fullmatch(value[field][path]) is None
+                for field in ("queue_item_sha256_by_path",
+                              "pre_sha256_by_path", "staged_sha256_by_path",
+                              "post_sha256_by_path", "audit_report_sha256_by_path",
+                              "distinctness_generation_root_by_path")
+                for path in paths) or
+            any(not isinstance(value["source_provenance_evidence_by_path"][path], dict) or
+                set(value["source_provenance_evidence_by_path"][path]) !=
+                {"path", "sha256"} or
+                SHA256.fullmatch(value["source_provenance_evidence_by_path"][path].get(
+                    "sha256", "")) is None for path in paths) or
+            any(not isinstance(
+                    value["corrigidos_por_classe_by_path"][path], dict) or
+                not value["corrigidos_por_classe_by_path"][path]
+                for path in paths) or
+            value.get("audit_ok") is not True or
+            value.get("mutation_applied") is not True or
+            value.get("publication_allowed") is not False or
+            value.get("index_policy") != "noindex" or
+            not isinstance(value.get("journal_path"), str) or
+            not isinstance(value.get("journal_sha256"), str) or
+            SHA256.fullmatch(value["journal_sha256"]) is None):
+        raise WaveError("receipt da wave contém identidade inválida")
+    if current_sha256_by_path is not None and (
+            dict(current_sha256_by_path) != value["post_sha256_by_path"]):
+        raise WaveError("receipt forjado/stale diverge do estoque vivo")
+    return dict(value)
+
+
+def finalize_wave(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    tasks, contract, queue_sha256 = load_queue_wave(
+        pathlib.Path(args.queue_file), args.wave_id)
+    manifest = validate_draft_manifest(_decode_drafts(args.drafts_base64), tasks)
+    bindings = _capture_drafts(tasks, manifest)
+    commands_by_path: dict[str, list[dict[str, Any]]] = {
+        path: [] for path in bindings}
+    pre_provenance: dict[str, dict[str, list[Any]]] = {
+        path: {} for path in bindings
+    }
+    journal: JournalBinding | None = None
+    wave_guard: ExitStack | None = None
+    receipt_written = False
+    coordinator = bindings[min(bindings)].workspace
+    try:
+        wave_guard = _lock_wave_journal(contract["wave_id"])
+        existing = _load_existing_green_receipt(
+            coordinator, bindings, contract, queue_sha256)
+        if existing is not None:
+            receipt, receipt_path, receipt_sha256 = existing
+            receipt_written = True
+            return {
+                "receipt_path": receipt_path,
+                "receipt_sha256": receipt_sha256,
+                "wave_id": contract["wave_id"],
+                "queue_artifact_sha256": queue_sha256,
+                "audited_sha256_by_path": receipt["post_sha256_by_path"],
+                "audit_ok": True,
+                "mutation_applied": True,
+            }, 0
+        # Read each exact staged payload once before any journal or stock write.
+        for path, binding in sorted(bindings.items()):
+            blockers, summary = _local_audit(binding)
+            commands_by_path[path].append(summary)
+            pre_provenance[path] = blockers
+            recaptured = _verify_staged_unbound(
+                binding.task, binding.workspace, binding.staged.digest)
+            if recaptured.digest != binding.staged.digest:
+                raise WaveError("staged mudou durante auditoria local")
+
+        queue_items = {
+            path: binding.task["queue_item_sha256"]
+            for path, binding in bindings.items()
+        }
+        staged_sha = {
+            path: binding.staged.digest for path, binding in bindings.items()
+        }
+        pre_sha = {
+            path: binding.task["target_sha256"]
+            for path, binding in bindings.items()
+        }
+        plan = _wave_plan(bindings, contract, queue_sha256)
+        journal = _open_or_create_journal(coordinator, plan)
+        dependency_epoch = _dependency_epoch(bindings, queue_sha256)
+        with _lock_wave(bindings):
+            dependency_identities = single._capture_dependency_identities(
+                dependency_epoch)
+            installed_records = _journal_completed(journal, "member_installed")
+            provenance_done = _journal_completed(
+                journal, "provenance_completed")
+            allowed_post = {
+                path: record["post_provenance_sha256"]
+                for path, record in provenance_done.items()
+            }
+            _assert_member_states(bindings, allowed_post)
+            for path, binding in sorted(bindings.items()):
+                single._assert_dependency_identities(
+                    dependency_epoch, dependency_identities)
+                observed = producer.snapshot_sha256(INSTALL_ROOT / path)
+                state = (
+                    "post-provenance"
+                    if path in allowed_post and observed == allowed_post[path]
+                    else classify_wave_member_state(
+                        binding.task["target_sha256"], binding.staged.digest,
+                        observed)
+                )
+                if state == "pending":
+                    producer.atomic_replace_cas(
+                        INSTALL_ROOT / path, binding.staged.payload,
+                        binding.task["target_sha256"],
+                        dependency_sha256=dependency_epoch)
+                    if producer.snapshot_sha256(
+                            INSTALL_ROOT / path) != binding.staged.digest:
+                        raise WaveError("CAS da wave instalou digest divergente")
+                    journal = _append_journal(
+                        journal, "member_installed", member_path=path,
+                        staged_sha256=binding.staged.digest)
+                elif state == "installed" and path not in installed_records:
+                    journal = _append_journal(
+                        journal, "member_installed", member_path=path,
+                        staged_sha256=binding.staged.digest,
+                        recovered_effect=True)
+                elif state == "post-provenance" and path not in installed_records:
+                    raise WaveError(
+                        "proveniência no journal não possui instalação anterior")
+                _assert_member_states(bindings, allowed_post)
+            if not any(record.get("event") == "all_members_installed"
+                       for record in journal.records):
+                journal = _append_journal(journal, "all_members_installed")
+
+            provenance_started = _journal_completed(
+                journal, "provenance_started")
+            post_sha: dict[str, str] = {}
+            provenance_evidence: dict[str, dict[str, str]] = {}
+            provenance_evidence_epoch: dict[pathlib.Path, str] = {}
+            checked_at = dt.datetime.now(dt.timezone.utc).date().isoformat()
+            for path, binding in sorted(bindings.items()):
+                prior = provenance_done.get(path)
+                if prior is not None:
+                    digest = prior.get("post_provenance_sha256")
+                    evidence = prior.get("source_provenance_evidence")
+                    if (not isinstance(digest, str) or
+                            SHA256.fullmatch(digest) is None or
+                            not isinstance(evidence, dict) or
+                            not isinstance(prior.get("commands"), list) or
+                            producer.snapshot_sha256(INSTALL_ROOT / path) != digest):
+                        raise WaveError("proveniência concluída sofreu drift")
+                    post_sha[path] = digest
+                    provenance_evidence[path] = evidence
+                    commands_by_path[path].extend(prior["commands"])
+                    evidence_path = INSTALL_ROOT / evidence["path"]
+                    prior_evidence = provenance_evidence_epoch.get(evidence_path)
+                    if (prior_evidence is not None and
+                            prior_evidence != evidence["sha256"]):
+                        raise WaveError(
+                            "sidecar de proveniência diverge entre membros")
+                    provenance_evidence_epoch[evidence_path] = evidence["sha256"]
+                    continue
+                if path in provenance_started:
+                    if producer.snapshot_sha256(
+                            INSTALL_ROOT / path) != binding.staged.digest:
+                        raise WaveError(
+                            "proveniência interrompida tem efeito não autenticado")
+                else:
+                    journal = _append_journal(
+                        journal, "provenance_started", member_path=path)
+                _verify_unbound_scope(binding.task, INSTALL_ROOT / path)
+                with single._resource_lock(single.SOURCE_PROVENANCE_LOCK):
+                    summaries, evidence = single._source_provenance(
+                        path, checked_at)
+                commands_by_path[path].extend(summaries)
+                snapshot = _verify_unbound_scope(
+                    binding.task, INSTALL_ROOT / path)
+                post_sha[path] = snapshot.digest
+                provenance_evidence[path] = evidence
+                evidence_path = INSTALL_ROOT / evidence["path"]
+                prior_evidence = provenance_evidence_epoch.get(evidence_path)
+                if (prior_evidence is not None and
+                        prior_evidence != evidence["sha256"]):
+                    raise WaveError(
+                        "sidecar de proveniência diverge entre membros")
+                provenance_evidence_epoch[evidence_path] = evidence["sha256"]
+                journal = _append_journal(
+                    journal, "provenance_completed", member_path=path,
+                    post_provenance_sha256=snapshot.digest,
+                    source_provenance_evidence=evidence,
+                    commands=summaries)
+                single._assert_dependency_identities(
+                    dependency_epoch, dependency_identities)
+
+            # This is the crucial ordering: every exact target is now visible.
+            # No member is judged against the pre-wave duplicate state.
+            audit_sha: dict[str, str] = {}
+            generation_roots: dict[str, str] = {}
+            for path, binding in sorted(bindings.items()):
+                with single._resource_lock(single.HEAVY_AUDIT_LOCK):
+                    stdout, summary = single._run(
+                        ["/usr/bin/nice", "-n", "19", "/usr/bin/python3",
+                         str(INSTALL_ROOT / "tools/audit_v2_pages.py"),
+                         str(INSTALL_ROOT / path), "--expect-n",
+                         str(binding.task["n"]), "--against-stock"],
+                        timeout_seconds=1800,
+                        label="wave-final-against-stock-audit")
+                commands_by_path[path].append(summary)
+                report = single._parse_audit(
+                    stdout, "wave-final-against-stock-audit")
+                observed = producer.snapshot_sha256(INSTALL_ROOT / path)
+                if observed != post_sha[path]:
+                    raise WaveError("membro mudou durante auditoria pós-wave")
+                _verify_unbound_scope(binding.task, INSTALL_ROOT / path)
+                generation_roots[path] = single._validate_final_audit(
+                    report, binding.task, observed)
+                audit_sha[path] = _sha256(stdout)
+            single._assert_dependency_identities(
+                dependency_epoch, dependency_identities)
+            producer._assert_dependency_epoch(provenance_evidence_epoch)
+            if _assert_member_states(bindings, post_sha) != {
+                    path: "post-provenance" for path in bindings}:
+                raise WaveError("estado pós-wave divergiu antes do receipt")
+            journal = _append_journal(
+                journal, "post_wave_audit_passed",
+                post_sha256_by_path=post_sha,
+                audit_report_sha256_by_path=audit_sha)
+            receipt = {
+                "schema_version": RECEIPT_SCHEMA,
+                "wave_id": contract["wave_id"],
+                "group_id": contract["group_id"],
+                "cohort_index": contract["cohort_index"],
+                "cohort_count": contract["cohort_count"],
+                "member_paths": contract["member_paths"],
+                "component_ids": contract["component_ids"],
+                "preserved_owners": contract["preserved_owners"],
+                "queue_artifact_sha256": queue_sha256,
+                "queue_item_sha256_by_path": queue_items,
+                "corrigidos_por_classe_by_path": {
+                    path: binding.corrections
+                    for path, binding in bindings.items()
+                },
+                "pre_sha256_by_path": pre_sha,
+                "staged_sha256_by_path": staged_sha,
+                "post_sha256_by_path": post_sha,
+                "source_provenance_evidence_by_path": provenance_evidence,
+                "audit_report_sha256_by_path": audit_sha,
+                "distinctness_generation_root_by_path": generation_roots,
+                "journal_path": str(journal.path),
+                "journal_sha256": _journal_payload_sha256(journal),
+                "commands_by_path": commands_by_path,
+                "pre_provenance_defects_by_path": pre_provenance,
+                "audit_ok": True,
+                "mutation_applied": True,
+                "publication_allowed": False,
+                "index_policy": "noindex",
+            }
+            validate_wave_receipt(
+                receipt, wave_id=contract["wave_id"],
+                queue_artifact_sha256=queue_sha256,
+                current_sha256_by_path=post_sha)
+            receipt_path, receipt_sha256 = _write_receipt(
+                coordinator, receipt)
+            receipt_written = True
+        return {
+            "receipt_path": receipt_path,
+            "receipt_sha256": receipt_sha256,
+            "wave_id": contract["wave_id"],
+            "queue_artifact_sha256": queue_sha256,
+            "audited_sha256_by_path": post_sha,
+            "audit_ok": True,
+            "mutation_applied": True,
+        }, 0
+    except Exception as error:
+        if journal is not None and not receipt_written:
+            try:
+                journal = _append_journal(
+                    journal, "failed", error_class=type(error).__name__,
+                    error=str(error)[:2000])
+            except Exception:
+                pass
+        mutation_applied = False
+        for path, binding in bindings.items():
+            try:
+                if producer.snapshot_sha256(INSTALL_ROOT / path) != (
+                        binding.task["target_sha256"]):
+                    mutation_applied = True
+            except Exception:
+                mutation_applied = True
+        return {
+            "wave_id": contract["wave_id"],
+            "audit_ok": False,
+            "mutation_applied": mutation_applied,
+            "error_class": type(error).__name__,
+            "error": str(error)[:2000],
+            "publication_allowed": False,
+            "index_policy": "noindex",
+        }, 75 if isinstance(error, single.LockBusy) else 2
+    finally:
+        if journal is not None:
+            os.close(journal.descriptor)
+        if wave_guard is not None:
+            wave_guard.close()
+        for binding in bindings.values():
+            os.close(binding.workspace.descriptor)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--queue-file", required=True)
+    parser.add_argument("--wave-id", required=True)
+    parser.add_argument("--drafts-base64", required=True)
+    args = parser.parse_args()
+
+    def terminate(signum: int, _frame: Any) -> None:
+        raise WaveError(f"finalizador de wave interrompido por sinal {signum}")
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    signal.signal(signal.SIGHUP, terminate)
+    try:
+        result, exit_code = finalize_wave(args)
+    except Exception as error:
+        result = {
+            "audit_ok": False,
+            "mutation_applied": False,
+            "error_class": type(error).__name__,
+            "error": str(error)[:2000],
+            "publication_allowed": False,
+            "index_policy": "noindex",
+        }
+        exit_code = 75 if isinstance(error, single.LockBusy) else 2
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    raise SystemExit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

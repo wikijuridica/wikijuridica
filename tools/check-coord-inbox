@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# tools/check-coord-inbox — READ-ONLY.
+#
+# Lê mensagens do bus de coordenação (.agents/runtime/coordination/bus.jsonl)
+# endereçadas ao agente chamador (to == ID ou to == all). É um snapshot: rode
+# no início da sessão e após mudança material (por exemplo, fim de comando
+# pesado ou dependência liberada), nunca em polling passivo.
+#
+# Uso:
+#   tools/check-coord-inbox --agent claude-maestro-pts7
+#   tools/check-coord-inbox --agent codex-eng-pts4 --last 30
+#   tools/check-coord-inbox --agent codex-eng-pts4 --since 2026-07-14T20:00:00
+#   tools/check-coord-inbox --agent codex-eng-pts4 --sent          # mensagens que EU enviei
+#   tools/check-coord-inbox --agent codex-eng-pts4 --quiet         # corpo resumido
+#
+# Flags:
+#   --agent ID       obrigatório
+#   --since ISO8601  opcional. Só mensagens com ts >= valor (mutuamente exclusivo com --last)
+#   --last N         opcional, default 15. Últimas N mensagens que batem no filtro
+#   --sent           opcional. Mostra from==ID em vez de to==ID/all
+#   --quiet | -q     opcional (ou WIKI_QUIET=1). Só verbosidade: mantém TODAS as
+#                    mensagens que batem no filtro e o assunto íntegro, mas corta
+#                    o corpo em 600 caracteres SEMPRE marcando o corte com
+#                    "[...truncado...]" — mensagem do bus é ordem operacional e
+#                    nunca some em silêncio. Não muda filtro nem exit code.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+AGENT=""
+SINCE=""
+LAST=15
+LAST_SET=0
+SENT=0
+QUIET=0
+if [ "${WIKI_QUIET:-0}" = "1" ]; then
+	QUIET=1
+fi
+
+usage() {
+	echo "Uso: tools/check-coord-inbox --agent ID [--since ISO8601 | --last N] [--sent] [--quiet]" >&2
+	exit 2
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--agent)
+		[ $# -ge 2 ] || usage
+		AGENT="$2"
+		shift 2
+		;;
+	--since)
+		[ $# -ge 2 ] || usage
+		SINCE="$2"
+		shift 2
+		;;
+	--last)
+		[ $# -ge 2 ] || usage
+		LAST="$2"
+		LAST_SET=1
+		shift 2
+		;;
+	--sent)
+		SENT=1
+		shift
+		;;
+	--quiet | -q)
+		QUIET=1
+		shift
+		;;
+	-h | --help) usage ;;
+	*)
+		echo "flag desconhecida: $1" >&2
+		usage
+		;;
+	esac
+done
+
+[ -n "$AGENT" ] || {
+	echo "erro: --agent é obrigatório" >&2
+	usage
+}
+
+if [ -n "$SINCE" ] && [ "$LAST_SET" -eq 1 ]; then
+	echo "erro: --since e --last são mutuamente exclusivos" >&2
+	exit 2
+fi
+
+python3 - "$ROOT" "$AGENT" "$SINCE" "$LAST" "$SENT" "$QUIET" <<'PYEOF'
+import collections
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+from datetime import datetime
+
+root, agent, since, last_raw, sent, quiet_raw = sys.argv[1:7]
+sent = sent == "1"
+quiet = quiet_raw == "1"
+# Corpo resumido no modo silencioso. O corte NUNCA é silencioso: mensagem do bus
+# carrega ordem operacional (ex.: "NAO mutar data/editorial ate o anuncio") e o
+# leitor precisa saber que existe mais texto para ler sem --quiet.
+QUIET_BODY_CHARS = 600
+
+MAX_BUS_BYTES = 8 * 1024 * 1024
+MAX_LINE_BYTES = 16 * 1024
+MAX_LAST = 100
+MAX_SINCE_RESULTS = 1000
+ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def fail(message, code=1):
+    print(f"erro: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+if not ID_PATTERN.fullmatch(agent):
+    fail("--agent inválido; use 1–96 caracteres ASCII alfanuméricos, '_' ou '-'", 2)
+try:
+    last = int(last_raw)
+except ValueError:
+    fail("--last deve ser inteiro", 2)
+if not 1 <= last <= MAX_LAST:
+    fail(f"--last deve estar entre 1 e {MAX_LAST}", 2)
+
+
+def open_absolute_directory(path):
+    if not os.path.isabs(path):
+        fail(f"raiz não absoluta: {path}")
+    current = os.open("/", DIRECTORY_FLAGS)
+    try:
+        for component in (part for part in path.split(os.sep) if part):
+            nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            os.close(current)
+            current = nxt
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def open_coord_directory():
+    root_fd = open_absolute_directory(root)
+    current = root_fd
+    try:
+        for component in (".agents", "runtime", "coordination"):
+            nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            named = os.stat(component, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(nxt)
+            if (not stat.S_ISDIR(named.st_mode) or
+                    (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                os.close(nxt)
+                fail("ancestral de coordenação foi trocado")
+            os.close(current)
+            current = nxt
+        return current
+    except FileNotFoundError:
+        os.close(current)
+        return None
+    except Exception:
+        os.close(current)
+        raise
+
+
+def read_bus():
+    coord_fd = open_coord_directory()
+    if coord_fd is None:
+        return None
+    try:
+        try:
+            fd = os.open(
+                "bus.jsonl",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=coord_fd,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            opened = os.fstat(fd)
+            named = os.stat("bus.jsonl", dir_fd=coord_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                    not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+                    (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                fail("bus.jsonl deve ser regular, sem symlink/hardlink e com identidade estável")
+            if opened.st_size > MAX_BUS_BYTES:
+                fail(f"bus.jsonl excede o teto de {MAX_BUS_BYTES} bytes")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fail("bus está recebendo append; reavalie quando houver mudança material")
+            payload = bytearray()
+            while len(payload) <= MAX_BUS_BYTES:
+                chunk = os.read(fd, min(65536, MAX_BUS_BYTES + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MAX_BUS_BYTES or os.read(fd, 1):
+                fail(f"bus.jsonl excede o teto de {MAX_BUS_BYTES} bytes")
+            after = os.fstat(fd)
+            current = os.stat("bus.jsonl", dir_fd=coord_fd, follow_symlinks=False)
+            if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                 after.st_ctime_ns, after.st_mode, after.st_nlink) !=
+                    (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+                     opened.st_ctime_ns, opened.st_mode, opened.st_nlink) or
+                    (current.st_dev, current.st_ino, current.st_size,
+                     current.st_mtime_ns, current.st_ctime_ns, current.st_mode,
+                     current.st_nlink) !=
+                    (after.st_dev, after.st_ino, after.st_size,
+                     after.st_mtime_ns, after.st_ctime_ns, after.st_mode, 1)):
+                fail("bus.jsonl mudou durante a leitura")
+            return bytes(payload)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(coord_fd)
+
+
+payload = read_bus()
+if payload is None:
+    print("sem mensagens (bus ainda não existe)")
+    raise SystemExit(0)
+if not payload:
+    print("sem mensagens (bus vazio)")
+    raise SystemExit(0)
+
+since_dt = None
+if since:
+    try:
+        since_dt = datetime.fromisoformat(since)
+    except ValueError:
+        print(f"erro: --since inválido, use ISO8601 (ex 2026-07-14T20:00:00): {since}", file=sys.stderr)
+        raise SystemExit(2)
+    if since_dt.tzinfo is None:
+        # --since sem timezone: assume o fuso local (mesmo usado ao gravar ts)
+        local_tz = datetime.now().astimezone().tzinfo
+        since_dt = since_dt.replace(tzinfo=local_tz)
+
+def matches(rec):
+    if sent:
+        if rec.get("from") != agent:
+            return False
+    else:
+        if rec.get("to") not in (agent, "all"):
+            return False
+    if since_dt is not None:
+        try:
+            rec_dt = datetime.fromisoformat(rec.get("ts", ""))
+        except (TypeError, ValueError):
+            return False
+        try:
+            too_old = rec_dt < since_dt
+        except TypeError:
+            return False
+        if too_old:
+            return False
+    return True
+
+filtered = [] if since_dt is not None else collections.deque(maxlen=last)
+for lineno, raw_line in enumerate(payload.splitlines(), start=1):
+    if len(raw_line) > MAX_LINE_BYTES:
+        fail(f"linha {lineno} do bus excede {MAX_LINE_BYTES} bytes")
+    if not raw_line.strip():
+        continue
+    try:
+        rec = json.loads(raw_line)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        print(f"aviso: linha {lineno} do bus é JSON inválido, pulando", file=sys.stderr)
+        continue
+    if not isinstance(rec, dict):
+        print(f"aviso: linha {lineno} do bus não é objeto JSON, pulando", file=sys.stderr)
+        continue
+    if matches(rec):
+        filtered.append(rec)
+        if since_dt is not None and len(filtered) > MAX_SINCE_RESULTS:
+            fail(
+                f"--since retornaria mais de {MAX_SINCE_RESULTS} mensagens; "
+                "use um instante mais recente"
+            )
+
+filtered = list(filtered)
+
+if not filtered:
+    label = "enviadas" if sent else "recebidas"
+    print(f"sem mensagens {label} para {agent}")
+    raise SystemExit(0)
+
+
+def display(value, max_chars):
+    if not isinstance(value, str):
+        return "?"
+    value = value[:max_chars]
+    return "".join(
+        character if character in "\n\t" or ord(character) >= 32 else "�"
+        for character in value
+    )
+
+for rec in filtered:
+    ts = display(rec.get("ts", "?"), 80)
+    frm = display(rec.get("from", "?"), 96)
+    to = display(rec.get("to", "?"), 96)
+    priority = display(rec.get("priority", "normal"), 16)
+    subject = display(rec.get("subject", ""), 256)
+    body = display(rec.get("body", ""), 4096)
+    print(f"[{ts}] {frm}→{to} ({priority}) {subject}")
+    if quiet and len(body) > QUIET_BODY_CHARS:
+        omitted = len(body) - QUIET_BODY_CHARS
+        print(f"  {body[:QUIET_BODY_CHARS]}")
+        print(f"  [...truncado: +{omitted} caracteres — rode sem --quiet para o corpo inteiro]")
+    else:
+        print(f"  {body}")
+PYEOF

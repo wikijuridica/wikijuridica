@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# ensure-audit-ready — prepara a auditoria de páginas UMA vez por onda.
+#
+# POR QUE ESTA FERRAMENTA EXISTE (medido em 2026-07-28):
+# Uma amostra de 60 shards / 596 páginas ativas deu 0 shards aprovados (0,0%),
+# com `distinctness_index_unavailable` em 60/60. O texto não era o problema.
+# O auditor canônico (tools/audit_v2_pages.py) é fail-closed e estava certo em
+# recusar — mas ele recusa por três causas que se alternam, e cada uma volta
+# minutos depois que alguém repara à mão:
+#
+#   1. cached_factory_stale:<arquivo.go>  — um agente editou Go e o binário
+#      .cache/go-cmd-bin/factory/factory ficou mais velho que a fonte.
+#   2. cached_factory_stale:module_metadata — alguém tocou go.mod/go.sum.
+#   3. live divergence shards exceed max=32 — uma onda de escrita mudou mais
+#      shards do que o orçamento de sobreposição incremental
+#      (DefaultMaxOverlayShards, internal/v2pagedistinctness/types.go:32).
+#
+# O efeito combinado é um ciclo: produzir conteúdo em lote estoura (3) e
+# melhorar o motor dispara (1)/(2). Os dois regimes de trabalho que o projeto
+# precisa manter simultâneos desligam a auditoria um do outro, e reparar à mão
+# nunca sai disso.
+#
+# A SAÍDA NÃO É AFROUXAR O GATE. É preparar o ambiente ANTES do lote, com o
+# auditor permanecendo estritamente fail-closed:
+#   - reconstruir a FERRAMENTA a partir da fonte é determinístico e não muda
+#     nenhuma regra de veredito; ao contrário, garante que a auditoria rode com
+#     a regra ATUAL em vez de uma stale;
+#   - produzir o ÍNDICE pelo produtor sancionado (`factory index-distinctness`)
+#     custa 6,07 s de CPU / 7,65 s de parede medidos sobre 678 shards — barato o
+#     bastante para ser rotina por onda em vez de emergência.
+# Reparar o índice DENTRO da auditoria continua PROIBIDO (viraria falso-verde):
+# por isso a preparação é um passo separado, explícito e auditável.
+#
+# Revisão adversarial (2026-07-28) rejeitou a alternativa de auto-rebuild dentro
+# do auditor por dois motivos que esta ferramenta respeita:
+#   (a) auto-rebuild resolve só 1 das 3 causas — a divergência de índice ficaria
+#       de pé e a auditoria seguiria em 0%;
+#   (b) o rebuild TEM que passar por tools/run-go-cmd-cached, que já serializa
+#       por lock e instala o binário atomicamente (mv -fT). Um `go build -o`
+#       direto abriria escrita parcial e "text file busy".
+#
+# USO:
+#   tools/ensure-audit-ready              # prepara e verifica (rota focal)
+#   tools/ensure-audit-ready --check      # só diagnostica, não repara
+#   tools/ensure-audit-ready --json       # saída legível por máquina
+#   tools/ensure-audit-ready --for-global # exige índice EXATO (medição global)
+#
+# É idempotente e barato quando tudo já está fresco.
+#
+# QUAL MODO ESTA FERRAMENTA CERTIFICA (corrigido em 2026-08-04):
+# "Pronto" não é uma propriedade absoluta — depende de QUEM vai consultar o
+# índice, e há dois consumidores com exigências diferentes:
+#
+#   - rota focal (`--against-stock`, usada pelas ondas de revisão): resolve a
+#     divergência por SOBREPOSIÇÃO e tolera até DefaultMaxOverlayShards=32
+#     shards divergentes. É o default desta ferramenta.
+#   - medição GLOBAL (`audit_v2_pages.py --global`): o lote da fábrica exige
+#     inventário e digest EXATOS contra o estoque vivo
+#     (`requireExactGenerationInventory`). Zero divergência. Use `--for-global`.
+#
+# Sem essa distinção a ferramenta dava falso-verde: em 2026-08-04 respondeu
+# {"ready":true} com 2 shards em sobreposição e a medição global morreu logo
+# depois por conteúdo divergente. Certificar sem dizer para quê era o defeito.
+#
+# CONSEQUÊNCIA OPERACIONAL de `--for-global`: a medição global e uma onda de
+# ESCRITA de conteúdo não podem correr juntas. Qualquer shard gravado durante a
+# janela invalida o lote — inclusive shard NOVO, que muda a contagem do
+# inventário. Com `--for-global` a ferramenta passa a dizer honestamente
+# ready:false durante a onda, em vez de liberar uma medição condenada.
+
+set -euo pipefail
+
+ROOT="$(
+	unset CDPATH
+	cd -- "$(dirname -- "$0")/.." && pwd
+)"
+cd "$ROOT"
+
+FACTORY_BIN="$ROOT/.cache/go-cmd-bin/factory/factory"
+DEPS_LIST="$ROOT/.cache/go-cmd-bin/factory/deps.list"
+LOCK="/tmp/opt-wiki-ensure-audit-ready.lock"
+
+CHECK_ONLY=0
+AS_JSON=0
+FOR_GLOBAL=0
+for arg in "$@"; do
+	case "$arg" in
+	--check) CHECK_ONLY=1 ;;
+	--json) AS_JSON=1 ;;
+	--for-global) FOR_GLOBAL=1 ;;
+	-h | --help)
+		sed -n '2,40p' "$0"
+		exit 0
+		;;
+	*)
+		echo "ensure-audit-ready: argumento desconhecido: $arg (use --check, --json, --for-global)" >&2
+		exit 2
+		;;
+	esac
+done
+
+say() {
+	if [[ "$AS_JSON" == "0" ]]; then
+		echo "ensure-audit-ready: $*"
+	fi
+}
+
+# Um shard qualquer serve de canário: se a auditoria dele consegue CONSULTAR o
+# índice, o ambiente está pronto. Escolhemos determinísticamente o primeiro em
+# ordem, para o resultado ser reproduzível entre execuções.
+canary_shard() {
+	local first
+	first="$(find data/editorial/v2_pages -maxdepth 1 -name '*.jsonl' -type f | sort | head -1)"
+	printf '%s' "$first"
+}
+
+# Devolve o motivo de indisponibilidade do índice, ou string vazia se o auditor
+# conseguiu consultá-lo. Note que um shard pode REPROVAR por defeito editorial
+# legítimo e mesmo assim ter o índice disponível — é exatamente essa distinção
+# que interessa aqui, e por isso lemos distinctness_index.reason, nunca `ok`.
+index_reason() {
+	local shard="$1" lines
+	[[ -n "$shard" && -f "$shard" ]] || {
+		printf 'canary_shard_ausente'
+		return 0
+	}
+	lines="$(grep -c '' "$shard" 2>/dev/null || echo 0)"
+	# O auditor sai com 1 sempre que o shard reprova — e reprovar por defeito
+	# editorial é um resultado LEGÍTIMO aqui, não um erro desta ferramenta. Sob
+	# `set -euo pipefail` esse exit derrubaria o script inteiro, então a saída é
+	# capturada primeiro e o status descartado de propósito; o que decide é o
+	# campo distinctness_index.status, não o código de saída.
+	local audit_json
+	audit_json="$(nice -n 19 python3 "$ROOT/tools/audit_v2_pages.py" "$shard" \
+		--expect-n "$lines" --against-stock 2>/dev/null || true)"
+	printf '%s' "$audit_json" |
+		STRICT_EXACT_INDEX="$FOR_GLOBAL" python3 -c '
+import json, os, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("auditor_sem_saida_json")
+    raise SystemExit(0)
+index = payload.get("distinctness_index") or {}
+status = index.get("status")
+# "ready" é o único estado em que a consulta ao índice funcionou.
+if status != "ready":
+    print(index.get("reason") or status or "desconhecido")
+    raise SystemExit(0)
+# 2026-08-04 — FALSO-VERDE MEDIDO. O canário é auditado por --against-stock,
+# que resolve divergência por SOBREPOSIÇÃO e tolera até
+# DefaultMaxOverlayShards=32 shards divergentes
+# (internal/v2pagedistinctness/types.go:32). O lote GLOBAL não tolera nenhum:
+# requireExactGenerationInventory (internal/v2pagedistinctness/batch.go:427)
+# exige inventário e digest de conteúdo EXATOS contra o estoque vivo. Por isso
+# esta ferramenta respondeu {"ready":true,"indexed":false} às 09:56 e a medição
+# global morreu em seguida com "global batch generation content differs from
+# live shard=data/editorial/v2_pages/bancario-05.jsonl": ela certificou um modo
+# (focal) e o chamador usou outro (global). Certificar sem dizer PARA QUÊ era o
+# defeito; --for-global torna o critério explícito e igual ao do consumidor.
+if os.environ.get("STRICT_EXACT_INDEX") == "1":
+    overlay = index.get("overlay_shards_parsed")
+    if overlay != 0:
+        print("indice_diverge_do_estoque_vivo:overlay_shards_parsed=%s" % (overlay,))
+        raise SystemExit(0)
+print("")
+'
+}
+
+deps_list_stale() {
+	# O teste de frescor do auditor (tools/audit_v2_pages.py:25537-25603) itera o
+	# manifesto de dependências para decidir se o binário envelheceu. Se o
+	# próprio manifesto for mais velho que o binário, pacote novo no fecho deixa
+	# de ser vigiado — falso-FRESCO. Encontrado ao vivo em 2026-07-28: deps.list
+	# de 22/07 contra binário de 28/07.
+	[[ -f "$DEPS_LIST" && -f "$FACTORY_BIN" ]] || return 0
+	[[ "$DEPS_LIST" -ot "$FACTORY_BIN" ]]
+}
+
+rebuild_factory() {
+	# Sempre pelo wrapper: ele serializa por lock, instala com mv -fT atômico e
+	# regenera o deps.list. `go build -o` direto abriria escrita parcial.
+	say "reconstruindo o binário factory pelo wrapper sancionado"
+	"$ROOT/tools/run-go-cmd-cached" ./cmd/factory --help >/dev/null 2>&1 || true
+}
+
+produce_index() {
+	say "produzindo o índice de distinção (produtor sancionado)"
+	"$FACTORY_BIN" index-distinctness
+}
+
+main() {
+	local shard reason rebuilt=0 indexed=0 forced_rebuild=0
+
+	shard="$(canary_shard)"
+	reason="$(index_reason "$shard")"
+
+	if [[ -z "$reason" ]] && ! deps_list_stale; then
+		say "já pronto (índice consultável, manifesto de dependências fresco)"
+		if [[ "$AS_JSON" == "1" ]]; then
+			printf '{"ready":true,"rebuilt":false,"indexed":false,"reason":""}\n'
+		fi
+		return 0
+	fi
+
+	if [[ "$CHECK_ONLY" == "1" ]]; then
+		local diag="${reason:-deps_list_stale}"
+		if [[ "$AS_JSON" == "1" ]]; then
+			printf '{"ready":false,"rebuilt":false,"indexed":false,"reason":"%s"}\n' "$diag"
+		else
+			echo "ensure-audit-ready: NÃO pronto — $diag" >&2
+			echo "ensure-audit-ready: rode 'tools/ensure-audit-ready' para preparar" >&2
+		fi
+		return 1
+	fi
+
+	# Serializa a preparação: N auditorias concorrentes não devem reconstruir em
+	# manada. Quem chega depois espera e reavalia — o trabalho já pode estar feito.
+	exec 9>"$LOCK"
+	flock 9
+
+	shard="$(canary_shard)"
+	reason="$(index_reason "$shard")"
+	if [[ -z "$reason" ]] && ! deps_list_stale; then
+		say "outro processo já preparou enquanto eu esperava o lock"
+		if [[ "$AS_JSON" == "1" ]]; then
+			printf '{"ready":true,"rebuilt":false,"indexed":false,"reason":""}\n'
+		fi
+		return 0
+	fi
+
+	if deps_list_stale; then
+		forced_rebuild=1
+		say "manifesto de dependências mais velho que o binário — falso-fresco latente"
+	fi
+
+	if [[ "$forced_rebuild" == "1" || "$reason" == cached_factory_stale:* || ! -x "$FACTORY_BIN" ]]; then
+		rebuild_factory
+		rebuilt=1
+		reason="$(index_reason "$shard")"
+	fi
+
+	if [[ -n "$reason" ]]; then
+		produce_index
+		indexed=1
+		reason="$(index_reason "$shard")"
+	fi
+
+	# Uma segunda causa pode ter aparecido durante a preparação (ex.: outro
+	# agente tocou go.mod enquanto o índice era produzido). Uma única repetição
+	# resolve o caso comum sem virar laço: se ainda falhar, reprovamos e
+	# dizemos o motivo, em vez de insistir para sempre.
+	if [[ -n "$reason" ]]; then
+		say "estado mudou durante a preparação ($reason) — repetindo uma vez"
+		rebuild_factory
+		rebuilt=1
+		produce_index
+		indexed=1
+		reason="$(index_reason "$shard")"
+	fi
+
+	if [[ -n "$reason" ]]; then
+		if [[ "$AS_JSON" == "1" ]]; then
+			printf '{"ready":false,"rebuilt":%s,"indexed":%s,"reason":"%s"}\n' \
+				"$([[ $rebuilt == 1 ]] && echo true || echo false)" \
+				"$([[ $indexed == 1 ]] && echo true || echo false)" "$reason"
+		else
+			echo "ensure-audit-ready: FALHOU — índice segue indisponível: $reason" >&2
+		fi
+		return 1
+	fi
+
+	say "pronto (rebuild=$rebuilt índice=$indexed)"
+	if [[ "$AS_JSON" == "1" ]]; then
+		printf '{"ready":true,"rebuilt":%s,"indexed":%s,"reason":""}\n' \
+			"$([[ $rebuilt == 1 ]] && echo true || echo false)" \
+			"$([[ $indexed == 1 ]] && echo true || echo false)"
+	fi
+	return 0
+}
+
+main

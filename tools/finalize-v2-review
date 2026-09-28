@@ -1,0 +1,1417 @@
+#!/usr/bin/env python3
+"""Finaliza um draft de revisão v2 de forma serial, autenticada e fail-closed.
+
+Os agentes redatores produzem somente ``review.jsonl`` em workspaces privados.
+Este consumidor determinístico valida o snapshot, retém os locks relacionais
+do alvo e dos peers durante a transação e toma cada lock global somente durante
+o recurso correspondente. Promove por CAS relacional, atualiza proveniência e
+executa exatamente uma auditoria focal contra o estoque. O stdout e o arquivo
+``finalizer-receipt.json`` são recibos; nenhum deles autoriza publicação.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import ExitStack
+from typing import Any, Mapping, NamedTuple
+
+
+INSTALL_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(INSTALL_ROOT) not in sys.path:
+    sys.path.insert(0, str(INSTALL_ROOT))
+
+from tools import generate_v2_review_queue as producer  # noqa: E402
+from tools import audit_v2_pages as auditor_contract  # noqa: E402
+
+
+SHA256 = re.compile(r"[0-9a-f]{64}")
+SLUG = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+)+")
+DEFECT_CLASS = re.compile(r"[a-z][a-z0-9_]*")
+INTENT_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+TARGET_REL = re.compile(
+    r"data/editorial/v2_pages/[a-z0-9_]+(?:-[a-z0-9_]+)+\.jsonl")
+PROVENANCE_EVIDENCE_REL = re.compile(
+    r"data/source-registry/v2_source_provenance_live_evidence_sets/"
+    r"exact-[0-9a-f]{64}\.jsonl")
+MAX_ARGUMENT_BYTES = 4 * 1024 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
+WORKSPACE_SUFFIX = re.compile(r"[a-z0-9_]{6,64}")
+SAFE_CHILD_ENV = {
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONNOUSERSITE": "1",
+    "GOMAXPROCS": "2",
+}
+SOURCE_PROVENANCE_LOCK = pathlib.Path("/tmp/opt-wiki-source-provenance.lock")
+HEAVY_AUDIT_LOCK = pathlib.Path("/tmp/opt-wiki-agent-heavy.lock")
+V3_EPOCH_KEYS = frozenset({
+    "algorithm_fingerprint", "authenticated_shards", "batch_fingerprint",
+    "generation_root", "index_policy", "mode", "publication_allowed",
+    "schema_version", "stock_root",
+})
+EXPECTED_INCREMENTAL_ALGORITHM_FINGERPRINT = (
+    "820fdf028ed4a3f17a1cf33baf4afb374b04eb470e562b5f522e1c751d84b5da"
+)
+EXPECTED_GLOBAL_BATCH_FINGERPRINT = (
+    "0ce4bfd7be926422d4dfba669ebdda9a8871003b0e9bbbe5ae288630f1640bec"
+)
+
+
+class FinalizationError(RuntimeError):
+    """O draft não pode formar claim autenticada."""
+
+
+class LockBusy(FinalizationError):
+    """Um produtor legítimo já possui recurso necessário."""
+
+
+class WorkspaceBinding(NamedTuple):
+    """Diretório privado mantido aberto e ligado ao nome canônico.
+
+    O pai é ``producer.workflow_workspace_parent()``, nunca ``/tmp``.
+    """
+
+    path: pathlib.Path
+    descriptor: int
+    device: int
+    inode: int
+    uid: int
+    mode: int
+
+
+class ReceiptReservation(NamedTuple):
+    """Nome create-only reservado antes da primeira operação mutável."""
+
+    descriptor: int
+    device: int
+    inode: int
+
+
+def _decode_base64_json(raw: str, label: str) -> Any:
+    if not isinstance(raw, str) or len(raw) > (MAX_ARGUMENT_BYTES * 2):
+        raise FinalizationError(f"{label} excede limite")
+    try:
+        payload = base64.b64decode(raw, validate=True)
+    except (ValueError, TypeError) as error:
+        raise FinalizationError(f"{label} não é base64 canônico") from error
+    if not payload or len(payload) > MAX_ARGUMENT_BYTES:
+        raise FinalizationError(f"{label} vazio ou excede limite")
+    if base64.b64encode(payload).decode("ascii") != raw:
+        raise FinalizationError(f"{label} não é base64 canônico")
+    try:
+        return producer.decode_json_no_duplicate_keys(payload, label)
+    except ValueError as error:
+        raise FinalizationError(f"{label} não é JSON fechado") from error
+
+
+def _canonical_json(value: Any) -> bytes:
+    return (json.dumps(
+        value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _bounded_corrections(value: Any, task: Mapping[str, Any]) -> dict[str, int]:
+    defects = task.get("defeitos")
+    if (not isinstance(value, dict) or not value or
+            not isinstance(defects, dict)):
+        raise FinalizationError("correções devem ser objeto não vazio")
+    normalized: dict[str, int] = {}
+    for code, count in value.items():
+        expected = defects.get(code)
+        if (not isinstance(code, str) or DEFECT_CLASS.fullmatch(code) is None or
+                type(expected) is not int or expected < 1 or
+                type(count) is not int or count < 1 or count > expected):
+            raise FinalizationError("mapa de correções não corresponde à fila")
+        normalized[code] = count
+    return dict(sorted(normalized.items()))
+
+
+def _validate_task(
+    value: Any, *, allow_exact_component_wave: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise FinalizationError("queue item deve ser objeto")
+    if ("exact_component_wave" in value and
+            not allow_exact_component_wave):
+        raise FinalizationError(
+            "item exact_component_wave exige finalize-v2-review-wave")
+    slug = value.get("slug")
+    target_sha256 = value.get("target_sha256")
+    n = value.get("n")
+    if (not isinstance(slug, str) or SLUG.fullmatch(slug) is None or
+            not isinstance(target_sha256, str) or
+            SHA256.fullmatch(target_sha256) is None or
+            type(n) is not int or n < 1 or n > 100_000):
+        raise FinalizationError("identidade do queue item é inválida")
+    area = value.get("area")
+    defects = value.get("defeitos")
+    targets_by_class = value.get("alvos")
+    if (not isinstance(area, str) or
+            re.fullmatch(r"[a-z0-9_]+(?:-[a-z0-9_]+)*", area) is None or
+            not isinstance(defects, dict) or not defects or
+            not isinstance(targets_by_class, dict) or
+            set(defects) != set(targets_by_class)):
+        raise FinalizationError("classes do queue item são inválidas")
+    for code, targets in targets_by_class.items():
+        count = defects.get(code)
+        if (not isinstance(code, str) or DEFECT_CLASS.fullmatch(code) is None or
+                not isinstance(targets, list) or not targets or
+                len(targets) != len(set(targets)) or
+                any(not isinstance(target, str) or
+                    target != target.strip() or not target or
+                    len(target) > 1024 for target in targets) or
+                type(count) is not int or count != len(targets)):
+            raise FinalizationError(
+                "alvos/defeitos do queue item não são projeções exatas")
+
+    target_intent_ids = value.get("target_intent_ids")
+    review_target_intent_ids = value.get("review_target_intent_ids")
+    preserved = value.get("preserved_record_sha256")
+    if (not isinstance(target_intent_ids, list) or
+            len(target_intent_ids) != n or
+            len(set(target_intent_ids)) != len(target_intent_ids) or
+            any(not isinstance(intent, str) or
+                INTENT_ID.fullmatch(intent) is None
+                for intent in target_intent_ids) or
+            not isinstance(review_target_intent_ids, list) or
+            not review_target_intent_ids or
+            len(set(review_target_intent_ids)) !=
+            len(review_target_intent_ids) or
+            any(not isinstance(intent, str) or
+                INTENT_ID.fullmatch(intent) is None
+                for intent in review_target_intent_ids) or
+            type(value.get("file_wide_review")) is not bool or
+            not isinstance(preserved, dict)):
+        raise FinalizationError("escopo do queue item é inválido")
+    target_set = set(target_intent_ids)
+    derived_targets: set[str] = set()
+    requires_file_wide = False
+    for defect_class, targets in targets_by_class.items():
+        file_wide_pattern = producer.FILE_WIDE_REVIEW_DEFECT_TARGETS.get(
+            defect_class)
+        if file_wide_pattern is not None:
+            if any(file_wide_pattern.fullmatch(target) is None
+                   for target in targets):
+                raise FinalizationError(
+                    "alvo file-wide não corresponde à allowlist canônica")
+            requires_file_wide = True
+            continue
+        for raw_target in targets:
+            candidate = raw_target.split("~", 1)[0].split(":", 1)[0]
+            if (INTENT_ID.fullmatch(candidate) is None or
+                    candidate not in target_set):
+                raise FinalizationError(
+                    "alvo record-level não resolve no shard autenticado")
+            derived_targets.add(candidate)
+    expected_review_targets = (
+        list(target_intent_ids) if requires_file_wide else
+        [intent for intent in target_intent_ids if intent in derived_targets]
+    )
+    expected_preserved = set(target_intent_ids) - set(expected_review_targets)
+    if (not expected_review_targets or
+            value["file_wide_review"] != requires_file_wide or
+            review_target_intent_ids != expected_review_targets or
+            set(preserved) != expected_preserved or
+            any(not isinstance(intent, str) or
+                INTENT_ID.fullmatch(intent) is None or
+                not isinstance(digest, str) or
+                SHA256.fullmatch(digest) is None
+                for intent, digest in preserved.items())):
+        raise FinalizationError(
+            "escopo editável não deriva exatamente dos alvos da fila")
+    expected_file = f"data/editorial/v2_pages/{slug}.jsonl"
+    dependencies = value.get("distinctness_dependency_sha256")
+    if (not isinstance(dependencies, dict) or len(dependencies) > 50_000 or
+            any(not isinstance(path, str) or TARGET_REL.fullmatch(path) is None or
+                not isinstance(digest, str) or SHA256.fullmatch(digest) is None
+                for path, digest in dependencies.items())):
+        raise FinalizationError("epoch relacional do queue item é inválido")
+    if expected_file in dependencies:
+        raise FinalizationError("alvo não pode aparecer como peer relacional")
+    _validate_relational_task(value, expected_file, dependencies)
+    return dict(value)
+
+
+def _validate_relational_task(
+    value: Mapping[str, Any],
+    target_rel: str,
+    dependencies: Mapping[str, str],
+) -> None:
+    """Revalida a projeção relacional; fingerprint sozinho não é autoridade."""
+    classes = set(value["alvos"])
+    operational = sorted(
+        code for code in classes
+        if code == "intent_id_dup_global" or code.startswith("distinctness_")
+    )
+    if operational:
+        raise FinalizationError(
+            "classe operacional não pode virar tarefa editorial: " +
+            ",".join(operational))
+
+    # Evidência n-gram continua fechada mesmo depois do vertex cover selecionar
+    # só uma direção da aresta simétrica.
+    ngram_classes = classes & set(producer.NGRAM_DEFECT_CLASSES)
+    raw_ngram_evidence = value.get("evidencias")
+    if ngram_classes:
+        if (not isinstance(raw_ngram_evidence, dict) or
+                set(raw_ngram_evidence) != ngram_classes):
+            raise FinalizationError(
+                "evidências ngram não cobrem exatamente as classes da tarefa")
+        for code in sorted(ngram_classes):
+            entries = raw_ngram_evidence.get(code)
+            targets = value["alvos"][code]
+            if (not isinstance(entries, list) or len(entries) != len(targets) or
+                    not all(isinstance(entry, dict) for entry in entries)):
+                raise FinalizationError(
+                    f"evidência ngram inválida: {code}")
+            observed: set[str] = set()
+            for entry in entries:
+                if set(entry) != {"target", "phrase", "field", "peer_field"}:
+                    raise FinalizationError(
+                        f"schema de evidência ngram aberto: {code}")
+                raw_target = entry.get("target")
+                try:
+                    current, peer = producer._parse_ngram_target(raw_target)
+                except (TypeError, ValueError) as error:
+                    raise FinalizationError(
+                        f"aresta ngram inválida: {code}") from error
+                if (raw_target not in targets or raw_target in observed or
+                        INTENT_ID.fullmatch(current) is None or
+                        INTENT_ID.fullmatch(peer) is None or current == peer or
+                        (code == "ngram_dup" and
+                         peer not in value["target_intent_ids"]) or
+                        not isinstance(entry.get("phrase"), str) or
+                        len(entry["phrase"].split()) !=
+                        producer.NGRAM_EVIDENCE_WORDS or
+                        entry["phrase"] != " ".join(entry["phrase"].split()) or
+                        not isinstance(entry.get("field"), str) or
+                        producer.NGRAM_EVIDENCE_FIELD_RE.fullmatch(
+                            entry["field"]) is None or
+                        not isinstance(entry.get("peer_field"), str) or
+                        producer.NGRAM_EVIDENCE_FIELD_RE.fullmatch(
+                            entry["peer_field"]) is None):
+                    raise FinalizationError(
+                        f"conteúdo de evidência ngram inválido: {code}")
+                observed.add(raw_target)
+            if observed != set(targets):
+                raise FinalizationError(
+                    f"evidência ngram diverge dos alvos: {code}")
+    elif "evidencias" in value:
+        raise FinalizationError("evidencias sem classe ngram correspondente")
+
+    v3_classes = classes & set(producer.V3_REVIEW_DEFECT_CLASSES)
+    raw_v3 = value.get("evidencias_distinctness")
+    raw_components = value.get("componentes_distinctness")
+    epoch = value.get("distinctness_epoch")
+    if not v3_classes:
+        if any(key in value for key in (
+                "evidencias_distinctness", "componentes_distinctness",
+                "distinctness_epoch")):
+            raise FinalizationError(
+                "artefato distinctness v3 existe sem classe v3")
+        return
+    if not isinstance(raw_v3, dict) or set(raw_v3) != v3_classes:
+        raise FinalizationError(
+            "evidências distinctness não cobrem exatamente as classes v3")
+
+    review_targets = set(value["review_target_intent_ids"])
+    required_dependency_paths: set[str] = set()
+    exact_targets: dict[str, set[str]] = {}
+    for code in sorted(v3_classes):
+        targets = value["alvos"][code]
+        entries = raw_v3.get(code)
+        if (not isinstance(entries, list) or len(entries) != len(targets) or
+                not all(isinstance(entry, dict) for entry in entries)):
+            raise FinalizationError(
+                f"evidência distinctness inválida: {code}")
+        observed: set[str] = set()
+        class_targets: set[str] = set()
+        for entry in entries:
+            try:
+                producer._validate_v3_issue_schema(entry, target_rel)
+                target = producer._v3_endpoint(
+                    entry.get("projection_target"), "target")
+                peer = producer._v3_endpoint(
+                    entry.get("projection_peer"), "peer")
+                left = producer._v3_endpoint(entry.get("left"), "left")
+                right = producer._v3_endpoint(entry.get("right"), "right")
+            except (TypeError, ValueError) as error:
+                raise FinalizationError(
+                    f"schema distinctness v3 inválido: {code}") from error
+            identity = f"{target[1]}~{peer[1]}"
+            if (entry.get("code") != code or target[0] != target_rel or
+                    target == peer or {left, right} != {target, peer} or
+                    target[1] not in review_targets or
+                    identity not in targets or identity in observed):
+                raise FinalizationError(
+                    f"projeção distinctness v3 divergente: {code}")
+            observed.add(identity)
+            class_targets.add(target[1])
+            if peer[0] != target_rel:
+                required_dependency_paths.add(peer[0])
+        if observed != set(targets):
+            raise FinalizationError(
+                f"evidência distinctness diverge dos alvos: {code}")
+        exact_targets[code] = class_targets
+
+    exact_classes = v3_classes & set(producer.V3_EXACT_REVIEW_DEFECT_CLASSES)
+    if exact_classes:
+        if (not isinstance(raw_components, dict) or
+                set(raw_components) != exact_classes):
+            raise FinalizationError(
+                "componentes exact distinctness não cobrem as classes")
+        for code in sorted(exact_classes):
+            entries = raw_components.get(code)
+            if not isinstance(entries, list) or not entries:
+                raise FinalizationError(
+                    f"componentes distinctness inválidos: {code}")
+            observed_targets: set[str] = set()
+            for component in entries:
+                if (not isinstance(component, dict) or set(component) != {
+                        "projection_target", "preserved_owner",
+                        "component_id", "member_count"}):
+                    raise FinalizationError(
+                        f"schema de componente distinctness aberto: {code}")
+                try:
+                    target = producer._v3_endpoint(
+                        component.get("projection_target"), "component-target")
+                    owner = producer._v3_endpoint(
+                        component.get("preserved_owner"), "component-owner")
+                except (TypeError, ValueError) as error:
+                    raise FinalizationError(
+                        f"endpoint de componente inválido: {code}") from error
+                member_count = component.get("member_count")
+                component_id = component.get("component_id")
+                if (target[0] != target_rel or target == owner or
+                        target[1] not in exact_targets[code] or
+                        target[1] in observed_targets or
+                        type(member_count) is not int or
+                        not 2 <= member_count <= producer.V3_COUNTER_MAX or
+                        not isinstance(component_id, str) or
+                        SHA256.fullmatch(component_id) is None):
+                    raise FinalizationError(
+                        f"conteúdo de componente distinctness inválido: {code}")
+                observed_targets.add(target[1])
+                if owner[0] != target_rel:
+                    required_dependency_paths.add(owner[0])
+            if observed_targets != exact_targets[code]:
+                raise FinalizationError(
+                    f"componentes distinctness divergem dos alvos: {code}")
+    elif "componentes_distinctness" in value:
+        raise FinalizationError(
+            "componentes distinctness sem classe exact correspondente")
+
+    if not required_dependency_paths.issubset(dependencies):
+        raise FinalizationError(
+            "peer v3 não está coberto pelo epoch de dependências")
+    if not isinstance(epoch, dict) or set(epoch) != V3_EPOCH_KEYS:
+        raise FinalizationError("schema do distinctness_epoch é inválido")
+    authenticated = epoch.get("authenticated_shards")
+    if (epoch.get("mode") != producer.GLOBAL_DISTINCTNESS_MODE or
+            epoch.get("schema_version") != 1 or
+            epoch.get("algorithm_fingerprint") !=
+            EXPECTED_INCREMENTAL_ALGORITHM_FINGERPRINT or
+            epoch.get("batch_fingerprint") !=
+            EXPECTED_GLOBAL_BATCH_FINGERPRINT or
+            not isinstance(epoch.get("generation_root"), str) or
+            SHA256.fullmatch(epoch["generation_root"]) is None or
+            not isinstance(epoch.get("stock_root"), str) or
+            SHA256.fullmatch(epoch["stock_root"]) is None or
+            type(authenticated) is not int or
+            not len(dependencies) + 1 <= authenticated <=
+            producer.V3_COUNTER_MAX or
+            epoch.get("publication_allowed") is not False or
+            epoch.get("index_policy") != "noindex"):
+        raise FinalizationError("conteúdo do distinctness_epoch é inválido")
+
+
+def _queue_item_fingerprint(item: Mapping[str, Any]) -> str:
+    try:
+        return producer.review_queue_item_sha256(item)
+    except ValueError as error:
+        raise FinalizationError("item da fila não é JSON canônico") from error
+
+
+def _parse_queue_payload(payload: bytes, slug: str) -> dict[str, Any]:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise FinalizationError("fila canônica não é UTF-8") from error
+    rca_prefix = "const REVIEW_QUEUE_OPERATIONAL_RCA = "
+    files_prefix = "const files = "
+    rca_lines = [line[len(rca_prefix):] for line in text.splitlines()
+                 if line.startswith(rca_prefix)]
+    files_lines = [line[len(files_prefix):] for line in text.splitlines()
+                   if line.startswith(files_prefix)]
+    if len(rca_lines) != 1 or len(files_lines) != 1:
+        raise FinalizationError("fila não possui envelope canônico único")
+    try:
+        rca = producer.decode_json_no_duplicate_keys(
+            rca_lines[0].encode("utf-8"), "queue-rca")
+        entries = producer.decode_json_no_duplicate_keys(
+            files_lines[0].encode("utf-8"), "queue-files")
+    except ValueError as error:
+        raise FinalizationError("envelope JSON da fila é inválido") from error
+    if rca is not None:
+        raise FinalizationError("fila está desabilitada por RCA operacional")
+    if not isinstance(entries, list) or not entries:
+        raise FinalizationError("fila canônica está vazia")
+    matches = [item for item in entries
+               if isinstance(item, dict) and item.get("slug") == slug]
+    if len(matches) != 1:
+        raise FinalizationError("slug ausente ou duplicado na fila canônica")
+    item = _validate_task(matches[0])
+    declared = item.get("queue_item_sha256")
+    if (not isinstance(declared, str) or SHA256.fullmatch(declared) is None or
+            declared != _queue_item_fingerprint(item)):
+        raise FinalizationError("fingerprint do item da fila diverge")
+    return item
+
+
+def _load_queue_item(path: pathlib.Path, slug: str) -> tuple[dict[str, Any], str]:
+    expected = (INSTALL_ROOT / "scripts/workflows/writing-review-todo.js").resolve()
+    try:
+        actual = path.resolve(strict=True)
+    except OSError as error:
+        raise FinalizationError("fila canônica está ausente") from error
+    if actual != expected:
+        raise FinalizationError(f"queue-file deve ser {expected}")
+    snapshot = producer.read_regular_file_snapshot(actual, max_bytes=64 * 1024 * 1024)
+    return _parse_queue_payload(snapshot.payload, slug), snapshot.digest
+
+
+def _workspace_info(descriptor: int) -> tuple[int, int, int, int]:
+    info = os.fstat(descriptor)
+    mode = stat.S_IMODE(info.st_mode)
+    if (not stat.S_ISDIR(info.st_mode) or mode != 0o700 or
+            info.st_uid != os.geteuid()):
+        raise FinalizationError(
+            "workspace deve ser diretório privado 0700 do processo")
+    return info.st_dev, info.st_ino, info.st_uid, mode
+
+
+def _open_workspace(task: Mapping[str, Any], raw_path: Any) -> WorkspaceBinding:
+    """Abre somente o namespace que ``create_workflow_workspace`` produz.
+
+    O pai vem de ``producer.workflow_workspace_parent()`` — fonte única, não
+    uma cópia. Este consumidor ficou preso a ``/tmp`` quando o produtor migrou
+    para ``.agents/runtime/wworkspaces`` (92c6a7f8, 2026-08-04) e, até
+    2026-09-05, recusou todo workspace real do fluxo de revisão. ``/tmp`` não
+    é mais namespace aceito: o produtor não escreve lá e o systemd o apaga a
+    cada boot.
+    """
+    if (not isinstance(raw_path, str) or not raw_path or
+            "\x00" in raw_path or not os.path.isabs(raw_path) or
+            os.path.abspath(raw_path) != raw_path):
+        raise FinalizationError("workspace deve ser path absoluto canônico")
+    path = pathlib.Path(raw_path)
+    parent = producer.workflow_workspace_parent()
+    prefix = f"wiki-v2-{task['slug']}-{task['target_sha256'][:12]}-"
+    suffix = path.name[len(prefix):] if path.name.startswith(prefix) else ""
+    if (path.parent != parent or
+            WORKSPACE_SUFFIX.fullmatch(suffix) is None):
+        raise FinalizationError(
+            "workspace não pertence ao namespace privado desta tarefa")
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    parent_fd = os.open(os.fspath(parent), parent_flags)
+    try:
+        descriptor = os.open(
+            path.name, parent_flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    try:
+        device, inode, uid, mode = _workspace_info(descriptor)
+        return WorkspaceBinding(path, descriptor, device, inode, uid, mode)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _assert_workspace_binding(binding: WorkspaceBinding) -> None:
+    observed = _workspace_info(binding.descriptor)
+    expected = (binding.device, binding.inode, binding.uid, binding.mode)
+    if observed != expected:
+        raise FinalizationError("inode do workspace aberto evoluiu")
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    # O pai foi validado em _open_workspace; reabrir o MESMO pai é o que
+    # autentica que o nome canônico ainda aponta para o inode ligado.
+    parent_fd = os.open(os.fspath(binding.path.parent), parent_flags)
+    candidate_fd: int | None = None
+    try:
+        candidate_fd = os.open(
+            binding.path.name, parent_flags, dir_fd=parent_fd)
+        if _workspace_info(candidate_fd) != expected:
+            raise FinalizationError(
+                "nome canônico do workspace foi trocado")
+    finally:
+        if candidate_fd is not None:
+            os.close(candidate_fd)
+        os.close(parent_fd)
+
+
+def _reserve_receipt(binding: WorkspaceBinding) -> ReceiptReservation:
+    """Reserva o recibo antes da promoção; colisão falha sem mutar o alvo."""
+    _assert_workspace_binding(binding)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(
+        "finalizer-receipt.json", flags, 0o000,
+        dir_fd=binding.descriptor)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                info.st_size != 0):
+            raise FinalizationError("reserva do receipt não é regular e vazia")
+        os.fsync(binding.descriptor)
+        _assert_workspace_binding(binding)
+        return ReceiptReservation(descriptor, info.st_dev, info.st_ino)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _receipt_path_identity(
+    binding: WorkspaceBinding,
+    reservation: ReceiptReservation,
+) -> os.stat_result:
+    info = os.stat(
+        "finalizer-receipt.json", dir_fd=binding.descriptor,
+        follow_symlinks=False)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+            (info.st_dev, info.st_ino) !=
+            (reservation.device, reservation.inode)):
+        raise FinalizationError("nome do receipt deixou de apontar à reserva")
+    return info
+
+
+def _open_lock(path: pathlib.Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise FinalizationError(f"lock inseguro: {path}")
+        os.fchmod(fd, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise LockBusy(f"lock ocupado: {path}") from error
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _lock_set(
+    slug: str,
+    dependency_paths: Mapping[str, str] | None = None,
+) -> ExitStack:
+    stack = ExitStack()
+    try:
+        # Ordem única do produto: epoch EX global antes de qualquer lock por
+        # shard/peer. atomic_replace_cas entra de forma reentrante no mesmo
+        # lease e nunca inverte esta ordem.
+        stack.enter_context(
+            producer.canonical_stock_write_lease(INSTALL_ROOT))
+        # Trave alvo + todos os peers em ordem global antes dos locks de
+        # proveniência/auditor. Todo lock é fail-fast; nenhuma finalização pode
+        # mudar um peer no intervalo entre o epoch final e o receipt verde.
+        shard_slugs = {slug}
+        for relative in (dependency_paths or {}):
+            if TARGET_REL.fullmatch(relative) is None:
+                raise FinalizationError(
+                    f"path relacional não pode formar lock: {relative}")
+            shard_slugs.add(pathlib.PurePosixPath(relative).stem)
+        paths = [
+            pathlib.Path(f"/tmp/opt-wiki-v2-{peer}.transaction.lock")
+            for peer in sorted(shard_slugs)
+        ]
+        for path in paths:
+            fd = _open_lock(path)
+            stack.callback(os.close, fd)
+        return stack
+    except Exception:
+        stack.close()
+        raise
+
+
+def _resource_lock(path: pathlib.Path) -> ExitStack:
+    """Obtém um único lock global somente durante o recurso correspondente."""
+    if path not in {SOURCE_PROVENANCE_LOCK, HEAVY_AUDIT_LOCK}:
+        raise FinalizationError(f"lock global desconhecido: {path}")
+    stack = ExitStack()
+    try:
+        descriptor = _open_lock(path)
+        stack.callback(os.close, descriptor)
+        return stack
+    except Exception:
+        stack.close()
+        raise
+
+
+def _path_identity(path: pathlib.Path) -> tuple[int, ...]:
+    """Captura metadados autenticados sem seguir componentes simbólicos."""
+    directory_fd, name, _ = producer._open_parent_directory(path)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise FinalizationError(f"dependência não é regular única: {path}")
+        return (
+            info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+            info.st_gid, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _capture_dependency_identities(
+    dependencies: Mapping[pathlib.Path, str],
+) -> dict[pathlib.Path, tuple[int, ...]]:
+    producer._assert_dependency_epoch(dependencies)
+    identities = {
+        path: _path_identity(path)
+        for path in sorted(dependencies, key=lambda item: os.fspath(item))
+    }
+    # Hash-identidade-hash: uma troca entre as duas capturas não vira epoch.
+    producer._assert_dependency_epoch(dependencies)
+    return identities
+
+
+def _assert_dependency_identities(
+    dependencies: Mapping[pathlib.Path, str],
+    expected: Mapping[pathlib.Path, tuple[int, ...]],
+) -> None:
+    producer._assert_dependency_epoch(dependencies)
+    observed = {
+        path: _path_identity(path)
+        for path in sorted(dependencies, key=lambda item: os.fspath(item))
+    }
+    producer._assert_dependency_epoch(dependencies)
+    if observed != expected:
+        raise FinalizationError(
+            "epoch relacional sofreu troca/ABA durante a finalização")
+
+
+def _assert_relational_dependency_bindings(
+    task: Mapping[str, Any],
+) -> None:
+    """Liga cada peer ngram global legado a um único shard autenticado."""
+    targets = task["alvos"].get("ngram_dup_global", [])
+    if not targets:
+        return
+    peer_intents: set[str] = set()
+    for raw_target in targets:
+        try:
+            _, peer = producer._parse_ngram_target(raw_target)
+        except (TypeError, ValueError) as error:
+            raise FinalizationError(
+                "peer ngram global inválido na fila") from error
+        if INTENT_ID.fullmatch(peer) is None:
+            raise FinalizationError("peer ngram global não é intent canônico")
+        peer_intents.add(peer)
+    locations: dict[str, list[str]] = {peer: [] for peer in peer_intents}
+    for relative, expected_digest in sorted(
+            task["distinctness_dependency_sha256"].items()):
+        snapshot = producer.read_regular_file_snapshot(
+            INSTALL_ROOT / relative, max_bytes=64 * 1024 * 1024)
+        if snapshot.digest != expected_digest:
+            raise FinalizationError(
+                f"dependência ngram evoluiu antes do binding: {relative}")
+        intents, _ = producer._review_jsonl_records(
+            snapshot.payload, f"dependência ngram {relative}")
+        for peer in peer_intents & set(intents):
+            locations[peer].append(relative)
+    ambiguous = {
+        peer: paths for peer, paths in locations.items() if len(paths) != 1
+    }
+    if ambiguous:
+        raise FinalizationError(
+            "peer ngram global ausente/ambíguo no epoch declarado: " +
+            ",".join(sorted(ambiguous)[:8]))
+
+
+def _immutable_payload_fd(payload: bytes) -> int:
+    """Cria inode anônimo selado para o auditor ler os bytes capturados."""
+    if not isinstance(payload, bytes) or not hasattr(os, "memfd_create"):
+        raise FinalizationError("memfd selado é obrigatório para auditoria local")
+    flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+    descriptor = os.memfd_create("v2-review-audit.jsonl", flags)
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise FinalizationError("escrita curta no memfd de auditoria")
+            offset += written
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        seals = (
+            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+            fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        )
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    # O líder pode sair depois de criar descendentes. O grupo continua sendo
+    # nossa unidade de cancelamento mesmo quando poll() já devolve um status.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    leader_reaped = False
+    try:
+        process.wait(timeout=5)
+        leader_reaped = True
+    except subprocess.TimeoutExpired:
+        pass
+    group_alive = True
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        group_alive = False
+    if not group_alive:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if not leader_reaped and process.poll() is None:
+        process.wait()
+
+
+def _run(
+    command: list[str], *, timeout_seconds: int, label: str,
+    pass_fds: tuple[int, ...] = (),
+    accepted_returncodes: tuple[int, ...] = (0,),
+) -> tuple[bytes, dict[str, Any]]:
+    if (not accepted_returncodes or
+            any(type(code) is not int or code < 0 or code > 255
+                for code in accepted_returncodes) or
+            len(set(accepted_returncodes)) != len(accepted_returncodes)):
+        raise FinalizationError(f"{label}: returncodes aceitos inválidos")
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command, cwd=INSTALL_ROOT, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        pass_fds=pass_fds,
+        env={
+            **{key: value for key, value in os.environ.items()
+               if key not in {"PYTHONPATH", "PYTHONHOME"}},
+            **SAFE_CHILD_ENV,
+        },
+    )
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    selector = selectors.DefaultSelector()
+    timed_out = False
+    output_exceeded = False
+    deadline = started + timeout_seconds
+    try:
+        for name, stream in streams.items():
+            if stream is None:
+                raise FinalizationError(f"{label}: pipe {name} ausente")
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                _kill_process_group(process)
+                break
+            events = selector.select(remaining)
+            if not events:
+                timed_out = True
+                _kill_process_group(process)
+                break
+            for key, _ in events:
+                name = key.data
+                buffer = buffers[name]
+                remaining_budget = MAX_COMMAND_OUTPUT_BYTES + 1 - len(buffer)
+                chunk = os.read(
+                    key.fileobj.fileno(), max(1, min(64 * 1024,
+                                                     remaining_budget)))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > MAX_COMMAND_OUTPUT_BYTES:
+                    output_exceeded = True
+                    _kill_process_group(process)
+                    break
+            if output_exceeded:
+                break
+        if not timed_out and not output_exceeded:
+            return_code = process.wait()
+        else:
+            return_code = process.returncode
+    except BaseException:
+        _kill_process_group(process)
+        raise
+    finally:
+        selector.close()
+        for stream in streams.values():
+            if stream is not None and not stream.closed:
+                stream.close()
+    stdout = bytes(buffers["stdout"])
+    stderr = bytes(buffers["stderr"])
+    summary = {
+        "label": label,
+        "returncode": return_code,
+        "duration_ms": int((time.monotonic() - started) * 1000),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+    }
+    if timed_out:
+        raise FinalizationError(f"{label}: timeout com process group encerrado")
+    if output_exceeded:
+        raise FinalizationError(f"{label}: output excedeu limite")
+    if return_code not in accepted_returncodes:
+        detail = " ".join(stderr.decode("utf-8", errors="replace").split())
+        raise FinalizationError(f"{label}: exit={return_code}: {detail[:500]}")
+    return stdout, summary
+
+
+def _parse_audit(
+    payload: bytes, label: str, *, require_ok: bool = True,
+) -> dict[str, Any]:
+    try:
+        report = producer.decode_json_no_duplicate_keys(payload, label)
+    except ValueError as error:
+        raise FinalizationError(f"{label}: auditor não devolveu JSON") from error
+    if not isinstance(report, dict) or (
+            require_ok and report.get("ok") is not True):
+        defects = report.get("defects") if isinstance(report, dict) else None
+        raise FinalizationError(
+            f"{label}: auditor reprovou: {json.dumps(defects, ensure_ascii=False)[:1000]}")
+    return report
+
+
+def _audit_blockers(
+    report: Mapping[str, Any], task: Mapping[str, Any], label: str,
+) -> dict[str, list[Any]]:
+    defects = report.get("defects")
+    if (type(report.get("pages")) is not int or
+            report["pages"] != task["n"] or
+            type(report.get("active_pages")) is not int or
+            report["active_pages"] < 0 or
+            report["active_pages"] > task["n"] or
+            type(report.get("ok")) is not bool or
+            not isinstance(defects, dict) or
+            any(not isinstance(code, str) or
+                DEFECT_CLASS.fullmatch(code) is None or
+                not isinstance(values, list)
+                for code, values in defects.items())):
+        raise FinalizationError(f"{label}: schema/cardinalidade inválida")
+    return {
+        code: values for code, values in defects.items()
+        if code != "skipped" and values
+    }
+
+
+def _validate_audit_common(
+    report: Mapping[str, Any], task: Mapping[str, Any], label: str,
+) -> None:
+    blocking = _audit_blockers(report, task, label)
+    if blocking or report.get("ok") is not True:
+        raise FinalizationError(
+            f"{label}: blockers incompatíveis com ok=true")
+
+
+def _validate_pre_provenance_audit(
+    report: Mapping[str, Any], task: Mapping[str, Any], staged_payload: bytes,
+) -> dict[str, list[Any]]:
+    """Admite apenas metadados que o passo canônico de proveniência resolve."""
+    label = "staged-local-audit"
+    blocking = _audit_blockers(report, task, label)
+    if not blocking:
+        if report.get("ok") is not True:
+            raise FinalizationError(
+                f"{label}: ok=false sem blocker autenticado")
+        return {}
+    allowed = {
+        "official_source_verified_at_invalid",
+        "official_source_http_status_invalid",
+    }
+    if report.get("ok") is not False or not set(blocking).issubset(allowed):
+        raise FinalizationError(
+            f"{label}: blocker não resolvível por proveniência")
+    editable = set(task["review_target_intent_ids"])
+    affected = {
+        intent
+        for values in blocking.values()
+        for intent in values
+    }
+    if (not affected or not affected.issubset(editable) or
+            any(not isinstance(intent, str) or
+                INTENT_ID.fullmatch(intent) is None for intent in affected)):
+        raise FinalizationError(
+            f"{label}: proveniência tentaria ampliar escopo editorial")
+    _, raw_by_intent = producer._review_jsonl_records(
+        staged_payload, "staged pré-proveniência")
+    for code, intents in blocking.items():
+        for intent in intents:
+            row = producer.decode_json_no_duplicate_keys(
+                raw_by_intent[intent], f"staged pré-proveniência:{intent}")
+            sources = row.get("official_sources") if isinstance(row, dict) else None
+            if not isinstance(sources, list) or not sources:
+                raise FinalizationError(
+                    f"{label}: blocker de proveniência sem fonte concreta")
+            if code == "official_source_verified_at_invalid":
+                resolvable = any(
+                    isinstance(source, dict) and
+                    auditor_contract.parse_source_verified_at(
+                        source.get("verified_at")) is None
+                    for source in sources)
+            else:
+                resolvable = any(
+                    isinstance(source, dict) and
+                    (not isinstance(source.get("http_status"), int) or
+                     isinstance(source.get("http_status"), bool) or
+                     source.get("http_status") not in {200, 203, 206})
+                    for source in sources)
+            if not resolvable:
+                raise FinalizationError(
+                    f"{label}: blocker de proveniência não corresponde ao staged")
+    return blocking
+
+
+def _validate_final_audit(
+    report: Mapping[str, Any], task: Mapping[str, Any], expected_sha256: str,
+) -> str:
+    label = "final-against-stock-audit"
+    _validate_audit_common(report, task, label)
+    target_rel = f"data/editorial/v2_pages/{task['slug']}.jsonl"
+    index = report.get("distinctness_index")
+    contract_error = (
+        auditor_contract.incremental_distinctness_projection_contract_error(
+            index, report.get("distinctness_neighbors"), target_rel,
+            expected_sha256, report["active_pages"]))
+    if contract_error is not None:
+        raise FinalizationError(
+            f"{label}: contrato incremental projetado inválido: "
+            f"{contract_error}")
+    generation_root = index.get("generation_root") if isinstance(index, dict) else None
+    if report.get("file") != target_rel:
+        raise FinalizationError(
+            f"{label}: relatório não autentica o shard alvo")
+    return generation_root
+
+
+def _verify_staged(
+    task: Mapping[str, Any], workspace: pathlib.Path, staged_sha256: str,
+) -> producer.RegularFileSnapshot:
+    verifier = getattr(producer, "verify_staged_review_scope", None)
+    if verifier is None:
+        raise FinalizationError("produtor não possui verify_staged_review_scope")
+    slug = task["slug"]
+    snapshot = verifier(
+        root=INSTALL_ROOT,
+        workspace_path=workspace,
+        staged_path=workspace / "review.jsonl",
+        target_rel_path=f"data/editorial/v2_pages/{slug}.jsonl",
+        target_sha256=task["target_sha256"],
+        target_intent_ids=task.get("target_intent_ids"),
+        review_target_intent_ids=task.get("review_target_intent_ids"),
+        preserved_record_sha256=task.get("preserved_record_sha256"),
+        file_wide_review=task.get("file_wide_review"),
+    )
+    if snapshot.digest != staged_sha256:
+        raise FinalizationError("digest do staged diverge do draft")
+    return snapshot
+
+
+def _verify_live_review_scope(
+    task: Mapping[str, Any], target: pathlib.Path, expected_sha256: str,
+) -> producer.RegularFileSnapshot:
+    """Reautentica ordem e complemento após ferramentas que podem enriquecer."""
+    snapshot = producer.read_regular_file_snapshot(
+        target, max_bytes=64 * 1024 * 1024)
+    if snapshot.digest != expected_sha256:
+        raise FinalizationError("digest vivo diverge no fechamento do escopo")
+    intents, raw_by_intent = producer._review_jsonl_records(
+        snapshot.payload, "alvo finalizado")
+    if intents != tuple(task["target_intent_ids"]):
+        raise FinalizationError(
+            "finalização alterou cardinalidade ou ordem dos intent_ids")
+    changed_preserved = [
+        intent for intent, digest in task["preserved_record_sha256"].items()
+        if hashlib.sha256(raw_by_intent[intent]).hexdigest() != digest
+    ]
+    if changed_preserved:
+        raise FinalizationError(
+            "finalização alterou registro preservado: " +
+            ",".join(changed_preserved[:8]))
+    return snapshot
+
+
+def _cowork_live_browser_insumo_args(checked_at: str) -> list[str]:
+    """Passthrough opcional para --cowork-live-browser-insumo.
+
+    A ferramenta (internal/v2sourceprovenance/cowork_live_browser.go:44)
+    exige o nome exato ``data/source-audit/cowork_source_recheck_<8
+    digitos>.jsonl`` (nenhum sufixo passa no regex) e é fail-closed em
+    caminho ilegível — por isso o flag só é incluído quando o sidecar
+    sancionado do dia realmente existe no disco; sem ele, o --live roda como
+    antes (sem override de navegador), nunca quebra por ausência do arquivo.
+    """
+    date_digits = checked_at.replace("-", "")
+    insumo_rel = f"data/source-audit/cowork_source_recheck_{date_digits}.jsonl"
+    if not (INSTALL_ROOT / insumo_rel).is_file():
+        return []
+    return ["--cowork-live-browser-insumo", insumo_rel]
+
+
+def _source_provenance(
+    target_rel: str, checked_at: str,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    tool = str(INSTALL_ROOT / "tools/audit-v2-source-provenance")
+    insumo_args = _cowork_live_browser_insumo_args(checked_at)
+    summaries: list[dict[str, Any]] = []
+    plan, summary = _run(
+        [tool, "--root", str(INSTALL_ROOT), "--scope", "incomplete",
+         "--file", target_rel],
+        timeout_seconds=300, label="source-provenance-plan")
+    summaries.append(summary)
+    if b"request_urls=0 " not in plan:
+        _, summary = _run(
+            [tool, "--root", str(INSTALL_ROOT), "--live", "--scope",
+             "incomplete", "--checked-at", checked_at, "--metadata-only",
+             "--no-content-copy", "--reuse-successful", "--file",
+             target_rel, *insumo_args],
+            timeout_seconds=1500, label="source-provenance-live-incomplete")
+        summaries.append(summary)
+        _, summary = _run(
+            [tool, "--root", str(INSTALL_ROOT), "--apply", "--file",
+             target_rel],
+            timeout_seconds=300, label="source-provenance-apply")
+        summaries.append(summary)
+    _, summary = _run(
+        [tool, "--root", str(INSTALL_ROOT), "--live", "--scope", "all",
+         "--checked-at", checked_at, "--metadata-only", "--no-content-copy",
+         "--reuse-successful", "--file", target_rel, *insumo_args],
+        timeout_seconds=1500, label="source-provenance-live-all")
+    summaries.append(summary)
+    check_stdout, summary = _run(
+        [tool, "--root", str(INSTALL_ROOT), "--check", "--file", target_rel],
+        timeout_seconds=300, label="source-provenance-check")
+    summaries.append(summary)
+    return summaries, _source_provenance_evidence_binding(check_stdout)
+
+
+def _source_provenance_evidence_binding(payload: bytes) -> dict[str, str]:
+    """Liga o receipt ao sidecar exato que o check acabou de validar."""
+    try:
+        check_line = payload.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise FinalizationError(
+            "source-provenance-check: stdout não é UTF-8") from error
+    matches = re.findall(r"(?:^| )path=([^ ]+)(?: |$)", check_line)
+    if (len(matches) != 1 or
+            PROVENANCE_EVIDENCE_REL.fullmatch(matches[0]) is None or
+            "check=current-selection-pass" not in check_line or
+            not check_line.endswith(" publication=false")):
+        raise FinalizationError(
+            "source-provenance-check: binding de evidence inválido")
+    evidence = producer.read_regular_file_snapshot(
+        INSTALL_ROOT / matches[0], max_bytes=16 * 1024 * 1024)
+    return {"path": matches[0], "sha256": evidence.digest}
+
+
+def _write_receipt(
+    binding: WorkspaceBinding,
+    reservation: ReceiptReservation,
+    receipt: Mapping[str, Any],
+) -> tuple[pathlib.Path, str]:
+    payload = _canonical_json(receipt)
+    digest = hashlib.sha256(payload).hexdigest()
+    _assert_workspace_binding(binding)
+    info = os.fstat(reservation.descriptor)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+            info.st_size != 0 or
+            (info.st_dev, info.st_ino) !=
+            (reservation.device, reservation.inode)):
+        raise FinalizationError("reserva do receipt evoluiu antes da escrita")
+    _receipt_path_identity(binding, reservation)
+    offset = 0
+    while offset < len(payload):
+        written = os.write(reservation.descriptor, payload[offset:])
+        if written <= 0:
+            raise FinalizationError("escrita curta no receipt")
+        offset += written
+    os.fsync(reservation.descriptor)
+    os.fchmod(reservation.descriptor, 0o600)
+    os.fsync(reservation.descriptor)
+    after = _receipt_path_identity(binding, reservation)
+    if after.st_size != len(payload):
+        raise FinalizationError("tamanho do receipt diverge após escrita")
+    captured = os.pread(reservation.descriptor, len(payload) + 1, 0)
+    if captured != payload:
+        raise FinalizationError("bytes do receipt divergiram após escrita")
+    os.fsync(binding.descriptor)
+    _assert_workspace_binding(binding)
+    path = binding.path / "finalizer-receipt.json"
+    return path, digest
+
+
+def _record_mutation_after_failure(
+    receipt: dict[str, Any], target: pathlib.Path,
+) -> None:
+    """Não alegue mutation=false quando o CAS instalou bytes antes de falhar."""
+    try:
+        observed = producer.snapshot_sha256(
+            target, max_bytes=64 * 1024 * 1024)
+    except Exception as error:
+        receipt["mutation_state_error"] = (
+            f"{type(error).__name__}:{error}"[:1000])
+        return
+    receipt["observed_after_failure_sha256"] = observed
+    if observed != receipt["target_sha256"]:
+        receipt["mutation_applied"] = True
+
+
+def finalize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    if args.queue_file is None or args.queue_item_base64 is not None:
+        raise FinalizationError(
+            "somente o artefato canônico --queue-file pode autorizar mutação")
+    if not isinstance(args.slug, str) or SLUG.fullmatch(args.slug) is None:
+        raise FinalizationError("slug da fila é inválido")
+    task, queue_artifact_sha256 = _load_queue_item(
+        pathlib.Path(args.queue_file), args.slug)
+    corrections = _bounded_corrections(_decode_base64_json(
+        args.corrections_base64, "corrections"), task)
+    if (not isinstance(args.staged_sha256, str) or
+            SHA256.fullmatch(args.staged_sha256) is None):
+        raise FinalizationError("staged_sha256 inválido")
+    receipt: dict[str, Any] = {
+        "schema_version": 1,
+        "slug": task["slug"],
+        "file": f"data/editorial/v2_pages/{task['slug']}.jsonl",
+        "paginas": task["n"],
+        "target_sha256": task["target_sha256"],
+        "staged_sha256": args.staged_sha256,
+        "queue_item_sha256": _queue_item_fingerprint(task),
+        "corrigidos_por_classe": corrections,
+        "audit_ok": False,
+        "mutation_applied": False,
+        "publication_allowed": False,
+        "index_policy": "noindex",
+        "commands": [],
+        "queue_artifact_sha256": queue_artifact_sha256,
+    }
+    binding: WorkspaceBinding | None = None
+    reservation: ReceiptReservation | None = None
+    receipt_written = False
+    receipt_path: pathlib.Path | None = None
+    receipt_sha256: str | None = None
+    target: pathlib.Path | None = None
+    try:
+        binding = _open_workspace(task, args.workspace)
+        staged = _verify_staged(task, binding.path, args.staged_sha256)
+        _assert_workspace_binding(binding)
+        if staged.digest == task["target_sha256"]:
+            raise FinalizationError("draft não altera os bytes do alvo")
+        # O nome final fica create-only reservado antes de qualquer auditoria
+        # cara ou mutação. Um receipt preexistente nunca é descoberto só após
+        # a promoção do shard.
+        reservation = _reserve_receipt(binding)
+
+        # O auditor local lê um memfd selado com os MESMOS bytes retornados
+        # pelo verifier, não um path reabrível/trocável no workspace.
+        audit_fd = _immutable_payload_fd(staged.payload)
+        try:
+            with _resource_lock(HEAVY_AUDIT_LOCK):
+                audit_stdout, summary = _run(
+                    ["/usr/bin/nice", "-n", "19", "/usr/bin/python3",
+                     str(INSTALL_ROOT / "tools/audit_v2_pages.py"),
+                     f"/proc/self/fd/{audit_fd}", "--expect-n", str(task["n"])],
+                    timeout_seconds=900, label="staged-local-audit",
+                    pass_fds=(audit_fd,), accepted_returncodes=(0, 1))
+        finally:
+            os.close(audit_fd)
+        receipt["commands"].append(summary)
+        local_report = _parse_audit(
+            audit_stdout, "staged-local-audit", require_ok=False)
+        pre_provenance_defects = _validate_pre_provenance_audit(
+            local_report, task, staged.payload)
+        expected_local_returncode = 1 if pre_provenance_defects else 0
+        if summary["returncode"] != expected_local_returncode:
+            raise FinalizationError(
+                "staged-local-audit: exit diverge dos blockers de proveniência")
+        if pre_provenance_defects:
+            receipt["pre_provenance_defects"] = pre_provenance_defects
+        staged_after_audit = _verify_staged(
+            task, binding.path, args.staged_sha256)
+        _assert_workspace_binding(binding)
+        if staged_after_audit.digest != staged.digest:
+            raise FinalizationError("staged mudou durante auditoria local")
+
+        target_rel = receipt["file"]
+        target = INSTALL_ROOT / target_rel
+        dependency_epoch = {
+            INSTALL_ROOT / path: digest
+            for path, digest in task["distinctness_dependency_sha256"].items()
+        }
+        dependency_epoch[
+            INSTALL_ROOT / "scripts/workflows/writing-review-todo.js"
+        ] = queue_artifact_sha256
+        with _lock_set(
+                task["slug"], task["distinctness_dependency_sha256"]):
+            try:
+                _assert_workspace_binding(binding)
+                staged_locked = _verify_staged(
+                    task, binding.path, args.staged_sha256)
+                _assert_workspace_binding(binding)
+                if staged_locked.digest != staged.digest:
+                    raise FinalizationError("staged mudou antes da promoção")
+                dependency_identities = _capture_dependency_identities(
+                    dependency_epoch)
+                _assert_relational_dependency_bindings(task)
+                producer.atomic_replace_cas(
+                    target, staged_locked.payload, task["target_sha256"],
+                    dependency_sha256=dependency_epoch)
+                receipt["mutation_applied"] = True
+                promoted_sha256 = producer.snapshot_sha256(target)
+                if promoted_sha256 != staged_locked.digest:
+                    raise FinalizationError("CAS promoveu digest divergente")
+                receipt["promoted_sha256"] = promoted_sha256
+
+                checked_at = dt.datetime.now(dt.timezone.utc).date().isoformat()
+                # Rede/proveniência não monopoliza o lock de CPU pesada. O
+                # target/peers continuam serializados pelo lock transacional.
+                with _resource_lock(SOURCE_PROVENANCE_LOCK):
+                    provenance_commands, provenance_evidence = (
+                        _source_provenance(target_rel, checked_at))
+                    receipt["commands"].extend(provenance_commands)
+                    receipt["source_provenance_evidence"] = (
+                        provenance_evidence)
+                post_provenance = producer.snapshot_sha256(target)
+                if post_provenance == task["target_sha256"]:
+                    raise FinalizationError(
+                        "proveniência restaurou preimagem antiga")
+                _verify_live_review_scope(task, target, post_provenance)
+                receipt["post_provenance_sha256"] = post_provenance
+
+                with _resource_lock(HEAVY_AUDIT_LOCK):
+                    audit_stdout, summary = _run(
+                        ["/usr/bin/nice", "-n", "19", "/usr/bin/python3",
+                         str(INSTALL_ROOT / "tools/audit_v2_pages.py"),
+                         str(target), "--expect-n", str(task["n"]),
+                         "--against-stock"],
+                        timeout_seconds=1800,
+                        label="final-against-stock-audit")
+                receipt["commands"].append(summary)
+                final_report = _parse_audit(
+                    audit_stdout, "final-against-stock-audit")
+                audited_sha256 = producer.snapshot_sha256(target)
+                if audited_sha256 != post_provenance:
+                    raise FinalizationError(
+                        "alvo mudou durante auditoria final")
+                _verify_live_review_scope(task, target, audited_sha256)
+                generation_root = _validate_final_audit(
+                    final_report, task, audited_sha256)
+                _assert_dependency_identities(
+                    dependency_epoch, dependency_identities)
+                receipt["audited_sha256"] = audited_sha256
+                receipt["audit_report_sha256"] = hashlib.sha256(
+                    audit_stdout).hexdigest()
+                receipt["distinctness_generation_root"] = generation_root
+                receipt["audit_ok"] = True
+                # Receipt verde nasce ainda sob os locks do target e peers;
+                # os locks globais já foram liberados logo após seu recurso.
+                receipt_path, receipt_sha256 = _write_receipt(
+                    binding, reservation, receipt)
+                receipt_written = True
+            except Exception:
+                _record_mutation_after_failure(receipt, target)
+                raise
+    except Exception as error:
+        receipt["audit_ok"] = False
+        receipt["error_class"] = type(error).__name__
+        receipt["error"] = str(error)[:2000]
+
+    exit_code = 0 if receipt["audit_ok"] else (
+        75 if receipt.get("error_class") == "LockBusy" else 2)
+    envelope = dict(receipt)
+    if binding is not None and reservation is not None and not receipt_written:
+        try:
+            receipt_path, receipt_sha256 = _write_receipt(
+                binding, reservation, receipt)
+            receipt_written = True
+        except Exception as error:
+            envelope["audit_ok"] = False
+            envelope["receipt_error"] = (
+                f"{type(error).__name__}:{error}"[:2000])
+            exit_code = 2
+    if receipt_written and receipt_path is not None and receipt_sha256 is not None:
+        envelope["receipt_path"] = str(receipt_path)
+        envelope["receipt_sha256"] = receipt_sha256
+    if reservation is not None:
+        os.close(reservation.descriptor)
+    if binding is not None:
+        os.close(binding.descriptor)
+    return envelope, exit_code
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    queue_source = parser.add_mutually_exclusive_group(required=True)
+    queue_source.add_argument("--queue-item-base64")
+    queue_source.add_argument("--queue-file")
+    parser.add_argument("--slug")
+    parser.add_argument("--workspace", required=True)
+    parser.add_argument("--staged-sha256", required=True)
+    parser.add_argument("--corrections-base64", required=True)
+    args = parser.parse_args()
+    def terminate(signum: int, _frame: Any) -> None:
+        raise FinalizationError(f"finalizador interrompido por sinal {signum}")
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    signal.signal(signal.SIGHUP, terminate)
+    try:
+        result, exit_code = finalize(args)
+    except Exception as error:
+        result = {
+            "schema_version": 1,
+            "audit_ok": False,
+            "mutation_applied": False,
+            "error_class": type(error).__name__,
+            "error": str(error)[:2000],
+            "publication_allowed": False,
+            "index_policy": "noindex",
+        }
+        exit_code = 75 if isinstance(error, LockBusy) else 2
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    raise SystemExit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

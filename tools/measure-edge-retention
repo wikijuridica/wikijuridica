@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""measure-edge-retention — quanto tempo a borda GUARDA o acervo depois de aquecido.
+
+★ POR QUE ESTA MEDIÇÃO EXISTE (2026-08-29, BUG-059 da caça aos bugs)
+
+O aquecedor `warm-edge-cache` terminou às 12:43:29Z declarando
+`cache_status: {"hit": 10429, "revalidated": 36}` sobre 10.465 URLs — ou seja,
+o acervo inteiro quente. Menos de duas horas depois, sondando à mão com o UA
+oficial de sonda, três páginas do acervo devolveram `cf-cache-status: MISS`,
+enquanto a home devolveu `HIT` com `age: 24653`.
+
+Duas explicações concorriam, e nenhuma podia ser decidida por leitura:
+
+  (a) fragmentação da chave de cache — o aquecedor guardaria uma variante e o
+      visitante pediria outra;
+
+  (b) evicção — o POP descartaria o objeto pouco acessado antes do
+      `s-maxage=604800` declarado.
+
+★ VENCEU A (a), E ESTE ARQUIVO CHEGOU A AFIRMAR O CONTRÁRIO
+
+A primeira versão desta docstring declarava a fragmentação REFUTADA, apoiada num
+experimento que variou o `Accept` sobre uma URL que a própria sonda anterior
+acabara de aquecer — as três formas deram HIT com `age: 0`, e o `age: 0` era a
+denúncia que eu não li. Corrigido aqui porque comentário que mente é bug (R1), e
+este estava commitado.
+
+O experimento correto usa uma URL por variante, todas frescas. Medido em nove
+rotas sorteadas do índice, três por variante, mesmo User-Agent, mesmo instante:
+
+    Accept ausente         -> HIT, age ~26.000 s
+    Accept: */*            -> MISS
+    Accept de navegador    -> MISS
+
+A causa é a Cache Rule da borda, que declara `vary.headers.accept` em modo
+`normalize` com allowlist `["text/markdown"]` — e "cabeçalho ausente" é um valor
+normalizado DISTINTO de "cabeçalho presente sem text/markdown". O aquecedor
+chamava `varre(..., accept=None)` na passada de HTML, então esquentava uma
+terceira variante que nenhum cliente real pede.
+
+Os dois números que pareciam contraditórios estavam ambos certos: o gate de
+cobertura sonda com `curl -I` (que manda `Accept: */*`) e via 0%; a primeira
+campanha deste medidor sondava sem `Accept` e via 100%. Mediam variantes
+diferentes da mesma URL.
+
+Por isso este medidor passa a mandar `Accept` de navegador: medir a variante que
+ninguém consome é medir um fantasma. As linhas gravadas antes desta correção
+ficam no ledger e continuam válidas — elas descrevem a retenção da variante
+"cabeçalho ausente", e é assim que devem ser lidas.
+
+Este medidor decide entre as duas por observação: aquece uma amostra fixa, e
+volta a ela em janelas crescentes SEM re-aquecer, registrando quantas ainda
+respondem HIT e com que idade. A curva resultante é o tempo de retenção real da
+borda para este acervo — o número que faltava para decidir se o aquecimento
+diário compra alguma coisa.
+
+★ POR QUE A MEDIÇÃO NÃO CONTAMINA O QUE MEDE
+
+Toda requisição de reobservação é `HEAD`, com o UA interno e o cabeçalho
+`X-Warming-Request: true`. HEAD não popula objeto ausente na Cloudflare, então a
+janela seguinte continua medindo o efeito do aquecimento inicial e não o da
+sonda anterior. O aquecimento inicial é `GET`, marcado do mesmo jeito — nunca
+com User-Agent de bot real, que seria fraude.
+
+★ COMO LER O RESULTADO
+
+Cada linha de `data/ops/edge_retention.jsonl` é uma observação da MESMA amostra.
+`quentes` caindo ao longo de `minutos_apos_aquecer` é evicção medida; `quentes`
+estável até o `s-maxage` é retenção honesta e joga a causa do MISS para outro
+lugar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wikiuniverso  # noqa: E402
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LEDGER_REL = os.path.join("data", "ops", "edge_retention.jsonl")
+
+# UA próprio e cabeçalho de aquecimento: o contrato do repositório proíbe sondar
+# com User-Agent de bot real, e exige que tráfego interno seja identificável
+# para ficar fora de qualquer contagem de audiência.
+UA = "wikijuridica-superficie-probe/1.0"
+# `Accept` de navegador: é o valor que colapsa, depois da normalização da Cache
+# Rule, na mesma variante que o tráfego humano e a maior parte do tráfego de bot
+# produzem. Ver o bloco acima — medir sem ele mede uma variante fantasma.
+ACCEPT_NAVEGADOR = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8")
+
+CABECALHOS = {
+    "User-Agent": UA,
+    "X-Warming-Request": "true",
+    "Accept-Encoding": "gzip, br",
+    "Accept": ACCEPT_NAVEGADOR,
+}
+
+TEMPO_LIMITE_S = 20
+
+
+def amostra_estavel(urls: list[str], quantas: int, semente: str) -> list[str]:
+    """Amostra determinística: a MESMA lista em toda reobservação da campanha.
+
+    Sorteio por hash estável (sha256 da semente + URL), nunca `random`, para que
+    duas execuções da mesma campanha voltem exatamente às mesmas URLs — é isso
+    que torna a curva comparável entre janelas.
+    """
+    ordenadas = sorted(
+        urls, key=lambda u: hashlib.sha256((semente + "\x00" + u).encode("utf-8")).hexdigest()
+    )
+    return sorted(ordenadas[:quantas])
+
+
+def observa(url: str, metodo: str) -> dict:
+    pedido = urllib.request.Request(url, method=metodo, headers=CABECALHOS)
+    try:
+        with urllib.request.urlopen(pedido, timeout=TEMPO_LIMITE_S) as resposta:
+            if metodo == "GET":
+                resposta.read()
+            cabecalhos = resposta.headers
+            codigo = resposta.status
+    except urllib.error.HTTPError as erro:
+        cabecalhos = erro.headers
+        codigo = erro.code
+    except Exception as erro:  # rede, DNS, TLS
+        return {"url": url, "erro": type(erro).__name__}
+    idade = cabecalhos.get("age")
+    return {
+        "url": url,
+        "status": codigo,
+        "cache": (cabecalhos.get("cf-cache-status") or "SEM-CABECALHO").upper(),
+        "age_s": int(idade) if idade and idade.isdigit() else None,
+        "pop": (cabecalhos.get("cf-ray") or "").rsplit("-", 1)[-1] or None,
+    }
+
+
+def varre(urls: list[str], metodo: str, paralelas: int) -> list[dict]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=paralelas) as executor:
+        return list(executor.map(lambda u: observa(u, metodo), urls))
+
+
+def resume(observacoes: list[dict], base_url: str, campanha: str, minutos: float, fase: str) -> dict:
+    estados: dict[str, int] = {}
+    idades: list[int] = []
+    erros = 0
+    for obs in observacoes:
+        if "erro" in obs:
+            erros += 1
+            continue
+        estados[obs["cache"]] = estados.get(obs["cache"], 0) + 1
+        if obs["cache"] in ("HIT", "REVALIDATED") and obs["age_s"] is not None:
+            idades.append(obs["age_s"])
+    medidas = sum(estados.values())
+    quentes = estados.get("HIT", 0) + estados.get("REVALIDATED", 0)
+    return {
+        "schema_version": "edge_retention_v1",
+        "campanha": campanha,
+        "fase": fase,
+        "base_url": base_url,
+        "medido_em": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "minutos_apos_aquecer": round(minutos, 1),
+        "amostra": len(observacoes),
+        "medidas": medidas,
+        "erros_de_sonda": erros,
+        "estados": estados,
+        "quentes": quentes,
+        "quentes_pct": round(100.0 * quentes / medidas, 2) if medidas else 0.0,
+        "age_min_s": min(idades) if idades else None,
+        "age_max_s": max(idades) if idades else None,
+        "agente": UA,
+        "counts_as_audience": False,
+    }
+
+
+def grava(linha: dict) -> None:
+    destino = os.path.join(RAIZ, LEDGER_REL)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    with open(destino, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def main() -> int:
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--amostra", type=int, default=120)
+    analisador.add_argument("--paralelas", type=int, default=8)
+    analisador.add_argument(
+        "--janelas",
+        default="10,30,60,120,240",
+        help="minutos após o aquecimento em que a amostra é reobservada",
+    )
+    analisador.add_argument("--base-url", default="https://wikijuridica.com.br")
+    analisador.add_argument("--campanha", default=None)
+    analisador.add_argument("--seco", action="store_true", help="não grava no ledger")
+    opcoes = analisador.parse_args()
+
+    try:
+        # urls_publicas devolve a URL absoluta que o índice anuncia — é ela que a
+        # borda cacheia. caminhos_publicos devolve só o path e não serve para sondar.
+        caminhos = wikiuniverso.urls_publicas(RAIZ)
+    except wikiuniverso.UniversoIndisponivel as erro:
+        print(f"measure-edge-retention: universo indisponível: {erro}", file=sys.stderr)
+        return 2
+
+    campanha = opcoes.campanha or hashlib.sha256(
+        (str(len(caminhos)) + "|" + str(opcoes.amostra)).encode("utf-8")
+    ).hexdigest()[:12]
+    urls = amostra_estavel(caminhos, opcoes.amostra, campanha)
+    print(f"measure-edge-retention: universo={len(caminhos)} amostra={len(urls)} campanha={campanha}")
+
+    inicio = time.monotonic()
+    aquecimento = varre(urls, "GET", opcoes.paralelas)
+    linha = resume(aquecimento, opcoes.base_url, campanha, 0.0, "aquecimento")
+    print("  aquecimento:", json.dumps(linha["estados"], ensure_ascii=False))
+    if not opcoes.seco:
+        grava(linha)
+
+    janelas = [float(j) for j in opcoes.janelas.split(",") if j.strip()]
+    for minutos in janelas:
+        alvo = inicio + minutos * 60.0
+        while time.monotonic() < alvo:
+            time.sleep(min(30.0, alvo - time.monotonic()))
+        observacoes = varre(urls, "HEAD", opcoes.paralelas)
+        decorridos = (time.monotonic() - inicio) / 60.0
+        linha = resume(observacoes, opcoes.base_url, campanha, decorridos, "reobservacao")
+        print(
+            f"  t+{linha['minutos_apos_aquecer']:>6} min  quentes={linha['quentes']}/{linha['medidas']}"
+            f" ({linha['quentes_pct']}%)  estados={json.dumps(linha['estados'], ensure_ascii=False)}"
+        )
+        if not opcoes.seco:
+            grava(linha)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

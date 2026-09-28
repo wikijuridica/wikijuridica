@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""ai-task — tasklist persistente por sessao, no padrao dos comandos ai-*.
+
+Uso:
+  ai-task                      lista o estado atual
+  ai-task add "texto" [...]    adiciona uma ou mais tarefas
+  ai-task start N              marca em andamento
+  ai-task done N               marca concluida
+  ai-task block N "motivo"     marca bloqueada com motivo
+  ai-task note N "texto"       anexa observacao
+  ai-task reset                zera a lista da sessao
+
+Estado em ~/.claude/tasklists/<sessao>.json
+  <sessao> = $CLAUDE_SESSION_ID, ou $AI_TASK_SESSION, ou 'default'.
+
+NOTA (auditoria 2026-09-04): nesta maquina o Claude Code NAO exporta
+CLAUDE_SESSION_ID para o shell das ferramentas — foi verificado com `env`. Na
+pratica todas as sessoes caem em 'default.json' e compartilham a mesma lista.
+Enquanto isso for verdade, use AI_TASK_SESSION=<nome> para separar frentes.
+"""
+import errno
+import fcntl
+import json
+import os
+import sys
+from contextlib import contextmanager
+from datetime import datetime
+
+DIR = os.path.expanduser("~/.claude/tasklists")
+# `or` (e nao o default do .get): a variavel pode existir e estar VAZIA, e nesse
+# caso o nome do arquivo viraria ".json" — um arquivo oculto, diferente do que
+# qualquer outra sessao usa, e invisivel num `ls` comum.
+SESSAO = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("AI_TASK_SESSION") or "default"
+SESSAO = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in SESSAO)
+CAMINHO = os.path.join(DIR, f"{SESSAO}.json")
+TRAVA = CAMINHO + ".lock"
+
+MARCA = {"pendente": "[ ]", "andamento": "[~]", "feita": "[x]", "bloqueada": "[!]"}
+COR = {"pendente": "\033[0m", "andamento": "\033[33m", "feita": "\033[32m", "bloqueada": "\033[31m"}
+FIM_COR = "\033[0m"
+
+
+@contextmanager
+def travado():
+    """Serializa leitura+gravacao entre agentes paralelos.
+
+    Sem isto o ciclo le-modifica-grava de dois processos simultaneos se perde:
+    medido em 2026-09-04, 12 `add` concorrentes gravaram apenas 9 tarefas (3
+    sobrescritas) e 3 processos morreram lendo o arquivo no meio da troca.
+    """
+    os.makedirs(DIR, exist_ok=True)
+    fd = os.open(TRAVA, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def carrega():
+    try:
+        # encoding explicito: sob LC_ALL=C o padrao do open() vira ASCII e
+        # qualquer acento ja gravado explode com UnicodeDecodeError.
+        with open(CAMINHO, encoding="utf-8") as f:
+            dados = json.load(f)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        sys.exit(f"ai-task: nao consegui ler {CAMINHO}: {e.strerror or errno.errorcode.get(e.errno, e)}")
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"ai-task: {CAMINHO} nao e JSON valido (linha {e.lineno}, coluna {e.colno}: {e.msg}).\n"
+            f"          Veja o conteudo com `cat {CAMINHO}` ou recomece com `ai-task reset`."
+        )
+    if not isinstance(dados, list):
+        sys.exit(f"ai-task: {CAMINHO} deveria conter uma lista de tarefas, veio {type(dados).__name__}.")
+    return dados
+
+
+def salva(tarefas):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = f"{CAMINHO}.{os.getpid()}.tmp"   # tmp por PID: dois agentes nao brigam pelo mesmo temporario
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tarefas, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CAMINHO)
+
+
+def lista(tarefas):
+    if not tarefas:
+        print("  (lista vazia — use: ai-task add \"texto\")")
+        return
+    total = len(tarefas)
+    feitas = sum(1 for t in tarefas if t.get("estado") == "feita")
+    print(f"TAREFAS  {feitas}/{total} concluidas")
+    for i, t in enumerate(tarefas, 1):
+        estado = t.get("estado", "pendente")
+        c = COR.get(estado, "")
+        marca = MARCA.get(estado, "[?]")
+        print(f"  {c}{marca} {i:2d}. {t.get('texto', '')}{FIM_COR}")
+        if t.get("motivo"):
+            print(f"         motivo: {t['motivo']}")
+        for n in t.get("notas", []):
+            print(f"         - {n}")
+
+
+def pega_indice(tarefas, arg):
+    try:
+        n = int(arg)
+    except ValueError:
+        sys.exit(f"ai-task: '{arg}' nao e um numero de tarefa")
+    if not 1 <= n <= len(tarefas):
+        sys.exit(f"ai-task: tarefa {n} nao existe (ha {len(tarefas)})")
+    return n - 1
+
+
+def main():
+    if len(sys.argv) == 1:
+        with travado():
+            lista(carrega())
+        return
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+    agora = datetime.now().isoformat(timespec="seconds")
+
+    if cmd not in ("add", "start", "done", "block", "note", "reset"):
+        sys.exit(__doc__)
+
+    # a trava cobre o ciclo INTEIRO le-modifica-grava, nao so a gravacao
+    with travado():
+        # `reset` e a saida de emergencia: nao pode depender de conseguir ler o
+        # arquivo, senao um JSON corrompido tranca o comando que existe justamente
+        # para destravar essa situacao.
+        tarefas = [] if cmd == "reset" else carrega()
+
+        if cmd == "add":
+            if not args:
+                sys.exit("ai-task add: informe ao menos um texto")
+            for texto in args:
+                tarefas.append({"texto": texto, "estado": "pendente", "criada": agora, "notas": []})
+
+        elif cmd in ("start", "done", "block"):
+            if not args:
+                sys.exit(f"ai-task {cmd}: informe o numero da tarefa")
+            i = pega_indice(tarefas, args[0])
+            tarefas[i]["estado"] = {"start": "andamento", "done": "feita", "block": "bloqueada"}[cmd]
+            tarefas[i]["atualizada"] = agora
+            if cmd == "block":
+                tarefas[i]["motivo"] = args[1] if len(args) > 1 else "sem motivo informado"
+            elif "motivo" in tarefas[i]:
+                del tarefas[i]["motivo"]
+
+        elif cmd == "note":
+            if len(args) < 2:
+                sys.exit("ai-task note: informe numero e texto")
+            i = pega_indice(tarefas, args[0])
+            tarefas[i].setdefault("notas", []).append(args[1])
+
+        elif cmd == "reset":
+            tarefas = []
+
+        salva(tarefas)
+        if cmd == "reset":
+            print("  lista zerada")
+        else:
+            lista(tarefas)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# run-promote-cohort-loop — walk the public released cohort from the current
+# published_manifest count up to a target, calling the single-shot promoter
+# tools/run-promote-authorial-mass-public-release once per cohort step.
+#
+# The single-shot promoter can only advance the manifest by at most
+# WIKI_PUBLIC_RELEASE_COHORT_MAX records (default 250, hard-capped at 250 by the
+# public-release preflight). This driver reads the live manifest count on every
+# iteration (idempotent — safe to resume after any successful step), computes the
+# next cohort window [current, min(current+step, target)], and calls the promoter
+# until published_manifest holds exactly `target` records.
+#
+# SAFETY: dry-run is the DEFAULT. The driver only performs real public writes when
+# invoked with --execute (which forwards --allow-public-write to the promoter). In
+# dry-run it prints, in order, the exact commands it would run — nothing is executed.
+#
+# Usage:
+#   tools/run-promote-cohort-loop --target N [--step N] [--dry-run|--execute]
+#
+# Env:
+#   WIKI_PUBLIC_RELEASE_COHORT_MAX   cohort step size (default 250; must be 1..250)
+#   WIKI_PUBLIC_RELEASE_TARGET       target cumulative manifest records (REQUIRED,
+#                                    no default: derive it from the measured cut,
+#                                    e.g. included_in_manifest_plan of the run)
+set -euo pipefail
+
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+
+MANIFEST="data/editorial/published_manifest.jsonl"
+PROMOTER="tools/run-promote-authorial-mass-public-release"
+
+# Hard cap enforced by internal/publicrelease (P0ReleaseCohortMaxRecords) and by
+# the single-shot wrapper. Keep in sync — the driver fails fast rather than let a
+# bad step reach the promoter.
+COHORT_HARD_CAP=250
+P0_MILESTONE=10000
+
+# Sem default. O antigo (6846) foi congelado quando o estoque era menor e passou
+# a sub-promover em silêncio: com 7.962 aceitas, rodar sem --target parava 1.116
+# páginas antes do fim e o loop reportava "done" como se tivesse concluído.
+# Alvo de publicação é decisão por execução, derivada do corte medido — nunca uma
+# constante herdada. Ausente => a validação abaixo aborta com exit 2.
+TARGET="${WIKI_PUBLIC_RELEASE_TARGET:-}"
+STEP="${WIKI_PUBLIC_RELEASE_COHORT_MAX:-250}"
+MODE="dry-run"
+# Hold-list de sequenciamento (opcional). Segurar aqui NAO e reprovar: as
+# paginas listadas passaram em todos os gates; o operador so decidiu nao
+# publica-las nesta onda. Reprovacao de qualidade continua sendo exclusao do
+# plano do manifesto.
+HOLD_FILE="${WIKI_PUBLIC_RELEASE_HOLD_FILE:-}"
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--target)
+		shift
+		[ "$#" -gt 0 ] || {
+			printf 'run-promote-cohort-loop: --target needs a value\n' >&2
+			exit 2
+		}
+		TARGET="$1"
+		;;
+	--target=*) TARGET="${1#*=}" ;;
+	--hold-file)
+		shift
+		[ "$#" -gt 0 ] || {
+			printf 'run-promote-cohort-loop: --hold-file needs a value\n' >&2
+			exit 2
+		}
+		HOLD_FILE="$1"
+		;;
+	--hold-file=*) HOLD_FILE="${1#*=}" ;;
+	--step)
+		shift
+		[ "$#" -gt 0 ] || {
+			printf 'run-promote-cohort-loop: --step needs a value\n' >&2
+			exit 2
+		}
+		STEP="$1"
+		;;
+	--step=*) STEP="${1#*=}" ;;
+	--dry-run) MODE="dry-run" ;;
+	--execute) MODE="execute" ;;
+	-h | --help)
+		sed -n '2,26p' "$0"
+		exit 0
+		;;
+	*)
+		printf 'run-promote-cohort-loop: unknown argument: %s\n' "$1" >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+# --- validate numeric inputs (fail-fast) ---------------------------------------
+case "$TARGET" in
+'')
+	printf 'run-promote-cohort-loop: --target is REQUIRED (no default)\n  derive it from the measured cut of this run (included_in_manifest_plan),\n  e.g. --target 4366; or export WIKI_PUBLIC_RELEASE_TARGET\n' >&2
+	exit 2
+	;;
+*[!0-9]*)
+	printf 'run-promote-cohort-loop: --target must be a non-negative integer\n' >&2
+	exit 2
+	;;
+esac
+case "$STEP" in '' | *[!0-9]*)
+	printf 'run-promote-cohort-loop: --step must be a non-negative integer\n' >&2
+	exit 2
+	;;
+esac
+TARGET=$((10#$TARGET))
+STEP=$((10#$STEP))
+
+if [ "$STEP" -lt 1 ] || [ "$STEP" -gt "$COHORT_HARD_CAP" ]; then
+	printf 'run-promote-cohort-loop: --step (WIKI_PUBLIC_RELEASE_COHORT_MAX) must be within 1..%s (got %s)\n' "$COHORT_HARD_CAP" "$STEP" >&2
+	exit 2
+fi
+if [ "$TARGET" -lt 1 ]; then
+	printf 'run-promote-cohort-loop: --target must be >= 1 (got %s)\n' "$TARGET" >&2
+	exit 2
+fi
+if [ "$TARGET" -gt "$P0_MILESTONE" ]; then
+	printf 'run-promote-cohort-loop: --target cannot exceed the P0 milestone of %s (got %s)\n' "$P0_MILESTONE" "$TARGET" >&2
+	exit 2
+fi
+
+# --- live manifest count (matches internal/publishedmanifest.LoadRecords: -------
+# ------ blank / whitespace-only lines are not records) -------------------------
+count_manifest() {
+	if [ ! -f "$MANIFEST" ]; then
+		printf '0'
+		return
+	fi
+	awk 'NF{c++} END{print c+0}' "$MANIFEST"
+}
+
+printf 'run-promote-cohort-loop: mode=%s target=%s step=%s manifest=%s\n' "$MODE" "$TARGET" "$STEP" "$MANIFEST" >&2
+
+# Seed the cursor from the LIVE manifest count. In execute mode we re-read the live
+# count after every step (idempotent/resumable); in dry-run the live manifest never
+# moves, so we advance a simulated cursor to print the full planned sequence.
+current="$(count_manifest)"
+if [ "$current" -gt "$TARGET" ]; then
+	printf 'run-promote-cohort-loop: FATAL manifest already ahead of target: manifest=%s target=%s\n' "$current" "$TARGET" >&2
+	exit 1
+fi
+
+step_index=0
+while [ "$current" -lt "$TARGET" ]; do
+	final=$((current + STEP))
+	if [ "$final" -gt "$TARGET" ]; then
+		final="$TARGET"
+	fi
+
+	step_index=$((step_index + 1))
+	printf 'run-promote-cohort-loop: step %s -> current=%s final=%s delta=%s\n' "$step_index" "$current" "$final" "$((final - current))" >&2
+
+	if [ "$MODE" = "dry-run" ]; then
+		# Echo the exact command; do NOT execute. Advance the simulated cursor.
+		if [ -n "$HOLD_FILE" ]; then
+			printf '%s --allow-public-write --expected-current-manifest-records=%s --expected-manifest-records=%s --hold-file=%s\n' "$PROMOTER" "$current" "$final" "$HOLD_FILE"
+		else
+			printf '%s --allow-public-write --expected-current-manifest-records=%s --expected-manifest-records=%s\n' "$PROMOTER" "$current" "$final"
+		fi
+		current="$final"
+		continue
+	fi
+
+	# --- execute: real public write (maestro-triggered) ------------------------
+	# Array: cada argumento e uma palavra propria, sem depender de word splitting
+	# (caminho de hold-file com espaco quebrava a expansao sem aspas).
+	promoter_args=(--allow-public-write "--expected-current-manifest-records=$current" "--expected-manifest-records=$final")
+	if [ -n "$HOLD_FILE" ]; then
+		promoter_args+=("--hold-file=$HOLD_FILE")
+	fi
+	if ! "$PROMOTER" "${promoter_args[@]}"; then
+		printf 'run-promote-cohort-loop: FATAL promoter failed at step %s (current=%s final=%s) — aborting\n' "$step_index" "$current" "$final" >&2
+		exit 1
+	fi
+
+	# Fail-fast: re-read the LIVE manifest and confirm it advanced to `final`;
+	# never loop blind and never trust the promoter's exit code alone.
+	after="$(count_manifest)"
+	if [ "$after" -ne "$final" ]; then
+		printf 'run-promote-cohort-loop: FATAL manifest did not advance as expected: got=%s want=%s (step %s) — aborting\n' "$after" "$final" "$step_index" >&2
+		exit 1
+	fi
+	current="$after"
+done
+
+printf 'run-promote-cohort-loop: done mode=%s steps=%s final_manifest=%s target=%s\n' "$MODE" "$step_index" "$current" "$TARGET" >&2

@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Mede a ortografia do que esta REALMENTE no ar, e nao a de uma camada interna.
+
+POR QUE ESTA FERRAMENTA EXISTE (2026-09-10).
+
+`check-ptbr-spellcheck` reprova com `misspellings=824`, e a evidencia dele
+(`data/ops/ptbr_spellcheck_evidence.jsonl`) declara:
+
+    input_layer: "data/editorial/refined_public_prose.jsonl"
+    checked_at:  "2026-06-26"
+    publication_allowed: false
+    render_allowed: false
+    index_policy: "noindex"
+
+Ou seja: ele reprova a publicacao por ortografia de um artefato que NUNCA vai ao
+ar, medido ha mais de dois meses. `refined_public_prose` e camada intermediaria —
+o proprio plano ja mediu que `refinement_changed` e `false` nos 7.959 registros e
+que o texto dela e prefixo truncado do draft.
+
+Nao ha nada de errado com aquele gate medir a camada dele. O que faltava era
+ALGUEM medir o HTML servido, que e o que o leitor le, o Googlebot indexa e o
+assistente de IA cita. Esta ferramenta faz isso, e foi ela que achou quatro erros
+de portugues no ar em 2026-09-10 — corrigidos em `tools/generate-v2-ortografia-20260910`
+e na errata de fonte do gerador de temas.
+
+E `measure-*`, nao `check-*`: ela NAO reprova e NAO grava nada em `data/`. Serve
+para levantar o censo e alimentar decisao humana — quais tokens sao erro, quais
+sao sigla que falta na allowlist, quais sao transcricao de fonte oficial que nao
+se corrige.
+
+A ISENCAO ESPELHA A DO GATE, DE PROPOSITO. `internal/ptbrspell.isAllowedAcronymToken`
+isenta sigla toda maiuscula e, desde 2026-09-10, sigla no plural (`CDAs`); a
+allowlist textual de `content/ptbr_spellcheck_allowlist.txt` e comparada por
+dobra (minuscula + sem acento), como `ptbrtext.FoldTokenForCompare`. Se as duas
+regras divergirem, esta medicao e o gate passam a falar de conjuntos diferentes e
+nenhuma comparacao entre elas significa nada.
+
+E A ISENCAO VALE NAS DUAS PONTAS, desde 2026-09-10 dos dois lados. A saida do
+hunspell NAO e subconjunto da entrada — ele parte hifen —, entao `ATPV-e` entra
+inteiro e sai como `ATPV` + `e`. O gate passou a aplicar a regra de sigla
+tambem a saida (`misspellingCounts`), e esta ferramenta faz o mesmo no mesmo
+dia. O paragrafo acima descrevia so a ponta de entrada, e fica com esta emenda
+em vez de ser reescrito.
+
+E ENDERECO SAIU DA CONTA EM 2026-09-10, com o numero que forcou a mudanca.
+A passada exata sobre os 11.287 `index.html` publicou, no topo do censo, quatro
+tokens que NAO sao erro de portugues: `br` (1.658 paginas), `gov` (1.604), `Gov`
+(69) e `ans` (16), mais `jurisprudencia` (10). Todos nasciam desta ferramenta
+quebrar no ponto e na barra `Consumidor.gov.br`, `(gov.br/ans)` e
+`/jurisprudencia/stj-tema-1261/` — nome de servico federal e caminho do proprio
+portal escritos dentro da frase. Falso positivo de instrumento e pior que erro
+nao achado: ele manda corrigir texto que esta certo, e foi o que este censo fez
+por uma passada inteira. O paragrafo acima, que descrevia a tokenizacao sem
+ressalva de endereco, fica com esta emenda em vez de ser reescrito.
+
+O artefato passou a se autodescrever no mesmo dia: `descartado_motivo` nomeia
+cada classe de descarte com a regra que a aplica, e `enderecos_ignorados` conta
+quantos enderecos sairam por classe. Censo que so publica o que sobrou nao
+deixa saber se um token ausente foi aprovado, isentado ou nunca medido.
+
+Uso:
+    ./tools/measure-ortografia-publicada
+    ./tools/measure-ortografia-publicada --json censo.json
+    ./tools/measure-ortografia-publicada --stride 15     # amostra, para ensaio
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ALLOWLIST = "content/ptbr_spellcheck_allowlist.txt"
+HUNSPELL = "/usr/bin/hunspell"
+DICIONARIO = "pt_BR"
+
+# `<script>` e `<style>` saem inteiros — o JSON-LD mora num `<script>` e o seu
+# conteudo tambem aparece no HTML visivel quando importa (o `name` de uma fonte
+# oficial sai no texto do link e no aria-label), entao nada de util se perde.
+BLOCO = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.S | re.I)
+TAGS = re.compile(r"<[^>]+>")
+TOKEN = re.compile(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ][0-9A-Za-zÀ-ÖØ-öø-ÿ'’-]*")
+
+# ENDERECO NAO E PROSA, e o hunspell nao tem nada a dizer sobre ele.
+#
+# O CASO, medido em 2026-09-10 sobre os 11.287 `index.html`: os quatro tokens de
+# maior alcance do censo eram `br` (1.658 paginas), `gov` (1.604), `Gov` (69) e
+# `ans` (16), mais `jurisprudencia` (10). Nenhum e erro de portugues. Eles nascem
+# do TOKEN acima quebrar no ponto e na barra:
+#
+#   "Procon e Consumidor.gov.br podem mediar"  ->  Consumidor + gov + br
+#   "ANS, canais do consumidor (gov.br/ans)"   ->  gov + br + ans
+#   "transcrita em /jurisprudencia/stj-tema-1261/"  ->  jurisprudencia + stj…
+#
+# Sao nome de servico federal e caminho do proprio portal escritos DENTRO da
+# frase — texto correto que o instrumento partia em pedacos e depois acusava.
+#
+# O dominio de topo e uma lista FECHADA, e ela foi levantada da arvore, nao
+# imaginada: varrendo o texto visivel por `rotulo(.rotulo)+`, a UNICA terminacao
+# alfabetica de 2 a 5 letras que aparece e `.br` (360 ocorrencias numa amostra
+# de 1.612 paginas). As demais entram por seguranca, e nenhuma delas pode casar
+# palavra portuguesa: `8.078` termina em `078`, e `presumida.Assim` termina em
+# `Assim`, fora da lista nos dois casos.
+# A LISTA TEM UM ELEMENTO SO, E ISSO E MEDICAO. Varrendo o texto visivel dos
+# 11.287 `index.html` por `rotulo(.rotulo)+`, as terminacoes alfabeticas de 2 a
+# 5 letras que aparecem sao `.br` (2.581), `.txt` (4, `robots.txt`), `.json` (2)
+# e `.md` (1) — e mais nada. `com`, `org` e `net` NAO ocorrem.
+#
+# E `com` nao entra "por seguranca": ele e PERIGOSO. `Com` abre frase em
+# portugues juridico o tempo todo ("Com efeito,", "Com base nisso"), e o
+# `ENDERECO` e insensivel a caixa: com `com` na lista, `entendimento anterior.Com
+# efeito` casaria `anterior.Com` e o instrumento apagaria a palavra ANTES do
+# ponto — que e exatamente o token que ele existe para medir. Uma versao
+# anterior desta constante trazia `com|org|net|jus|leg|edu|int|info` por
+# cautela; a cautela era o defeito, e sai hoje com este registro.
+DOMINIO_DE_TOPO = "br"
+URL_ABSOLUTA = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.I)
+ENDERECO = re.compile(
+    # A BARRA SAIU DESTA GUARDA EM 2026-09-10, e o motivo esta medido: com
+    # `/` aqui, `Celpe-Bras (Inep/gov.br)` nao casava, e `br` sobrevivia em 7
+    # paginas e `gov` em 1 — o rotulo escrito depois de uma barra continua sendo
+    # dominio. O que a guarda tem de barrar e continuacao de dominio (`\w`, `.`,
+    # `-`), para nao casar no meio de um host.
+    r"(?<![\w-])"
+    # O PONTO INICIAL E OPCIONAL, e isso tambem saiu de survivor. `".bet.br"` —
+    # a extensao das casas de aposta autorizadas, escrita entre aspas e COM o
+    # ponto na frente — deixava `br` vivo em 6 paginas, porque a guarda de
+    # contexto barrava o `.` anterior. Extensao de dominio escrita assim continua
+    # sendo endereco.
+    # Uma das duas formas, e nunca `br` solto: ou ponto inicial com zero ou mais
+    # rotulos (`.br`, `.bet.br`), ou um ou mais rotulos sem ponto inicial
+    # (`gov.br`, `consumidor.gov.br`). Com `*` e sem o ponto obrigatorio, a
+    # regra casaria a palavra `br` sozinha, e o instrumento passaria a apagar
+    # token em vez de endereco.
+    r"(?:\.(?:[0-9A-Za-zÀ-ÖØ-öø-ÿ](?:[0-9A-Za-zÀ-ÖØ-öø-ÿ-]*[0-9A-Za-zÀ-ÖØ-öø-ÿ])?\.)*"
+    r"|(?:[0-9A-Za-zÀ-ÖØ-öø-ÿ](?:[0-9A-Za-zÀ-ÖØ-öø-ÿ-]*[0-9A-Za-zÀ-ÖØ-öø-ÿ])?\.)+)"
+    rf"(?:{DOMINIO_DE_TOPO})"
+    r"(?![0-9A-Za-zÀ-ÖØ-öø-ÿ])"
+    r"(?:/[^\s<>\"']*)?", re.I)
+CAMINHO = re.compile(r"(?<!\S)/[0-9A-Za-z][0-9A-Za-z._~%-]*(?:/[0-9A-Za-z._~%-]+)*/?(?!\S)")
+# NOME DE ARQUIVO TAMBEM NAO E PROSA, e a lista de extensoes tem a mesma regra
+# das outras: so entra o que a arvore tem. Medido no texto visivel dos 11.287
+# `index.html` — `robots.txt` (2 paginas), `datasets.json` (1) e `index.md` (1),
+# escritos DENTRO da frase para o leitor humano. Sao os tres unicos, e por isso
+# a lista tem tres elementos. Nenhuma dessas extensoes e palavra portuguesa, e
+# nenhuma abre frase.
+EXTENSAO_DE_ARQUIVO = "txt|json|md|xml|csv|jsonl|gz|css|js|html"
+ARQUIVO = re.compile(
+    r"(?<![\w-])"
+    r"[0-9A-Za-z][0-9A-Za-z._-]*\."
+    rf"(?:{EXTENSAO_DE_ARQUIVO})"
+    r"(?![0-9A-Za-zÀ-ÖØ-öø-ÿ])")
+
+
+# O ARTEFATO TEM DE DIZER O QUE NAO ESTA NELE. Um censo que so publica o que
+# sobrou nao permite a quem o le depois saber se um token ausente foi aprovado,
+# isentado ou nunca medido — e essa ambiguidade e a mesma que o repositorio ja
+# pagou em `detector-conta-em-vez-de-comparar-conjunto`.
+DESCARTADO_MOTIVO = {
+    "sigla": "token todo maiusculo de 2 a 8 letras, ou o plural dele "
+             "(`CDAs`), isento na ENTRADA e na SAIDA do hunspell — espelha "
+             "internal/ptbrspell.isAllowedAcronymToken",
+    "allowlist": "termo de content/ptbr_spellcheck_allowlist.txt, comparado "
+                 "por dobra (minuscula + sem acento), como "
+                 "ptbrtext.FoldTokenForCompare",
+    "endereco": "URL absoluta, dominio com terminacao da lista fechada "
+                "DOMINIO_DE_TOPO (com ou sem caminho), nome de arquivo com "
+                "extensao de EXTENSAO_DE_ARQUIVO e caminho solto do proprio "
+                "portal — endereco nao e prosa, e o contador por classe esta "
+                "em `enderecos_ignorados`",
+    "curto_ou_numero": "token com menos de 2 caracteres, ou so digitos",
+    "nao_descartado": "todo o resto entra no hunspell; o que ele recusa sai em "
+                      "`misspellings` (com pagina de origem) ou em `sem_origem` "
+                      "(pedaco que ele partiu por hifen ou apostrofo)",
+}
+
+
+def dobra(token: str) -> str:
+    decomposto = unicodedata.normalize("NFD", token.lower())
+    return "".join(c for c in decomposto if unicodedata.category(c) != "Mn")
+
+
+def e_sigla(token: str) -> bool:
+    """Espelha isAllowedAcronymToken: toda maiuscula, ou toda maiuscula + plural."""
+    letras = [c for c in token if c.isalpha()]
+    if letras and all(c.isupper() for c in letras):
+        return 2 <= len(letras) <= 8
+    if token.endswith("s"):
+        raiz = [c for c in token[:-1] if c.isalpha()]
+        if raiz and all(c.isupper() for c in raiz):
+            return 2 <= len(raiz) <= 8
+    return False
+
+
+def carrega_allowlist(raiz: str) -> set[str]:
+    caminho = os.path.join(raiz, ALLOWLIST)
+    if not os.path.exists(caminho):
+        return set()
+    termos = set()
+    with open(caminho, encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if linha and not linha.startswith("#"):
+                termos.add(dobra(linha))
+    return termos
+
+
+def paginas(raiz: str, stride: int) -> list[str]:
+    encontradas = []
+    for pasta, _subpastas, arquivos in os.walk(os.path.join(raiz, "public")):
+        if "index.html" in arquivos:
+            encontradas.append(os.path.join(pasta, "index.html"))
+    encontradas.sort()
+    if stride > 1:
+        # Stride deterministico, e o numero fica no relatorio: amostra nunca se
+        # apresenta como populacao.
+        encontradas = encontradas[::stride]
+    return encontradas
+
+
+def censo(raiz: str, stride: int) -> dict:
+    allow = carrega_allowlist(raiz)
+    arquivos = paginas(raiz, stride)
+    onde: dict[str, set[str]] = collections.defaultdict(set)
+    enderecos: dict[str, int] = collections.Counter()
+    for caminho in arquivos:
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            bruto = arquivo.read()
+        # `html.unescape` DEPOIS de tirar as tags, nunca antes: entidade
+        # desescapada cedo pode formar `<` e criar tag que nao existia. E ela
+        # tem de existir — sem ela `&amp;` vira o token `amp`, que este censo
+        # contou como erro de portugues em 19 paginas ate 2026-09-10. O leitor
+        # ve `&`; quem via `amp` era so o instrumento.
+        texto = html.unescape(TAGS.sub(" ", BLOCO.sub(" ", bruto)))
+        # A ORDEM AQUI E INDIFERENTE, e isso foi MEDIDO, nao suposto: a versao
+        # anterior deste comentario afirmava que inverter fazia o `/ans` de
+        # `gov.br/ans` escapar como caminho, e a bancada de mutacao mostrou que
+        # nao — trocar `CAMINHO` e `ENDERECO` de lugar deixa os 11 testes
+        # verdes. O motivo e que `CAMINHO` exige a barra abrindo um token
+        # delimitado por espaco (`(?<!\S)/`), e a barra de um dominio vem colada
+        # ao rotulo. O comentario fica com a data e o motivo, como manda o
+        # contrato para paragrafo superado.
+        for padrao, chave in ((URL_ABSOLUTA, "url"), (ENDERECO, "dominio"),
+                              (ARQUIVO, "arquivo"), (CAMINHO, "caminho")):
+            texto, trocas = padrao.subn(" ", texto)
+            enderecos[chave] += trocas
+        rel = os.path.relpath(caminho, raiz)
+        for achado in TOKEN.finditer(texto):
+            token = achado.group(0)
+            if len(token) < 2 or token.isdigit():
+                continue
+            if e_sigla(token) or dobra(token) in allow:
+                continue
+            onde[token].add(rel)
+
+    candidatos = sorted(onde)
+    if not candidatos:
+        return {"arquivos": len(arquivos), "stride": stride, "candidatos": 0,
+                "misspellings": {}, "enderecos_ignorados": dict(enderecos),
+                "descartado_motivo": DESCARTADO_MOTIVO}
+    resultado = subprocess.run([HUNSPELL, "-d", DICIONARIO, "-l"],
+                               input="\n".join(candidatos),
+                               capture_output=True, text=True, check=False)
+    if resultado.returncode != 0 and not resultado.stdout:
+        raise SystemExit(f"hunspell falhou (rc={resultado.returncode}): "
+                         f"{resultado.stderr.strip()[:300]}")
+    # A ISENCAO VALE NOS DOIS EXTREMOS, e nao so na entrada. Desde 2026-09-10
+    # `internal/ptbrspell.misspellingCounts` aplica `isAllowedAcronymToken`
+    # tambem a SAIDA do hunspell, porque `ATPV-e` entra inteiro e sai como
+    # `ATPV` + `e`: a sigla isenta na entrada voltava como erro pela porta dos
+    # fundos. Sem espelhar isso aqui, os dois numeros deixariam de ser
+    # comparaveis — que e a condicao que o cabecalho desta ferramenta declara.
+    # Medido no corpus do gate: 25 pedacos assim, todos siglas reais (ATPV,
+    # CRLV, CT-e, DASN-SIMEI, FG-Fies, NFS, PGFN…), mais a mascara de numero de
+    # processo da Resolucao CNJ 65/2008 (NNNNNNN-DD.AAAA.J.TR.OOOO).
+    fora = sorted({l.strip() for l in resultado.stdout.splitlines()
+                   if l.strip() and not e_sigla(l.strip())})
+    # A SAIDA DO HUNSPELL NAO E SUBCONJUNTO DA ENTRADA, e supor que fosse quebrou
+    # a primeira versao desta ferramenta com IndexError. Ele aplica a propria
+    # tokenizacao: um token que entrou com hifen ou apostrofo tipografico sai
+    # partido em pedacos, e o pedaco nao existe no indice de origem.
+    #
+    # O pedaco NAO se descarta em silencio — descarte em silencio e como um
+    # detector deixa de ver uma familia inteira sem ninguem notar. Ele e contado
+    # em `sem_origem` e sai no relatorio.
+    com_origem = {t: {"paginas": len(onde[t]), "exemplo": sorted(onde[t])[0]}
+                  for t in fora if onde.get(t)}
+    sem_origem = sorted(t for t in fora if not onde.get(t))
+    return {
+        "arquivos": len(arquivos),
+        "stride": stride,
+        "exata": stride == 1,
+        "candidatos": len(candidatos),
+        "allowlist_termos": len(allow),
+        "misspellings": com_origem,
+        "sem_origem": sem_origem,
+        "enderecos_ignorados": dict(enderecos),
+        "descartado_motivo": DESCARTADO_MOTIVO,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    analisador = argparse.ArgumentParser(description="censo de ortografia do HTML servido")
+    analisador.add_argument("--json", metavar="ARQUIVO",
+                            help="grava o censo completo neste arquivo")
+    analisador.add_argument("--stride", type=int, default=1,
+                            help="1 = passada exata (padrao); >1 = amostra por stride")
+    analisador.add_argument("--raiz", default=RAIZ)
+    analisador.add_argument("--top", type=int, default=40)
+    argumentos = analisador.parse_args(argv)
+    if argumentos.stride < 1:
+        raise SystemExit("--stride tem de ser >= 1")
+
+    estado = censo(argumentos.raiz, argumentos.stride)
+    escopo = ("passada EXATA" if estado.get("exata")
+              else f"AMOSTRA por stride {estado['stride']} — NAO e populacao")
+    print(f"{estado['arquivos']} pagina(s) de public/ ({escopo})")
+    print(f"tokens candidatos: {estado['candidatos']} "
+          f"(sigla e allowlist de {estado.get('allowlist_termos', 0)} termos ja fora)")
+    print(f"fora do dicionario pt_BR: {len(estado['misspellings'])}")
+    sem_origem = estado.get("sem_origem") or []
+    if sem_origem:
+        print(f"pedacos que o hunspell devolveu partidos (hifen/apostrofo), "
+              f"sem pagina de origem: {len(sem_origem)} — {', '.join(sem_origem[:8])}"
+              + ("…" if len(sem_origem) > 8 else ""))
+    print()
+    por_alcance = sorted(estado["misspellings"].items(),
+                         key=lambda par: (-par[1]["paginas"], par[0]))
+    for token, dados in por_alcance[:argumentos.top]:
+        print(f"  {token:28s} {dados['paginas']:5d} pagina(s)  {dados['exemplo']}")
+    if len(por_alcance) > argumentos.top:
+        print(f"  … e mais {len(por_alcance) - argumentos.top}; use --json para o censo inteiro")
+    if argumentos.json:
+        with open(argumentos.json, "w", encoding="utf-8") as arquivo:
+            json.dump(estado, arquivo, ensure_ascii=False, indent=1, sort_keys=True)
+        print(f"\ncenso gravado em {argumentos.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

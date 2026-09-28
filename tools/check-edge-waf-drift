@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""check-edge-waf-drift — as regras WAF e o Bot Management da zona são os que o repositório declara?
+
+READ-ONLY. Sai 1 quando a fase `http_request_firewall_custom` viva diverge de
+ops/cloudflare/waf-custom-rules.json ou quando o Bot Management diverge de
+ops/cloudflare/bot-management.json; sai 2 quando NÃO CONSEGUE medir (sem
+credencial, API fora) — indisponibilidade nunca é reprovação neste repositório.
+
+POR QUE EXISTE (medido em 2026-09-02). As duas regras WAF (bloqueio de scanner
+por path; bloqueio de método de escrita fora de /mcp, /a2a, /api) estavam
+versionadas e NENHUM gate as lia na zona; o estado do Bot Management
+(ai_bots_protection, ai_training/ai_search/ai_user, fight_mode, robots.txt
+gerenciado — tudo `disabled`, por DEC-023) não estava versionado em lugar
+nenhum. A Cache Rule já foi esvaziada pelo painel em 2026-08-22 e levou cinco
+dias para alguém consumir o alarme; um clique em "bloquear bots de IA" faria o
+mesmo com os crawlers de IA, e a origem nunca veria — o bloqueio acontece na
+borda, antes do túnel. Este gate lê as duas superfícies com a credencial que
+as alcança e reprova qualquer deriva.
+
+CREDENCIAL: o token de zona (CLOUDFLARE_ZONE_TOKEN, Bearer) NÃO lê firewall nem
+bot_management (10000 "Authentication error" / "request is not authorized",
+medido) — por isso este gate usa direto a Global API Key (CLOUDFLARE_EMAIL +
+CLOUDFLARE_API_TOKEN, cabeçalhos X-Auth-Email/X-Auth-Key) para essas duas
+leituras, via tools/cloudflare_auth.py (escopo "firewall"): tentar o token de
+zona primeiro seria uma chamada fadada a falhar por escopo. A zona em si
+(GET /zones?name=) resolve com o token de zona (escopo "leitura" — Zone Read
+está no escopo dele). Nunca cunha token novo (CLAUDE.md: nenhuma credencial
+nova).
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+API = "https://api.cloudflare.com/client/v4"
+WAF_CANONICO = os.path.join(RAIZ, "ops/cloudflare/waf-custom-rules.json")
+BM_CANONICO = os.path.join(RAIZ, "ops/cloudflare/bot-management.json")
+FASE = "http_request_firewall_custom"
+
+
+def pega(url, cabecalhos):
+    req = urllib.request.Request(url, headers=cabecalhos)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8")), None
+    except urllib.error.HTTPError as erro:
+        try:
+            return json.loads(erro.read().decode("utf-8")), None
+        except Exception:
+            return None, f"HTTP {erro.code}"
+    except Exception as erro:
+        return None, str(erro)[:160]
+
+
+def ler_firewall(url, env):
+    """(dados, rotulo, erro) -- exatamente um de dados/erro é None. Vai DIRETO
+    pela Global API Key (escopo "firewall" de tools/cloudflare_auth.py): o
+    token de zona nunca alcança WAF/bot_management (10000 "Authentication
+    error", medido), então tentá-lo primeiro só somaria uma chamada fadada."""
+    cab, rotulo = cloudflare_auth.cabecalhos("firewall", env=env)
+    if cab is None:
+        return None, None, "sem Global API Key para ler firewall/bot_management em .env.local"
+    dados, erro = pega(url, cab)
+    if erro:
+        return None, None, erro
+    if not dados.get("success"):
+        return None, None, "; ".join(e.get("message", "") for e in dados.get("errors", []))
+    return dados, rotulo, None
+
+
+def normaliza_regra(r):
+    return {"expression": " ".join((r.get("expression") or "").split()),
+            "action": r.get("action"), "enabled": r.get("enabled", True)}
+
+
+def resolve_zona(env):
+    with open(os.path.join(RAIZ, "content/site.json"), encoding="utf-8") as f:
+        dominio = json.load(f)["base_url"].rstrip("/").split("//", 1)[-1]
+    zid, erro = cloudflare_auth.zona_id(dominio, escopo="leitura", env=env)
+    if erro:
+        return None, f"zona {dominio} não resolvida ({erro})"
+    return zid, None
+
+
+def main():
+    env = cloudflare_auth.ambiente()
+    zona_id, erro = resolve_zona(env)
+    if erro:
+        print(f"INCONCLUSIVO: {erro}", file=sys.stderr)
+        return 2
+    problemas = []
+
+    dados, rotulo, erro = ler_firewall(f"{API}/zones/{zona_id}/rulesets/phases/{FASE}/entrypoint", env)
+    if erro:
+        print(f"INCONCLUSIVO: WAF não lido ({erro})", file=sys.stderr)
+        return 2
+    vivas = [normaliza_regra(r) for r in (dados.get("result") or {}).get("rules", [])]
+    versao = (dados.get("result") or {}).get("version")
+    with open(WAF_CANONICO, encoding="utf-8") as f:
+        canon = json.load(f)
+    canonicas = [normaliza_regra(r) for r in (canon.get("rules") if isinstance(canon, dict) else canon)]
+    print(f"WAF ({FASE}) lido com {rotulo}: {len(vivas)} regra(s) viva(s), versão {versao}; versionadas: {len(canonicas)}")
+    if vivas != canonicas:
+        faltam = [c for c in canonicas if c not in vivas]
+        sobram = [v for v in vivas if v not in canonicas]
+        for c in faltam:
+            problemas.append(f"WAF: regra versionada AUSENTE/diferente na zona: {c['action']} {c['expression'][:90]}")
+        for v in sobram:
+            problemas.append(f"WAF: regra viva NÃO versionada: {v['action']} {v['expression'][:90]}")
+        if not faltam and not sobram:
+            problemas.append("WAF: mesma lista em ordem diferente (a ordem é semântica no WAF)")
+
+    dados, rotulo2, erro = ler_firewall(f"{API}/zones/{zona_id}/bot_management", env)
+    if erro:
+        print(f"INCONCLUSIVO: bot_management não lido ({erro})", file=sys.stderr)
+        return 2
+    vivo = dados.get("result") or {}
+    with open(BM_CANONICO, encoding="utf-8") as f:
+        bm = json.load(f)["estado"]
+    print(f"Bot Management lido com {rotulo2}: {len(bm)} campo(s) comparado(s)")
+    for chave, esperado in sorted(bm.items()):
+        if vivo.get(chave) != esperado:
+            problemas.append(f"Bot Management: {chave} = {vivo.get(chave)!r} na zona, versionado {esperado!r}")
+    ligados = [k for k in ("ai_bots_protection", "ai_training", "ai_search", "ai_user", "crawler_protection", "content_bots_protection")
+               if str(vivo.get(k, "disabled")) not in ("disabled", "false", "False", "")]
+    if vivo.get("fight_mode") or vivo.get("is_robots_txt_managed") or ligados:
+        problemas.append(f"Bot Management: proteção contra bot LIGADA na borda ({ligados or 'fight_mode/robots gerenciado'}) — "
+                         f"DEC-023 proíbe bloquear bot por identidade; a origem não veria nada")
+
+    if problemas:
+        print("\ncheck-edge-waf-drift: FAIL")
+        for p in problemas:
+            print(f"  - {p}")
+        print("\n  Remédio: se a mudança foi intencional, versione-a (ops/cloudflare/*.json) com o motivo;")
+        print("  se não foi, restaure pelo painel/API e registre o incidente em docs/goal/BUGLOG.md.")
+        return 1
+    print("\ncheck-edge-waf-drift: OK (WAF e Bot Management da zona são os versionados; nenhum bloqueio de bot ligado)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

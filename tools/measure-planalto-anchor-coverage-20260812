@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""measure-planalto-anchor-coverage-20260812 — a citação aponta mesmo para o artigo?
+
+Ferramenta de MEDIÇÃO (read-only sobre o acervo). Faz três coisas, nesta ordem:
+
+  1. varre `data/editorial/v2_pages/*.jsonl` e lista toda combinação
+     `URL#âncora` declarada em `official_sources[].url`, com a contagem de
+     ocorrências e de páginas;
+  2. baixa cada URL-base citada E as variantes do MESMO documento oficial
+     (sufixo `compilado`/`compilada`/`cons` acrescentado ou removido), extraindo
+     de cada HTML, com `html.parser`, o conjunto REAL de atributos `id`/`name`;
+  3. classifica cada combinação em: âncora existe · âncora com outra grafia no
+     mesmo documento · âncora ausente (com ou sem variante que a tenha) ·
+     documento inacessível.
+
+Por que existe: a URL responde 200 mesmo quando a âncora não existe — o
+fragmento não é enviado ao servidor. Nenhum verificador de link acusa o defeito,
+e só a leitura do HTML da fonte revela que "art. 14 do CDC" cai no topo de uma
+lei inteira. A régua do repo para pular ou acusar um gate é medir de forma
+reproduzível: este arquivo é a medição, e o resultado por documento (status,
+sha256, número de âncoras, normas alteradoras) fica em
+`data/editorial/v2_planalto_anchor_conference_20260812.jsonl`.
+
+O HTML baixado é cache: fica fora do repo (98 MB) e se regenera em minutos; o
+que prova a conferência é o sha256 gravado no JSONL.
+
+Uso:
+    tools/measure-planalto-anchor-coverage-20260812                # mede e grava
+    tools/measure-planalto-anchor-coverage-20260812 --sem-rede     # só o cache
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PAGES = ROOT / "data/editorial/v2_pages"
+SAIDA = ROOT / "data/editorial/v2_planalto_anchor_conference_20260812.jsonl"
+CACHE = Path(os.environ.get("PLANALTO_CACHE",
+                            "/tmp/wiki-planalto-cache-20260812"))
+# Identidade canonica (CLAUDE.md secao 11). Medido em 2026-09-05 contra
+# www.planalto.gov.br (dominante: 69,9% das URLs em official_sources):
+# 200/194.129 B (l8906.htm), 200/230.913 B (l13709compilado.htm). As demais
+# URLs de official_sources[] cobrem outros hosts oficiais -- ver o mesmo
+# levantamento em generate-normative-fingerprint-baseline-20260812.
+UA = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+      "+https://wikijuridica.com.br/bot/; coleta-oficial)")
+HOJE = "2026-08-12"
+
+# Só conta como ALTERAÇÃO a nota que muda o texto: "Vide" e "Vigência" são
+# remissão e data de vigor, e aparecem numa versão e não na outra sem que isso
+# signifique texto desatualizado.
+MARCA = re.compile(r"(Redação dada|Incluíd|Acrescid|Revogad|Renumerad)", re.I)
+NORMA = re.compile(
+    r"(Lei Complementar|Lei|Emenda Constitucional|Medida Provisória|"
+    r"Decreto-Lei|Decreto)[^\d]{0,20}?([\d][\d.]{2,})", re.I)
+ANO = re.compile(r"\b((?:19|20)\d{2})\b")
+
+
+class ColetorDeAncoras(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        for chave, valor in attrs:
+            if chave in ("id", "name") and valor:
+                self.ids.add(valor.strip())
+
+    handle_startendtag = handle_starttag
+
+
+def decodifica(bruto: bytes) -> tuple[str, str]:
+    for codificacao in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return bruto.decode(codificacao), codificacao
+        except UnicodeDecodeError:
+            continue
+    return bruto.decode("latin-1", "replace"), "latin-1/replace"
+
+
+def normas_alteradoras(texto: str) -> tuple[list[str], int]:
+    plano = re.sub(r"<[^>]+>", " ", texto).replace("&nbsp;", " ")
+    plano = re.sub(r"&[a-z]+;", " ", plano)
+    plano = re.sub(r"\s+", " ", plano)
+    achados: set[str] = set()
+    anos: list[int] = []
+    for nota in re.findall(r"\(([^()]{0,240})\)", plano):
+        if not MARCA.search(nota):
+            continue
+        anos_da_nota = ANO.findall(nota)
+        ano = anos_da_nota[-1] if anos_da_nota else ""
+        for especie, numero in NORMA.findall(nota):
+            # "10.467" e "10467" são a MESMA lei: sem normalizar o ponto, a
+            # comparação entre duas versões do documento inventa diferença.
+            achados.add(f"{especie.title()} {numero.replace('.', '')}/{ano}")
+        if ano:
+            anos.append(int(ano))
+    return sorted(achados), (max(anos) if anos else 0)
+
+
+def variantes(url: str) -> list[str]:
+    """Variantes do MESMO documento oficial — hipóteses a confirmar por download."""
+    achado = re.match(r"^(.*/)([^/]+)\.(htm|html)$", url)
+    if not achado:
+        return []
+    prefixo, nome, extensao = achado.groups()
+    baixo = nome.lower()
+    saida = []
+    for sufixo in ("compilado", "compilada", "cons"):
+        if baixo.endswith(sufixo):
+            saida.append(f"{prefixo}{nome[:-len(sufixo)]}.{extensao}")
+    if not any(baixo.endswith(s) for s in ("compilado", "compilada", "cons")):
+        saida += [f"{prefixo}{nome}compilado.{extensao}",
+                  f"{prefixo}{nome}compilada.{extensao}"]
+    return saida
+
+
+def caminho_cache(url: str) -> Path:
+    return CACHE / (hashlib.sha256(url.encode()).hexdigest()[:24] + ".htm")
+
+
+def baixa(url: str, sem_rede: bool) -> tuple[bytes, int]:
+    destino = caminho_cache(url)
+    if destino.is_file() and destino.stat().st_size > 0:
+        return destino.read_bytes(), 200
+    if sem_rede:
+        return b"", 0
+    CACHE.mkdir(parents=True, exist_ok=True)
+    for tentativa in range(3):
+        try:
+            pedido = urllib.request.Request(
+                url, headers={"User-Agent": UA, "Accept": "text/html,*/*"})
+            with urllib.request.urlopen(pedido, timeout=60) as resposta:
+                bruto = resposta.read()
+            destino.write_bytes(bruto)
+            time.sleep(3.5)
+            return bruto, 200
+        except urllib.error.HTTPError as erro:
+            return b"", erro.code
+        except Exception:
+            time.sleep(6 * (tentativa + 1))
+    return b"", 0
+
+
+def formas_do_fragmento(fragmento: str) -> list[str]:
+    """Formas equivalentes, da mais fiel à mais tolerante.
+
+    O acervo cita "#art14", "#art37%C2%A76" (o § percent-codificado) e, por
+    descuido de quem escreveu, "#art149A" onde o Planalto marcou "art149a".
+    """
+    limpo = urllib.parse.unquote(fragmento)
+    return [x for x in dict.fromkeys(
+        [fragmento, limpo, limpo.lower(), limpo.upper()]) if x]
+
+
+def varre_acervo() -> tuple[collections.Counter, dict[str, set[str]]]:
+    combinacoes: collections.Counter = collections.Counter()
+    paginas: dict[str, set[str]] = collections.defaultdict(set)
+    for shard in sorted(PAGES.glob("*.jsonl")):
+        for linha in shard.read_text(encoding="utf-8").splitlines():
+            if not linha.strip():
+                continue
+            registro = json.loads(linha)
+            for fonte in registro.get("official_sources") or []:
+                url = fonte.get("url") or ""
+                if "#" in url:
+                    combinacoes[url] += 1
+                    paginas[url].add(registro.get("intent_id") or "")
+    return combinacoes, paginas
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporario = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporario, path)
+    finally:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sem-rede", action="store_true",
+                        help="usa só o cache já baixado")
+    args = parser.parse_args()
+
+    combinacoes, paginas = varre_acervo()
+    bases = sorted({u.split("#", 1)[0] for u in combinacoes})
+    alvos: list[str] = []
+    for base in bases:
+        for candidata in [base] + variantes(base):
+            if candidata not in alvos:
+                alvos.append(candidata)
+    print(f"acervo: {sum(combinacoes.values())} ocorrência(s) de URL com "
+          f"fragmento, {len(combinacoes)} combinação(ões) distinta(s), "
+          f"{len(set().union(*paginas.values()))} página(s)")
+    print(f"conferindo {len(alvos)} documento(s) ({len(bases)} citado(s) + "
+          f"variantes)")
+
+    conferencia: dict[str, dict] = {}
+    for indice, url in enumerate(alvos, 1):
+        bruto, status = baixa(url, args.sem_rede)
+        registro = {"url": url, "consultado_em": HOJE, "http_status": status}
+        if bruto:
+            texto, codificacao = decodifica(bruto)
+            coletor = ColetorDeAncoras()
+            try:
+                coletor.feed(texto)
+            except Exception:
+                pass
+            leis, ano = normas_alteradoras(texto)
+            registro |= {
+                "sha256_documento": hashlib.sha256(bruto).hexdigest(),
+                "bytes": len(bruto), "encoding": codificacao,
+                "ancoras_no_documento": len(coletor.ids),
+                "normas_alteradoras": len(leis), "ano_max_alteracao": ano,
+            }
+            registro["_ancoras"] = coletor.ids
+        conferencia[url] = registro
+        if indice % 50 == 0:
+            print(f"  [{indice}/{len(alvos)}]", flush=True)
+
+    classe: collections.Counter = collections.Counter()
+    combos_classe: collections.Counter = collections.Counter()
+    pendentes: list[str] = []
+    for combinacao, quantas in combinacoes.items():
+        base, _, fragmento = combinacao.partition("#")
+        # `#page=N` num PDF não é âncora de HTML: é parâmetro de abertura do
+        # próprio formato, e o leitor de PDF do navegador o obedece. Medi-lo com
+        # extrator de id/name dá zero e sugeriria remover um fragmento correto.
+        if base.lower().endswith(".pdf") and fragmento.startswith("page="):
+            classe["fragmento_pdf_valido"] += quantas
+            combos_classe["fragmento_pdf_valido"] += 1
+            continue
+        documento = conferencia.get(base) or {}
+        ancoras = documento.get("_ancoras")
+        if ancoras is None:
+            classe["documento_inacessivel"] += quantas
+            combos_classe["documento_inacessivel"] += 1
+            pendentes.append(f"{combinacao} (HTTP {documento.get('http_status')})")
+            continue
+        formas = formas_do_fragmento(fragmento)
+        if fragmento in ancoras:
+            classe["ancora_existe"] += quantas
+            combos_classe["ancora_existe"] += 1
+        elif any(forma in ancoras for forma in formas):
+            classe["ancora_com_outra_grafia"] += quantas
+            combos_classe["ancora_com_outra_grafia"] += 1
+        else:
+            tem_variante = any(
+                (conferencia.get(v) or {}).get("_ancoras") is not None
+                and any(f in conferencia[v]["_ancoras"] for f in formas)
+                for v in variantes(base))
+            chave = ("ancora_ausente_com_variante" if tem_variante
+                     else "ancora_ausente_sem_variante")
+            classe[chave] += quantas
+            combos_classe[chave] += 1
+
+    print("\n=== ocorrências ===")
+    for nome, quantas in classe.most_common():
+        print(f"{quantas:6d}  {nome}")
+    print("=== combinações distintas ===")
+    for nome, quantas in combos_classe.most_common():
+        print(f"{quantas:6d}  {nome}")
+    if pendentes:
+        print("=== pendências (documento inacessível) ===")
+        for item in sorted(set(pendentes)):
+            print(f"  {item}")
+
+    linhas = [json.dumps({
+        "ferramenta": Path(__file__).name, "gerado_em": HOJE,
+        "tipo": "resumo",
+        "ocorrencias_por_classe": dict(classe),
+        "combinacoes_por_classe": dict(combos_classe),
+        "ocorrencias_com_fragmento": sum(combinacoes.values()),
+        "combinacoes_distintas": len(combinacoes),
+        "paginas_com_fragmento": len(set().union(*paginas.values())),
+    }, ensure_ascii=False)]
+    for url in sorted(conferencia):
+        registro = dict(conferencia[url])
+        registro.pop("_ancoras", None)
+        linhas.append(json.dumps(
+            {"ferramenta": Path(__file__).name, "gerado_em": HOJE,
+             "tipo": "documento_conferido", **registro}, ensure_ascii=False))
+    atomic_write(SAIDA, ("\n".join(linhas) + "\n").encode("utf-8"))
+    print(f"\nconferência: {len(linhas)} registro(s) em "
+          f"{os.path.relpath(SAIDA, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

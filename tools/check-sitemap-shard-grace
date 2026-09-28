@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Confere a coerencia de public/sitemaps/ ANTES que o boot do servidor a confira.
+
+POR QUE ESTE CHECK EXISTE (2026-08-13)
+--------------------------------------
+`internal/publishedmanifest/collectPublicSitemapHashes` recusa dois estados do
+diretorio: shard que existe em disco e NAO esta no indice
+(publishedmanifest.go:447) e <loc> repetida entre shards (:466). Essa validacao
+roda no BOOT do servidor (httpserver.go:480 -> New devolve erro). Ou seja: um arquivo
+sobrando em public/sitemaps/ nao produz um aviso, produz um servidor que NAO
+SOBE.
+
+Desde a carencia (internal/sitemapgrace) o diretorio passa a conter, de forma
+legitima, shards que NAO estao no indice: os que foram retirados do plano e
+seguem servindo 200 a quem tem o indice anterior, para nao devolver 4xx ao
+crawler. O manifesto pula esses — mas so os que carregam a MARCA. Um shard sem
+marca fora do indice continua sendo o estado que derruba o boot, e agora ha um
+caminho novo para produzi-lo (copia manual, remocao interrompida, publicacao
+morta no meio).
+
+Este check enxerga esse estado com o servidor no ar, em vez de descobri-lo no
+proximo restart — que e quando ninguem quer descobrir.
+
+O QUE ELE VERIFICA
+------------------
+1. Todo shard do indice existe em disco (indice que promete e nao entrega e 404
+   direto para o crawler).
+2. Todo shard em disco ou esta no indice, ou carrega a marca de carencia.
+3. Nenhuma <loc> se repete entre os shards ATIVOS (os em carencia repetem por
+   construcao: as URLs deles migraram para outro shard, e e exatamente por isso
+   que o manifesto os pula).
+4. Nenhum shard em carencia passou do prazo sem ser removido.
+5. A marca, quando existe, tem instante legivel.
+
+READ-ONLY: le public/sitemaps/ e public/sitemap.xml. Nao escreve nem publica.
+
+Uso:
+    tools/check-sitemap-shard-grace
+    tools/check-sitemap-shard-grace --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import glob
+import json
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+SHARDS = RAIZ / "public" / "sitemaps"
+INDICE = RAIZ / "public" / "sitemap.xml"
+
+# Espelham internal/sitemapgrace. Divergir aqui torna o check mentiroso, entao
+# ele confere o proprio espelho contra o fonte Go e avisa quando nao bate.
+MARCA = "sitemap-shard-em-carencia"
+CARENCIA_DIAS = 8
+FONTE_GO = RAIZ / "internal" / "sitemapgrace" / "grace.go"
+
+
+def confere_espelho() -> list[str]:
+    """O Go e a fonte; este arquivo e copia. Copia que envelhece mente."""
+    try:
+        fonte = FONTE_GO.read_text(encoding="utf-8")
+    except OSError:
+        return [f"nao consegui ler {FONTE_GO} para conferir as constantes espelhadas"]
+    avisos = []
+    if f'Marker = "{MARCA}"' not in fonte:
+        avisos.append(f"MARCA={MARCA!r} nao aparece em {FONTE_GO.name}; o espelho divergiu do Go")
+    if f"Period = {CARENCIA_DIAS} * 24 * time.Hour" not in fonte:
+        avisos.append(f"CARENCIA_DIAS={CARENCIA_DIAS} nao bate com Period em {FONTE_GO.name}")
+    return avisos
+
+
+def le_indice() -> set[str]:
+    if not INDICE.is_file():
+        return set()
+    texto = INDICE.read_text(encoding="utf-8")
+    return {loc.rsplit("/", 1)[-1] for loc in re.findall(r"<loc>([^<]+)</loc>", texto)}
+
+
+def datas_por_loc(texto: str) -> list[tuple[str, str]]:
+    """(loc, lastmod) de cada <url> do shard; lastmod "" quando ausente.
+
+    Le por BLOCO <url>, nunca por findall solto de <loc> somado a findall solto
+    de <lastmod>: `sitemap.appendURLEntry` emite <lastmod> com omitempty, entao
+    uma URL sem data desalinharia as duas listas e atribuiria a data de uma rota
+    a rota seguinte — exatamente o erro que a reconciliacao do publicador evita
+    recortando por bloco (internal/sitemap/carencia_lastmod.go:blocoDaURL).
+    """
+    pares = []
+    for bloco in re.findall(r"<url>(.*?)</url>", texto, re.S):
+        loc = re.search(r"<loc>([^<]*)</loc>", bloco)
+        if not loc:
+            continue
+        data = re.search(r"<lastmod>([^<]*)</lastmod>", bloco)
+        pares.append((loc.group(1), data.group(1) if data else ""))
+    return pares
+
+
+def marca_de(texto: str):
+    """(retirado_em, marcado) — retirado_em None quando o instante e ilegivel."""
+    achado = re.search(r"<!--\s*" + re.escape(MARCA) + r"\b([^>]*?)-->", texto[:4096], re.S)
+    if not achado:
+        return None, False
+    instante = re.search(r"retirado-em=(\S+)", achado.group(1))
+    if not instante:
+        return None, True
+    try:
+        return datetime.datetime.fromisoformat(instante.group(1).replace("Z", "+00:00")), True
+    except ValueError:
+        return None, True
+
+
+LEDGER = RAIZ / "data" / "ops" / "sitemap_shard_grace.jsonl"
+
+
+def removidos_recentes(janela_dias: int = CARENCIA_DIAS + 2) -> list[str]:
+    """Shards removidos na janela, deduplicados e em ordem estavel.
+
+    A janela e maior que a carencia de proposito: um deploy que falhe ou seja
+    pulado nao pode fazer o nome removido escapar da purga para sempre. Repetir
+    uma purga custa uma entrada numa chamada que ja acontece; perde-la custa
+    sete dias de fantasma na borda.
+    """
+    if not LEDGER.is_file():
+        return []
+    corte = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=janela_dias)
+    vistos: dict[str, None] = {}
+    for linha in LEDGER.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        if evento.get("evento") != "removido":
+            continue
+        try:
+            quando = datetime.datetime.fromisoformat(evento.get("em", "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if quando < corte:
+            continue
+        caminho = evento.get("shard", "")
+        if caminho:
+            vistos[caminho] = None
+    return list(vistos)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="saida legivel por maquina")
+    ap.add_argument("--listar-removidos", action="store_true",
+                    help="imprime os shards removidos na janela de carencia, um por linha, "
+                         "para o deploy acrescentar a purga de borda")
+    args = ap.parse_args()
+
+    if args.listar_removidos:
+        # POR QUE ESTA LISTA EXISTE: tools/deploy-publico monta a purga varrendo
+        # o disco, e o shard que acabou de ser REMOVIDO ja nao esta la. Sem isto
+        # a borda serve por ate sete dias uma copia 200 quente (o aquecedor a
+        # manteve assim durante a carencia) de um shard que a origem responde
+        # 410. Purgar URL que nao existe mais e inofensivo — a Cloudflare aceita
+        # e ignora —, entao a janela e generosa de proposito.
+        for caminho in removidos_recentes():
+            print(caminho)
+        return 0
+
+    falhas: list[str] = []
+    avisos: list[str] = confere_espelho()
+
+    indexados = le_indice()
+    em_disco = sorted(pathlib.Path(p).name for p in glob.glob(str(SHARDS / "pages-*.xml")))
+    if not em_disco:
+        print(f"check-sitemap-shard-grace: FAIL\n  - nenhum shard em {SHARDS}")
+        return 1
+
+    # 1. indice que promete e nao entrega
+    for nome in sorted(indexados - set(em_disco)):
+        falhas.append(f"o indice lista {nome} e o arquivo NAO existe — 404 direto para o crawler")
+
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    ativos, em_carencia, vencidos = [], [], []
+    locs_ativas: dict[str, str] = {}
+    # A DATA que cada canal anuncia para a MESMA URL. O shard em carencia e
+    # regravado a cada publicacao a partir do que estava em disco, entao ele
+    # carrega o <lastmod> do dia em que saiu do indice; o shard ativo carrega o
+    # que o plano vivo afirma hoje. Quando os dois discordam, o portal esta
+    # pedindo re-rastreio de URL que nao mudou a quem ainda tem o indice
+    # anterior — 8.387 URLs assim foram medidas em 2026-08-29 (BUG-064).
+    #
+    # E MEDICAO, NAO FALHA: a divergencia e consequencia de uma publicacao
+    # anterior e se cura sozinha na proxima (cmd/publish-v2-direct chama
+    # sitemap.ReconciliaLastModDaCarencia desde a correcao). Reprovar aqui
+    # deixaria o deploy vermelho por um estado que o proprio deploy conserta.
+    lastmod_ativo: dict[str, str] = {}
+    lastmod_carencia: list[tuple[str, str]] = []
+
+    for nome in em_disco:
+        texto = (SHARDS / nome).read_text(encoding="utf-8")
+        retirado_em, marcado = marca_de(texto)
+        no_indice = nome in indexados
+
+        if no_indice and marcado:
+            falhas.append(f"{nome} esta no indice E carrega marca de carencia — os dois estados sao exclusivos")
+            continue
+        if not no_indice and not marcado:
+            # 2. o estado que derruba o boot
+            falhas.append(
+                f"{nome} existe em disco, NAO esta no indice e NAO tem marca de carencia — "
+                "publishedmanifest.go:447 recusa isso no boot (log.Fatal)")
+            continue
+
+        if marcado:
+            if retirado_em is None:
+                # 5. marca ilegivel: o Go degrada para "sem instante" e o remove na
+                # publicacao seguinte, entao nao derruba nada — mas a carencia se
+                # perde em silencio, que e o defeito que ela existe para evitar.
+                avisos.append(f"{nome} tem marca de carencia com instante ilegivel; sera removido na proxima publicacao")
+                em_carencia.append(nome)
+                lastmod_carencia.extend(datas_por_loc(texto))
+                continue
+            idade = agora - retirado_em
+            em_carencia.append(nome)
+            lastmod_carencia.extend(datas_por_loc(texto))
+            if idade.days >= CARENCIA_DIAS:
+                vencidos.append((nome, idade.days))
+            continue
+
+        ativos.append(nome)
+        # 3. loc repetida entre ATIVOS
+        for loc, data in datas_por_loc(texto):
+            if loc in locs_ativas:
+                falhas.append(f"<loc> repetida entre shards ativos: {loc} em {locs_ativas[loc]} e {nome}")
+            locs_ativas[loc] = nome
+            lastmod_ativo[loc] = data
+
+    # 4. carencia vencida que ninguem limpou
+    for nome, dias in vencidos:
+        falhas.append(
+            f"{nome} esta em carencia ha {dias} dias (teto {CARENCIA_DIAS}) e nao foi removido — "
+            "a limpeza da publicacao nao rodou")
+
+    # Divergencia de <lastmod> entre o que a carencia anuncia e o que o indice
+    # vivo afirma sobre a MESMA URL. loc que nao existe em nenhum shard ativo
+    # saiu do acervo de verdade: a data dela fica congelada de proposito, e por
+    # isso ela e contada a parte, nunca como divergencia.
+    divergentes = 0
+    orfas = 0
+    for loc, data in lastmod_carencia:
+        vivo = lastmod_ativo.get(loc)
+        if vivo is None:
+            orfas += 1
+        elif vivo != data:
+            divergentes += 1
+
+    if args.json:
+        print(json.dumps({
+            "ativos": len(ativos), "em_carencia": em_carencia,
+            "vencidos": [n for n, _ in vencidos], "locs_ativas": len(locs_ativas),
+            "shards_em_disco": len(em_disco), "shards_no_indice": len(indexados),
+            "locs_em_carencia": len(lastmod_carencia),
+            "locs_carencia_divergentes": divergentes,
+            "locs_carencia_orfas": orfas,
+            "falhas": falhas, "avisos": avisos,
+        }, ensure_ascii=False, indent=1))
+        return 1 if falhas else 0
+
+    for aviso in avisos:
+        print(f"  AVISO: {aviso}")
+    print(f"  shards ativos: {len(ativos)} | em carencia: {len(em_carencia)} | <loc> ativas: {len(locs_ativas)}")
+    if em_carencia:
+        print(f"  em carencia (servidos 200 a quem tem o indice anterior): {', '.join(em_carencia)}")
+        print(f"  <loc> em carencia: {len(lastmod_carencia)} | lastmod divergente do indice vivo: "
+              f"{divergentes} | fora do acervo (data congelada, correto): {orfas}")
+    if falhas:
+        print("check-sitemap-shard-grace: FAIL")
+        for f in falhas:
+            print(f"  - {f}")
+        return 1
+    print("check-sitemap-shard-grace: pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

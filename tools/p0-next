@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# p0-next — dispatcher de autonomia. Diz a PROXIMA frente P0 a executar agora,
+# lendo o estado vivo (agentes/workflows ativos, deadlock de commit) + o frontboard
+# persistente (.agents/runtime/p0_frontboard.jsonl). O engenheiro consulta isto
+# sempre que terminaria uma leva, para NUNCA ficar ocioso esperando o keep-working
+# hook. Read-only: nao altera nada, so recomenda.
+#
+# Uso:
+#   tools/p0-next              # estado + proxima frente recomendada
+#   tools/p0-next --json       # saida estruturada
+set -uo pipefail
+ROOT="${WIKI_ROOT:-/opt/wiki}"
+BOARD="$ROOT/.agents/runtime/p0_frontboard.jsonl"
+JSON=0
+[ "${1:-}" = "--json" ] && JSON=1
+now=$(date +%s)
+
+# --- liveness: agentes/comandos com transcript tocado nos ultimos 180s ---
+live_out=$(find /tmp/claude-1000/-opt-wiki -name '*.output' -newermt '-180 seconds' 2>/dev/null | wc -l | tr -d ' ')
+live_wf=$(find "$HOME/.claude/projects/-opt-wiki" -path '*subagents/workflows*' -name 'journal.jsonl' -newermt '-180 seconds' 2>/dev/null | wc -l | tr -d ' ')
+
+# --- agentes possivelmente TRAVADOS: transcript parado > 600s mas nao 'completed' ---
+# Stall SO dos agentes marcados 'running' no frontboard cujo owner-transcript
+# esta parado > 600s. (.output de 116B e o pointer normal de agente CONCLUIDO,
+# nunca um stall — nao usar tamanho como sinal.)
+stalled=""
+for oid in $(python3 -c "import sys
+sys.path.insert(0,'$ROOT/tools')
+import frontboard
+for r in frontboard.por_status(frontboard.carrega('$BOARD'),'em_voo'):
+ o=frontboard.dono(r)
+ if o.startswith('agent:'): print(o.split(':',1)[1])" 2>/dev/null); do
+	f=$(find /tmp/claude-1000/-opt-wiki -name "${oid}*.output" 2>/dev/null | head -1)
+	[ -z "$f" ] && continue
+	age=$((now - $(stat -c %Y "$f" 2>/dev/null || echo "$now")))
+	[ "$age" -gt 600 ] && stalled="$stalled ${oid}(${age}s)"
+done
+
+# --- commit deadlock? (dry-run, so pega os gates de dados sem escrever) ---
+deadlock="?"
+if command -v git >/dev/null 2>&1; then
+	if (cd "$ROOT" && GIT_EDITOR=true git commit --dry-run 2>&1 | grep -qiE 'supersession|semantic|authority digest|stale'); then deadlock="SIM"; else deadlock="talvez-ok"; fi
+fi
+
+python3 - "$BOARD" "$live_out" "$live_wf" "$deadlock" "$JSON" "$stalled" "$ROOT" <<'PY'
+# LER PELO MODULO CANONICO, nunca por filtro literal de status: ate 2026-08-26
+# este script filtrava `available`/`running`/`blocked`, vocabulario que o board
+# abandonou — resultado medido: 144 linhas no arquivo, ZERO casadas, e ele
+# imprimia "Nada AVAILABLE" com 58 tarefas livres, mandando o agente entrante
+# PARAR. O `wiki-brief` chamava essa recomendacao de "MENTIRA" por escrito e
+# pedia o conserto. O modulo entende os dois vocabularios e o board volta a ser
+# legivel sem que nenhuma das 144 linhas historicas precise ser reescrita.
+import json,sys
+board,live_out,live_wf,deadlock,as_json,stalled,root=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5]=="1",sys.argv[6],sys.argv[7]
+sys.path.insert(0,root+"/tools")
+import frontboard
+rows=frontboard.carrega(board)
+if not rows:
+    print("frontboard ausente ou vazio:",board); sys.exit(0)
+erros=rows[0].get("_erros_de_parse",0)
+avail=frontboard.livres(rows)
+running=frontboard.por_status(rows,'em_voo')
+blocked=frontboard.por_status(rows,'bloqueada')
+desconhecidas=frontboard.por_status(rows,'desconhecida')
+nxt=avail[0] if avail else None
+def limpa(r): return {k:v for k,v in r.items() if not k.startswith('_')}
+if as_json:
+    print(json.dumps({"live_agents":int(live_out),"live_workflows":int(live_wf),"commit_deadlock":deadlock,
+                      "stalled":stalled.strip(),"parse_errors":erros,
+                      "next":limpa(nxt) if nxt else None,
+                      "available":[limpa(r) for r in avail],
+                      "running":[limpa(r) for r in running],
+                      "blocked":[limpa(r) for r in blocked],
+                      "unknown_status":[limpa(r) for r in desconhecidas]},ensure_ascii=False))
+    sys.exit(0)
+print(f"== ESTADO VIVO ==  agentes~ativos={live_out}  workflows~ativos={live_wf}  commit_deadlock={deadlock}")
+if stalled.strip(): print(f"!! POSSIVEL STALL (resume via SendMessage): {stalled.strip()}")
+if erros: print(f"!! {erros} linha(s) do frontboard NAO parsearam — corrija antes de confiar na contagem")
+if desconhecidas:
+    print(f"!! {len(desconhecidas)} tarefa(s) com status fora do mapa canonico (nao sumiram, mas nao sao classificaveis):")
+    for r in desconhecidas[:5]: print(f"     [{r.get('id','?')}] status={r.get('status')!r}")
+    print("     -> acrescente o status novo em tools/frontboard.py:_STATUS_CANONICO")
+print(f"\n-- EM VOO ({len(running)}) --")
+for r in running: print(f"  [{r.get('id','?')}] {r.get('front','')}  ({frontboard.dono(r)})")
+print(f"-- BLOQUEADAS ({len(blocked)}) --")
+for r in blocked: print(f"  [{r.get('id','?')}] {r.get('front','')}  <- {r.get('blocked_by','?')}")
+print(f"-- LIVRES ({len(avail)}, ranqueadas; 'quase' vem depois das livres de proposito) --")
+for r in avail[:20]: print(f"  P{r['_prioridade']} [{r.get('id','?')}] ({r['_status']}) {r.get('front','')}")
+if len(avail)>20: print(f"  ... e mais {len(avail)-20} — use --json para a lista inteira")
+print()
+if nxt:
+    print(f"==> PROXIMA ACAO: [{nxt.get('id','?')}] (P{nxt['_prioridade']}, {nxt['_status']})")
+    print(f"    {nxt.get('front','')}")
+    print(f"    ACAO: {nxt.get('action','(definir)')}")
+    print(f"    NOTA: {(nxt.get('note','') or '')[:400]}")
+else:
+    print("==> Nada LIVRE. Processe as EM VOO (integre resultados) e desbloqueie as BLOQUEADAS.")
+    if stalled.strip(): print("    Ha stall -> resuma o agente travado (SendMessage) antes de tudo.")
+PY

@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""generate-sitemap-shard-grace-series — a serie que faltava: disco x indice de
+shards de sitemap, dia a dia.
+
+POR QUE ELE EXISTE (2026-08-29, BUG-028 da caca aos bugs)
+---------------------------------------------------------
+`data/ops/sitemap_shard_grace.jsonl` existia com UMA linha, aberta em
+2026-08-28T20:39:02Z, declarando "35 shards em public/sitemaps/, 35 no indice,
+0 fora do indice, 0 em carencia, 0 removidos".
+
+Vinte e uma horas depois o disco dizia outra coisa: 62 shards, 34 no indice, 28
+fora do indice, 28 em carencia, 8.436 <loc> anunciadas. O ledger errava por +28
+shards e por -28 de carencia — nao por descuido, mas por CONSTRUCAO: o unico
+escritor do arquivo e `registrarEventoDeCarencia`
+(cmd/publish-v2-direct/main.go), e ele so e chamado de dentro do closure
+`remover()`, depois do `os.Remove`. Quer dizer: o ledger registra o shard que
+SAI da carencia e nao registra o que ENTRA (main.go, `orfaosEmCarencia++`).
+Vinte e oito shards entraram em carencia sem deixar rastro nenhum.
+
+Estado que so existe no disco nao responde "melhorou?", que e a unica pergunta
+que importa depois de uma correcao. Com a serie, a queda de
+`locs_carencia_divergentes` de 8.387 para 0 na proxima publicacao vira evidencia
+datada da correcao do BUG-064, em vez de uma afirmacao de sessao.
+
+QUEM MEDE E QUEM ESCREVE SAO SEPARADOS, e esse e o contrato da casa:
+`tools/check-*` sao read-only, `tools/generate-*` escrevem. Este script NAO
+recalcula nada — ele roda `tools/check-sitemap-shard-grace --json`, que ja e a
+autoridade sobre esse diretorio, e persiste o que ele mediu.
+
+APPEND-ONLY, E ISSO E DELIBERADO
+--------------------------------
+O ledger e compartilhado com `cmd/publish-v2-direct`, que anexa eventos
+"removido" com O_APPEND durante a publicacao. Um gerador que reescrevesse o
+arquivo (tmp + rename, como faz `generate-time-to-first-crawl-series`) poderia
+perder um evento gravado no intervalo — e evento "removido" perdido significa
+nome que escapa da purga de borda e fantasma 200 servido por ate sete dias
+(deploy-publico:830 consome exatamente esses nomes). Aqui so se anexa.
+
+Sem reescrita, a idempotencia se faz por GUARDA: se o ultimo inventario do
+ledger tem a mesma data e os mesmos numeros, nada mudou e nenhuma linha nova e
+escrita. Duas execucoes no mesmo dia sobre o mesmo estado deixam UMA linha; um
+estado que mudou as 18h depois de medido as 10h deixa DUAS, e as duas sao
+verdade. E o meio-termo entre o ledger de cobertura, que acumulou 21 linhas de
+replay para uma unica chave, e uma substituicao que apagaria historico legitimo.
+
+Uso:
+    tools/generate-sitemap-shard-grace-series
+    tools/generate-sitemap-shard-grace-series --dry-run   # imprime, nao escreve
+    tools/generate-sitemap-shard-grace-series --forcar    # anexa mesmo sem mudanca
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+LEDGER = RAIZ / "data" / "ops" / "sitemap_shard_grace.jsonl"
+MEDIDOR = RAIZ / "tools" / "check-sitemap-shard-grace"
+SCHEMA = "sitemap_shard_grace_v1"
+
+# Os campos que definem o ESTADO. A guarda de mudanca compara exatamente estes:
+# "em" e "commit" mudam a cada execucao e nao sao estado, entao entram na linha
+# mas nunca na comparacao — se entrassem, toda execucao pareceria diferente e a
+# guarda nao guardaria nada.
+CAMPOS_DE_ESTADO = (
+    "shards_em_disco",
+    "shards_no_indice",
+    "shards_fora_do_indice",
+    "shards_em_carencia",
+    "shards_vencidos",
+    "locs_ativas",
+    "locs_em_carencia",
+    "locs_carencia_divergentes",
+    "locs_carencia_orfas",
+)
+
+
+def commit_atual() -> str:
+    try:
+        saida = subprocess.run(
+            ["git", "-C", str(RAIZ), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        return saida.stdout.strip() if saida.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def mede() -> dict:
+    """Roda o check read-only e devolve o JSON dele.
+
+    Exit 1 do medidor significa VEREDITO ("medi e achei falha de coerencia"),
+    nao ferramenta quebrada: ele imprime o JSON completo nos dois casos, com as
+    falhas no campo `falhas`. Registrar o estado defeituoso e justamente o que a
+    serie existe para fazer — descartar a medicao porque ela achou problema
+    apagaria o unico dia que importa. Exit >1 ou saida ilegivel, ai sim, e
+    instrumento quebrado e o gerador aborta sem escrever.
+    """
+    saida = subprocess.run(
+        [str(MEDIDOR), "--json"], capture_output=True, text=True, timeout=300, check=False,
+    )
+    if saida.returncode not in (0, 1):
+        raise SystemExit(
+            f"check-sitemap-shard-grace saiu {saida.returncode} (instrumento quebrado, nao veredito):\n"
+            f"{saida.stderr.strip() or saida.stdout.strip()}")
+    try:
+        return json.loads(saida.stdout)
+    except ValueError as erro:
+        raise SystemExit(f"saida de check-sitemap-shard-grace nao e JSON ({erro}): {saida.stdout[:400]!r}")
+
+
+def ultimo_inventario() -> dict | None:
+    """A ultima linha `evento=inventario` do ledger, ou None.
+
+    Le o arquivo inteiro e nao so a cauda: as linhas `removido` da publicacao se
+    intercalam com os inventarios, e olhar apenas a ultima linha compararia o
+    inventario de hoje com um evento de remocao — que nao tem campo de estado
+    nenhum e faria a guarda anexar sempre.
+    """
+    if not LEDGER.is_file():
+        return None
+    achado = None
+    for bruta in LEDGER.read_text(encoding="utf-8").splitlines():
+        bruta = bruta.strip()
+        if not bruta:
+            continue
+        try:
+            linha = json.loads(bruta)
+        except ValueError:
+            continue
+        if isinstance(linha, dict) and linha.get("evento") == "inventario":
+            achado = linha
+    return achado
+
+
+def monta(medicao: dict, agora: datetime) -> dict:
+    em_carencia = medicao.get("em_carencia") or []
+    return {
+        "schema_version": SCHEMA,
+        "evento": "inventario",
+        "data": agora.date().isoformat(),
+        "em": agora.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commit": commit_atual(),
+        "shard": "",
+        "shards_em_disco": medicao.get("shards_em_disco", 0),
+        "shards_no_indice": medicao.get("shards_no_indice", 0),
+        "shards_fora_do_indice": len(em_carencia),
+        "shards_em_carencia": len(em_carencia),
+        "shards_vencidos": len(medicao.get("vencidos") or []),
+        "locs_ativas": medicao.get("locs_ativas", 0),
+        "locs_em_carencia": medicao.get("locs_em_carencia", 0),
+        "locs_carencia_divergentes": medicao.get("locs_carencia_divergentes", 0),
+        "locs_carencia_orfas": medicao.get("locs_carencia_orfas", 0),
+        "carencia": em_carencia,
+        "falhas": medicao.get("falhas") or [],
+        "avisos": medicao.get("avisos") or [],
+        "motivo": "inventario periodico medido por tools/check-sitemap-shard-grace --json",
+    }
+
+
+def mudou(nova: dict, anterior: dict | None) -> bool:
+    if anterior is None:
+        return True
+    if anterior.get("data") != nova.get("data"):
+        return True
+    for campo in CAMPOS_DE_ESTADO:
+        if anterior.get(campo) != nova.get(campo):
+            return True
+    # A linha de abertura do ledger (2026-08-28) e prosa: os numeros dela vivem
+    # dentro de `motivo` e nenhum CAMPO_DE_ESTADO existe. Comparar campo ausente
+    # com campo ausente daria "igual" e suprimiria a primeira medicao de
+    # verdade, que e exatamente a que corrige o ledger.
+    if not any(campo in anterior for campo in CAMPOS_DE_ESTADO):
+        return True
+    return False
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true", help="imprime a linha e nao escreve")
+    ap.add_argument("--forcar", action="store_true", help="anexa mesmo que o estado nao tenha mudado")
+    args = ap.parse_args()
+
+    agora = datetime.now(timezone.utc)
+    linha = monta(mede(), agora)
+    anterior = ultimo_inventario()
+
+    resumo = (f"disco={linha['shards_em_disco']} indice={linha['shards_no_indice']} "
+              f"carencia={linha['shards_em_carencia']} vencidos={linha['shards_vencidos']} "
+              f"locs_ativas={linha['locs_ativas']} locs_carencia={linha['locs_em_carencia']} "
+              f"divergentes={linha['locs_carencia_divergentes']}")
+
+    if not args.forcar and not mudou(linha, anterior):
+        print(f"sitemap_shard_grace: estado inalterado desde {anterior.get('em')} — nenhuma linha nova ({resumo})")
+        return 0
+
+    if args.dry_run:
+        print(json.dumps(linha, ensure_ascii=False))
+        print(f"sitemap_shard_grace: ENSAIO, nada escrito ({resumo})")
+        return 0
+
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    # O_APPEND puro: a publicacao escreve neste mesmo arquivo enquanto isto roda,
+    # e uma escrita curta com O_APPEND e atomica no Linux — nenhum evento
+    # "removido" se perde e nenhuma linha sai entrelacada.
+    with open(LEDGER, "a", encoding="utf-8") as saida:
+        saida.write(json.dumps(linha, ensure_ascii=False) + "\n")
+        saida.flush()
+        os.fsync(saida.fileno())
+
+    print(f"sitemap_shard_grace: 1 linha anexada a data/ops/{LEDGER.name} ({resumo})")
+    for falha in linha["falhas"]:
+        print(f"  FALHA REGISTRADA: {falha}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

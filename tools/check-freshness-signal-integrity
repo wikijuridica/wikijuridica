@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""check-freshness-signal-integrity — os sinais de frescor dizem a mesma verdade?
+
+POR QUE EXISTE: o Google usa `lastmod` para agendar revisita **quando ele é
+consistentemente preciso** (doc oficial de sitemaps). Um portal que se
+contradiz sobre a própria data de modificação ensina o buscador a ignorar o
+sinal — e aí nenhuma atualização futura será levada a sério. Em 2026-08-12
+mediu-se exatamente essa contradição: `internal/feed.entryTimestamp` tinha
+precedência própria e ignorava `ContentRevisedAt`, então as 20 páginas revisadas
+em 07/08 saíam datadas de 07/08 no sitemap e de 06/08 no feed.
+
+O QUE ESTE CHECK **NÃO** FAZ, e a omissão é deliberada: ele NÃO reprova por
+"muitas páginas compartilham o mesmo lastmod". Esse critério parece bom e é
+armadilha — hoje 99,7% do acervo tem a data de 06/08 porque foi **mesmo**
+publicado num dia só, e um gate assim só ficaria verde carimbando data nova em
+página não revisada. Isso é fraude de sinal, e é o oposto do que se quer. O que
+se mede aqui é CONSISTÊNCIA, não distribuição.
+
+VERIFICA:
+  1. lastmod do sitemap == Page.LastModified() para 100% das URLs editoriais;
+  2. <updated> do feed == a entrada mais recente dele, e coerente com o maior
+     lastmod do sitemap (tolerância de 48h);
+  3. a contagem declarada no llms.txt bate com o conjunto que ela diz contar
+     (páginas informativas: artigo + wiki + pergunta), não com o total de URLs;
+  4. a reconferência de fonte oficial (`sources_verified_at`) não está movendo o
+     `lastmod` — carimbar frescor por varredura de verificação é fraude de sinal,
+     e é o campo que existe justamente para NÃO fazer isso.
+
+Uso:
+    tools/check-freshness-signal-integrity
+    tools/check-freshness-signal-integrity --json
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+PAGES = os.path.join(ROOT, "content", "pages.json")
+SITEMAPS = os.path.join(ROOT, "public", "sitemaps", "*.xml")
+# O indice e a autoridade sobre quais shards existem para o buscador.
+INDICE_SITEMAP = os.path.join(ROOT, "public", "sitemap.xml")
+FEED = os.path.join(ROOT, "public", "feed.xml")
+LLMS = os.path.join(ROOT, "public", "llms.txt")
+LEDGER = os.path.join(ROOT, "data", "ops", "page_content_revision.jsonl")
+BASE = "https://wikijuridica.com.br"
+
+# Tipos que o llms.txt chama de "páginas informativas sobre problemas concretos
+# de direito". Hub, paginação e institucional não entram — não são conteúdo.
+# O VOCABULARIO E O DO CODIGO, e nao uma terceira lista escrita aqui.
+#
+# Espelha content.LegalPageTypes (internal/content/content.go:22), que governa a
+# contagem do P0, o JSON-LD Article e agora a linha de abertura do llms.txt.
+#
+# Ate 2026-08-26 este conjunto tinha tres tipos -- artigo, wiki e pergunta --
+# enquanto o acervo ja publicava precedente (205), jurisprudencia (54) e
+# noticia-juridica (48) das familias derivadas da DEC-032. O gate acusava
+# divergencia de contagem no llms.txt, e a acusacao apontava para o lado errado:
+# quem estava desatualizado era a regua, nao o documento medido.
+#
+# Se um tipo novo entrar em LegalPageTypes e nao aqui, este gate volta a acusar
+# divergencia sem que haja defeito -- e a correcao e alinhar, nunca afrouxar.
+TIPOS_INFORMATIVOS = {
+    "wiki", "legislacao", "dispositivo-legal", "jurisprudencia", "precedente",
+    "noticia-juridica", "artigo", "pergunta", "hub-tematico",
+}
+
+TOLERANCIA_FEED_HORAS = 48
+
+
+def last_modified(pagina):
+    """Espelha content.Page.LastModified() — precedência única do projeto."""
+    for campo in ("content_revised_at", "reviewed_at", "publication_date"):
+        valor = (pagina.get(campo) or "").strip()
+        if valor:
+            return valor
+    return ""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    problemas = []
+    detalhe = {}
+
+    if not os.path.exists(PAGES):
+        print("content/pages.json ausente", file=sys.stderr)
+        return 2
+    with open(PAGES, encoding="utf-8") as arquivo:
+        paginas = json.load(arquivo)
+    esperado = {p["path"]: last_modified(p) for p in paginas if p.get("path")}
+    idx_paginas = {p["path"]: p for p in paginas if p.get("path")}
+
+    # 1. sitemap x pages.json
+    #
+    # OS SHARDS SAIEM DO INDICE, NAO DE UM GLOB — e a diferenca produziu 365
+    # divergencias FALSAS.
+    #
+    # Medido em 2026-08-26: public/sitemap.xml lista 31 shards e o disco tem 35.
+    # Os quatro extras (pages-0032 a 0035) sao restos de um plano de shards
+    # anterior, e carregam copias das mesmas URLs com lastmod antigo. Lendo por
+    # glob, o gate somava essas copias, o valor velho vencia por ordem
+    # alfabetica, e o resultado era um alarme sobre 365 URLs que estao CERTAS em
+    # todas as camadas que importam (ledger, pages.json, shard anunciado).
+    #
+    # O Googlebot le o INDICE e busca o que ele anuncia -- shard fora do indice
+    # nao existe para ele. Medir o que o buscador nao le e a armadilha que este
+    # repositorio cataloga: ler a camada que alguem SUPOS em vez da que o
+    # consumidor tem. Arquivo orfao no disco e outro assunto, com politica
+    # propria de carencia, e nao pertence a esta medicao.
+    anunciados = set()
+    if os.path.exists(INDICE_SITEMAP):
+        with open(INDICE_SITEMAP, encoding="utf-8") as arquivo:
+            for loc in re.findall(r"<loc>([^<]+)</loc>", arquivo.read()):
+                anunciados.add(os.path.basename(loc))
+    locs = {}
+    for caminho in sorted(glob.glob(SITEMAPS)):
+        if anunciados and os.path.basename(caminho) not in anunciados:
+            continue
+        with open(caminho, encoding="utf-8") as arquivo:
+            conteudo = arquivo.read()
+        for bloco in re.findall(r"<url>(.*?)</url>", conteudo, re.S):
+            loc = re.search(r"<loc>([^<]+)</loc>", bloco)
+            mod = re.search(r"<lastmod>([^<]+)</lastmod>", bloco)
+            if loc:
+                locs[loc.group(1).replace(BASE, "")] = (mod.group(1) if mod else "")
+    detalhe["sitemap_urls"] = len(locs)
+
+    divergentes = []
+    sem_lastmod = []
+    for path, mod in locs.items():
+        if path not in esperado:
+            continue  # hub/paginação: derivada, não vem de pages.json
+        if not mod:
+            sem_lastmod.append(path)
+        elif mod != esperado[path]:
+            divergentes.append((path, mod, esperado[path]))
+    detalhe["editoriais_conferidas"] = sum(1 for p in locs if p in esperado)
+    detalhe["lastmod_divergente"] = len(divergentes)
+    detalhe["lastmod_ausente"] = len(sem_lastmod)
+    if divergentes:
+        problemas.append("lastmod_divergente_do_dado:%d (ex.: %s sitemap=%s dado=%s)"
+                         % (len(divergentes), divergentes[0][0], divergentes[0][1], divergentes[0][2]))
+    if sem_lastmod:
+        problemas.append("lastmod_ausente:%d (ex.: %s)" % (len(sem_lastmod), sem_lastmod[0]))
+
+    # 2. feed
+    if os.path.exists(FEED):
+        with open(FEED, encoding="utf-8") as arquivo:
+            atom = arquivo.read()
+        cabecalho = re.search(r"<updated>([^<]+)</updated>", atom)
+        entradas = re.findall(r"<entry>.*?<updated>([^<]+)</updated>.*?</entry>", atom, re.S)
+        detalhe["feed_entradas"] = len(entradas)
+        detalhe["feed_updated"] = cabecalho.group(1) if cabecalho else None
+        if cabecalho and entradas:
+            mais_recente = max(entradas)
+            if cabecalho.group(1) != mais_recente:
+                problemas.append("feed_updated_nao_e_a_entrada_mais_recente:%s vs %s"
+                                 % (cabecalho.group(1), mais_recente))
+        maior_lastmod = max((m for m in locs.values() if m), default="")
+        if cabecalho and maior_lastmod:
+            try:
+                feed_dia = datetime.date.fromisoformat(cabecalho.group(1)[:10])
+                mapa_dia = datetime.date.fromisoformat(maior_lastmod[:10])
+                atraso_h = (mapa_dia - feed_dia).days * 24
+                detalhe["feed_atraso_horas"] = atraso_h
+                if atraso_h > TOLERANCIA_FEED_HORAS:
+                    problemas.append("feed_atrasado_em_relacao_ao_sitemap:%dh (feed=%s sitemap=%s)"
+                                     % (atraso_h, feed_dia, mapa_dia))
+            except ValueError:
+                problemas.append("feed_updated_com_data_invalida:%s" % cabecalho.group(1))
+    else:
+        problemas.append("feed_ausente")
+
+    # 3. llms.txt
+    informativas = sum(1 for p in paginas
+                       if p.get("page_type") in TIPOS_INFORMATIVOS
+                       and p.get("status") == "published"
+                       and p.get("index_policy") == "index")
+    detalhe["paginas_informativas"] = informativas
+    if os.path.exists(LLMS):
+        with open(LLMS, encoding="utf-8") as arquivo:
+            texto = arquivo.read()
+        declarado = re.search(r"(\d{3,})\s+páginas", texto)
+        detalhe["llms_declara"] = int(declarado.group(1)) if declarado else None
+        if declarado and int(declarado.group(1)) != informativas:
+            problemas.append("llms_txt_contagem_divergente:declara=%s real=%d"
+                             % (declarado.group(1), informativas))
+    else:
+        problemas.append("llms_ausente")
+
+    # 4. a reconferência de fonte oficial NÃO pode estar movendo o sinal
+    #
+    # `sources_verified_at` (internal/content/content.go) responde "a lei citada
+    # continua a mesma?" e nasce FORA da precedência de `last_modified` acima.
+    # O teste Go TestLastModifiedIgnoraSourcesVerifiedAt trava a separação no
+    # struct; aqui ela é conferida no ARTEFATO, que é onde a fraude apareceria
+    # para o buscador: uma varredura de reconferência empurrando `lastmod`.
+    #
+    # A condição é deliberadamente estreita para não ter falso positivo: só
+    # acusa quando a página TEM data de conteúdo mais antiga — nesse caso
+    # `LastModified()` obrigatoriamente devolveria a data de conteúdo, e
+    # anunciar a data da reconferência só é possível se alguém a copiou para um
+    # campo da cadeia. Página revisada por humano no MESMO dia da reconferência
+    # é indistinguível por dado e por isso fica fora: não se acusa coincidência.
+    vazando = []
+    com_reconferencia = 0
+    for pagina in paginas:
+        reconferida = (pagina.get("sources_verified_at") or "").strip()
+        if not reconferida:
+            continue
+        com_reconferencia += 1
+        conteudo = (pagina.get("content_revised_at") or "").strip()
+        if conteudo and last_modified(pagina) == reconferida > conteudo:
+            vazando.append(pagina.get("path"))
+    detalhe["paginas_com_reconferencia_de_fonte"] = com_reconferencia
+    detalhe["reconferencia_virou_lastmod"] = len(vazando)
+    if vazando:
+        problemas.append("reconferencia_de_fonte_virou_lastmod:%d (ex.: %s)"
+                         % (len(vazando), vazando[0]))
+
+    # 5. o ledger de conteúdo (fonte da verdade sobre "quando o conteúdo desta
+    #    rota mudou de fato", tools/generate-page-content-revision) tem de já
+    #    ter chegado ao sinal que sai — sitemap e Last-Modified compartilham a
+    #    MESMA precedência (internal/content.Page.LastModified), e os dois só
+    #    andam quando ContentRevisedAt é escrito em content/pages.json.
+    #
+    #    O FURO QUE ESTE BLOCO FECHA (achado de auditoria, 2026-08-13): as
+    #    seções 1-4 acima só comparam sitemap CONTRA pages.json — os dois lados
+    #    concordam mesmo quando ambos estão igualmente atrasados em relação ao
+    #    conteúdo real. Medido ao vivo no mesmo dia: o ledger já registrava 32
+    #    rotas com `revised_on` de HOJE (conteúdo novo publicado), e o sitemap
+    #    continuava anunciando dias antes para essas mesmas rotas — as seções
+    #    1-4 ficavam verdes porque pages.json e sitemap concordavam entre si,
+    #    só que os dois mentiam igualmente. É exatamente o "lastmod que não
+    #    acompanha mudança real" que degrada a confiança do crawler no campo.
+    #
+    #    Comparação por DIA (10 primeiros caracteres) dos dois formatos
+    #    canônicos (AAAA-MM-DD e AAAA-MM-DDThh:mm:ssZ) — nunca por instante,
+    #    porque publicação e o carimbo do ledger não acontecem no mesmo
+    #    segundo e microdiferença de horário não é o defeito que se procura.
+    atrasadas = []
+    if os.path.exists(LEDGER):
+        ledger_rotas = 0
+        with open(LEDGER, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                ledger_rotas += 1
+                registro = json.loads(linha)
+                caminho = registro.get("path")
+                revisado = (registro.get("revised_on") or "")[:10]
+                pagina = idx_paginas.get(caminho)
+                if not pagina or not revisado:
+                    continue
+                declarado = last_modified(pagina)[:10]
+                if declarado and revisado > declarado:
+                    atrasadas.append((caminho, revisado, declarado))
+        detalhe["ledger_rotas"] = ledger_rotas
+    else:
+        problemas.append("ledger_de_conteudo_ausente:data/ops/page_content_revision.jsonl")
+    detalhe["lastmod_atrasado_vs_ledger"] = len(atrasadas)
+    if atrasadas:
+        atrasadas.sort()
+        problemas.append("lastmod_atrasado_vs_ledger:%d (ex.: %s ledger=%s declarado=%s)"
+                         % (len(atrasadas), atrasadas[0][0], atrasadas[0][1], atrasadas[0][2]))
+
+    if args.json:
+        print(json.dumps({"problemas": problemas, "detalhe": detalhe}, ensure_ascii=False, sort_keys=True))
+    else:
+        print("check-freshness-signal-integrity")
+        print("  sitemap: %d URLs, %d editoriais conferidas, %d com lastmod divergente, %d sem lastmod"
+              % (detalhe.get("sitemap_urls", 0), detalhe.get("editoriais_conferidas", 0),
+                 detalhe.get("lastmod_divergente", 0), detalhe.get("lastmod_ausente", 0)))
+        print("  feed   : updated=%s, %s entradas, atraso=%sh"
+              % (detalhe.get("feed_updated"), detalhe.get("feed_entradas"), detalhe.get("feed_atraso_horas")))
+        print("  llms   : declara=%s, informativas reais=%s"
+              % (detalhe.get("llms_declara"), detalhe.get("paginas_informativas")))
+        print("  fonte  : %s página(s) com reconferência, %s com a data da reconferência no lastmod"
+              % (detalhe.get("paginas_com_reconferencia_de_fonte", 0),
+                 detalhe.get("reconferencia_virou_lastmod", 0)))
+        print("  ledger : %s rota(s) no registro de conteúdo, %s com sinal servido atrasado em relação a ele"
+              % (detalhe.get("ledger_rotas", 0), detalhe.get("lastmod_atrasado_vs_ledger", 0)))
+        if problemas:
+            print("  PROBLEMAS:")
+            for problema in problemas:
+                print("   - %s" % problema)
+        else:
+            print("  OK — os três sinais dizem a mesma verdade")
+    return 1 if problemas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

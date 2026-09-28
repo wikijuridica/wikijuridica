@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Publica o acervo consertando, sozinho, o que costuma impedir a publicação.
+
+POR QUE ISTO EXISTE (ordem do dono, 2026-08-27)
+==============================================
+"O processo deve ser inteligente e se tiver falha, a engenharia é ele mesmo se
+corrigir, como se fosse um bot de publicação, mas inteligente."
+
+A `cmd/publish-v2-direct` é uma TRANSAÇÃO: ela valida, escreve e prova coerência
+— e está certa em recusar quando o terreno não está pronto. O que faltava era
+alguém que preparasse o terreno. Na prática esse alguém era um humano lembrando
+de três coisas, e numa única publicação de 27/08 as três falharam:
+
+  1. LOCK ÓRFÃO — uma execução anterior morreu e deixou `.publish-v2-direct.lock`
+     com o PID de um processo que já não existe. A transação recusa, corretamente,
+     porque não sabe distinguir órfão de concorrente.
+  2. CENSO ATRASADO — agentes regeneraram 390 páginas às 10:00; o censo era das
+     04:36. Cinco páginas novas foram recusadas com `sem_linha_no_censo`: existiam,
+     estavam corretas, e simplesmente não constavam de um censo anterior a elas.
+  3. GÊMEAS `.br` INCOMPLETAS — a recompressão só rodava dentro do publish, e uma
+     execução cortada no meio deixou o acervo com 2,5% de cobertura sem ninguém
+     notar. Quem pede `Accept-Encoding: br`, a Cloudflare inclusive, recebia HTML
+     cru — ou, pior, corpo ANTIGO, porque `brotli_static` serve `$uri.br` sem
+     comparar frescor.
+
+O QUE "INTELIGENTE" SIGNIFICA AQUI, E O QUE NÃO SIGNIFICA
+=========================================================
+Consertar é permitido só onde o conserto é DERIVÁVEL e VERIFICÁVEL: regenerar um
+índice a partir do estoque, remover um lock cujo PID comprovadamente morreu,
+recomprimir um arquivo a partir do fonte. Nenhum desses inventa informação — todos
+recomputam algo a partir de uma fonte que já está no disco.
+
+O que ele NUNCA faz: afrouxar gate, pular validação de coerência, publicar página
+que o censo reprovou por mérito, ou "resolver" divergência escolhendo um lado. Aí
+não é conserto, é fraude — e a transação continua sendo a autoridade.
+
+Quando não consegue consertar, ele PARA e diz exatamente o quê, em vez de tentar
+de novo em loop.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+RAIZ = "/opt/wiki"
+LOCK = "data/ops/.publish-v2-direct.lock"
+CENSO = "data/editorial/v2_publication_severity.jsonl"
+SHARDS = "data/editorial/v2_pages/*.jsonl"
+ARQUIVO_DE_LOCKS = ".agents/runtime/archives/locks-orfaos"
+PISO_BROTLI = 90
+
+
+def passo(titulo):
+    print(f"\n=== {titulo} ===", flush=True)
+
+
+def roda(cmd, timeout_s=1800):
+    return subprocess.run(cmd, cwd=RAIZ, check=False, timeout=timeout_s)
+
+
+def saida_de(cmd, timeout_s=300):
+    r = subprocess.run(cmd, cwd=RAIZ, check=False, capture_output=True,
+                       text=True, timeout=timeout_s)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+# ---------------------------------------------------------------- lock órfão
+
+def destrava(seco):
+    """Remove o lock SÓ se o PID dele comprovadamente morreu."""
+    caminho = os.path.join(RAIZ, LOCK)
+    if not os.path.exists(caminho):
+        print("sem lock de publicação")
+        return True
+    conteudo = open(caminho, encoding="utf-8").read().strip()
+    print(f"lock presente: {conteudo}")
+    achado = re.search(r"pid=(\d+)", conteudo)
+    if not achado:
+        print("o lock não declara PID — não sei provar que é órfão, e não removo "
+              "às cegas", file=sys.stderr)
+        return False
+    pid = achado.group(1)
+    if os.path.isdir(f"/proc/{pid}"):
+        print(f"PID {pid} está VIVO — há publicação em curso. Não é órfão; "
+              "esperar é o certo.", file=sys.stderr)
+        return False
+    idade_min = (time.time() - os.path.getmtime(caminho)) / 60
+    print(f"PID {pid} não existe mais (/proc/{pid} ausente), lock com "
+          f"{idade_min:.0f} min — órfão")
+    if seco:
+        print("  --seco: removeria o lock")
+        return True
+    destino = os.path.join(RAIZ, ARQUIVO_DE_LOCKS)
+    os.makedirs(destino, exist_ok=True)
+    # Arquiva antes de remover: neste repositório nada se deleta sem cópia.
+    with open(os.path.join(destino, f"publish-orfao-{pid}-{int(time.time())}.lock"),
+              "w", encoding="utf-8") as fh:
+        fh.write(conteudo + "\n")
+    os.remove(caminho)
+    print("  lock arquivado e removido")
+    return True
+
+
+# ---------------------------------------------------------------- censo
+
+def censo_em_dia(seco):
+    """Regenera o censo quando existe shard mais novo que ele.
+
+    ★ A COMPARAÇÃO NÃO MORA MAIS AQUI (2026-09-16). Até esta data esta função
+    reimplementava o `getmtime` do censo contra o dos shards — a TERCEIRA
+    cópia da mesma regra no repositório, ao lado de
+    `tools/check-censo-acompanha-estoque` (que é o dono dela e, até hoje, não
+    tinha um único chamador) e da ausência total dela em
+    `tools/deploy-publico`, que por isso publicou 30 páginas a menos em
+    2026-09-16 sem parar.
+
+    Duas cópias da mesma regra divergem com o tempo: é o defeito que este
+    repositório já pagou várias vezes, e é o mesmo argumento que
+    `tools/generate-censo-acompanha-estoque` escreve para delegar ao check em
+    vez de recalcular. Agora são três chamadores e um dono.
+    """
+    conferencia = roda([sys.executable, "tools/check-censo-acompanha-estoque"])
+    if conferencia.returncode == 0:
+        return True
+    if conferencia.returncode != 1:
+        print(f"  o check do censo falhou por outro motivo (exit "
+              f"{conferencia.returncode}) — não regenero às cegas", file=sys.stderr)
+        return False
+    print("  publicar assim recusaria as páginas novas com `sem_linha_no_censo`")
+    if seco:
+        print("  --seco: regeneraria o censo")
+        return True
+    codigo = roda(["nice", "-n", "19", "python3",
+                   "tools/generate-v2-publication-severity", "--write"]).returncode
+    if codigo != 0:
+        print(f"  o gerador do censo falhou (exit {codigo}) — PARO aqui, porque "
+              "publicar com censo velho recusaria justamente o conteúdo novo",
+              file=sys.stderr)
+        return False
+    print("  censo regenerado")
+    return True
+
+
+# ---------------------------------------------------------------- publicação
+
+def publica(seco):
+    if seco:
+        print("--seco: rodaria a transação SEM --allow-public-write")
+        codigo = roda(["./tools/go-modern", "run", "./cmd/publish-v2-direct"]).returncode
+    else:
+        codigo = roda(["nice", "-n", "10", "./tools/go-modern", "run",
+                       "./cmd/publish-v2-direct", "--allow-public-write"]).returncode
+    if codigo != 0:
+        print(f"a transação recusou (exit {codigo}). NÃO insisto: recusa da "
+              "transação é veredito sobre coerência, não obstáculo a contornar.",
+              file=sys.stderr)
+        return False
+    return True
+
+
+# ---------------------------------------------------------------- compressão
+
+def compressao_completa(seco):
+    """Garante as gêmeas .br — a transação pode ter sido cortada antes delas."""
+    codigo, texto = saida_de(["python3", "-c", """
+import os, glob
+gemeas = [g for g in glob.glob('public/**/*.br', recursive=True) if not g.endswith('.tmp')]
+fontes = glob.glob('public/**/*.html', recursive=True) + glob.glob('public/**/*.xml', recursive=True) \\
+       + glob.glob('public/**/*.txt', recursive=True) + glob.glob('public/**/*.json', recursive=True)
+velhas = sum(1 for b in gemeas if os.path.exists(b[:-3]) and os.path.getmtime(b) < os.path.getmtime(b[:-3]))
+print(len(gemeas), len(fontes), velhas)
+"""])
+    try:
+        gemeas, fontes, velhas = (int(x) for x in texto.split())
+    except ValueError:
+        print("não consegui medir a compressão", file=sys.stderr)
+        return False
+    cobertura = gemeas * 100 // max(fontes, 1)
+    print(f"gêmeas .br: {gemeas}/{fontes} ({cobertura}%), {velhas} velha(s)")
+    if cobertura >= PISO_BROTLI and velhas == 0:
+        print("compressão completa e fresca")
+        return True
+    if seco:
+        print("  --seco: recomprimiria")
+        return True
+    print(f"  abaixo do piso de {PISO_BROTLI}% ou com gêmea velha — recomprimindo")
+    for orfao in glob.glob(os.path.join(RAIZ, "public/**/*.br.tmp"), recursive=True):
+        os.remove(orfao)
+    codigo = roda(["nice", "-n", "19", "python3", "tools/generate-brotli-static",
+                   "--jobs", "4"], timeout_s=2400).returncode
+    if codigo != 0:
+        print(f"  a recompressão falhou (exit {codigo})", file=sys.stderr)
+        return False
+    return True
+
+
+# ---------------------------------------------------------------- veredito
+
+def confere():
+    """Prova, contra produção, que o que se publicou está servível."""
+    ok = True
+    for rota in ("/", "/glossario/intimacao/", "/llms.txt", "/sitemap.xml"):
+        codigo, texto = saida_de(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                                  "--max-time", "12",
+                                  "-A", "wikijuridica-superficie-probe/1.0",
+                                  "-H", "X-Warming-Request: true",
+                                  f"http://127.0.0.1:8088{rota}"])
+        estado = texto.strip()
+        print(f"  {rota:<26} {estado}")
+        if estado != "200":
+            ok = False
+    codigo, _ = saida_de(["./tools/check-paridade-go-nginx"])
+    print(f"  paridade Go×nginx           exit={codigo}")
+    return ok and codigo == 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--seco", action="store_true", help="diz o que faria, sem fazer")
+    args = ap.parse_args()
+
+    passo("1. lock de publicação")
+    if not destrava(args.seco):
+        return 1
+
+    passo("2. censo acompanha o estoque?")
+    if not censo_em_dia(args.seco):
+        return 1
+
+    passo("3. transação de publicação")
+    if not publica(args.seco):
+        return 1
+
+    passo("4. compressão do acervo")
+    if not compressao_completa(args.seco):
+        # Compressão incompleta é DEGRADAÇÃO, não motivo para dizer que a
+        # publicação falhou: o conteúdo está correto no disco e o nginx comprime
+        # na hora. Mas tem de aparecer.
+        print("ATENÇÃO: publicado, porém sem as gêmeas .br completas.", file=sys.stderr)
+
+    passo("5. conferência em produção")
+    if not confere():
+        print("\nPUBLICADO, MAS A CONFERÊNCIA ACUSOU — investigue antes de seguir.",
+              file=sys.stderr)
+        return 1
+
+    print("\npublicação concluída e conferida.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

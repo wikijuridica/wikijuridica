@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""generate-motor-tier-a — seleciona os artigos de norma elegiveis a pagina
+propria, com TODA exclusao nomeada e contada.
+
+POR QUE ESTE ARQUIVO EXISTE. O plano do motor mediu, em 2026-09-09, que a
+pagina de artigo com o insumo daquele dia teria mediana de UM bloco e ~50
+palavras autorais contra o piso de 250 — publicar 1.218 paginas assim seria
+thin content em escala. Depois de a Frente D criar as tres familias de aresta
+que eram zero (pagina->sumula 4.320, dispositivo<->dispositivo 1.606,
+tema->dispositivo 266), a mediana subiu para TRES blocos. Este seletor e o que
+transforma essa mudanca num conjunto auditavel, em vez de numa estimativa.
+
+AS QUATRO EXCLUSOES, e cada uma custou uma leitura de disco:
+
+1. ROTA JA PUBLICADA. `lei-dl-911-art-3` esta no ar. Um seletor que derivasse
+   o apelido por conta propria emitiria `911-art-3` para o mesmo artigo —
+   conteudo duplicado autoinfligido que `check-v2-cross-shard-collision` nao
+   pega, porque sao shards e slugs diferentes.
+
+2. APELIDO NAO DERIVAVEL DO DISCO. A tabela de apelido vem dos `intent_id`
+   ja publicados (`lei-<apelido>-art-<N>`) e de mais lugar nenhum: sao 20
+   prefixos reais. O plano chegou a listar `cp`, `cpp`, `ctn` e `lgpd`, que
+   NAO existem em rota nenhuma — apelido inventado e a causa raiz do caso
+   `dl-911`. URN cujo apelido nao esteja na tabela e RECUSADA, nunca chutada.
+
+3. SEM TEXTO DO ARTIGO. Sem o texto oficial nao ha camada citada, nao ha
+   ancora e nao ha pagina. Medido: 196 dos 847 candidatos.
+
+4. NORMA REVOGADA. `data/source-snapshots/manifest.jsonl` traz
+   `vigencia_status` e `revogado_por` — vigencia se le da fonte, nao de uma
+   lista fixa. O grafo tem UMA aresta `revoga` e nao serve para isto.
+
+O PISO DE EVIDENCIA e a intersecao que o plano chama de Tier A honesto:
+>= 3 acordaos citantes E (sumula NAO processual OU dispositivo co-citado).
+As sumulas processuais (STJ 7/83/182/211/568, STF 279/282/283/284) sao
+excluidas porque marcam obice de admissibilidade, nao tese sobre o artigo.
+
+Uso:
+    tools/generate-motor-tier-a [--raiz .] [--saida data/editorial/motor/tier_a_artigos.jsonl]
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+
+GRAFO = "data/ai/grafo.sqlite"
+SNAPSHOTS = "data/source-snapshots/manifest.jsonl"
+CORPUS = "data/legal-corpus/*.json"
+SHARDS_LEIS = "data/editorial/v2_pages/leis-*.jsonl"
+# O SHARD DE SAIDA NAO E ENTRADA. `leis-motor-*.jsonl` e produzido por
+# cmd/generate-lei-artigo-pages A PARTIR desta selecao; le-lo de volta como
+# "rota ja publicada" faz o seletor esvaziar a si mesmo a cada passada — o
+# artefato que le a si mesmo, que a memoria do repo chama pelo nome. Rota
+# publicada de verdade so entra no conjunto depois do release.
+SHARD_DE_SAIDA = "leis-motor-"
+SAIDA = "data/editorial/motor/tier_a_artigos.jsonl"
+SCHEMA = "motor_tier_a_artigos_v1"
+
+MINIMO_ACORDAOS = 3
+
+# Obice de admissibilidade, nao tese sobre o artigo. Ligar a pagina de um
+# artigo a Sumula 7 do STJ ("a pretensao de simples reexame de prova nao enseja
+# recurso especial") nao diz nada sobre o artigo.
+# AS CHAVES DO GRAFO TEM PREFIXO, e ignorar isso desligou o filtro inteiro.
+# Medido em 2026-09-10: os nos sao `sumula:STJ:7`, nao `STJ:7`. Comparado sem
+# normalizar, NENHUM enunciado processual era excluido — e a pagina saia
+# dizendo "enunciados de admissibilidade ficam de fora" logo acima de uma lista
+# que comecava pela Sumula 7. Errado no dado e contraditorio no texto.
+# A LISTA NAO E MAIS ESCRITA A MAO. Ela vem de
+# data/ops/sumulas_de_admissibilidade.jsonl, derivado por classificacao sobre o
+# corpus: enunciado de admissibilidade fala do CABIMENTO do recurso, o de merito
+# fala do direito discutido. Medido em 2026-09-10: a lista manual tinha 9
+# chaves e deixava passar a Sumula 5 do STJ ("a simples interpretacao de
+# clausula contratual nao enseja recurso especial", 556 acordaos), a 115 do STJ
+# ("advogado sem procuracao nos autos", 360) e a 280 do STF ("por ofensa a
+# direito local nao cabe recurso extraordinario", 131) — as tres publicadas em
+# pagina que dizia, no mesmo paragrafo, que enunciado de admissibilidade ficava
+# de fora. A lista derivada tem 41 chaves.
+SUMULAS_ADMISSIBILIDADE_REL = "data/ops/sumulas_de_admissibilidade.jsonl"
+CLASSES_EXCLUIDAS = {
+    "admissibilidade",
+    "obice_de_via_nao_recursal",
+    # Rotulo suspeito: o numero existe nos DOIS tribunais e um dos dois e de
+    # admissibilidade. O corpus troca o tribunal em 24 casos medidos, entao
+    # publicar o rotulo seria apostar em qual deles a fonte acertou.
+    "rotulo_suspeito_nao_publicar",
+}
+
+# Piso de 2026-09-10, usado so quando o derivado nao existe no disco: sem ele o
+# filtro voltaria a ser nenhum, que e pior que ser curto.
+SUMULAS_PROCESSUAIS = {
+    "STJ:7", "STJ:83", "STJ:182", "STJ:211", "STJ:568",
+    "STF:279", "STF:282", "STF:283", "STF:284",
+}
+
+
+def carrega_admissibilidade(raiz):
+    """Le o derivado; ausente, cai no piso escrito, e DIZ que caiu."""
+    caminho = os.path.join(raiz, SUMULAS_ADMISSIBILIDADE_REL)
+    if not os.path.isfile(caminho):
+        print(f"generate-motor-tier-a: {SUMULAS_ADMISSIBILIDADE_REL} ausente — "
+              f"usando o piso de {len(SUMULAS_PROCESSUAIS)} chaves", file=sys.stderr)
+        return set(SUMULAS_PROCESSUAIS)
+    chaves = set()
+    with open(caminho, encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            if registro.get("classificacao") in CLASSES_EXCLUIDAS and registro.get("chave"):
+                chaves.add(sumula_normalizada(registro["chave"]))
+    return chaves or set(SUMULAS_PROCESSUAIS)
+
+
+def sumula_normalizada(chave):
+    """Tira o prefixo `sumula:` que o grafo usa nos nos."""
+    return (chave or "").split("sumula:", 1)[-1]
+
+
+def nao_processuais(chaves, excluidas):
+    return sorted(c for c in chaves if sumula_normalizada(c) not in excluidas)
+
+
+def numero_da_fonte(registro):
+    """Numero da norma declarado pela PROPRIA pagina publicada.
+
+    A pagina que fixou o apelido diz qual norma ela e, em `official_sources`:
+    `lei-clt-art-3` aponta `.../decreto-lei/del5452.htm#art3` e se chama
+    "Decreto-Lei 5.452/1943 (CLT)". E o join mais forte que existe aqui —
+    derivar o numero do nome do arquivo do corpus (cc.json, clt.json) seria
+    adivinhacao, e adivinhar apelido e a causa raiz do caso `dl-911`.
+    """
+    for fonte in registro.get("official_sources") or []:
+        if not isinstance(fonte, dict):
+            continue
+        alvo = ((fonte.get("url") or "") + " " + (fonte.get("name") or "")).lower()
+        if "constitui" in alvo:
+            return "1988"
+        casa = re.search(r"/(?:l|del|dl|lcp|dec)([0-9]{3,5})", alvo)
+        if casa:
+            return casa.group(1)
+        casa = re.search(r"(?:lei|decreto-lei|decreto|lcp|lc)[^0-9]{0,8}([0-9][0-9.]{2,7})", alvo)
+        if casa:
+            return casa.group(1).replace(".", "")
+    return None
+
+
+def apelidos_publicados(raiz, numeros=None):
+    """Tabela apelido -> numero de rotas, derivada SO do que esta publicado.
+
+    `numeros` recebe o mapa numero da norma -> apelido, derivado da fonte
+    oficial que cada pagina publicada declara.
+    """
+    numeros = numeros if numeros is not None else {}
+    tabela = collections.Counter()
+    for caminho in sorted(glob.glob(os.path.join(raiz, SHARDS_LEIS))):
+        if os.path.basename(caminho).startswith(SHARD_DE_SAIDA):
+            continue
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                casa = re.match(r"^lei-(.+?)-art-(.+)$", registro.get("intent_id", ""))
+                if casa:
+                    tabela[casa.group(1)] += 1
+                    numero = numero_da_fonte(registro)
+                    if numero:
+                        numeros[numero] = casa.group(1)
+    return tabela
+
+
+def rotas_publicadas(raiz):
+    """Os `intent_id` de artigo ja no ar, para nunca emitir rota duplicada."""
+    publicadas = set()
+    for caminho in sorted(glob.glob(os.path.join(raiz, SHARDS_LEIS))):
+        if os.path.basename(caminho).startswith(SHARD_DE_SAIDA):
+            continue
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    publicadas.add(json.loads(linha).get("intent_id", ""))
+                except json.JSONDecodeError:
+                    continue
+    return publicadas
+
+
+def parse_urn(urn):
+    """Alias curto de parte_da_urn, para uso dentro de compreensao."""
+    return parte_da_urn(urn)
+
+
+def parte_da_urn(urn):
+    """(numero da norma, artigo) a partir de `...;<numero>!art<N>`."""
+    casa = re.search(r";([0-9A-Za-z.-]+)!art([0-9A-Za-z-]+)", urn or "")
+    return (casa.group(1), casa.group(2)) if casa else None
+
+
+def indice_do_corpus(raiz):
+    """numero da norma -> {artigo: texto}, do texto integral em legal-corpus."""
+    indice = collections.defaultdict(dict)
+    for caminho in sorted(glob.glob(os.path.join(raiz, CORPUS))):
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                documento = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        artigos = documento.get("articles") or {}
+        if not isinstance(artigos, dict):
+            continue
+        # O NUMERO DA NORMA VEM DO CAMPO `nome`, que o proprio corpus declara
+        # ("Codigo de Defesa do Consumidor (Lei 8.078/1990)"). Derivar do nome
+        # do ARQUIVO perde cc.json, clt.json, cdc.json — que nao tem digito
+        # nenhum no nome —, e foi assim que a primeira passada deste seletor
+        # devolveu 8 artigos onde havia centenas.
+        nome = (documento.get("nome") or "")
+        alvo = (nome + " " + (documento.get("citation_url") or "")).lower()
+        numeros = set()
+        for bruto in re.findall(r"(?:lei|decreto-lei|decreto|lcp|lc)\s*n?o?\s*([0-9][0-9.]{2,7})", nome.lower()):
+            numeros.add(bruto.replace(".", ""))
+        for bruto in re.findall(r"/(?:l|del|dl|lcp|dec)([0-9]{3,5})", alvo):
+            numeros.add(bruto)
+        if "constitui" in alvo:
+            numeros.add("1988")
+        for numero in numeros:
+            for artigo, texto in artigos.items():
+                if isinstance(texto, str) and texto.strip():
+                    indice[numero].setdefault(artigo, texto)
+    return indice
+
+
+def artigo_base(bruto):
+    """`art_223-B`, `art223b`, `art. 223-B`, `art223_par2` -> `223b`.
+
+    O paragrafo REDUZ ao artigo de propriedade: a vigencia que interessa a pagina
+    e a do artigo, e o manifest observa o artigo, nao o paragrafo."""
+    texto = (bruto or "").strip().lower()
+    # A LETRA DO ARTIGO E UMA SO, e o `(?![a-z])` e o que separa `art_223-B`
+    # (letra) de `art_152_par2` (paragrafo): sem ele o "p" de "par" entrava como
+    # letra e `152par2` reduzia a "152p", que nao casa artigo nenhum no manifest.
+    # O teste test_artigo_base_reduz_paragrafo_e_letra pegou isso.
+    casa = re.match(r"art[\s_.]*([0-9]+)(?:[\s_.-]*([a-z])(?![a-z]))?", texto)
+    if not casa:
+        return None
+    return casa.group(1) + (casa.group(2) or "")
+
+
+def cocitado_revogado(urn, vigencia_artigo, vigencia_norma):
+    """O dispositivo co-citado esta revogado?
+
+    Oferecer artigo revogado ao leitor como "anda junto" e erro de fato. A
+    pergunta se responde pela observacao DO ARTIGO quando ela existe, e so cai
+    para a norma na ausencia dela — a mesma assimetria do laco principal:
+    evidencia de norma reprova, nunca aprova."""
+    parte = parse_urn(urn)
+    if not parte:
+        return False
+    numero, artigo = parte
+    if vigencia_norma.get(numero) == "revogado":
+        return True
+    base = artigo_base("art" + artigo)
+    observado = vigencia_artigo.get((numero, base)) if base else None
+    if observado is None:
+        return False
+    return bool(observado[1]) or observado[0] == "revogado"
+
+
+def vigencia_por_artigo(raiz):
+    """(numero, artigo_base) -> `vigencia_status` da observacao MAIS RECENTE.
+
+    ★ VIGENCIA DE ARTIGO NAO SE DERIVA DA NORMA, e essa era a falha (2026-09-10).
+    A versao anterior desta funcao devolvia o status PREDOMINANTE por numero de
+    norma, e o gerador o aplicava ao artigo. Uma norma vigente com um artigo
+    revogado sairia como "vigente" na pagina daquele artigo — a classe de defeito
+    que a auditoria adversarial ja tinha pego uma vez neste motor (artigo
+    inconstitucional afirmado em vigor).
+
+    Medido no manifest de 2026-09-10: 13.300 das 13.437 linhas trazem
+    `dispositivo` (formato `art_1`), cobrindo 6.558 artigos distintos — a
+    evidencia POR ARTIGO existe e estava sendo jogada fora. Dos 255 do Tier A,
+    233 tem observacao de artigo (zero deles nao-vigente) e 22 nao tem: 18 ja
+    caiam como `nao_verificado` e QUATRO (Codigo Civil arts. 757, 760, 765 e 786)
+    sairiam como "vigente" sobre evidencia que nao os observa. Esses quatro
+    passam a ser `vigencia_da_norma_apenas`, que o gerador recusa como qualquer
+    outra vigencia nao confirmada.
+
+    A escolha e pela observacao mais recente (`version_seq`, depois
+    `as_of_date`), nao pela predominante: contar ocorrencias faz a historia da
+    norma vencer o estado de hoje."""
+    caminho = os.path.join(raiz, SNAPSHOTS)
+    if not os.path.isfile(caminho):
+        return {}, {}
+    por_artigo = {}
+    por_norma = collections.defaultdict(collections.Counter)
+    with open(caminho, encoding="utf-8") as fonte:
+        linhas = list(fonte)
+    for linha in linhas:
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            registro = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        parte = re.search(r";([0-9A-Za-z.-]+)", registro.get("urn_lex") or "")
+        if not parte:
+            continue
+        numero = parte.group(1)
+        por_norma[numero][registro.get("vigencia_status")] += 1
+        artigo = artigo_base(registro.get("dispositivo"))
+        if not artigo:
+            continue
+        ordem = (registro.get("version_seq") or 0, registro.get("as_of_date") or "")
+        chave = (numero, artigo)
+        anterior = por_artigo.get(chave)
+        if anterior is None or ordem >= anterior[0]:
+            por_artigo[chave] = (ordem, registro.get("vigencia_status"),
+                                 registro.get("revogado_por") or "")
+    norma = {
+        numero: contagem.most_common(1)[0][0]
+        for numero, contagem in por_norma.items()
+        if contagem
+    }
+    return {chave: (valor[1], valor[2]) for chave, valor in por_artigo.items()}, norma
+
+
+def evidencia_do_grafo(raiz):
+    """Le o grafo UMA vez e devolve as cinco medidas por dispositivo."""
+    caminho = os.path.join(raiz, GRAFO)
+    conexao = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
+
+    def consulta(sql):
+        return conexao.execute(sql).fetchall()
+
+    acordaos = dict(consulta("""
+        select d.chave, count(distinct e.origem) from arestas e
+        join nos o on o.id = e.origem and o.tipo = 'acordao'
+        join nos d on d.id = e.destino and d.tipo = 'dispositivo'
+        where e.tipo = 'cita' group by 1"""))
+
+    orgaos = collections.defaultdict(set)
+    for dispositivo, tribunal in consulta("""
+        select dd.chave, tt.chave from arestas e1
+        join arestas e2 on e1.origem = e2.origem
+        join nos a on a.id = e1.origem and a.tipo = 'acordao'
+        join nos dd on dd.id = e1.destino and dd.tipo = 'dispositivo'
+        join nos tt on tt.id = e2.destino and tt.tipo = 'tribunal'
+        where e1.tipo = 'cita' and e2.tipo = 'julgado_por'"""):
+        orgaos[dispositivo].add(tribunal)
+
+    sumulas = collections.defaultdict(set)
+    for dispositivo, sumula in consulta("""
+        select dd.chave, ss.chave from arestas e1
+        join arestas e2 on e1.origem = e2.origem
+        join nos a on a.id = e1.origem and a.tipo = 'acordao'
+        join nos dd on dd.id = e1.destino and dd.tipo = 'dispositivo'
+        join nos ss on ss.id = e2.destino and ss.tipo = 'sumula'
+        where e1.tipo = 'cita' and e2.tipo = 'cita'"""):
+        sumulas[dispositivo].add(sumula)
+
+    cocitados = collections.defaultdict(set)
+    for origem, destino in consulta("""
+        select o.chave, d.chave from arestas e
+        join nos o on o.id = e.origem and o.tipo = 'dispositivo'
+        join nos d on d.id = e.destino and d.tipo = 'dispositivo'
+        where e.tipo = 'cocitada_com'"""):
+        cocitados[origem].add(destino)
+
+    temas = collections.defaultdict(set)
+    for tema, dispositivo in consulta("""
+        select tt.chave, dd.chave from arestas e
+        join nos tt on tt.id = e.origem and tt.tipo = 'tema'
+        join nos dd on dd.id = e.destino and dd.tipo = 'dispositivo'
+        where e.tipo = 'cita'"""):
+        temas[dispositivo].add(tema)
+
+    conexao.close()
+    return acordaos, orgaos, sumulas, cocitados, temas
+
+
+def blocos_disponiveis(urn, acordaos, orgaos, sumulas, cocitados, temas, admissibilidade):
+    """Os blocos que a pagina deste artigo teria. `posicao_na_norma` e sempre."""
+    blocos = ["posicao_na_norma"]
+    if acordaos.get(urn, 0) >= MINIMO_ACORDAOS:
+        blocos.append("como_o_stj_aplica")
+    if nao_processuais(sumulas.get(urn, set()), admissibilidade):
+        blocos.append("sumula_relacionada")
+    if acordaos.get(urn, 0) >= 5 and len(orgaos.get(urn, ())) >= 2:
+        blocos.append("divergencia_entre_turmas")
+    if temas.get(urn):
+        blocos.append("tema_repetitivo")
+    if cocitados.get(urn):
+        blocos.append("artigos_que_andam_juntos")
+    return blocos
+
+
+def funde_evidencia(destino, origem):
+    """Funde duas linhas do MESMO artigo (caput e paragrafo).
+
+    `acordaos_citantes` fica com o MAIOR dos dois, nunca com a soma: o acordao
+    que cita o caput e o paragrafo e UM acordao, e somar inflaria a evidencia
+    que a pagina afirma. Os conjuntos se unem, porque sao coisas distintas de
+    verdade.
+    """
+    destino["acordaos_citantes"] = max(destino["acordaos_citantes"], origem["acordaos_citantes"])
+    for campo in ("orgaos_julgadores", "sumulas_nao_processuais",
+                  "dispositivos_cocitados", "temas_repetitivos", "blocos_disponiveis"):
+        destino[campo] = sorted(set(destino[campo]) | set(origem[campo]))
+    urns = set(destino.get("urns_do_artigo") or [destino["urn_lex"]])
+    urns.add(origem["urn_lex"])
+    destino["urns_do_artigo"] = sorted(urns)
+    return destino
+
+
+def main_com_argv(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--raiz", default=".")
+    ap.add_argument("--saida", default=None)
+    ap.add_argument("--minimo-acordaos", type=int, default=MINIMO_ACORDAOS)
+    args = ap.parse_args(argv)
+
+    caminho_grafo = os.path.join(args.raiz, GRAFO)
+    if not os.path.isfile(caminho_grafo):
+        print(f"generate-motor-tier-a: falta {caminho_grafo}", file=sys.stderr)
+        return 2
+
+    admissibilidade = carrega_admissibilidade(args.raiz)
+    acordaos, orgaos, sumulas, cocitados, temas = evidencia_do_grafo(args.raiz)
+    numero_do_apelido = {}
+    tabela = apelidos_publicados(args.raiz, numero_do_apelido)
+    publicadas = rotas_publicadas(args.raiz)
+    corpus = indice_do_corpus(args.raiz)
+    vigencia_artigo, vigencia_norma = vigencia_por_artigo(args.raiz)
+
+    # O apelido que JA E o numero (8213, 9656...) mapeia para si mesmo.
+    for apelido in tabela:
+        casa = re.match(r"^(?:dl-|lc-|dec-)?([0-9]{3,5})$", apelido)
+        if casa:
+            numero_do_apelido[casa.group(1)] = apelido
+
+    excluidos = collections.Counter()
+    por_intent = {}
+    for urn in sorted(acordaos):
+        parte = parte_da_urn(urn)
+        if not parte:
+            excluidos["urn_sem_artigo"] += 1
+            continue
+        numero, artigo = parte
+
+        if acordaos.get(urn, 0) < args.minimo_acordaos:
+            excluidos["abaixo_do_piso_de_acordaos"] += 1
+            continue
+        blocos = blocos_disponiveis(urn, acordaos, orgaos, sumulas, cocitados, temas, admissibilidade)
+        if not ({"sumula_relacionada", "artigos_que_andam_juntos"} & set(blocos)):
+            excluidos["sem_sumula_nao_processual_nem_cocitacao"] += 1
+            continue
+
+        # A EVIDENCIA E DO ARTIGO, e so cai para a norma para REPROVAR, nunca
+        # para aprovar: norma revogada revoga o artigo, mas norma vigente nao
+        # prova nada sobre um artigo que a fonte nao observou.
+        base = artigo_base("art" + artigo)
+        observado = vigencia_artigo.get((numero, base)) if base else None
+        if vigencia_norma.get(numero) == "revogado":
+            excluidos["norma_revogada"] += 1
+            continue
+        if observado is None:
+            status = "vigencia_da_norma_apenas"
+        elif observado[1]:
+            excluidos["artigo_revogado_na_fonte"] += 1
+            continue
+        else:
+            status = observado[0]
+        if status == "revogado":
+            excluidos["artigo_revogado_na_fonte"] += 1
+            continue
+
+        texto = corpus.get(numero, {}).get(artigo) or corpus.get(numero, {}).get(artigo.upper())
+        if not texto:
+            excluidos["sem_texto_do_artigo"] += 1
+            continue
+
+        apelido = numero_do_apelido.get(numero)
+        if apelido is None:
+            # Apelido nao derivavel do disco: RECUSA, nunca chute. E a causa
+            # raiz do caso `dl-911` — o plano chegou a listar cp/cpp/ctn/lgpd,
+            # que nao existem em rota nenhuma.
+            excluidos["apelido_nao_derivavel_do_disco"] += 1
+            continue
+
+        intent = f"lei-{apelido}-art-{artigo}"
+        if intent in publicadas:
+            excluidos["rota_ja_publicada"] += 1
+            continue
+
+        registro_novo = {
+            "schema": SCHEMA,
+            "urn_lex": urn,
+            "intent_id": intent,
+            "apelido": apelido,
+            "norma": numero,
+            "artigo": artigo,
+            "vigencia_status": status or "nao_verificado",
+            "acordaos_citantes": acordaos.get(urn, 0),
+            "orgaos_julgadores": sorted(orgaos.get(urn, ())),
+            "sumulas_nao_processuais": nao_processuais(sumulas.get(urn, set()), admissibilidade),
+            # A CO-CITACAO NAO PODE APONTAR NORMA REVOGADA. Medido em
+            # 2026-09-10: a Lei 5.869/1973 (CPC revogado) aparecia como
+            # "dispositivo que anda junto" numa pagina do CPC de 2015 — o
+            # acordao antigo citou os dois, mas oferecer o revogado ao leitor
+            # como leitura complementar e erro de fato, nao curiosidade
+            # historica.
+            "dispositivos_cocitados": [
+                outro for outro in sorted(cocitados.get(urn, ()))
+                if not cocitado_revogado(outro, vigencia_artigo, vigencia_norma)
+            ],
+            "temas_repetitivos": sorted(temas.get(urn, ())),
+            "blocos_disponiveis": blocos,
+            "texto_chars": len(texto),
+        }
+        # UM ARTIGO, UMA PAGINA. As URNs de paragrafo (`!art105_par2`) tratam do
+        # MESMO artigo que o caput e reduzem ao mesmo intent_id: emiti-las
+        # separadas produziria `lei-cpc-art-485` tres vezes no shard, que e rota
+        # duplicada — o dano que este seletor existe para impedir. Medido em
+        # 2026-09-10: 35 intent_id repetidos, todos por paragrafo. A evidencia
+        # das duas linhas se FUNDE, em vez de uma delas se perder.
+        anterior = por_intent.get(intent)
+        if anterior is None:
+            por_intent[intent] = registro_novo
+        else:
+            funde_evidencia(anterior, registro_novo)
+            excluidos["urn_de_paragrafo_fundida_no_artigo"] += 1
+
+    selecionados = [por_intent[chave] for chave in sorted(por_intent)]
+
+    saida = args.saida or os.path.join(args.raiz, SAIDA)
+    os.makedirs(os.path.dirname(saida), exist_ok=True)
+    temporario = saida + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as f:
+        for registro in selecionados:
+            f.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(temporario, saida)
+
+    distribuicao = collections.Counter(len(r["blocos_disponiveis"]) for r in selecionados)
+    print(f"tier A selecionado: {len(selecionados)} artigos -> {saida}")
+    print("blocos por pagina:", dict(sorted(distribuicao.items())))
+    print("exclusoes, cada uma nomeada:")
+    for motivo, quantos in excluidos.most_common():
+        print(f"  {motivo:38s} {quantos}")
+    print(f"apelidos derivados do disco: {len(tabela)}")
+    return 0
+
+
+def main():
+    return main_com_argv(None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

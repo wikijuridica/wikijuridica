@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""generate-catalog-url-repair — troca URL de catálogo que o gate rejeita por URL documental.
+
+O DEFEITO (medido em 2026-07-29): 822 entradas de
+data/editorial/v2_source_hint_catalog.json apontam para
+https://normas.leg.br/?urn=urn:lex:br:federal:lei:AAAA-MM-DD;NNNNN — a URL
+RESPONDE 200, mas o gate a REJEITA, e com razão: _canonical_official_source_url
+(tools/generate_v2_review_queue.py:1524 e a função logo abaixo) exige **path
+documental específico**, e essa URL carrega o documento em QUERY sobre o path raiz.
+Query não identifica documento de forma estável — o gate está certo, a entrada é
+que está errada.
+
+O ESTRAGO QUE ISSO CAUSAVA: uma única entrada ruim envenena a intenção inteira.
+O resolvedor, ao encontrar um hint que não valida, força a intenção para "strict"
+e ZERA os overrides já resolvidos; o CAS então só aceita tombstone. Foi por isso
+que tools/generate-v2-tombstone-revival recusou os 121 tombstones de uma vez,
+todos com a mesma causa: "source_hints.cadin-lei-10522-2002: URL oficial HTTPS
+inválida".
+
+O QUE ESTA FERRAMENTA FAZ: extrai a URN LexML (espécie, data, número) da própria
+URL — não adivinha —, deriva a URL documental do Planalto por regra de época e
+**só grava o que responder 200** em requisição de metadado (HEAD). Entrada que não
+resolver fica INTACTA: preferir uma entrada reconhecidamente quebrada a uma
+inventada é o contrato deste projeto, e URL inventada é fraude.
+
+Reaproveita a derivação já provada em tools/generate-planalto-source-hints
+(14/14 no ensaio, incluindo as variantes compilado/compilada, decreto-lei, lei
+complementar, emenda e o diretório de quadriênio pós-2011).
+
+Uso:
+  tools/generate-catalog-url-repair --dry-run
+  tools/generate-catalog-url-repair --apply [--limit N]
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CATALOG = os.path.join(ROOT, "data/editorial/v2_source_hint_catalog.json")
+UA = "Mozilla/5.0 WikiJuridicaV2SourceProvenance/1.0 metadata-only no-content-copy"
+
+# urn:lex:br:federal:lei:2002-07-19;10522  ->  (especie, ano, numero)
+URN = re.compile(
+    r"urn:lex:br:federal:([a-z._-]+):(\d{4})-\d{2}-\d{2};([\d.]+)", re.I)
+
+ESPECIE = {
+    "lei": "lei",
+    "lei.complementar": "lc",
+    "decreto.lei": "decreto-lei",
+    "decreto": "decreto",
+    "emenda.constitucional": "emenda",
+    "constituicao": "constituicao",
+}
+
+
+def carregar_derivador():
+    """Importa candidate_urls de generate-planalto-source-hints (sem .py no nome)."""
+    caminho = os.path.join(ROOT, "tools", "generate-planalto-source-hints")
+    spec = importlib.util.spec_from_loader(
+        "planalto_hints", importlib.machinery.SourceFileLoader("planalto_hints", caminho))
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo.candidate_urls
+
+
+def precisa_reparo(url):
+    """True quando o gate rejeitaria: query presente ou path raiz."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return True
+    partes = urllib.parse.urlsplit(url)
+    return bool(partes.query) or partes.path.strip("/") == ""
+
+
+def probe(url, timeout=12):
+    proc = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-I", "-m", str(timeout),
+         "-w", "%{http_code}", "-A", UA, url],
+        capture_output=True, text=True)
+    return (proc.stdout or "").strip()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--rate", type=float, default=2.0)
+    args = parser.parse_args()
+    if not args.apply and not args.dry_run:
+        parser.error("escolha --apply ou --dry-run")
+
+    candidate_urls = carregar_derivador()
+    with open(CATALOG, encoding="utf-8") as handle:
+        catalogo = json.load(handle)
+    hints = catalogo.get("source_hints")
+    if hints is None:
+        parser.error("catalogo sem chave source_hints — schema mudou, pare e investigue")
+
+    quebradas = [(k, v) for k, v in hints.items()
+                 if isinstance(v, dict) and precisa_reparo(v.get("url"))]
+    print("entradas que o gate rejeita: %d de %d" % (len(quebradas), len(hints)))
+
+    alvos = quebradas[:args.limit] if args.limit else quebradas
+    reparadas, sem_urn, sem_resposta = {}, [], []
+    cache = {}
+    intervalo = 1.0 / args.rate if args.rate > 0 else 0
+
+    for chave, valor in alvos:
+        achado = URN.search(valor.get("url") or "")
+        if not achado:
+            sem_urn.append(chave)
+            continue
+        bruto, ano, numero = achado.group(1).lower(), int(achado.group(2)), achado.group(3)
+        especie = ESPECIE.get(bruto)
+        if not especie:
+            sem_urn.append(chave)
+            continue
+        numero = numero.replace(".", "")
+        # Muitas chaves apontam para a MESMA norma (ex.: 60 artigos do Código
+        # Civil). Resolver uma vez e reusar evita martelar o Planalto.
+        cache_key = (especie, numero, ano)
+        if cache_key in cache:
+            url = cache[cache_key]
+        else:
+            url = None
+            for candidato in candidate_urls(especie, numero, ano):
+                if probe(candidato) == "200":
+                    url = candidato
+                    break
+                if intervalo:
+                    time.sleep(intervalo)
+            cache[cache_key] = url
+        if url:
+            novo = dict(valor)
+            novo["url"] = url
+            reparadas[chave] = novo
+        else:
+            sem_resposta.append(chave)
+
+    print("reparadas: %d | sem URN reconhecivel: %d | nenhum candidato 200: %d" % (
+        len(reparadas), len(sem_urn), len(sem_resposta)))
+    for chave in list(reparadas)[:12]:
+        print("  %-46s -> %s" % (chave[:46], reparadas[chave]["url"]))
+
+    if not args.apply:
+        print("\n--dry-run: nada foi alterado")
+        return 0
+    if not reparadas:
+        print("\nnada a reparar")
+        return 0
+
+    hints.update(reparadas)
+    tmp = CATALOG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(catalogo, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, CATALOG)
+    print("\ncatalogo reparado: %d entradas reescritas" % len(reparadas))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

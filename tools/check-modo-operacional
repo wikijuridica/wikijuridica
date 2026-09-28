@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""check-modo-operacional — prova que o modo operacional deste repositório é
+IMPOSTO, e não apenas escrito.
+
+POR QUE EXISTE. A auditoria do §P0a mediu que três dos cinco erros caros de uma
+sessão aconteceram com a regra JÁ CARREGADA no contexto. Regra escrita não é
+regra: é esperança. Este gate cobra que cada proibição que custou incidente
+tenha um mecanismo que a torne inevitável, que o mecanismo esteja REGISTRADO
+(hook no disco sem entrada no settings.json não impõe nada), que ele DISPARE, e
+que a mensagem dele ENSINE o caminho certo em vez de apenas negar.
+
+Os cinco testes:
+
+  T1 INVENTÁRIO   hooks, rules, skills e agents existem e estão bem formados.
+  T2 DISPARO      cada hook bloqueia o payload que deve bloquear, com exit 2,
+                  e a mensagem contém o comando certo (asserção positiva).
+  T3 FALSO-POSITIVO  cada hook deixa passar a forma correta e a prosa que
+                  apenas CITA o comando — um guarda que impede de documentar a
+                  regra que ele aplica trabalha contra si.
+  T4 CUSTO        p50/p95 por hook contra o teto (--max-ms, default 300).
+  T5 REGISTRO     todo hook desta frente está no .claude/settings.json.
+
+PROVA POR MUTAÇÃO (--provar-mutacao): para cada hook, monta uma cópia da árvore
+de hooks com AQUELE hook neutralizado e exige que o T2 fique VERMELHO nomeando
+o hook. Sem isso, um T2 verde não distingue "o hook bloqueou" de "o payload
+nunca bloquearia".
+
+READ-ONLY: não escreve JSONL, manifesto, sitemap, content/, public/ nem dado
+permanente. A cópia da mutação vive em diretório temporário e é removida.
+
+Uso:
+    tools/check-modo-operacional
+    tools/check-modo-operacional --provar-mutacao
+    tools/check-modo-operacional --max-ms 300 --repeticoes 20
+    tools/check-modo-operacional --json
+
+Exit: 0 verde · 1 algum teste vermelho · 2 não conseguiu medir.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+RAIZ = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+CLAUDE = os.path.join(RAIZ, ".claude")
+HOOKS = os.path.join(CLAUDE, "hooks")
+
+# ---------------------------------------------------------------------------
+# A tabela de casos. Cada entrada é um incidente real deste repositório.
+#
+#   bloqueia  — payloads que o hook TEM de barrar (exit 2)
+#   permite   — payloads que o hook TEM de deixar passar (exit 0), incluindo a
+#               prosa que só cita o comando
+#   ensina    — trechos que a mensagem do bloqueio TEM de conter. É o que separa
+#               "hook que nega" de "hook que ensina o caminho certo".
+CASOS: dict[str, dict] = {
+    "block-check-runner-sem-alvo.sh": {
+        "incidente": "cmd/check sem argumento roda TODOS: 45 processos, load 52 (2026-08-29)",
+        "bloqueia": [
+            "./tools/run-check",
+            "./tools/go-modern run ./cmd/check",
+            "./tools/run-check foo && ./tools/run-check",
+            "echo ok\n./tools/run-check",
+        ],
+        "permite": [
+            "./tools/go-modern run ./cmd/check contrato-dado-real",
+            "./tools/run-check agent-skills-discovery --timings",
+            "./tools/go-modern run ./cmd/check --lista-nomes",
+            "./tools/run-check --checks a,b",
+            "./tools/check-csp-style-hashes",
+            "mkdir -p run-check-exemplo",
+            "cat > s.md <<'FIM'\n./tools/run-check\nFIM",
+        ],
+        "ensina": ["--lista-nomes", "generate-check-selection-profiles"],
+    },
+    "block-sudo-nginx-t.sh": {
+        "incidente": "sudo nginx -t devolve var/nginx a nobody: workers em EACCES, canal inteiro em 500",
+        "bloqueia": ["sudo nginx -t", "sudo -n nginx -T", "sudo nginx -t\necho ok"],
+        "permite": [
+            "nginx -t",
+            "sudo nginx -s reload",
+            "sudo -n systemctl reload nginx",
+            "cat > s.md <<'FIM'\nsudo nginx -t\nFIM",
+        ],
+        "ensina": ["nginx -t", "systemctl reload nginx"],
+    },
+    "block-git-add-por-diretorio.sh": {
+        "incidente": "git add por diretório já varreu trabalho não-commitado de outra sessão 3x",
+        "bloqueia": [
+            "git add .",
+            "git add -A",
+            "git add --all",
+            "git add -u",
+            "git add data/",
+            "git add internal/render",
+            "git add data/\necho ok",
+            # GLOB que casa DIRETORIO: o git adicionaria a arvore inteira. Quem
+            # decide e' o que o glob CASA, nao o texto dele.
+            "git add .claude/*",
+        ],
+        "permite": [
+            "git add internal/render/page.go",
+            "git add CLAUDE.md",
+            "git add -p internal/",
+            "cat > s.md <<'FIM'\ngit add -A\nFIM",
+            # LISTA DERIVADA — o predicado e' "o git RECEBE um diretorio", nao
+            # "o comando MENCIONA um". Em 2026-09-16 estes eram barrados porque o
+            # word splitting partia a substituicao e um pedaco (`.claude/hooks`)
+            # parecia um diretorio literal que o git nunca recebe. O falso
+            # positivo encarecia a forma CERTA e empurrava para `git add <dir>`,
+            # que e' o defeito real: guarda que torna o caminho certo mais caro
+            # que o errado inverte o incentivo que ela existe para criar.
+            "find .claude/hooks .claude/rules -type f -print0 | xargs -0 git add --",
+            "find .claude/hooks -type f -print0 | xargs -0 git add",
+            "find .claude/hooks -type f -exec git add {} +",
+            "git add $(find .claude/hooks -type f)",
+            "git add $(git ls-files -m -- internal/render)",
+            "for f in $(find .claude/hooks -type f); do git add \"$f\"; done",
+            "git add \"$arquivo\"",
+            # GLOB que so casa arquivo.
+            "git add .claude/hooks/*.sh",
+        ],
+        "ensina": ["git add internal/render/page.go", "git status --short",
+                   "xargs -0 git add --"],
+    },
+    "block-git-add-com-commit.sh": {
+        "incidente": "add+commit no mesmo comando: pre-commit reprova com 'indice mudou durante compilacao'",
+        "bloqueia": ["git add x.go && git commit -F /tmp/m.txt"],
+        "permite": [
+            "git add internal/render/page.go",
+            "git commit -F /tmp/m.txt",
+            "git status && git commit -F /tmp/m.txt",
+        ],
+        "ensina": ["git add caminho/exato", "git commit -F"],
+    },
+    "block-commit-sem-arquivo-de-mensagem.sh": {
+        "incidente": "mensagem por -m e --no-verify: o contrato exige -F e corrigir a causa",
+        "bloqueia": [
+            ('git commit -m "feat: x"', ["git commit -F", "-F /tmp/msg.txt"]),
+            ("git commit --no-verify -F /tmp/m.txt", ["corrija a CAUSA", "indice mudou durante compilacao"]),
+        ],
+        "permite": [
+            "git commit -F /tmp/m.txt",
+            "git commit --amend -F /tmp/m.txt",
+            # PATHSPEC e a forma sancionada de escopar um commit sem tocar a
+            # worktree. O `cauda` do hook corta em [;&|], nao em `--`, entao ele
+            # varre o pathspec junto: se um caminho contivesse algo parecido com
+            # `-m`, a forma CERTA seria barrada. Fixture permanente.
+            "git commit -F /tmp/m.txt -- internal/render/page.go",
+            "git commit -F /tmp/m.txt -- internal/",
+            "git commit -F /tmp/msg.txt -- data/ai/fila.sqlite",
+            "cat > s.md <<'FIM'\ngit commit -m x\nFIM",
+        ],
+        "ensina": ["git commit -F"],
+    },
+    "block-display-zero-social.sh": {
+        "incidente": "o :0 tem a VM com PJe/e-SAJ e o token de assinatura do titular",
+        "bloqueia": [
+            "DISPLAY=:0 xdotool key Return",
+            "DISPLAY=:0.0 virt-viewer --attach pje",
+            # INTERPRETADOR + SCRIPT: a forma que o repositorio de fato usa. O
+            # comando e `node`; o alvo e ARGUMENTO. Saia com exit 0 ate
+            # 2026-09-16, nas DUAS formas de payload.
+            "DISPLAY=:0 node scripts/olhar-pagina.mjs",
+            "DISPLAY=:0 scrot /tmp/tela.png",
+        ],
+        "permite": [
+            "DISPLAY=:99 node scripts/olhar-pagina.mjs",
+            "./tools/publicar-perfis-sociais --rede facebook --todas",
+            "DISPLAY=:0 xdpyinfo | head",
+            # Os dois falsos positivos medidos em 2026-09-16: `import` como
+            # primeira palavra de script, e `:0` dentro de hora ou de fatia.
+            # Guarda que barra o comando inocente ensina a contorna-la, e guarda
+            # contornada nao protege a VM com o token de assinatura.
+            'python3 -c "import pathlib"  # a doc desta regra cita :0',
+            'echo "earlyoom matou llama-server as 12:04:53"',
+            'python3 -c "print(texto[:0])"',
+        ],
+        "ensina": ["DISPLAY=:99", "publicar-perfis-sociais"],
+    },
+    # Injetores: nunca bloqueiam. Para eles, "bloqueia" significa INJETA contexto.
+    "avisa-deploy-publico.sh": {
+        "incidente": "a decisão --ressemear/purga acontece uma vez, no ato do comando",
+        "injetor": True,
+        "bloqueia": ["./tools/deploy-publico --ressemear", "git status && ./tools/deploy-publico"],
+        "permite": [
+            "mkdir -p deploy-publico",
+            "echo 'ver tools/deploy-publico' > /tmp/m.txt",
+            "cat > s.md <<'FIM'\nskill deploy-publico\nFIM",
+        ],
+        "ensina": ["--ressemear", "warm-edge-cache", "edge_cache_purge.jsonl"],
+    },
+    "avisa-derivado-editorial.sh": {
+        "incidente": "regenerar fora de ordem parou a fábrica 31 dias; o erro diz 'fingerprint mismatch'",
+        "injetor": True,
+        "bloqueia": ["./tools/generate-authorial-mass-drafts"],
+        "permite": [
+            "echo 'rode generate-authorial-mass-drafts' > /tmp/x",
+            "mkdir -p generate-authorial-mass-exemplo",
+        ],
+        "ensina": ["fingerprint mismatch", "CADEIA_EDITORIAL_ORDEM_DE_REGENERACAO"],
+    },
+    # Os dois hooks da ordem de 2026-09-22. Nao sao Bash: o de Agent le subagent_type/model, o
+    # de escrita le file_path e agent_type. Por isso os itens sao dict (tool_input inteiro), e
+    # a ferramenta do caso diz qual e. O registrador PostToolUse:Agent NAO entra aqui: ele nunca
+    # bloqueia, entao a prova por mutacao (que exige T2 vermelho) nao se aplica a ele.
+    "block-agent-haiku.sh": {
+        "incidente": "roster contradisse a politica de 2026-09-15 a 2026-09-22; investigador em model: haiku",
+        "ferramenta": "Agent",
+        "bloqueia": [
+            {"tool_input": {"subagent_type": "general-purpose", "description": "x", "prompt": "y", "model": "haiku"}},
+            {"tool_input": {"subagent_type": "general-purpose", "description": "x", "prompt": "y", "model": "sonnet"}},
+        ],
+        "permite": [
+            {"tool_input": {"subagent_type": "general-purpose", "description": "x", "prompt": "y", "model": "opus"}},
+            {"tool_input": {"subagent_type": "auditor-adversarial", "description": "x", "prompt": "y", "model": "fable"}},
+            {"tool_input": {"subagent_type": "investigador", "description": "x", "prompt": "y", "model": "sonnet"}},
+        ],
+        "ensina": ["sonnet", "investigador", "documentador-de-contexto", "opus"],
+    },
+    "block-write-fora-de-contexto.sh": {
+        "incidente": "ordem do dono, 2026-09-22: Sonnet 5 colhe contexto e nao edita; agente de contexto escrevendo fora de .agents/runtime/contexto/",
+        "ferramenta": "Write",
+        "bloqueia": [
+            {"tool_input": {"file_path": os.path.join(RAIZ, "CLAUDE.md"), "content": "x"}, "agent_type": "documentador-de-contexto"},
+        ],
+        "permite": [
+            {"tool_input": {"file_path": os.path.join(RAIZ, ".agents/runtime/contexto/2026-09-22-mapa.md"), "content": "x"}, "agent_type": "documentador-de-contexto"},
+            {"tool_input": {"file_path": os.path.join(RAIZ, "internal/seo/meta.go"), "content": "package seo"}, "agent_type": "engenheiro-go"},
+        ],
+        "ensina": [".agents/runtime/contexto/"],
+    },
+}
+
+
+# AS DUAS FORMAS DO PAYLOAD, e por que o gate cobra as duas.
+#
+# O harness serializa o JSON do hook, e nada no contrato diz se sai compacto
+# (`"command":"x"`) ou espacado (`"command": "x"`, o default do json.dumps).
+# Em 2026-09-16 um hook recortava o comando so da forma COMPACTA; com a
+# espacada ele caia no JSON inteiro e a analise posicional passava a procurar
+# posicao de comando dentro de `{"tool_name": "Bash", ...`, onde ela nao existe.
+# Os tres casos perigosos sairam com exit 0 — a guarda da VM com o token de
+# assinatura falhando ABERTA, em silencio, por um espaco.
+#
+# Por isso cada fixture roda nas DUAS formas e elas tem de CONCORDAR: um hook
+# cujo veredito depende do espacamento do serializador e um hook quebrado,
+# mesmo que a forma testada por acaso esteja certa.
+FORMATOS = (("compacto", (",", ":")), ("espacado", None))
+
+
+def payload(entrada, separators=None, ferramenta: str = "Bash", agent_type: str | None = None) -> bytes:
+    # entrada e um comando Bash (str) ou um tool_input ja montado (dict), para os hooks que
+    # julgam a ferramenta Agent (subagent_type/model) ou a escrita de arquivo (file_path).
+    tool_input = {"command": entrada} if isinstance(entrada, str) else dict(entrada)
+    d = {"tool_name": ferramenta, "tool_input": tool_input}
+    if agent_type is not None:
+        d["agent_type"] = agent_type
+    return json.dumps(d, separators=separators).encode()
+
+
+def roda_hook(caminho: str, entrada, ferramenta: str = "Bash", agent_type: str | None = None,
+              cwd: str | None = None) -> tuple[int, str, str]:
+    """Roda nas duas formas. Divergencia entre elas ja e falha, e e reportada
+    como exit -1 para o chamador distinguir. Com cwd, fixa a raiz e exporta
+    CLAUDE_PROJECT_DIR, porque o hook de Agent le o roster e o de escrita
+    resolve o destino contra a raiz."""
+    env = None
+    if cwd is not None:
+        env = os.environ.copy()
+        env["CLAUDE_PROJECT_DIR"] = cwd
+    vistos = []
+    for _, sep in FORMATOS:
+        p = subprocess.run(["bash", caminho], input=payload(entrada, sep, ferramenta, agent_type),
+                           capture_output=True, cwd=cwd, env=env)
+        vistos.append((p.returncode,
+                       p.stdout.decode("utf-8", "replace"),
+                       p.stderr.decode("utf-8", "replace")))
+    if vistos[0][0] != vistos[1][0]:
+        aviso = (f"veredito DEPENDE do espacamento do JSON: compacto exit="
+                 f"{vistos[0][0]}, espacado exit={vistos[1][0]}")
+        return -1, "", aviso
+    return vistos[1]
+
+
+def mensagem_do_hook(saida: str, erro: str) -> str:
+    """O texto que chega ao modelo, pelas duas rotas que o hook emite."""
+    texto = erro
+    try:
+        j = json.loads(saida) if saida.strip() else {}
+        h = j.get("hookSpecificOutput", {})
+        texto += "\n" + h.get("permissionDecisionReason", "") + "\n" + h.get("additionalContext", "")
+    except json.JSONDecodeError:
+        pass
+    return texto
+
+
+# ---------------------------------------------------------------------------
+def frontmatter_valido(caminho: str) -> str | None:
+    """Devolve a mensagem de erro se o frontmatter nao for YAML valido.
+
+    POR QUE ISTO E UM TESTE. Em 2026-09-16 `.claude/agents/investigador.md`
+    estava com YAML invalido em HEAD -- a description continha "Read-only: NAO
+    edita", e o ": " em escalar simples faz o parser ler aquilo como mapeamento
+    aninhado. Um frontmatter que nao parseia e a falha SILENCIOSA que esta
+    frente existe para eliminar: os campos `memory:` e `skills:` acrescentados
+    logo abaixo poderiam ser ignorados sem uma linha de aviso, e a correcao da
+    causa-raiz (levar a licao ao subagente) nao valeria para aquele agente.
+    Aspas duplas na description resolvem sem mudar uma palavra do texto.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None  # sem o modulo, nao se inventa veredito
+    with open(caminho, encoding="utf-8") as fh:
+        texto = fh.read()
+    m = re.match(r"---\n(.*?)\n---", texto, re.S)
+    if not m:
+        return "sem frontmatter"
+    try:
+        dados = yaml.safe_load(m.group(1))
+    except Exception as exc:  # noqa: BLE001 - a mensagem do parser e o valor
+        return f"YAML invalido: {exc}"
+    if not isinstance(dados, dict):
+        return "frontmatter nao e um mapeamento"
+    return None
+
+
+def t1_inventario(falhas: list[str], dados: dict) -> None:
+    cfg_path = os.path.join(CLAUDE, "settings.json")
+    if not os.path.exists(cfg_path):
+        falhas.append("T1 .claude/settings.json ausente")
+        return
+    with open(cfg_path, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+
+    registrados = set()
+    for _evento, blocos in cfg.get("hooks", {}).items():
+        for bloco in blocos:
+            for h in bloco.get("hooks", []):
+                for nome in re.findall(r"\.claude/hooks/([\w.-]+)", h.get("command", "")):
+                    registrados.add(nome)
+    dados["hooks_registrados"] = sorted(registrados)
+
+    for nome in registrados:
+        alvo = os.path.join(HOOKS, nome)
+        if not os.path.exists(alvo):
+            falhas.append(f"T1 hook registrado no settings.json mas ausente do disco: {nome}")
+        elif not os.access(alvo, os.X_OK):
+            falhas.append(f"T1 hook sem bit de execução: {nome}")
+
+    # Rules: frontmatter com `paths:` e cada glob casando arquivo real.
+    rules_dir = os.path.join(CLAUDE, "rules")
+    regras = sorted(f for f in os.listdir(rules_dir) if f.endswith(".md")) if os.path.isdir(rules_dir) else []
+    dados["rules"] = regras
+    if len(regras) < 6:
+        falhas.append(f"T1 esperadas >= 6 regras por caminho, encontradas {len(regras)}")
+    import glob as _glob
+    for r in regras:
+        if erro := frontmatter_valido(os.path.join(rules_dir, r)):
+            falhas.append(f"T1 rule {r}: {erro}")
+        with open(os.path.join(rules_dir, r), encoding="utf-8") as fh:
+            texto = fh.read()
+        m = re.match(r"---\n(.*?)\n---", texto, re.S)
+        if not m:
+            falhas.append(f"T1 rule sem frontmatter: {r}")
+            continue
+        globs = re.findall(r"-\s+\"([^\"]+)\"", m.group(1))
+        if not globs:
+            falhas.append(f"T1 rule sem paths: {r}")
+        for g in globs:
+            # `**` devolve o PRÓPRIO diretório-base: no Python 3.11.2 deste host,
+            # glob.glob('/opt/wiki/naoexiste-xyz/**', recursive=True) devolve
+            # ['/opt/wiki/naoexiste-xyz/'] com o diretório AUSENTE (o 3.12 devolve []),
+            # e diretório que só tem subdiretório "casa" em qualquer versão. Contar
+            # esses itens deixava passar glob que nunca carrega a rule. A rule carrega
+            # quando um ARQUIVO casado é lido: conta só o que existe e é arquivo.
+            arquivos = [p for p in _glob.glob(os.path.join(RAIZ, g), recursive=True) if os.path.isfile(p)]
+            if not arquivos:
+                falhas.append(f"T1 rule {r}: glob não casa nenhum arquivo real: {g}")
+        # len() conta CARACTERES, não bytes: com acento, `wc -c` dá mais que isto (antes
+        # do corte de 2026-09-23, fila-do-cerebro.md tinha 25206 B e 25087 caracteres).
+        # Corte por `wc -m`.
+        if len(texto) > 6000:
+            falhas.append(f"T1 rule longa demais ({len(texto)} caracteres, teto 6000): {r}")
+
+    # Skills: SKILL.md com name e description.
+    skills_dir = os.path.join(CLAUDE, "skills")
+    skills = sorted(d for d in os.listdir(skills_dir) if os.path.isdir(os.path.join(skills_dir, d))) if os.path.isdir(skills_dir) else []
+    dados["skills"] = skills
+    if len(skills) < 13:
+        falhas.append(f"T1 esperadas >= 13 skills (5 antigas + 8 do P0a), encontradas {len(skills)}")
+    for s in skills:
+        sm = os.path.join(skills_dir, s, "SKILL.md")
+        if not os.path.exists(sm):
+            falhas.append(f"T1 skill sem SKILL.md: {s}")
+            continue
+        if erro := frontmatter_valido(sm):
+            falhas.append(f"T1 skill {s}: {erro}")
+        with open(sm, encoding="utf-8") as fh:
+            texto = fh.read()
+        m = re.match(r"---\n(.*?)\n---", texto, re.S)
+        if not m or "description:" not in m.group(1):
+            falhas.append(f"T1 skill sem description no frontmatter: {s}")
+        elif len(m.group(1)) > 1536:
+            falhas.append(f"T1 frontmatter de skill acima do corte de 1536 chars: {s}")
+
+    # Agents: memory: e skills: — a correção da causa-raiz. A doc oficial diz que
+    # a auto memory da conversa principal NÃO é carregada em subagente (só o fork
+    # herda), e é por isso que o mesmo erro volta: a lição não chega ao próximo.
+    agents_dir = os.path.join(CLAUDE, "agents")
+    agentes = sorted(f for f in os.listdir(agents_dir) if f.endswith(".md")) if os.path.isdir(agents_dir) else []
+    dados["agents"] = agentes
+    for a in agentes:
+        if erro := frontmatter_valido(os.path.join(agents_dir, a)):
+            falhas.append(f"T1 agent {a}: {erro} — os campos memory/skills abaixo podem ser ignorados em silencio")
+        with open(os.path.join(agents_dir, a), encoding="utf-8") as fh:
+            texto = fh.read()
+        m = re.match(r"---\n(.*?)\n---", texto, re.S)
+        if not m:
+            falhas.append(f"T1 agent sem frontmatter: {a}")
+            continue
+        fm = m.group(1)
+        if not re.search(r"^memory:\s*(user|project|local)\s*$", fm, re.M):
+            falhas.append(f"T1 agent sem `memory:` (user|project|local): {a}")
+        nomes = re.findall(r"^\s+-\s+([\w-]+)\s*$", fm, re.M)
+        if "skills:" not in fm or not nomes:
+            falhas.append(f"T1 agent sem `skills:` no frontmatter: {a}")
+        for n in nomes:
+            if n not in skills:
+                falhas.append(f"T1 agent {a} declara skill inexistente: {n}")
+
+
+def _desmonta(caso: dict, item):
+    """Item de bloqueia/permite: str (comando Bash), tupla (cmd, ensina) ou dict
+    ({tool_input, agent_type?, ensina?}). Item dict roda com cwd=RAIZ, porque o hook de
+    Agent le o roster e o de escrita resolve o destino contra a raiz."""
+    if isinstance(item, dict):
+        return item["tool_input"], item.get("ensina", caso.get("ensina", [])), item.get("agent_type"), RAIZ
+    if isinstance(item, tuple):
+        return item[0], item[1], None, None
+    return item, caso.get("ensina", []), None, None
+
+
+def t2_t3_disparo(falhas: list[str], dados: dict, dir_hooks: str = HOOKS, so: str | None = None) -> None:
+    for nome, caso in CASOS.items():
+        if so and nome != so:
+            continue
+        alvo = os.path.join(dir_hooks, nome)
+        if not os.path.exists(alvo):
+            falhas.append(f"T2 hook ausente: {nome}")
+            continue
+        injetor = caso.get("injetor", False)
+        ferramenta = caso.get("ferramenta", "Bash")
+        for item in caso["bloqueia"]:
+            cmd, ensina, agent_type, cwd = _desmonta(caso, item)
+            rc, out, err = roda_hook(alvo, cmd, ferramenta, agent_type, cwd)
+            if rc == -1:
+                falhas.append(f"T2 {nome} {err}: {cmd!r}")
+                continue
+            agiu = (out.strip() != "") if injetor else (rc == 2)
+            if not agiu:
+                rotulo = "não injetou contexto" if injetor else f"não bloqueou (exit={rc})"
+                falhas.append(f"T2 {nome} {rotulo}: {cmd!r}")
+                continue
+            msg = mensagem_do_hook(out, err)
+            for trecho in ensina:
+                if trecho not in msg:
+                    falhas.append(f"T2 {nome} agiu mas a mensagem não ensina {trecho!r}: {cmd!r}")
+        for item in caso["permite"]:
+            cmd, _ensina, agent_type, cwd = _desmonta(caso, item)
+            rc, out, err = roda_hook(alvo, cmd, ferramenta, agent_type, cwd)
+            if rc == -1:
+                falhas.append(f"T3 {nome} {err}: {cmd!r}")
+                continue
+            agiu = (out.strip() != "") if injetor else (rc != 0)
+            if agiu:
+                rotulo = "injetou em" if injetor else f"bloqueou (exit={rc})"
+                falhas.append(f"T3 falso-positivo — {nome} {rotulo}: {cmd!r}")
+
+
+def t4_custo(falhas: list[str], dados: dict, max_ms: float, n: int) -> None:
+    medidas = {}
+    for nome, caso in CASOS.items():
+        alvo = os.path.join(HOOKS, nome)
+        if not os.path.exists(alvo):
+            continue
+        ferramenta = caso.get("ferramenta", "Bash")
+        # frio: um payload que o hook NAO casa, para medir a saida rapida. O default e um
+        # Bash inocuo; hook de outra ferramenta pode declarar o seu (sempre nao-casante).
+        frio = caso.get("frio", "ls -la tools/")
+        disparo_in, _e, disparo_at, disparo_cwd = _desmonta(caso, caso["bloqueia"][0])
+        linha = {}
+        for rotulo, (entrada, ferr, at, cwd) in (("disparo", (disparo_in, ferramenta, disparo_at, disparo_cwd)),
+                                                 ("frio", (frio, "Bash", None, None))):
+            ts = []
+            dados_in = payload(entrada, None, ferr, at)
+            env = None
+            if cwd is not None:
+                env = os.environ.copy()
+                env["CLAUDE_PROJECT_DIR"] = cwd
+            for _ in range(n):
+                t0 = time.perf_counter()
+                subprocess.run(["bash", alvo], input=dados_in, capture_output=True, cwd=cwd, env=env)
+                ts.append((time.perf_counter() - t0) * 1000)
+            ts.sort()
+            linha[rotulo] = {"p50": round(statistics.median(ts), 1),
+                             "p95": round(ts[max(0, int(0.95 * len(ts)) - 1)], 1)}
+        medidas[nome] = linha
+        if linha["frio"]["p95"] > max_ms:
+            falhas.append(f"T4 {nome} p95 no caminho frio {linha['frio']['p95']} ms > teto {max_ms} ms")
+    dados["custo_ms"] = medidas
+    if medidas:
+        dados["pior_p95_frio_ms"] = max(v["frio"]["p95"] for v in medidas.values())
+
+
+def t5_registro(falhas: list[str], dados: dict) -> None:
+    registrados = set(dados.get("hooks_registrados", []))
+    for nome in CASOS:
+        if nome not in registrados:
+            falhas.append(f"T5 hook existe no disco mas NÃO está em .claude/settings.json: {nome}")
+
+
+def prova_por_mutacao(dados: dict) -> list[str]:
+    """Desligar um hook tem de deixar o T2 VERMELHO nomeando aquele hook."""
+    problemas = []
+    for nome in CASOS:
+        origem = os.path.join(HOOKS, nome)
+        if not os.path.exists(origem):
+            continue
+        with tempfile.TemporaryDirectory(prefix="modo-operacional-mut-") as tmp:
+            destino = os.path.join(tmp, "hooks")
+            shutil.copytree(HOOKS, destino)
+            # Neutraliza SOMENTE este hook; os demais ficam intactos.
+            with open(os.path.join(destino, nome), "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env bash\nexit 0\n")
+            falhas_mut: list[str] = []
+            t2_t3_disparo(falhas_mut, {}, dir_hooks=destino, so=nome)
+            nomeia = [f for f in falhas_mut if nome in f and f.startswith("T2")]
+            if not nomeia:
+                problemas.append(f"MUTAÇÃO {nome}: desligar o hook NÃO deixou o T2 vermelho — o teste não o cobre")
+            else:
+                dados.setdefault("mutacao", {})[nome] = nomeia[0]
+    return problemas
+
+
+# ---------------------------------------------------------------------------
+def medir_tokens(dados: dict) -> None:
+    """Item 8 do §P0a: custo comparativo `CLAUDE.md` longo x skill+rules.
+
+    MÉTODO, DECLARADO (a documentação oficial NÃO cobre este número):
+
+    A  bytes ÷ 3,5 — a mesma regra que o plano usou para PT-BR, mantida aqui
+       para que os dois números sejam comparáveis. É ESTIMATIVA, não contagem.
+    B  tiktoken `cl100k_base` — contagem real de um tokenizador, de FAMÍLIA
+       DIFERENTE da do Claude. Serve como piso/teto independente da estimativa,
+       não como verdade sobre o tokenizador deste modelo.
+
+    O que se compara, e por quê: o conteúdo que este P0a escreveu em skills e
+    rules É conteúdo que, na arquitetura anterior, teria virado prosa no
+    `CLAUDE.md`. Então o custo contrafactual é "esse mesmo texto dentro do
+    CLAUDE.md", que a doc oficial diz entrar INTEIRO em TODA requisição
+    (context-window). O custo real é:
+
+      FIXO      só o frontmatter das skills entra no launch (descrição, cortada
+                em 1.536 caracteres). Rule e corpo de skill NÃO entram.
+      SOB DEMANDA  corpo da rule carrega quando um arquivo casado é lido; corpo
+                da skill carrega quando ela é invocada; hook só custa quando
+                emite additionalContext.
+
+    A economia não é o ganho principal — o ganho é o retrabalho evitado. Mas o
+    número tem de existir, porque o plano o pediu e ninguém o mediu.
+    """
+    def bytes_de(caminho: str) -> int:
+        try:
+            return os.path.getsize(caminho)
+        except OSError:
+            return 0
+
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        conta = lambda t: len(enc.encode(t))
+        tem_b = True
+    except Exception:
+        conta = lambda t: 0
+        tem_b = False
+
+    skills_dir = os.path.join(CLAUDE, "skills")
+    rules_dir = os.path.join(CLAUDE, "rules")
+
+    # SOMENTE as 8 skills que ESTA frente escreveu entram no contrafactual. As 5
+    # anteriores (estado-real, ler-gigante, medir-bots, publicar-lote,
+    # verificar-citacao-legal) ja eram skills — nunca foram prosa de CLAUDE.md, e
+    # conta-las inflaria o numero que se afirma. Medir o que se afirma, nao o que
+    # esta por perto.
+    NOVAS_DO_P0A = {
+        "deploy-publico", "ordem-derivados-editoriais", "verificar-producao-viva",
+        "commit-v2", "commit-go", "rodar-gate", "purgar-e-aquecer-borda",
+        "deploy-binario-go",
+    }
+    corpo_total = 0
+    frontmatter_total = 0
+    corpo_tk = 0
+    fm_tk = 0
+    por_skill = {}
+    preexistentes_bytes = 0
+    for d in sorted(os.listdir(skills_dir)):
+        sm = os.path.join(skills_dir, d, "SKILL.md")
+        if not os.path.exists(sm):
+            continue
+        texto = open(sm, encoding="utf-8").read()
+        if d not in NOVAS_DO_P0A:
+            preexistentes_bytes += len(texto.encode("utf-8"))
+            continue
+        m = re.match(r"---\n(.*?)\n---\n", texto, re.S)
+        fm = m.group(1) if m else ""
+        corpo = texto[m.end():] if m else texto
+        frontmatter_total += len(fm.encode("utf-8"))
+        corpo_total += len(corpo.encode("utf-8"))
+        fm_tk += conta(fm)
+        corpo_tk += conta(corpo)
+        por_skill[d] = len(texto.encode("utf-8"))
+
+    rules_bytes = 0
+    rules_tk = 0
+    for r in sorted(os.listdir(rules_dir)) if os.path.isdir(rules_dir) else []:
+        if not r.endswith(".md"):
+            continue
+        texto = open(os.path.join(rules_dir, r), encoding="utf-8").read()
+        rules_bytes += len(texto.encode("utf-8"))
+        rules_tk += conta(texto)
+
+    total_bytes = frontmatter_total + corpo_total + rules_bytes
+    est = lambda b: round(b / 3.5)
+
+    dados["tokens"] = {
+        "metodo_A": "bytes / 3,5 (PT-BR), a mesma regra do plano",
+        "metodo_B": ("tiktoken cl100k_base — tokenizador de OUTRA familia, "
+                     "cross-check, nao verdade sobre o tokenizador do Claude")
+                    if tem_b else "tiktoken indisponivel",
+        "contrafactual_no_claude_md": {
+            "bytes": total_bytes, "A": est(total_bytes),
+            "B": (fm_tk + corpo_tk + rules_tk) if tem_b else None,
+            "quando": "TODA requisicao de TODA sessao",
+        },
+        "custo_fixo_real": {
+            "bytes": frontmatter_total, "A": est(frontmatter_total),
+            "B": fm_tk if tem_b else None,
+            "quando": "so o frontmatter das skills, no launch",
+        },
+        "sob_demanda": {
+            "corpo_das_skills_bytes": corpo_total, "A": est(corpo_total),
+            "regras_bytes": rules_bytes, "A_regras": est(rules_bytes),
+            "quando": "corpo da skill ao invocar; rule ao ler arquivo casado",
+        },
+        "skills_bytes": por_skill,
+        "fora_da_conta": {
+            "skills_preexistentes_bytes": preexistentes_bytes,
+            "porque": "ja eram skills antes do P0a; nunca foram prosa de CLAUDE.md",
+        },
+    }
+    fixo = frontmatter_total
+    dados["tokens"]["reducao_do_custo_fixo"] = {
+        "de_A": est(total_bytes), "para_A": est(fixo),
+        "fator": round(total_bytes / fixo, 1) if fixo else None,
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-ms", type=float, default=300.0)
+    ap.add_argument("--repeticoes", type=int, default=20)
+    ap.add_argument("--provar-mutacao", action="store_true")
+    ap.add_argument("--medir-tokens", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    falhas: list[str] = []
+    dados: dict = {}
+    t1_inventario(falhas, dados)
+    t2_t3_disparo(falhas, dados)
+    t4_custo(falhas, dados, args.max_ms, args.repeticoes)
+    t5_registro(falhas, dados)
+    if args.provar_mutacao:
+        falhas += prova_por_mutacao(dados)
+    if args.medir_tokens:
+        medir_tokens(dados)
+
+    if args.json:
+        print(json.dumps({"falhas": falhas, "dados": dados}, ensure_ascii=False, indent=2))
+        return 1 if falhas else 0
+
+    print(f"hooks registrados : {len(dados.get('hooks_registrados', []))}")
+    print(f"regras por caminho: {len(dados.get('rules', []))}")
+    print(f"skills            : {len(dados.get('skills', []))}")
+    print(f"agentes           : {len(dados.get('agents', []))}")
+    if "custo_ms" in dados:
+        print(f"\n{'hook':<42}{'disparo p50/p95':>18}{'frio p50/p95':>18}")
+        for nome, m in dados["custo_ms"].items():
+            print(f"{nome:<42}{m['disparo']['p50']:>8.1f}/{m['disparo']['p95']:<9.1f}"
+                  f"{m['frio']['p50']:>8.1f}/{m['frio']['p95']:<9.1f}")
+        print(f"\npior p95 no caminho frio: {dados['pior_p95_frio_ms']} ms (teto {args.max_ms} ms)")
+    if args.medir_tokens:
+        t = dados["tokens"]
+        print(f"\nCUSTO EM TOKENS — método A: {t['metodo_A']}")
+        print(f"                  método B: {t['metodo_B']}")
+        cf, fx, sd = t["contrafactual_no_claude_md"], t["custo_fixo_real"], t["sob_demanda"]
+        print(f"\n  se esse texto vivesse no CLAUDE.md : {cf['bytes']:>7} B  A={cf['A']:>6}  B={cf['B']}  ({cf['quando']})")
+        print(f"  custo FIXO como skill+rules       : {fx['bytes']:>7} B  A={fx['A']:>6}  B={fx['B']}  ({fx['quando']})")
+        print(f"  corpo das skills (sob demanda)    : {sd['corpo_das_skills_bytes']:>7} B  A={sd['A']:>6}")
+        print(f"  regras por caminho (sob demanda)  : {sd['regras_bytes']:>7} B  A={sd['A_regras']:>6}")
+        fc = t["fora_da_conta"]
+        print(f"  FORA da conta: 5 skills anteriores: {fc['skills_preexistentes_bytes']:>7} B  ({fc['porque']})")
+        r = t["reducao_do_custo_fixo"]
+        print(f"\n  custo fixo por sessão: {r['de_A']} -> {r['para_A']} tokens (fator {r['fator']}x)")
+    if args.provar_mutacao:
+        print(f"\nprova por mutação: {len(dados.get('mutacao', {}))} hooks provados "
+              f"(desligar cada um deixa o T2 vermelho nomeando-o)")
+    if falhas:
+        print(f"\nVERMELHO — {len(falhas)} falha(s):")
+        for f in falhas:
+            print(f"  {f}")
+        return 1
+    print("\nVERDE — mecanismos existem, disparam, ensinam, custam dentro do teto e estão registrados.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

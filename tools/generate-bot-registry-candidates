@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""generate-bot-registry-candidates — acha bot novo, NUNCA registra sozinho.
+
+Lê o ledger de origem por requisição `data/ops/access/nginx-*.jsonl` (campos
+`user_agent`, `remote_addr`) e agrupa por TOKEN DE PRODUTO do User-Agent — não por
+`agent_key` — porque `agent_key` só existe quando `tools/botagents.agente_de`
+já reconhece o UA; um bot genuinamente novo chega com `agent_key: null`, e
+filtrar por `agent_key ∉ registry` deixaria esses de fora, que são
+exatamente os que importam encontrar (medido em 2026-09-03:
+"agent-tools.cloud-crawler" e "GolemreachTrustBot" chegam com `agent_key`
+nulo e ≥20 req/dia — não apareceriam se o critério fosse por `agent_key`).
+
+Para cada token com ≥20 requisições/dia e AUSENTE de
+`content/crawl_policy.json` (bot_registry), tenta resolver:
+
+  - `policy_source`: a URL que o PRÓPRIO operador embute no User-Agent
+    (convenção `(+https://...)`, usada por praticamente todo bot que se
+    identifica — Googlebot, GPTBot, SemrushBot etc.). Sondada com o UA de
+    prova deste projeto; só grava se responder 200. Sem URL no UA, ou URL que
+    não responde 200: `"sem fonte oficial"`. NUNCA um mapa manual
+    operador→doc — isso é o defeito que este gerador existe para não repetir.
+  - `rdns_confirmado`: rDNS FORWARD-CONFIRMED (PTR do IP, depois A/AAAA do
+    host de volta) sobre até 5 IPs distintos do `remote_addr` observado para
+    aquele token, no mesmo ledger de origem.
+
+A CAMADA É A ORIGEM, E ELA É PISO (Regra 15). O acervo sai de `public/` com
+`s-maxage=604800`, então o `HIT` na Cloudflare não chega ao nginx e este ledger
+não o vê. Medido em 2026-09-16: `AhrefsSiteAudit` fez 5.859 requisições na borda
+nas 24h encerradas em 16:00:00Z contra 1.182 na origem no dia 15/09 inteiro. Este gerador
+ACHA o candidato (a origem basta para isso, porque todo bot acaba pedindo alguma
+rota que não está em cache), mas o VOLUME dele se lê na borda, por
+`tools/measure-borda-agentes-sem-chave`. `data/ops/edge_bot_agents_daily.jsonl`
+não serve de fonte aqui e nunca serviu: ele é indexado por `agent_key`, então,
+por construção, só contém bot que `botagents.agente_de` JÁ reconhece — a
+docstring afirmou o contrário até 2026-09-16 e o código nunca o leu.
+
+Escreve `data/ops/bot_registry_candidates.jsonl`, idempotente por
+(token, date) — não repete linha já gravada para o mesmo dia. NUNCA edita
+`internal/crawl/crawl.go`, `content/crawl_policy.json`, nginx ou
+`tools/botagents.py`.
+
+QUEM DECIDE, E QUANDO (corrigido em 2026-09-16). Até esta data a docstring dizia
+"quem decide registrar é humano" — decisão devolvida ao dono, vedada pela Regra
+8, e o efeito medido foi 375 linhas e 48 tokens acumulados em 26 dias sem
+UM consumidor: `grep -rln bot_registry_candidates` devolvia só este arquivo.
+Hoje a decisão é da sessão que encontra o candidato, ela é obrigatória e tem
+prazo: todo token visto em DUAS datas distintas precisa de linha em
+`ops/bots-decididos.jsonl`, e `tools/check-bot-registry-decidido` (gate
+`bot-registry-decidido` em `cmd/check`) fica vermelho enquanto faltar. Decidir
+NÃO é registrar: `nao_identificado` com o UA literal é decisão legítima e
+barata. Registrar de fato continua sendo por `tools/generate-bot-registry-entry`.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import socket
+import sys
+import urllib.error
+import urllib.request
+from collections import defaultdict
+
+# SEM ISTO, gethostbyaddr/getaddrinfo SEM RESOLUÇÃO ficam sem teto de tempo —
+# medido: a primeira execução deste gerador travou minutos num IP sem PTR,
+# porque o timeout padrão do socket é "nenhum". 3s é folga generosa sobre
+# qualquer resolvedor são; um PTR que não responde nisso não vale esperar.
+socket.setdefaulttimeout(3)
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+POLITICA = os.path.join(RAIZ, "content", "crawl_policy.json")
+ACCESS_GLOB = os.path.join(RAIZ, "data", "ops", "access", "nginx-*.jsonl")
+SAIDA = os.path.join(RAIZ, "data", "ops", "bot_registry_candidates.jsonl")
+
+# A FORMA CANÔNICA, e ela não é cosmética: `sonda_200` SAI PARA A REDE — bate na
+# URL de documentação que o operador do bot embute no próprio User-Agent. Até
+# 2026-09-16 essa requisição levava `wikijuridica-superficie-probe/1.0`, um UA
+# escrito à mão, fora da forma que o contrato fixa (CLAUDE.md, seção da
+# identidade de saída). O prefixo `Mozilla/5.0 (compatible;` não é disfarce e não
+# é opcional: medido em 2026-09-05 contra planalto.gov.br, todo UA sem ele levou
+# `Recv failure` do WAF. Aqui ele também deixa a requisição ATRIBUÍVEL a nós no
+# log do operador que estamos consultando.
+PROBE_UA = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+            "+https://wikijuridica.com.br/bot/; verificacao-de-doc-de-bot)")
+LIMIAR_REQ_DIA = 20
+MAX_IPS_RDNS = 5
+
+# Tokens de produto que NUNCA são bot — navegador humano ou ausência de UA.
+# "Mozilla" sozinho é o primeiro token de praticamente todo browser real
+# (Chrome, Firefox, Safari, Edge todos começam com "Mozilla/5.0"), e também de
+# muitos bots que imitam browser — por isso ele é IGNORADO como token de
+# produto, mas o UA inteiro ainda é varrido pelo padrão de nome de bot abaixo
+# (ver token_de_produto).
+TOKENS_IGNORADOS = {"", "-", "mozilla"}
+
+# A URL que o operador embute no UA (convenção `+https://…`) é DOCUMENTAÇÃO, não
+# identidade — e o CAMINHO dela carrega as mesmas palavras que PADRAO_NOME_DE_BOT
+# procura. Medido em 2026-09-16: o UA
+# `…(compatible; AhrefsSiteAudit/6.1; +http://ahrefs.com/robot/site-audit)` era
+# agrupado sob o token `robot`, tirado do caminho da URL. Ele fez 1.182
+# requisições na origem em 2026-09-15 (data/ops/access/nginx-2026-09-15.jsonl) e
+# 5.859 na borda nas 24h encerradas em 2026-09-16T16:00:00Z — e
+# data/ops/bot_registry_candidates.jsonl guardou duas linhas com
+# `"token": "robot"`, que não é o nome de agente nenhum. Extrair a URL ANTES de
+# procurar nome de bot é o conserto.
+PADRAO_URL_NO_UA = re.compile(r"\+?https?://[^\s()<>\";]+")
+
+# `(compatible; TOKEN/versao; …)` é como se declara praticamente todo bot que
+# imita navegador — Googlebot, Baiduspider, AhrefsSiteAudit, ChatGPT-User,
+# meta-externalagent. O slot é POSICIONAL, e por isso vale MAIS que o sufixo: na
+# mesma janela de 2026-09-15, `ChatGPT-User/1.0` e `meta-externalagent/1.1` caíam
+# no balde `Mozilla` (7.078 requisições no dia) exatamente por não terminarem em
+# "Bot". Um balde chamado "Mozilla" com um `user_agent_sample` sorteado entre
+# milhares é rótulo com autoridade sobre coisa nenhuma.
+PADRAO_COMPATIBLE = re.compile(
+    r"compatible\s*[;:]\s*([A-Za-z][A-Za-z0-9_.\-]*)", re.IGNORECASE)
+
+# `[Ff]etcher` e `[Pp]review` entraram junto do conserto acima: `Feedfetcher`,
+# `BingPreview` e `SkypeUriPreview` se declaram por sufixo como os `*Bot`, e sem
+# eles o passo 3 devolveria None para agente que de fato se nomeia.
+PADRAO_NOME_DE_BOT = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_.-]*"
+    r"(?:[Bb]ot|[Cc]rawler|[Ss]pider|[Ss]can(?:ner)?|[Ff]etcher|[Pp]review))\b"
+)
+
+
+def token_de_produto(user_agent):
+    """Extrai o token que identifica o AGENTE, não o motor de renderização.
+
+    Quatro passos, nesta ordem, e a ordem é o produto:
+
+      1. o primeiro token da string (até '/', '(' ou espaço), quando ele não é
+         genérico demais — é a forma de quem se declara sem imitar navegador
+         (`mcpbeat/0.1`, `SentinelOracle/0.1`, `curl/8.5.0`);
+      2. o slot `compatible; TOKEN`, a convenção de quem imita navegador;
+      3. um token com cara de nome de agente (`*Bot`, `*Crawler`, `*Spider`,
+         `*Scan[ner]`, `*Fetcher`, `*Preview`), procurado no UA JÁ SEM AS URLs
+         de documentação — sem isso "Mozilla/5.0 (…) GolemreachTrustBot" seria
+         agrupado sob "Mozilla", e "(+http://ahrefs.com/robot/site-audit)" sob
+         "robot";
+      4. `None` — navegador puro não é candidato a registro de bot, e nomeá-lo
+         "Mozilla" só cria um balde que esconde o tamanho do que há dentro.
+
+    O QUE ESTE PARSER NÃO PROMETE: agente que imita navegador, não usa o slot
+    `compatible;` e não tem sufixo de nome de agente sai como None — ele é
+    indistinguível de um humano pelo User-Agent sozinho, e inventar um token
+    para ele seria adivinhar. Quem mede o tamanho desse resíduo é
+    `tools/measure-borda-agentes-sem-chave`, no balde `e_navegador`.
+    """
+    ua = (user_agent or "").strip()
+    if not ua:
+        return None
+    primeiro = re.match(r"^([^\s/(){}]+)", ua)
+    candidato = primeiro.group(1) if primeiro else None
+    if candidato and candidato.lower() not in TOKENS_IGNORADOS:
+        return candidato
+    declarado = PADRAO_COMPATIBLE.search(ua)
+    if declarado:
+        return declarado.group(1)
+    achado = PADRAO_NOME_DE_BOT.search(PADRAO_URL_NO_UA.sub(" ", ua))
+    if achado:
+        return achado.group(1)
+    return None
+
+
+def extrai_url_do_ua(user_agent):
+    m = re.search(r"\(?\+?(https?://[^\s()<>\"]+)\)?", user_agent or "")
+    if not m:
+        return None
+    return m.group(1).rstrip(").,;")
+
+
+def sonda_200(url):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": PROBE_UA,
+        "X-Warming-Request": "true",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001 — qualquer falha de rede é "não confirmado"
+        return False
+
+
+def rdns_forward_confirmado(ip):
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:  # noqa: BLE001
+        return None
+    ips_do_host = {i[4][0] for i in infos}
+    if ip in ips_do_host:
+        return host
+    return None
+
+
+def registrados():
+    with open(POLITICA, encoding="utf-8") as f:
+        politica = json.load(f)
+    return {e["user_agent"].lower() for e in politica["bot_registry"]}
+
+
+def le_ledger_de_origem(dias):
+    """token -> {"requests": {data: n}, "ips": set(), "ua_amostra": str}"""
+    agregados = defaultdict(lambda: {"requests": defaultdict(int), "ips": set(), "ua_amostra": ""})
+    arquivos = sorted(glob.glob(ACCESS_GLOB))
+    if dias:
+        arquivos = arquivos[-dias:]
+    for caminho in arquivos:
+        data = os.path.basename(caminho).replace("nginx-", "").replace(".jsonl", "")
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                try:
+                    d = json.loads(linha)
+                except Exception:  # noqa: BLE001
+                    continue
+                ua = d.get("user_agent") or ""
+                token = token_de_produto(ua)
+                if not token:
+                    continue
+                entry = agregados[token]
+                entry["requests"][data] += 1
+                if not entry["ua_amostra"]:
+                    entry["ua_amostra"] = ua
+                ip = d.get("remote_addr")
+                if ip and len(entry["ips"]) < 200:  # teto de memória, não de precisão
+                    entry["ips"].add(ip)
+    return agregados
+
+
+def ja_gravado(token, data):
+    if not os.path.isfile(SAIDA):
+        return False
+    baixo = token.lower()
+    with open(SAIDA, encoding="utf-8") as f:
+        for linha in f:
+            try:
+                d = json.loads(linha)
+            except Exception:  # noqa: BLE001
+                continue
+            if d.get("token", "").lower() == baixo and d.get("date") == data:
+                return True
+    return False
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dias", type=int, default=0,
+                    help="só os N arquivos mais recentes de nginx-*.jsonl (0 = todos)")
+    p.add_argument("--limiar", type=int, default=LIMIAR_REQ_DIA)
+    p.add_argument("--dry-run", action="store_true", help="não escreve, só imprime")
+    args = p.parse_args()
+
+    tokens_registrados = registrados()
+    agregados = le_ledger_de_origem(args.dias)
+
+    candidatos = []
+    for token, info in sorted(agregados.items()):
+        if token.lower() in tokens_registrados:
+            continue
+        for data, n in sorted(info["requests"].items()):
+            if n < args.limiar:
+                continue
+            if ja_gravado(token, data):
+                continue
+            candidatos.append((token, data, n, info))
+
+    if not candidatos:
+        print("generate-bot-registry-candidates: nenhum candidato novo (limiar=%d req/dia)" % args.limiar)
+        return 0
+
+    linhas_novas = []
+    for token, data, n, info in candidatos:
+        url = extrai_url_do_ua(info["ua_amostra"])
+        policy_source = "sem fonte oficial"
+        if url and sonda_200(url):
+            policy_source = url
+
+        ips_amostra = sorted(info["ips"])[:MAX_IPS_RDNS]
+        rdns_hosts = []
+        for ip in ips_amostra:
+            host = rdns_forward_confirmado(ip)
+            if host:
+                rdns_hosts.append({"ip": ip, "host": host})
+
+        registro = {
+            "schema_version": "bot_registry_candidate_v1",
+            "token": token,
+            "date": data,
+            "requests": n,
+            "user_agent_sample": info["ua_amostra"],
+            "policy_source": policy_source,
+            "rdns_confirmado": len(rdns_hosts) > 0,
+            "rdns_hosts": rdns_hosts,
+            "ips_amostrados": ips_amostra,
+        }
+        linhas_novas.append(registro)
+        print("candidato: %-32s %s  %5d req  policy_source=%s  rdns=%s"
+              % (token, data, n, policy_source, "sim" if rdns_hosts else "nao"))
+
+    if args.dry_run:
+        print("generate-bot-registry-candidates: --dry-run, %d linha(s) não gravada(s)" % len(linhas_novas))
+        return 0
+
+    with open(SAIDA, "a", encoding="utf-8") as f:
+        for registro in linhas_novas:
+            f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+    print("generate-bot-registry-candidates: %d candidato(s) gravado(s) em %s" % (len(linhas_novas), SAIDA))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""check-rotas-anunciadas-alcancaveis — descritor que promete rota morta reprova.
+
+O QUE ELE MEDE, E O CASO QUE O FEZ NASCER.
+
+O canal de máquina se apresenta por três descritores — `/openapi.json`,
+`/.well-known/ai-catalog.json` e `/.well-known/agent-card.json`. Um agente lê um
+deles e chama o que estiver lá. Se a rota anunciada não responde, o agente recebe
+404 numa promessa nossa: não há como ele saber que a culpa é do anúncio.
+
+`internal/agentsurface` já é a fonte única das rotas e sabe disso — o comentário
+dele diz, com todas as letras, que uma rota fica FORA da lista anunciada
+enquanto não existir, porque "anunciar antes de existir" é o defeito. A
+disciplina estava certa e mesmo assim o defeito aconteceu, por um caminho que
+nenhum teste olhava:
+
+  medido em 2026-09-06, `/api/v1/redesocial/lote` respondia 200 no processo Go
+  (127.0.0.1:8089) e 404 pelo nginx (127.0.0.1:8088) — que é por onde todo
+  agente da internet chega. Causa: `location ^~ /api/v1/redesocial/` encaminha o
+  prefixo inteiro para o cmd/social (8091), e essa rota é servida pelo cmd/server
+  (8089). Colisão de prefixo, não erro de lógica.
+
+POR QUE OS TESTES EXISTENTES NÃO PEGAVAM. Eles sondam o handler em memória ou o
+Go direto, e nos dois a rota responde. A pergunta que faltava não é "o servidor
+serve?", é "quem chega de fora alcança?". São coisas diferentes, e o ingress é
+exatamente o lugar onde elas se separam: já houve 13 minutos registrados em que o
+Go respondia e o proxy não.
+
+A FONTE É O DESCRITOR SERVIDO, nunca a lista em Go, e isso é deliberado: o
+defeito nasceu justamente da diferença entre o que o código PRETENDE anunciar e
+o que de fato sai no descritor. Ler a lista Go reproduziria a intenção e perderia
+o fato.
+
+READ-ONLY: faz requisições GET com identidade própria e não escreve nada.
+Exit 0 = toda rota anunciada é alcançável; 1 = alguma não é; 2 = descritor
+indisponível (o portal não está no ar).
+"""
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+
+ORIGEM = "http://127.0.0.1:8088"
+GO = "http://127.0.0.1:8089"
+
+# A IDENTIDADE DA SONDA. UA próprio impede que esta verificação apareça como
+# visitante; X-Warming-Request a tira da contagem de tráfego real. Forjar UA de
+# bot aqui seria fraude, e é barrado por hook.
+CABECALHOS = {
+    "User-Agent": "wikijuridica-superficie-probe/1.0",
+    "X-Warming-Request": "true",
+}
+
+DESCRITORES = (
+    "/openapi.json",
+    "/.well-known/ai-catalog.json",
+    "/.well-known/agent-card.json",
+)
+
+# STATUS QUE PROVAM EXISTÊNCIA, e o critério é "o roteador conhece a rota".
+#
+#   405 -- existe e não aceita GET (o /mcp é POST). Conhecida.
+#   401/403 -- existe e exige credencial. Conhecida.
+#   400 -- existe e recusou a ENTRADA. `/api/v1/search` sem `q` é o caso real:
+#          alguém processou a requisição e a considerou malformada, o que só
+#          acontece com rota que o roteador conhece. Medido em 2026-09-06: 400
+#          nos dois lados, e sondá-la com `q` devolveria 200 -- mas este gate
+#          mede EXISTÊNCIA da rota, não o contrato de cada uma, e inventar um
+#          parâmetro plausível por rota o transformaria num teste de API que
+#          envelhece a cada campo novo.
+#   2xx/3xx -- responde.
+#
+# 404 e 000 são os dois que reprovam: o primeiro diz que ninguém a reconhece, o
+# segundo que nem a conexão completou. Aceitar 404 aqui esvaziaria o gate, que é
+# precisamente o defeito que ele existe para achar.
+VIVOS = {400, 401, 403, 405}
+
+
+def busca(url, timeout=20):
+    req = urllib.request.Request(url, headers=CABECALHOS, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception:
+        return 0, b""
+
+
+def caminhos_do_descritor(caminho, corpo):
+    """Extrai as rotas próprias que o descritor anuncia.
+
+    Só caminhos absolutos do próprio site: URL de terceiro num descritor é
+    referência (licença, documentação), não promessa de rota nossa.
+    """
+    achados = set()
+    try:
+        doc = json.loads(corpo.decode("utf-8"))
+    except Exception:
+        return achados
+
+    def rota_propria(valor):
+        if not isinstance(valor, str):
+            return None
+        if valor.startswith("/"):
+            return valor
+        m = re.match(r"^https?://[^/]*wikijuridica\.com\.br(/[^\s\"]*)$", valor)
+        return m.group(1) if m else None
+
+    # OpenAPI declara as rotas em `paths`; ai-catalog e agent-card as declaram em
+    # campos de URL espalhados. Varrer recursivamente cobre os três sem que este
+    # gate precise conhecer o schema de cada um -- e schema é justamente o que
+    # muda sem avisar.
+    # OPENAPI: `paths` E RELATIVO A `servers[].url`, e ignorar isso torna o gate
+    # inutil. Medido em 2026-09-06: com `servers[0].url` =
+    # "https://wikijuridica.com.br/api/v1", o path "/lote" e o endereco
+    # "/api/v1/lote" -- que responde 200. Lendo "/lote" cru, o gate acusou OITO
+    # rotas saudaveis de uma vez e escondeu a unica de verdade no meio delas.
+    #
+    # Detector que acusa oito falsos positivos e detector que ninguem le: este
+    # repositorio ja teve um que acusou 46 paginas e as 46 eram falso positivo, e
+    # a regra que ficou e que detector novo nasce com a propria isencao provada.
+    if isinstance(doc.get("paths"), dict):
+        prefixo = ""
+        servidores = doc.get("servers")
+        if isinstance(servidores, list) and servidores:
+            bruto = servidores[0].get("url") if isinstance(servidores[0], dict) else None
+            r = rota_propria(bruto) if bruto else None
+            if r:
+                prefixo = r.rstrip("/")
+        for p in doc["paths"]:
+            if isinstance(p, str) and p.startswith("/"):
+                achados.add(prefixo + p)
+
+    def desce(no):
+        if isinstance(no, dict):
+            for chave, valor in no.items():
+                if chave in ("url", "endpoint", "href", "uri") :
+                    r = rota_propria(valor)
+                    if r:
+                        achados.add(r)
+                desce(valor)
+        elif isinstance(no, list):
+            for item in no:
+                desce(item)
+
+    desce(doc)
+    # Rota com template (`{id}`) não é endereço: chamá-la mediria o 404 do
+    # placeholder, não o da rota.
+    return {a for a in achados if "{" not in a and "}" not in a}
+
+
+def main():
+    anunciadas = {}
+    for d in DESCRITORES:
+        status, corpo = busca(ORIGEM + d)
+        if status != 200:
+            print(f"check-rotas-anunciadas-alcancaveis: descritor {d} respondeu {status}")
+            return 2
+        for rota in caminhos_do_descritor(d, corpo):
+            anunciadas.setdefault(rota, []).append(d)
+
+    if not anunciadas:
+        print("check-rotas-anunciadas-alcancaveis: nenhum caminho extraido dos descritores -- "
+              "o gate nao pode passar por nao ter olhado")
+        return 2
+
+    mortas = []
+    print(f"rotas anunciadas nos {len(DESCRITORES)} descritores: {len(anunciadas)}")
+    for rota in sorted(anunciadas):
+        status, _ = busca(ORIGEM + rota, timeout=25)
+        if 200 <= status < 400 or status in VIVOS:
+            continue
+        status_go, _ = busca(GO + rota, timeout=25)
+        mortas.append((rota, status, status_go, anunciadas[rota]))
+
+    if not mortas:
+        print(f"APROVADO: as {len(anunciadas)} rotas anunciadas sao alcancaveis por quem chega de fora")
+        return 0
+
+    print(f"REPROVADO: {len(mortas)} rota(s) anunciada(s) e NAO alcancavel(is) pelo ingress:")
+    for rota, status, status_go, onde in mortas:
+        print(f"  {rota}")
+        print(f"    nginx (8088, por onde o agente chega): {status}")
+        print(f"    go    (8089, o processo que a serve) : {status_go}")
+        print(f"    anunciada em: {', '.join(onde)}")
+        if status == 404 and 200 <= status_go < 400:
+            print("    O PROCESSO SERVE E O INGRESS NAO ENTREGA. Isso e colisao de location no")
+            print("    nginx, nao defeito de codigo: confira se um `location ^~ <prefixo>/` mais")
+            print("    generico esta capturando esta rota e mandando-a para outro upstream.")
+            print("    O conserto e um `location = <rota>` (match exato vence o prefixo) que caia")
+            print("    no mesmo upstream que a serve -- nunca remover o anuncio, que e verdadeiro.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Mede o crescimento do REPOSITORIO por diretorio, e reprova quando ele acelera.
+
+POR QUE ESTE GATE EXISTE (2026-09-01)
+-------------------------------------
+Ja existia `check-disk-headroom`, e ele nao serve para isto por dois motivos
+medidos:
+
+  1. ELE MEDE O VOLUME INTEIRO, que aqui e dominado por terceiros. Medicao de
+     2026-09-01: `/` esta em 87% com 85 GB livres, mas /opt/wiki responde por
+     42 GB de 527 GB usados (8%) — /home tem 237 GB e os projetos vizinhos em
+     /opt somam mais que o dobro do wiki. Um gate que dispara por disco cheio
+     acusa o wiki por consumo que nao e dele, e nao enxerga o wiki crescer
+     enquanto sobra espaco.
+  2. O PISO DELE OSCILA COM A HORA. Medido no mesmo dia, com o disco praticamente
+     igual: piso exigido de 126,31 GiB as 21:09, 86,44 GiB as 05:07 e 65,06 GiB
+     as 12:09 — 61 GiB de variacao em 15 horas. Gate que aprova ou reprova
+     conforme a hora nao e gate; ele falhou 41 vezes em 3 dias e esta verde agora.
+
+Este gate mede outra coisa, e por isso convive com aquele: o TAMANHO DO REPO por
+diretorio de primeiro nivel, em serie diaria, e o DELTA entre medicoes. Crescimento
+e um fato do repositorio, independente de quanto o vizinho ocupa.
+
+REPROVA quando um diretorio cresce mais que o teto diario sem que ninguem tenha
+declarado o porque. Nao e teto de tamanho — e teto de ACELERACAO: 42 GB estaveis
+sao saudaveis; 42 GB que viram 50 GB numa semana sao um vazamento a achar enquanto
+ainda ha espaco.
+
+READ-ONLY: mede e grava a propria serie; nao remove nada. Quem classifica residuo
+e `tools/inventario-residuo-repo`, e ele tambem nao apaga.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+SERIE = RAIZ / "data/ops/disk_growth.jsonl"
+
+# Diretorios que sao residuo POR DESENHO e crescem sem significar defeito: cache
+# regeneravel e o espelho do ensaio (hardlink, que o `du` conta mas o disco nao).
+ESPERADO_CRESCER = {".cache", "var", ".git"}
+
+
+def tamanho(caminho: pathlib.Path) -> int:
+    """Bytes ocupados, contando hardlink UMA vez (du -sx), como o disco conta."""
+    try:
+        saida = subprocess.run(["du", "-sxb", str(caminho)], capture_output=True,
+                               text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError):
+        return -1
+    if saida.returncode != 0:
+        return -1
+    try:
+        return int(saida.stdout.split()[0])
+    except (IndexError, ValueError):
+        return -1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--teto-gb-dia", type=float, default=2.0,
+                    help="crescimento diario que reprova, por diretorio (default 2 GB/dia). "
+                         "Derivado da medicao: o ritmo do VOLUME inteiro e 7,8 GiB/dia e o "
+                         "wiki e 8%% dele, entao 2 GB/dia de um unico diretorio ja e anomalia.")
+    ap.add_argument("--gravar", action="store_true",
+                    help="acrescenta a medicao de hoje a serie (o timer usa isto)")
+    args = ap.parse_args()
+
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    medicao: dict[str, int] = {}
+    for filho in sorted(RAIZ.iterdir()):
+        if not filho.is_dir() or filho.is_symlink():
+            continue
+        if filho.name in {".git-crypt"}:
+            continue
+        bytes_ = tamanho(filho)
+        if bytes_ >= 0:
+            medicao[filho.name] = bytes_
+
+    total = sum(medicao.values())
+    linha = {
+        "schema_version": "disk_growth_v1",
+        "medido_em": agora.isoformat(timespec="seconds"),
+        "total_bytes": total,
+        "por_diretorio": medicao,
+    }
+
+    anterior = None
+    if SERIE.is_file():
+        for bruto in SERIE.read_text(encoding="utf-8", errors="replace").splitlines():
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                anterior = json.loads(bruto)
+            except json.JSONDecodeError:
+                continue
+
+    print(f"tamanho do repositorio: {total / 1e9:.2f} GB")
+    for nome, bytes_ in sorted(medicao.items(), key=lambda kv: -kv[1])[:8]:
+        print(f"    {nome:26s} {bytes_ / 1e9:7.2f} GB")
+
+    problemas: list[str] = []
+    if anterior:
+        try:
+            quando = datetime.datetime.fromisoformat(anterior["medido_em"])
+        except (KeyError, ValueError):
+            quando = None
+        if quando:
+            dias = max((agora - quando).total_seconds() / 86400.0, 1e-6)
+            print(f"\n  delta desde a medicao anterior ({dias:.2f} dia(s)):")
+            antes = anterior.get("por_diretorio", {})
+            for nome, bytes_ in sorted(medicao.items(), key=lambda kv: -kv[1]):
+                if nome not in antes:
+                    continue
+                delta = bytes_ - antes[nome]
+                if abs(delta) < 50e6:
+                    continue
+                por_dia = delta / 1e9 / dias
+                marca = ""
+                if por_dia > args.teto_gb_dia and nome not in ESPERADO_CRESCER:
+                    marca = "  <== ACIMA DO TETO"
+                    problemas.append(f"{nome} cresceu {por_dia:.2f} GB/dia (teto {args.teto_gb_dia})")
+                print(f"    {nome:26s} {delta / 1e9:+7.2f} GB  ({por_dia:+.2f} GB/dia){marca}")
+        else:
+            print("\n  (medicao anterior sem data legivel — sem delta)")
+    else:
+        print("\n  primeira medicao: sem delta, e isso NAO e aprovacao — e ausencia de base.")
+
+    if args.gravar:
+        SERIE.parent.mkdir(parents=True, exist_ok=True)
+        with SERIE.open("a", encoding="utf-8") as saida:
+            saida.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+        print(f"\n  gravado em {os.path.relpath(SERIE, RAIZ)}")
+
+    if problemas:
+        print("\ncheck-disk-growth: FAIL")
+        for problema in problemas:
+            print(f"  - {problema}")
+        print("  Crescimento acelerado e vazamento a achar enquanto ainda ha espaco.")
+        print("  Classifique o residuo antes de remover: tools/inventario-residuo-repo")
+        return 1
+
+    print("\ncheck-disk-growth: pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

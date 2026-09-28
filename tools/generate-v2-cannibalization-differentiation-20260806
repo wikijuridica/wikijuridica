@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""generate-v2-cannibalization-differentiation-20260806 — duas páginas, duas perguntas.
+
+O DEFEITO. 17 pares de páginas disputam a MESMA consulta, e as duas estão no ar.
+Medido por tools/measure-supersession-duplication: não é plágio — o Jaccard do
+corpo vai no máximo a 0,27 —, é canibalização. O buscador não sabe qual das duas
+ranquear e as duas perdem força.
+
+Em quatro casos o slug é literalmente o mesmo em dois lugares:
+/glossario/testamento-vital/ e /sucessoes/testamento-vital/, o mesmo com
+codicilo, arrolamento-sumario e usucapiao-especial-urbana.
+
+POR QUE NÃO É CANONICAL. `publishedmanifest.go:843` exige canonical
+auto-referencial, e o servidor não sobe se isso for violado (`httpserver.go:247`
+→ `log.Fatal`). Canonical cruzado exigiria mudar o código do release; a solução
+aqui é editorial.
+
+POR QUE NÃO É FUSÃO. As páginas não são redundantes: cada uma responde de um
+ângulo diferente, e isso está nas seções que elas já têm. O que estava errado era
+o RÓTULO — title e h1 quase idênticos anunciando conteúdos distintos.
+
+O QUE ESTE GERADOR FAZ. Troca `title` e `h1` para que cada página anuncie o que
+de fato entrega, com base nos headings que ela já tem. NÃO toca no corpo, não
+acrescenta afirmação nenhuma e por isso não exige fonte nova. Exemplos:
+
+  /inpi/registrar-software-inpi/       "o que ele prova"  (base legal e efeito)
+  /procedimentos/inpi-registrar-software/ "passo a passo" (hash, GRU 730, e-Software)
+
+  /glossario/rmi/                      "o que é a renda mensal inicial"
+  /previdenciario/verbete-rmi/         "fórmula, piso, teto e revisão"
+
+UM PAR FICOU DE FORA, e de propósito: prev-acumular-pensao-aposentadoria ×
+serv-acumulacao-pensao-e-aposentadoria-redutor. RGPS e regime próprio de servidor
+são regimes distintos, com regras distintas — o medidor os aproximou pelo
+vocabulário, mas o leitor de um não é o leitor do outro. É falso positivo.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, CAS pelo sha256 da LINHA
+viva, CAS pelo valor atual de title e h1, demais campos preservados byte a byte,
+word_count recalculado pela fórmula do ingest, escrita atômica com fsync,
+idempotente. NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-cannibalization-differentiation-20260806 --dry-run
+    tools/generate-v2-cannibalization-differentiation-20260806
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.cannibalization-differentiation-20260806.lock"
+
+TITLE_MIN, TITLE_MAX = 20, 65
+
+# intent_id -> (shard, title atual, title novo, h1 atual, h1 novo)
+REPAROS: dict[str, tuple[str, str, str, str, str]] = {
+    'banc-alienacao-fiduciaria-imovel-o-que-e': (
+        'data/editorial/v2_pages/bancario-14.jsonl',
+        'Alienação fiduciária de imóvel: o que é e como funciona', 'Alienação fiduciária: quitar e dar baixa',
+        'Como a alienação fiduciária organiza propriedade, posse e quitação', 'Alienação fiduciária no financiamento: encargos, quitação e baixa'),
+    'banc-previdencia-sem-beneficiario-indicado': (
+        'data/editorial/v2_pages/bancario-17.jsonl',
+        'Previdência privada sem beneficiário indicado', 'PGBL e VGBL sem beneficiário: como se habilitar',
+        'Quem recebe PGBL ou VGBL quando não há beneficiário cadastrado', 'PGBL ou VGBL sem beneficiário: habilitação e documentos'),
+    'banc-rmc-o-que-e': (
+        'data/editorial/v2_pages/bancario-05.jsonl',
+        'RMC: o que é a reserva de margem consignável do cartão', 'RMC: por que o saldo não diminui com o desconto',
+        'O que é RMC (reserva de margem consignável) no cartão consignado', 'RMC no contracheque: o desconto que não quita a dívida'),
+    'cid-averbacao-divorcio-certidao': (
+        'data/editorial/v2_pages/cidadania-02.jsonl',
+        'Averbar o divórcio: como atualizar a certidão de casamento', 'Certidão ainda diz casado: escritura ou mandado?',
+        'Me divorciei, mas a certidão ainda diz que sou casado: como resolver', 'Averbação do divórcio: escritura, mandado e volta do nome'),
+    'emp-dissolucao-parcial-sociedade-o-que-e': (
+        'data/editorial/v2_pages/empresarial-05.jsonl',
+        'Dissolução parcial de sociedade: o sócio sai, a empresa continua', 'Dissolução parcial: por que a lei preserva a empresa',
+        'O que é dissolução parcial de sociedade', 'Dissolução parcial de sociedade: quando ela se aplica'),
+    'ene-reclamar-na-aneel': (
+        'data/editorial/v2_pages/telecom_energia-06.jsonl',
+        'Reclamação na ANEEL: ouvidoria, etapas e prazo de resposta', 'Reclamar na ANEEL: etapas e quando ir ao Judiciário',
+        'Como escalar uma reclamação de energia até a ANEEL', 'Reclamação de energia: da distribuidora à ANEEL e à Justiça'),
+    'fam-averbar-divorcio-certidao-casamento': (
+        'data/editorial/v2_pages/familia-03.jsonl',
+        'Averbação do divórcio na certidão de casamento', 'Averbar o divórcio: documentos, prazo e novo casamento',
+        'Como averbar o divórcio na certidão de casamento, inclusive a distância', 'Averbação do divórcio: documentos, prazo e quem já quer casar'),
+    'gloss-arrolamento-sumario': (
+        'data/editorial/v2_pages/glossario-01.jsonl',
+        'Arrolamento sumário: o inventário judicial rápido', 'Arrolamento sumário ou inventário extrajudicial?',
+        'Arrolamento sumário: a via judicial simplificada de partilha', 'Arrolamento sumário: requisitos e diferença do extrajudicial'),
+    'gloss-assedio-moral-trabalho': (
+        'data/editorial/v2_pages/glossario-08.jsonl',
+        'Assédio moral no trabalho: o que caracteriza e como provar', 'Assédio moral: como provar e o que pedir',
+        'Assédio moral no trabalho: caracterização e consequências', 'Assédio moral no trabalho: provas e pedidos possíveis'),
+    'gloss-codicilo': (
+        'data/editorial/v2_pages/glossario-01.jsonl',
+        'Codicilo: última vontade sem as formas do testamento', 'Codicilo no inventário: o que ele não substitui',
+        'Codicilo: um escrito simples para instruções de pequena monta', 'Codicilo: o conceito e o que ele nunca substitui'),
+    'gloss-dados-de-criancas': (
+        'data/editorial/v2_pages/glossario2-15.jsonl',
+        'Dados de crianças e adolescentes na LGPD', 'Dado de criança na LGPD: o que o termo significa',
+        'Como a LGPD protege os dados de crianças e adolescentes', 'Dados de crianças e adolescentes: o conceito na LGPD'),
+    'gloss-dissolucao-parcial': (
+        'data/editorial/v2_pages/glossario-14.jsonl',
+        'Dissolução parcial: a sociedade continua após a saída', 'Sair da sociedade: prazos e responsabilidade',
+        'Dissolução parcial de sociedade: o que muda e o que permanece', 'Dissolução parcial: prazos de saída e responsabilidade do sócio'),
+    'gloss-junta-medica': (
+        'data/editorial/v2_pages/glossario2-16.jsonl',
+        'Junta médica no plano de saúde: quando é acionada', 'Junta médica: o que é e quando acionar a ANS',
+        'Junta médica: o desempate técnico entre os profissionais', 'Junta médica: o conceito e o caminho da reclamação à ANS'),
+    'gloss-justificacao-administrativa': (
+        'data/editorial/v2_pages/glossario-11.jsonl',
+        'Justificação administrativa: provar tempo sem documento', 'Justificação administrativa negada: o que fazer',
+        'Justificação administrativa: quando testemunhas suprem a falta de documento no INSS', 'Justificação administrativa: início de prova e recurso da negativa'),
+    'gloss-rmc-reserva-margem-cartao': (
+        'data/editorial/v2_pages/glossario2-08.jsonl',
+        'RMC: o que é a reserva de margem do cartão consignado', 'RMC não reconhecida: como contestar e cancelar',
+        'RMC: a reserva de margem para cartão de crédito consignado', 'RMC: o que é e como cancelar o cartão consignado'),
+    'gloss-rmi': (
+        'data/editorial/v2_pages/glossario-10.jsonl',
+        'RMI no INSS: como se calcula a renda mensal inicial', 'RMI: o que é a renda mensal inicial do INSS',
+        'RMI: como o INSS calcula a renda mensal inicial do benefício', 'RMI: o significado da renda mensal inicial do benefício'),
+    'gloss-testamento-vital': (
+        'data/editorial/v2_pages/glossario-01.jsonl',
+        'Testamento vital: as diretivas antecipadas de vontade', 'Testamento vital ou testamento comum: a diferença',
+        'Testamento vital: registrar hoje decisões médicas para o futuro', 'Testamento vital: o conceito e a diferença para o testamento'),
+    'gloss-usucapiao-especial-urbana': (
+        'data/editorial/v2_pages/glossario-12.jsonl',
+        'Usucapião especial urbana: 250 m² e cinco anos de moradia', 'Usucapião especial urbana: o conceito do art. 183',
+        'Usucapião especial urbana de imóvel de até 250 m²', 'Usucapião especial urbana: a definição constitucional'),
+    'imob-alienacao-fiduciaria-verbete': (
+        'data/editorial/v2_pages/imobiliario-11.jsonl',
+        'Alienação fiduciária de imóvel: propriedade e garantia', 'Propriedade fiduciária: posse, uso e limites',
+        'Como funciona a propriedade fiduciária do imóvel', 'Alienação fiduciária: quem tem a propriedade e quem tem a posse'),
+    'imob-usucapiao-especial-urbana': (
+        'data/editorial/v2_pages/imobiliario-17.jsonl',
+        'Usucapião especial urbana: 5 anos e até 250 m²', 'Usucapião especial urbana: requisitos e impedimentos',
+        'Usucapião especial urbana: a via constitucional de 5 anos', 'Usucapião especial urbana: quem pode pedir e quem não pode'),
+    'lgpd-protecao-criancas-adolescentes-regime': (
+        'data/editorial/v2_pages/lgpd-11.jsonl',
+        'Dados de crianças na LGPD: o que o art. 14 exige', 'Art. 14 da LGPD: o que a plataforma precisa fazer',
+        'Como a LGPD trata os dados de crianças e adolescentes', 'O que o art. 14 da LGPD exige de quem trata dados de criança'),
+    'pi-registrar-software-inpi': (
+        'data/editorial/v2_pages/inpi-10.jsonl',
+        'Registro de software no INPI: o passo a passo', 'Registro de software no INPI: o que ele prova',
+        'Como registrar um programa de computador no INPI', 'Registro de programa de computador: base legal e efeito da proteção'),
+    'prev-verbete-justificacao-administrativa': (
+        'data/editorial/v2_pages/previdenciario-17.jsonl',
+        'Justificação administrativa: a audiência de testemunhas no INSS', 'Justificação administrativa: o art. 108 e seus limites',
+        'O que é a justificação administrativa e quando o INSS a admite', 'Justificação administrativa: o que o art. 108 admite provar'),
+    'prev-verbete-rmi': (
+        'data/editorial/v2_pages/previdenciario-24.jsonl',
+        'RMI do INSS: como nasce o valor inicial', 'Cálculo da RMI: fórmula, piso, teto e revisão',
+        'O que é a renda mensal inicial de um benefício', 'Como a RMI é calculada e quando cabe pedir revisão'),
+    'proc-aneel-reclamar': (
+        'data/editorial/v2_pages/procedimentos-13.jsonl',
+        'Como reclamar da distribuidora de energia na ANEEL', 'Corte indevido, dano elétrico e fatura fora do padrão',
+        'Reclamação contra distribuidora de energia na ANEEL', 'ANEEL: corte indevido, dano elétrico e conta fora do padrão'),
+    'proc-detran-crlv-digital': (
+        'data/editorial/v2_pages/procedimentos-09.jsonl',
+        'CRLV digital: como emitir e conferir o documento', 'Emitir o CRLV digital: licenciamento e download',
+        'Como emitir e usar o CRLV digital do veículo', 'Como emitir o CRLV digital passo a passo no Detran'),
+    'proc-inpi-registrar-software': (
+        'data/editorial/v2_pages/procedimentos-13.jsonl',
+        'Como registrar programa de computador no e-Software', 'e-Software: passo a passo do pedido no INPI',
+        'Registro de programa de computador no INPI', 'Como preencher o e-Software: do resumo hash à GRU 730'),
+    'saude-o-que-e-junta-medica': (
+        'data/editorial/v2_pages/saude-08.jsonl',
+        'Junta médica do plano de saúde: como funciona', 'Junta médica: o desempate da RN 424/2017',
+        'Junta médica: o desempate técnico da RN 424/2017', 'Junta médica do plano: como o desempatador é escolhido'),
+    'suc-arrolamento-sumario': (
+        'data/editorial/v2_pages/sucessoes-03.jsonl',
+        'Arrolamento sumário: o inventário judicial rápido por acordo', 'Arrolamento sumário: sem teto de valor e ITCMD depois',
+        'Como funciona o arrolamento sumário entre herdeiros de acordo', 'Arrolamento sumário: acordo entre herdeiros e o ITCMD'),
+    'suc-codicilo': (
+        'data/editorial/v2_pages/sucessoes-10.jsonl',
+        'Codicilo: o escrito simples de última vontade', 'Codicilo: o que o art. 1.881 permite deixar',
+        'Codicilo: pequenas disposições sem testamento completo', 'Codicilo: limite de valor e convivência com o testamento'),
+    'suc-previdencia-sem-beneficiario': (
+        'data/editorial/v2_pages/sucessoes-12.jsonl',
+        'Previdência privada sem beneficiário: quem recebe', 'Previdência sem beneficiário: a ordem de quem recebe',
+        'Plano de previdência sem beneficiário: para quem vai o dinheiro', 'Previdência privada sem beneficiário: a regra supletiva'),
+    'suc-testamento-vital': (
+        'data/editorial/v2_pages/sucessoes-10.jsonl',
+        'Testamento vital: diretivas antecipadas de vontade', 'Testamento vital: como registrar e o que ele não faz',
+        'Testamento vital: decidir hoje sobre tratamentos do futuro', 'Testamento vital: registro, alcance e limites da recusa'),
+    'tra-crlv-digital-como-emitir': (
+        'data/editorial/v2_pages/transito-06.jsonl',
+        'CRLV digital: como emitir o documento do carro no app', 'CRLV digital vale na fiscalização? Base legal e uso',
+        'Como obter o CRLV digital do veículo', 'CRLV digital: validade na fiscalização e uso sem internet'),
+    'trab-assedio-moral-o-que-e': (
+        'data/editorial/v2_pages/trabalhista-10.jsonl',
+        'O que caracteriza assédio moral no trabalho', 'Assédio moral: o que é e o que não é no trabalho',
+        'Assédio moral no trabalho: o que é e o que não é', 'Assédio moral no trabalho: os três elementos e o que não conta'),
+}
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", (value or "").lower())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len(re.findall(r"[^\W_]+", folded, re.UNICODE))
+
+
+def word_count(record: dict) -> int:
+    """bodyWordCount, internal/v2ingest/validate.go:984.
+
+    title e h1 NÃO entram nessa conta, então o valor não deveria mudar. É
+    recalculado mesmo assim: se o declarado estivesse defasado por outro motivo,
+    gravar a linha sem revisar o número congelaria o defeito.
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def preflight() -> None:
+    """Valida ANTES de abrir o estoque: comprimento, unicidade e diferenciação."""
+    problemas: list[str] = []
+
+    titulos_novos: dict[str, str] = {}
+    h1_novos: dict[str, str] = {}
+    for intent, (_shard, title_atual, title_novo, h1_atual, h1_novo) in sorted(REPAROS.items()):
+        tamanho = len(title_novo)
+        if not TITLE_MIN <= tamanho <= TITLE_MAX:
+            problemas.append(f"{intent}: title tem {tamanho} caracteres, fora de {TITLE_MIN}-{TITLE_MAX}")
+        if title_novo == title_atual and h1_novo == h1_atual:
+            problemas.append(f"{intent}: nada muda")
+        chave_titulo = title_novo.strip().lower()
+        if chave_titulo in titulos_novos:
+            problemas.append(f"{intent}: title igual ao de {titulos_novos[chave_titulo]}")
+        titulos_novos[chave_titulo] = intent
+        chave_h1 = h1_novo.strip().lower()
+        if chave_h1 in h1_novos:
+            problemas.append(f"{intent}: h1 igual ao de {h1_novos[chave_h1]}")
+        h1_novos[chave_h1] = intent
+
+    # Unicidade contra TODO o acervo, não só entre os pares tratados.
+    for caminho in sorted((ROOT / "data/editorial/v2_pages").glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if not intent or intent in REPAROS:
+                    continue
+                titulo = (registro.get("title") or "").strip().lower()
+                if titulo in titulos_novos:
+                    problemas.append(
+                        f"{titulos_novos[titulo]}: title novo colide com {intent}")
+                h1 = (registro.get("h1") or "").strip().lower()
+                if h1 in h1_novos:
+                    problemas.append(f"{h1_novos[h1]}: h1 novo colide com {intent}")
+
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(REPAROS)} páginas, títulos únicos no acervo inteiro "
+          f"e dentro de {TITLE_MIN}-{TITLE_MAX} caracteres")
+
+
+def aplicar(shard_rel: str, alvos: dict, dry_run: bool) -> tuple[int, int]:
+    path = ROOT / shard_rel
+    linhas = path.read_bytes().decode("utf-8").split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    saida: list[str] = []
+    alterados = 0
+    ja_feitos = 0
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard_rel}: linha em branco {numero}")
+        registro = json.loads(raw)
+        intent = registro.get("intent_id")
+        if intent not in alvos:
+            saida.append(raw)
+            continue
+
+        title_atual, title_novo, h1_atual, h1_novo = alvos[intent]
+        if registro.get("title") == title_novo and registro.get("h1") == h1_novo:
+            ja_feitos += 1
+            saida.append(raw)
+            continue
+        if registro.get("title") != title_atual or registro.get("h1") != h1_atual:
+            raise SystemExit(
+                f"CAS FALHOU em {shard_rel}:{numero} ({intent}): o title/h1 vivo não é "
+                f"o esperado.\n  title vivo    : {registro.get('title')!r}\n"
+                f"  title esperado: {title_atual!r}\n"
+                f"  h1 vivo       : {registro.get('h1')!r}\n"
+                f"  h1 esperado   : {h1_atual!r}\n"
+                f"Reler o conteúdo vivo antes de reaplicar.")
+
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        registro["title"] = title_novo
+        registro["h1"] = h1_novo
+        registro["word_count"] = word_count(registro)
+        nova = json.dumps(registro, ensure_ascii=False, sort_keys=True)
+        atual = hashlib.sha256(
+            path.read_bytes().decode("utf-8").split("\n")[numero - 1].strip().encode("utf-8")
+        ).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {shard_rel}:{numero} ({intent}): "
+                f"outra frente tocou este registro durante a execução.")
+        saida.append(nova)
+        alterados += 1
+        print(f"  {intent}\n      title: {title_novo}\n      h1   : {h1_novo}")
+
+    if alterados and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(path, payload.encode("utf-8"))
+    return alterados, ja_feitos
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    preflight()
+
+    por_shard: dict[str, dict] = {}
+    for intent, (shard, title_atual, title_novo, h1_atual, h1_novo) in REPAROS.items():
+        por_shard.setdefault(shard, {})[intent] = (title_atual, title_novo, h1_atual, h1_novo)
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                total_alterados = 0
+                total_ja = 0
+                for shard in sorted(por_shard):
+                    alterados, ja = aplicar(shard, por_shard[shard], args.dry_run)
+                    total_alterados += alterados
+                    total_ja += ja
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print(f"\n--dry-run: {total_alterados} aplicável(is), {total_ja} já feita(s). Nada escrito.")
+        return 0
+    print(f"\n{total_alterados} diferenciada(s), {total_ja} já estava(m) diferenciada(s).")
+    if total_alterados:
+        print("Reingerir o estoque e republicar para o espelho refletir a mudança.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

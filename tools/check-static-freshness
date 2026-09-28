@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""check-static-freshness — o arquivo estatico servido ainda e o que o render produz?
+
+POR QUE EXISTE, com data e numero: em 2026-08-06, ao apontar o nginx para
+public/, a HOME passou a ser servida de public/index.html — um artefato de 05/08,
+anterior a publicacao das 9.400 paginas. 13.359 bytes e 12 links, sem a
+navegacao de areas de pratica; a correta tem 22.859 bytes e 41 links. O arquivo
+velho estava no disco havia um dia, inofensivo, porque a home vinha do processo
+Go. O cutover o promoveu a verdade, e o site regrediu na pagina que ancora a
+malha interna inteira.
+
+Nenhum gate pegou. check-served-vs-manifest compara o servido com o
+published_manifest — e a home nao esta no manifesto (e institucional).
+check-sitemap-fidelity compara conjuntos de URL, nao bytes. Havia um ponto cego
+exatamente onde o cutover mudou o comportamento.
+
+O QUE ELE COMPARA: para cada rota, o byte que o NGINX entrega (o que o visitante
+recebe) contra o byte que o RENDER VIVO produz (o Go, que monta a partir do
+estado atual do repositorio). Se divergirem, o disco esta servindo um artefato
+obsoleto.
+
+Cobre justamente o que os outros gates nao cobrem:
+  - institucionais (home, sobre, termos...) — fora do manifesto
+  - hubs de area — fora do sitemap por desenho (httpserver.go:334)
+  - amostra do acervo — barato, e fecha o circulo
+
+DIVERGENCIA NEM SEMPRE E DEFEITO DO DISCO: rota cujo conteudo depende de estado
+vivo (contagem de conteudos por area) DEVE vir do Go. Para essas, a resposta
+certa nao e materializar o arquivo, e sim garantir que o nginx nao as sirva do
+disco. O check aponta a divergencia; a decisao de qual lado corrigir e de quem
+le.
+
+Read-only. Requisicoes com UA proprio e X-Warming-Request: true, fora da
+contagem de trafego real.
+
+Uso:
+    tools/check-static-freshness
+    tools/check-static-freshness --amostra-acervo 40
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+PAGES = os.path.join(ROOT, "content/pages.json")
+PUBLIC = os.path.join(ROOT, "public")
+
+NGINX = "http://127.0.0.1:8088"
+GO = "http://127.0.0.1:8089"
+SNI = "wikijuridica.com.br"
+USER_AGENT = "wikijuridica-check-static-freshness/1.0 (+interno; nao-indexar)"
+
+TIPOS_JURIDICOS = {
+    "wiki", "legislacao", "dispositivo-legal", "jurisprudencia", "precedente",
+    "noticia-juridica", "artigo", "pergunta", "hub-tematico",
+}
+
+
+def buscar(base, caminho, timeout=20.0, tentativas=4):
+    """GET com respeito ao rate limit do nginx (120r/m, conf:59).
+
+    429 e o limitador pedindo calma, nao veredito sobre o conteudo: contar como
+    "sem resposta" transformaria protecao de infra em falso defeito.
+    """
+    pedido = urllib.request.Request(base.rstrip("/") + caminho, headers={
+        "Host": SNI,
+        "User-Agent": USER_AGENT,
+        "X-Warming-Request": "true",
+        "Accept-Encoding": "identity",
+    })
+    for tentativa in range(tentativas):
+        time.sleep(0.55)  # ~1,8 req/s, abaixo do teto por IP
+        try:
+            with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+                dados = resposta.read()
+                return hashlib.sha256(dados).hexdigest(), resposta.status, len(dados)
+        except urllib.error.HTTPError as erro:
+            if erro.code == 429 and tentativa < tentativas - 1:
+                time.sleep(2.0 * (tentativa + 1))
+                continue
+            return "", erro.code, 0
+        except Exception:
+            if tentativa < tentativas - 1:
+                continue
+            return "", 0, 0
+    return "", 0, 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--amostra-acervo", type=int, default=20)
+    args = parser.parse_args()
+
+    with open(PAGES, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+
+    institucionais = [p["path"] for p in paginas
+                      if p.get("page_type") not in TIPOS_JURIDICOS]
+    # Hubs de área: primeiro segmento das rotas do acervo, que o Go monta e o
+    # sitemap deliberadamente não lista.
+    areas = sorted({p["path"].split("/")[1] for p in paginas
+                    if p.get("page_type") in TIPOS_JURIDICOS and p["path"].count("/") > 2})
+    hubs = ["/%s/" % area for area in areas]
+    acervo = sorted(p["path"] for p in paginas if p.get("page_type") in TIPOS_JURIDICOS)
+    passo = max(1, len(acervo) // max(1, args.amostra_acervo))
+    amostra = acervo[::passo][:args.amostra_acervo]
+
+    grupos = [("institucional", sorted(set(institucionais))),
+              ("hub-de-area", hubs),
+              ("acervo", amostra)]
+
+    divergentes, indisponiveis, iguais = [], [], 0
+    # Artefato obsoleto ainda NÃO servido: arquivo que existe em public/ e já não
+    # bate com o render. Hoje ele é inofensivo; basta uma mudança de roteamento
+    # no nginx para virar o que o visitante recebe — foi exatamente assim que a
+    # home de 05/08 foi promovida a verdade. Pegar aqui é pegar antes.
+    obsoletos = []
+    for rotulo, rotas in grupos:
+        for rota in rotas:
+            sha_nginx, status_nginx, bytes_nginx = buscar(NGINX, rota)
+            sha_go, status_go, bytes_go = buscar(GO, rota)
+            arquivo = os.path.join(PUBLIC, rota.strip("/"), "index.html")
+            no_disco = os.path.exists(arquivo)
+            if no_disco and status_go == 200:
+                with open(arquivo, "rb") as handle:
+                    dados = handle.read()
+                if hashlib.sha256(dados).hexdigest() != sha_go:
+                    obsoletos.append((rotulo, rota, len(dados), bytes_go))
+            if status_go != 200 or status_nginx != 200:
+                indisponiveis.append((rotulo, rota, status_nginx, status_go))
+                continue
+            if sha_nginx == sha_go:
+                iguais += 1
+                continue
+            divergentes.append((rotulo, rota, bytes_nginx, bytes_go, no_disco))
+
+    total = iguais + len(divergentes)
+    print("=== FRESCOR DO ESTATICO (nginx vs render vivo) ===")
+    print("rotas conferidas      : %d" % (total + len(indisponiveis)))
+    print("identicas             : %d" % iguais)
+    print("divergentes           : %d" % len(divergentes))
+    if indisponiveis:
+        print("sem resposta 200      : %d" % len(indisponiveis))
+
+    if obsoletos:
+        print("arquivo obsoleto      : %d (existe em public/ e ja nao bate com o render)" % len(obsoletos))
+
+    if divergentes:
+        print("\n--- servido != render vivo ---")
+        for rotulo, rota, bn, bg, no_disco in sorted(divergentes):
+            origem = "arquivo em public/" if no_disco else "gerado (sem arquivo)"
+            print("  [%s] %s" % (rotulo, rota))
+            print("      nginx=%d bytes  render=%d bytes  delta=%+d  origem=%s"
+                  % (bn, bg, bg - bn, origem))
+
+    if obsoletos:
+        print("\n--- arquivo em public/ != render vivo (bomba-relogio de roteamento) ---")
+        for rotulo, rota, bd, bg in sorted(obsoletos):
+            print("  [%s] %s  disco=%d bytes  render=%d bytes  delta=%+d"
+                  % (rotulo, rota, bd, bg, bg - bd))
+
+    if divergentes or obsoletos:
+        print("\nREPROVADO: %d servida(s) divergente(s), %d arquivo(s) obsoleto(s)."
+              % (len(divergentes), len(obsoletos)))
+        print("Se a rota depende de estado vivo (contagem por area), o conserto e mantê-la")
+        print("fora do caminho estatico no nginx E remover o arquivo velho; se nao depende,")
+        print("o conserto e regerar o arquivo.")
+        return 1
+
+    for rotulo, rota, sn, sg in indisponiveis:
+        print("  [%s] %s nginx=%s go=%s" % (rotulo, rota, sn, sg))
+    print("\nOK: tudo que o nginx entrega bate com o render vivo.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

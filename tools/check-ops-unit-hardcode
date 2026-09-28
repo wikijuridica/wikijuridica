@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""check-ops-unit-hardcode — cobra que caminho absoluto repetido nas units de
+`ops/systemd/` nao possa divergir em silencio.
+
+POR QUE EXISTE. A auditoria do §P0a apontou dois valores duplicados nas units:
+`/home/rafael/go/bin` em quatro `Environment=PATH` e o binario do cloudflared,
+com CAMINHO e VERSAO, em dois `ExecStart`. Duplicacao em unit e' pior que em
+codigo: nao ha compilador, o erro so aparece no proximo boot do servico, e as
+units sao SYMLINK de `/etc/systemd/system/` para este repositorio — editar aqui
+JA e' editar a unit viva, com efeito no proximo `daemon-reload`.
+
+POR QUE ISTO E' UM GATE E NAO UMA SUBSTITUICAO.
+
+  `%h` NAO SERVE. A tentacao obvia e trocar `/home/rafael/go/bin` por
+  `%h/go/bin`. Medido em 2026-09-16 contra o systemd 252 desta maquina, o
+  `systemd.unit(5)` diz que `%h` e' "the home directory of the user running the
+  service manager instance. In case of the system manager this resolves to
+  /root". As quatro units tem `User=rafael`, mas o especificador NAO acompanha
+  `User=`: o PATH viraria `/root/go/bin`, que nao existe, e as quatro passariam
+  a nao achar a toolchain Go -- em silencio, no proximo ciclo do timer. A
+  substituicao "limpa" quebraria producao.
+
+  O BINARIO DO CLOUDFLARED NAO SE DESVERSIONA. `/home/rafael/bin/cloudflared`
+  EXISTE e e' um arquivo DIFERENTE do `cloudflared-2026.7.3` fixado nas units
+  (39.667.364 contra 39.278.667 bytes, de marco contra agosto). Apontar o
+  ExecStart para o nome sem versao trocaria, no proximo restart do tunel, o
+  binario que expoe o portal -- por um mais velho, sem diff que denuncie. Para
+  um binario de borda, versao literal no ExecStart e' AUDITABILIDADE, nao
+  hardcode a limpar.
+
+Entao o defeito real nao e' "ha literal": e' "ha COPIAS que podem divergir sem
+ninguem ver". Este gate remove essa possibilidade sem tocar em producao.
+
+O que cobra:
+  1. as quatro units de PATH declaram a MESMA linha `Environment=PATH=`;
+  2. o prefixo de PATH declarado existe no disco;
+  3. as units de cloudflared nomeiam o MESMO binario no ExecStart;
+  4. esse binario existe e e' executavel;
+  5. nenhuma unit nova introduz um terceiro caminho de toolchain divergente.
+
+READ-ONLY. Nao escreve nada e nao chama systemctl.
+
+Uso:
+    tools/check-ops-unit-hardcode
+    tools/check-ops-unit-hardcode --json
+
+Exit: 0 verde · 1 divergencia · 2 nao conseguiu ler as units.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+
+RAIZ = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+UNITS = os.path.join(RAIZ, "ops", "systemd")
+
+# A linha datada (2026-09-16) das units que declaram PATH com a toolchain Go.
+UNITS_COM_PATH = [
+    "wikijuridica-noticias-coleta.service",
+    "wikijuridica-daily-content-noticias.service",
+    "wikijuridica-qualidade-diaria.service",
+    "wikijuridica-qualidade-longa.service",
+]
+UNITS_CLOUDFLARED = [
+    "cloudflared-wikijuridica.service",
+    "cloudflared-wikijuridica-replica@.service",
+]
+
+
+def linha_path(texto: str) -> str | None:
+    m = re.search(r"^Environment=PATH=(.+)$", texto, re.M)
+    return m.group(1).strip() if m else None
+
+
+def binario_do_execstart(texto: str) -> str | None:
+    m = re.search(r"^ExecStart=(?:[-@+!]*)(\S+)", texto, re.M)
+    return m.group(1) if m else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--units", default=UNITS,
+                    help="diretorio de units a conferir (usado pela prova por mutacao)")
+    args = ap.parse_args()
+
+    units = args.units
+    if not os.path.isdir(units):
+        print(f"ops/systemd ausente em {units}", file=sys.stderr)
+        return 2
+
+    falhas: list[str] = []
+    dados: dict = {}
+
+    # 1 e 2 — PATH idêntico nas quatro, e o prefixo existe.
+    paths = {}
+    for u in UNITS_COM_PATH:
+        caminho = os.path.join(units, u)
+        if not os.path.exists(caminho):
+            falhas.append(f"unit da linha datada ausente: {u}")
+            continue
+        p = linha_path(open(caminho, encoding="utf-8").read())
+        if p is None:
+            falhas.append(f"{u}: perdeu a linha Environment=PATH=")
+            continue
+        paths[u] = p
+    dados["paths"] = paths
+    distintos = set(paths.values())
+    if len(distintos) > 1:
+        falhas.append("as units de PATH divergiram entre si: " +
+                      json.dumps(paths, ensure_ascii=False, indent=2))
+    for p in distintos:
+        prefixo = p.split(":", 1)[0]
+        if not os.path.isdir(prefixo):
+            falhas.append(f"prefixo de PATH declarado nao existe no disco: {prefixo}")
+
+    # 3 e 4 — cloudflared: mesmo binário nos dois, e ele existe.
+    binarios = {}
+    for u in UNITS_CLOUDFLARED:
+        caminho = os.path.join(units, u)
+        if not os.path.exists(caminho):
+            falhas.append(f"unit de cloudflared ausente: {u}")
+            continue
+        b = binario_do_execstart(open(caminho, encoding="utf-8").read())
+        if b is None:
+            falhas.append(f"{u}: sem ExecStart legivel")
+            continue
+        binarios[u] = b
+    dados["cloudflared"] = binarios
+    if len(set(binarios.values())) > 1:
+        falhas.append("as units de cloudflared apontam para binarios DIFERENTES: " +
+                      json.dumps(binarios, ensure_ascii=False, indent=2) +
+                      "\n  uma replica servindo binario diferente da principal e' deriva invisivel na borda")
+    for b in set(binarios.values()):
+        if not (os.path.isfile(b) and os.access(b, os.X_OK)):
+            falhas.append(f"binario do cloudflared do ExecStart nao existe ou nao e' executavel: {b}"
+                          "\n  o proximo restart do tunel derruba a exposicao do portal")
+
+    # 5 — nenhuma unit fora da linha datada introduz outro caminho de toolchain.
+    esperado = next(iter(distintos), None)
+    intrusos = []
+    for caminho in sorted(glob.glob(os.path.join(units, "*.service")) +
+                          glob.glob(os.path.join(units, "*.timer"))):
+        nome = os.path.basename(caminho)
+        if nome in UNITS_COM_PATH:
+            continue
+        p = linha_path(open(caminho, encoding="utf-8").read())
+        if p and esperado and p != esperado and "go/bin" in p:
+            intrusos.append(f"{nome}: {p}")
+    if intrusos:
+        falhas.append("unit NOVA declara PATH de toolchain divergente: " + "; ".join(intrusos) +
+                      "\n  acrescente-a a UNITS_COM_PATH (e alinhe a linha) ou use o mesmo PATH das quatro")
+    dados["intrusos"] = intrusos
+
+    if args.json:
+        print(json.dumps({"falhas": falhas, "dados": dados}, ensure_ascii=False, indent=2))
+        return 1 if falhas else 0
+
+    print(f"units com PATH de toolchain : {len(paths)} (linha datada de 2026-09-16)")
+    for u, p in paths.items():
+        print(f"  {u:<44} {p.split(':', 1)[0]}")
+    print(f"units de cloudflared        : {len(binarios)}")
+    for u, b in binarios.items():
+        print(f"  {u:<44} {b}")
+    if falhas:
+        print(f"\nVERMELHO — {len(falhas)} divergencia(s):")
+        for f in falhas:
+            print(f"  {f}")
+        return 1
+    print("\nVERDE — nenhuma copia divergiu e todo caminho declarado existe no disco.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

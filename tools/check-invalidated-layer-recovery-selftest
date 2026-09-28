@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""check-invalidated-layer-recovery-selftest — prova que o check NÃO escreve.
+
+O contrato do `CLAUDE.md` diz que `tools/check-*` é read-only. Até 2026-08-29
+`check-invalidated-layer-recovery` tinha uma flag `--recover` que fazia
+`os.rename` DENTRO da árvore de trabalho; a ação foi separada para
+`tools/repair-invalidated-layer`. Sem prova executável, a separação se desfaz na
+primeira pressa — então este selftest existe para reprovar quem a desfizer.
+
+A prova é feita por dois instrumentos independentes, porque cada um tem um
+ponto cego:
+
+  1. IMPRESSÃO DIGITAL DA ÁRVORE (caminho + tamanho + mtime_ns + sha256 do
+     conteúdo de cada arquivo do sandbox), tirada antes e depois. Ela pega
+     escrita silenciosa em arquivo que já existia — que um `ls` não pega.
+  2. DIRETÓRIO SOMENTE-LEITURA (modo 0o500). Ela pega criação e rename, que a
+     impressão digital também pegaria, mas provando pelo lado do sistema
+     operacional: se o código tentar escrever, o `PermissionError` estoura.
+
+Nenhum dos dois sozinho basta: (1) não distingue "não escreveu" de "escreveu e
+restaurou", e (2) não vê escrita em diretório fora do que foi travado.
+
+Os dois ramos de segurança do reparo também são exercitados, porque foi o
+critério deles que justificou mover o código em vez de apagá-lo: camada NÃO
+versionada (o vizinho stale é a única cópia — restaura) e camada versionada com
+bytes DIVERGENTES do HEAD (pode ser trabalho novo não commitado — recusa).
+
+Uso: ./tools/check-invalidated-layer-recovery-selftest
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FERRAMENTAS = pathlib.Path(__file__).resolve().parent
+CHECK = FERRAMENTAS / "check-invalidated-layer-recovery"
+REPAIR = FERRAMENTAS / "repair-invalidated-layer"
+MARCADOR = ".stale-resume-7-bootstrap-a1b2c3"
+
+falhas: list[str] = []
+
+
+def confere(descricao: str, condicao: bool, detalhe: str = "") -> None:
+    if condicao:
+        print(f"  ok   {descricao}")
+        return
+    falhas.append(descricao)
+    print(f"  FAIL {descricao}" + (f"\n       {detalhe}" if detalhe else ""))
+
+
+def impressao_digital(raiz: pathlib.Path) -> str:
+    """Caminho + tamanho + mtime_ns + sha256 de cada arquivo, em ordem estável."""
+    partes: list[str] = []
+    for caminho in sorted(raiz.rglob("*")):
+        relativo = caminho.relative_to(raiz).as_posix()
+        if caminho.is_dir():
+            partes.append(f"d {relativo}")
+            continue
+        estado = caminho.stat()
+        digest = hashlib.sha256(caminho.read_bytes()).hexdigest()
+        partes.append(f"f {relativo} {estado.st_size} {estado.st_mtime_ns} {digest}")
+    return hashlib.sha256("\n".join(partes).encode("utf-8")).hexdigest()
+
+
+def rodar(ferramenta: pathlib.Path, raiz: pathlib.Path,
+          *argumentos: str) -> subprocess.CompletedProcess:
+    ambiente = dict(os.environ, WIKI_ROOT=os.fspath(raiz))
+    return subprocess.run([sys.executable, os.fspath(ferramenta), *argumentos],
+                          cwd=raiz, env=ambiente, capture_output=True, text=True)
+
+
+def monta_sandbox(versionada: bool) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """Sandbox com uma camada invalidada (original ausente, vizinho stale presente)."""
+    raiz = pathlib.Path(tempfile.mkdtemp(prefix="invalidated-layer-selftest-"))
+    (raiz / "data" / "ops").mkdir(parents=True)
+    original = raiz / "data" / "ops" / "camada.jsonl"
+    conteudo = b'{"registro": 1}\n{"registro": 2}\n'
+    if versionada:
+        original.write_bytes(conteudo)
+        git = ["git", "-c", "user.email=selftest@wikijuridica.com.br",
+               "-c", "user.name=selftest"]
+        subprocess.run(["git", "init", "-q"], cwd=raiz, check=True,
+                       capture_output=True)
+        subprocess.run([*git, "add", "data/ops/camada.jsonl"], cwd=raiz,
+                       check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-q", "-m", "camada"], cwd=raiz,
+                       check=True, capture_output=True)
+        original.rename(original.with_name(original.name + MARCADOR))
+    else:
+        original.with_name(original.name + MARCADOR).write_bytes(conteudo)
+    return raiz, original, original.with_name(original.name + MARCADOR)
+
+
+def caso_check_nao_escreve() -> None:
+    print("caso 1 — o check acusa a camada fora do lugar e NÃO toca no disco")
+    raiz, original, stale = monta_sandbox(versionada=False)
+    try:
+        antes = impressao_digital(raiz)
+        saida = rodar(CHECK, raiz)
+        depois = impressao_digital(raiz)
+
+        confere("reprova (exit 1) com camada invalidada sem regeneração",
+                saida.returncode == 1, f"exit={saida.returncode} err={saida.stderr[:200]}")
+        confere("nomeia a camada e o vizinho que a preserva",
+                "data/ops/camada.jsonl" in saida.stderr and MARCADOR in saida.stderr,
+                saida.stderr[:300])
+        confere("aponta o reparo para tools/repair-invalidated-layer",
+                "tools/repair-invalidated-layer" in saida.stderr, saida.stderr[:300])
+        confere("a impressão digital da árvore é IDÊNTICA depois de rodar",
+                antes == depois, f"{antes[:16]} != {depois[:16]}")
+        confere("o original continua ausente (o check não restaurou nada)",
+                not original.exists() and stale.exists())
+
+        # A busca é pelo PARSER, não pelo texto do arquivo: a docstring do check
+        # narra que `--recover` existiu até 2026-08-29, e essa memória tem de
+        # continuar lá. O que não pode voltar é a flag DECLARADA — grepar o
+        # arquivo inteiro reprovaria a própria documentação do bug.
+        fonte_check = CHECK.read_text(encoding="utf-8")
+        declaradas = set(re.findall(r"""add_argument\(\s*["'](--[a-z0-9-]+)["']""",
+                                    fonte_check))
+        confere("o parser do check não declara nenhuma flag de escrita",
+                declaradas == {"--json"},
+                f"flags declaradas: {sorted(declaradas)} — só --json é aceitável; "
+                f"flag de ação no check desfaz a separação de papéis")
+        confere("e o check não chama mais os.rename/os.replace/shutil.move",
+                not re.search(r"os\.(rename|replace)\(|shutil\.(move|copy)", fonte_check),
+                "voltou chamada de escrita ao corpo do check")
+
+        # Segundo instrumento: o SO nega a escrita. Se o check tentar, estoura.
+        alvo = raiz / "data" / "ops"
+        os.chmod(alvo, 0o500)
+        try:
+            travado = rodar(CHECK, raiz)
+        finally:
+            os.chmod(alvo, 0o700)
+        confere("com data/ops em modo 0o500 o check ainda reprova, sem erro de escrita",
+                travado.returncode == 1 and "PermissionError" not in travado.stderr,
+                f"exit={travado.returncode} err={travado.stderr[:300]}")
+    finally:
+        shutil.rmtree(raiz, ignore_errors=True)
+
+
+def caso_repair_restaura_nao_versionada() -> None:
+    print("caso 2 — o repair restaura a camada que só existe no vizinho stale")
+    raiz, original, stale = monta_sandbox(versionada=False)
+    try:
+        conteudo = stale.read_bytes()
+        seco = rodar(REPAIR, raiz, "--dry-run")
+        confere("--dry-run anuncia a restauração sem mexer no disco",
+                seco.returncode == 0 and not original.exists() and stale.exists(),
+                f"exit={seco.returncode} out={seco.stdout[:200]}")
+
+        feito = rodar(REPAIR, raiz)
+        confere("o repair devolve o arquivo ao lugar (exit 0)",
+                feito.returncode == 0, f"exit={feito.returncode} err={feito.stderr[:200]}")
+        confere("o original voltou com os bytes intactos e o vizinho sumiu",
+                original.exists() and original.read_bytes() == conteudo and not stale.exists())
+
+        depois = rodar(CHECK, raiz)
+        confere("depois do reparo o check fica verde (exit 0)",
+                depois.returncode == 0, f"exit={depois.returncode} err={depois.stderr[:200]}")
+    finally:
+        shutil.rmtree(raiz, ignore_errors=True)
+
+
+def caso_repair_recusa_divergente() -> None:
+    print("caso 3 — o repair RECUSA quando os bytes divergem do HEAD")
+    raiz, original, stale = monta_sandbox(versionada=True)
+    try:
+        stale.write_bytes('{"registro": 1}\n{"registro": 2}\n{"registro": 3 — trabalho novo}\n'.encode("utf-8"))
+        recusa = rodar(REPAIR, raiz)
+        confere("recusa a restauração e sai != 0",
+                recusa.returncode != 0, f"exit={recusa.returncode}")
+        confere("explica que os bytes divergem do HEAD e exige análise",
+                "divergem do HEAD" in recusa.stderr, recusa.stderr[:300])
+        confere("não sobrescreveu nada: o original segue ausente",
+                not original.exists() and stale.exists())
+
+        # Mesmos bytes do HEAD: aí sim restaura.
+        stale.write_bytes(b'{"registro": 1}\n{"registro": 2}\n')
+        aceita = rodar(REPAIR, raiz)
+        confere("com os bytes do HEAD, restaura (exit 0)",
+                aceita.returncode == 0 and original.exists(),
+                f"exit={aceita.returncode} err={aceita.stderr[:200]}")
+        confere("registra a origem 'confere com o HEAD'",
+                "confere com o HEAD" in aceita.stdout, aceita.stdout[:300])
+    finally:
+        shutil.rmtree(raiz, ignore_errors=True)
+
+
+def caso_backup_legitimo() -> None:
+    print("caso 4 — vizinho stale com original PRESENTE é backup, não buraco")
+    raiz, original, stale = monta_sandbox(versionada=False)
+    try:
+        original.write_bytes(stale.read_bytes())
+        saida = rodar(CHECK, raiz)
+        confere("aprova (exit 0): camada já regenerada não é camada perdida",
+                saida.returncode == 0, f"exit={saida.returncode} err={saida.stderr[:200]}")
+        confere("conta o backup em vez de silenciar",
+                "backups de camada já regenerada: 1" in saida.stdout, saida.stdout[:300])
+        confere("e NUNCA apaga o backup",
+                stale.exists())
+    finally:
+        shutil.rmtree(raiz, ignore_errors=True)
+
+
+def main() -> int:
+    for ferramenta in (CHECK, REPAIR):
+        if not ferramenta.is_file():
+            print(f"REPROVADO: {ferramenta} não existe", file=sys.stderr)
+            return 2
+    caso_check_nao_escreve()
+    caso_repair_restaura_nao_versionada()
+    caso_repair_recusa_divergente()
+    caso_backup_legitimo()
+    print()
+    if falhas:
+        print(f"check-invalidated-layer-recovery-selftest: REPROVADO "
+              f"({len(falhas)} verificação(ões))", file=sys.stderr)
+        for item in falhas:
+            print(f"  - {item}", file=sys.stderr)
+        return 1
+    print("check-invalidated-layer-recovery-selftest: OK — o check não escreve, "
+          "e o repair preserva o critério do HEAD")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

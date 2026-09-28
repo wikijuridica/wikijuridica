@@ -1,0 +1,587 @@
+#!/usr/bin/env bash
+# tools/generate-coord-presence — ESCREVE (não é read-only).
+#
+# Registra/atualiza a presença do agente chamador em
+# .agents/runtime/coordination/presence/<ID>.json — a "verdade ao vivo" de quem
+# está trabalhando, em qual frente, e se tem comando pesado rodando. Deve ser
+# chamado no início da sessão e a cada mudança relevante de frente/comando.
+#
+# Uso:
+#   tools/generate-coord-presence --agent claude-infra-pts1 \
+#     --front "corrigindo check-coord-status" --heavy none
+#
+#   tools/generate-coord-presence --agent codex-eng-pts4 \
+#     --front "go test internal/render" --heavy "go-modern test ./internal/render/" \
+#     --pane %3 --pid 48213 --tty pts/4
+#
+# Flags:
+#   --agent ID     obrigatório. Convenção: <tool>-<papel>-<tty>, ex.: claude-maestro-pts7
+#   --front TEXTO  obrigatório. Descrição curta da frente/tarefa atual.
+#   --heavy TEXTO  obrigatório. Comando pesado em execução, ou "none".
+#   --pane %N      opcional. Detectado de $TMUX_PANE se omitido.
+#   --pid N        opcional. Detectado de $$ se omitido.
+#   --tty NOME     opcional. Detectado de `tty` se omitido.
+#
+# Portabilidade sandbox Cowork (2026-07-31, mesma classe userns/EPERM dos fixes
+# 999502f4/7523553d): o mount do Cowork recusa renameat2 com flags (EINVAL) e
+# unlink (EPERM). A promoção degrada em camadas — renameat2 com CAS, renameat
+# simples sob o flock, escrita direta — e a limpeza do temporário virou
+# best-effort. Detalhes e o racional completo no docstring do bloco Python.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+AGENT=""
+FRONT=""
+HEAVY=""
+PANE=""
+PID=""
+TTY_NAME=""
+
+usage() {
+	echo "Uso: tools/generate-coord-presence --agent ID --front TEXTO --heavy TEXTO [--pane %N] [--pid N] [--tty NOME]" >&2
+	exit 2
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--agent)
+		[ $# -ge 2 ] || usage
+		AGENT="$2"
+		shift 2
+		;;
+	--front)
+		[ $# -ge 2 ] || usage
+		FRONT="$2"
+		shift 2
+		;;
+	--heavy)
+		[ $# -ge 2 ] || usage
+		HEAVY="$2"
+		shift 2
+		;;
+	--pane)
+		[ $# -ge 2 ] || usage
+		PANE="$2"
+		shift 2
+		;;
+	--pid)
+		[ $# -ge 2 ] || usage
+		PID="$2"
+		shift 2
+		;;
+	--tty)
+		[ $# -ge 2 ] || usage
+		TTY_NAME="$2"
+		shift 2
+		;;
+	-h | --help) usage ;;
+	*)
+		echo "flag desconhecida: $1" >&2
+		usage
+		;;
+	esac
+done
+
+[ -n "$AGENT" ] || {
+	echo "erro: --agent é obrigatório" >&2
+	usage
+}
+[ -n "$FRONT" ] || {
+	echo "erro: --front é obrigatório" >&2
+	usage
+}
+[ -n "$HEAVY" ] || {
+	echo "erro: --heavy é obrigatório (use \"none\" se não houver)" >&2
+	usage
+}
+
+if [ -z "$PANE" ]; then
+	PANE="${TMUX_PANE:-unknown}"
+fi
+if [ -z "$PID" ]; then
+	PID="$$"
+fi
+if [ -z "$TTY_NAME" ]; then
+	TTY_NAME="$(tty 2>/dev/null || true)"
+	if [ -z "$TTY_NAME" ] || [ "$TTY_NAME" = "not a tty" ]; then
+		TTY_NAME="unknown"
+	fi
+fi
+
+python3 - "$ROOT" "$AGENT" "$FRONT" "$HEAVY" "$PANE" "$PID" "$TTY_NAME" <<'PYEOF'
+"""Promoção da presença: staging em temporário + troca atômica sob flock.
+
+PORTABILIDADE SANDBOX COWORK (2026-07-31, mesma classe userns/EPERM dos fixes
+999502f4/7523553d). O mount do sandbox Cowork não é um filesystem local comum:
+  * renameat2() com RENAME_NOREPLACE/RENAME_EXCHANGE devolve EINVAL — o
+    filesystem não implementa os flags (man renameat2);
+  * unlink() devolve EPERM — remoção é proibida no mount;
+  * rename() simples, write, chmod, utime e fsync funcionam.
+O sintoma era enganoso: o renameat2 estourava EINVAL, o `finally` tentava
+limpar o temporário, o unlink estourava EPERM e a exceção da LIMPEZA mascarava
+a causa-raiz — o operador via só "PermissionError: Operation not permitted:
+.<agente>.tmp-<hash>" e nenhuma pista do rename.
+
+O conserto é para frente e em três camadas, sempre condicionado ao errno
+(DEGRADE_ERRNOS) para NÃO afrouxar nada no host normal:
+  1. renameat2 com flags (CAS real) — caminho preferido, único usado no host;
+  2. renameat simples sob o mesmo flock — perde a defesa contra escritor NÃO
+     cooperativo (que ignora o lock), mantém atomicidade e exclusão mútua;
+  3. escrita direta no destino — último recurso, não atômico, avisado no stderr.
+Limpeza (unlink) e durabilidade (fsync) viraram best-effort: nenhuma das duas
+pode derrubar uma presença já instalada nem esconder o erro real.
+"""
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+import time
+from datetime import datetime
+
+root, agent, front, heavy, pane, pid, tty_name = sys.argv[1:8]
+
+MAX_PRESENCE_BYTES = 32 * 1024
+ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+RENAME_NOREPLACE = 1
+RENAME_EXCHANGE = 2
+# Errnos que significam "este mount/kernel não oferece a operação", nunca
+# "houve corrida": EINVAL (filesystem sem suporte aos flags do renameat2),
+# EPERM/EACCES (mount proíbe), ENOSYS (syscall ausente/bloqueado por seccomp),
+# ENOTSUP/EOPNOTSUPP. Qualquer outro errno continua estourando — é assim que o
+# comportamento estrito do host normal fica preservado.
+DEGRADE_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, name, None)
+        for name in ("EPERM", "EACCES", "EINVAL", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+    ) if code is not None
+)
+
+
+def fail(message, code=1):
+    print(f"erro: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def warn(message):
+    print(f"aviso: {message}", file=sys.stderr)
+
+
+def errno_label(error):
+    return errno.errorcode.get(error.errno, error.errno)
+
+
+def tolerant_fsync(fd, label):
+    """fsync é durabilidade, não correção: mount que o recusa não pode derrubar
+    uma presença que já está gravada e conferida."""
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        if error.errno not in DEGRADE_ERRNOS:
+            raise
+        warn(f"fsync recusado em {label} ({errno_label(error)}); "
+             "presença gravada sem garantia de durabilidade")
+
+
+def tolerant_unlink(directory_fd, name):
+    """Remove um temporário de presença; devolve True se o nome sumiu.
+
+    Mount que proíbe unlink (EPERM no sandbox Cowork) apenas deixa o resíduo
+    para trás. Remoção é higiene, jamais requisito de correção — e jamais pode
+    mascarar, de dentro do finally, o erro real da promoção.
+    """
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as error:
+        if error.errno not in DEGRADE_ERRNOS:
+            raise
+        warn(f"sem permissão para remover {name} ({errno_label(error)}); "
+             "resíduo preservado no diretório de presença")
+        return False
+
+
+def bounded(label, value, max_chars, max_bytes, allow_empty=False):
+    if not allow_empty and not value:
+        fail(f"{label} não pode ser vazio", 2)
+    if len(value) > max_chars or len(value.encode("utf-8")) > max_bytes:
+        fail(f"{label} excede o limite de {max_chars} caracteres/{max_bytes} bytes", 2)
+    if "\x00" in value:
+        fail(f"{label} contém NUL", 2)
+    if any(ord(character) < 32 and character not in "\n\t" for character in value):
+        fail(f"{label} contém caractere de controle", 2)
+
+
+def open_absolute_directory(path):
+    if not os.path.isabs(path):
+        fail(f"raiz não absoluta: {path}")
+    current = os.open("/", DIRECTORY_FLAGS)
+    try:
+        for component in (part for part in path.split(os.sep) if part):
+            nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            os.close(current)
+            current = nxt
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def open_relative_directory(parent_fd, relative, create=False):
+    current = os.dup(parent_fd)
+    try:
+        for component in relative.split("/"):
+            if component in ("", ".", ".."):
+                fail(f"componente de diretório inseguro: {relative}")
+            try:
+                nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            named = os.stat(component, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(nxt)
+            if (not stat.S_ISDIR(named.st_mode) or
+                    (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                os.close(nxt)
+                fail(f"ancestral trocado durante abertura: {relative}")
+            os.close(current)
+            current = nxt
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def same_snapshot(left, right):
+    """Compara o prestate completo enquanto o inode permanece no mesmo nome."""
+    return (
+        (left.st_dev, left.st_ino, left.st_mode, left.st_nlink, left.st_size,
+         left.st_mtime_ns, left.st_ctime_ns) ==
+        (right.st_dev, right.st_ino, right.st_mode, right.st_nlink, right.st_size,
+         right.st_mtime_ns, right.st_ctime_ns)
+    )
+
+
+def same_snapshot_after_rename(left, right):
+    """Autentica o inode após rename, que legitimamente altera st_ctime."""
+    return (
+        (left.st_dev, left.st_ino, left.st_mode, left.st_nlink, left.st_size,
+         left.st_mtime_ns) ==
+        (right.st_dev, right.st_ino, right.st_mode, right.st_nlink, right.st_size,
+         right.st_mtime_ns)
+    )
+
+
+def named_regular(directory_fd, name, missing_ok=False):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if missing_ok:
+            return None, None
+        raise
+    try:
+        opened = os.fstat(fd)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+                (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+            fail(f"{name} deve ser arquivo regular, sem symlink/hardlink e com identidade estável")
+        if opened.st_size > MAX_PRESENCE_BYTES:
+            fail(f"{name} excede o teto de {MAX_PRESENCE_BYTES} bytes")
+        payload = bytearray()
+        while len(payload) <= MAX_PRESENCE_BYTES:
+            chunk = os.read(fd, min(8192, MAX_PRESENCE_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_PRESENCE_BYTES or os.read(fd, 1):
+            fail(f"{name} excede o teto de {MAX_PRESENCE_BYTES} bytes")
+        after = os.fstat(fd)
+        if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+             after.st_ctime_ns, after.st_nlink) !=
+                (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+                 opened.st_ctime_ns, opened.st_nlink)):
+            fail(f"{name} mudou durante a leitura")
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or
+                not same_snapshot(current, after)):
+            fail(f"{name} foi trocado durante a leitura")
+        return after, bytes(payload)
+    finally:
+        os.close(fd)
+
+
+def checked_lock(directory_fd, name):
+    fd = os.open(
+        name,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    opened = os.fstat(fd)
+    named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+            opened.st_size != 0 or not stat.S_ISREG(named.st_mode) or
+            named.st_nlink != 1 or
+            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        os.close(fd)
+        fail(f"lock {name} inseguro")
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                fail("lock de presença ocupado por 5s; siga em frente independente")
+            time.sleep(0.05)
+    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino, current.st_nlink) != (opened.st_dev, opened.st_ino, 1):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        fail(f"lock {name} foi trocado")
+    return fd
+
+
+def renameat2(directory_fd, source, target, flags):
+    """CAS de diretório. libc sem o símbolo vira ENOSYS para cair no mesmo
+    caminho degradado do mount sem suporte, em vez de abortar a presença."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "renameat2", None)
+    if function is None:
+        raise OSError(errno.ENOSYS, "renameat2 indisponível nesta libc", target)
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    result = function(
+        directory_fd, os.fsencode(source), directory_fd, os.fsencode(target), flags
+    )
+    if result != 0:
+        value = ctypes.get_errno()
+        raise OSError(value, os.strerror(value), target)
+
+
+def degraded_install(directory_fd, source, target, payload, cause):
+    """Instala a presença sem renameat2, preservando o máximo de garantia.
+
+    Devolve "rename" quando o renameat simples consumiu o temporário (troca
+    ainda atômica; só se perde o CAS contra escritor que ignora o flock) e
+    "direct" quando nem o rename foi aceito e o payload teve de ser escrito no
+    próprio destino (NÃO atômico, último recurso) — aí o temporário continua no
+    disco e a limpeza best-effort cuida dele.
+    """
+    try:
+        os.rename(source, target, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    except OSError as error:
+        if error.errno not in DEGRADE_ERRNOS:
+            raise
+        warn(f"renameat simples também recusado ({errno_label(error)}); "
+             f"escrevendo direto em {target} — instalação NÃO atômica")
+        fd = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            written = os.write(fd, payload)
+            if written != len(payload):
+                fail(f"escrita parcial da presença ({written}/{len(payload)} bytes)")
+            tolerant_fsync(fd, target)
+        finally:
+            os.close(fd)
+        return "direct"
+    warn(f"renameat2 com flags recusado pelo mount ({errno_label(cause)}); "
+         "promovido por renameat simples sob o flock .presence.lock — "
+         "sem CAS contra escritor que ignore o lock")
+    return "rename"
+
+
+if not ID_PATTERN.fullmatch(agent):
+    fail("--agent inválido; use 1–96 caracteres ASCII alfanuméricos, '_' ou '-'", 2)
+bounded("--front", front, 1024, 4096)
+bounded("--heavy", heavy, 2048, 8192)
+bounded("--pane", pane, 128, 512)
+bounded("--tty", tty_name, 128, 512)
+if not pid.isdigit() or not (1 <= int(pid) <= 2**31 - 1):
+    fail("--pid deve ser inteiro positivo", 2)
+
+tool = "outro"
+if agent.startswith("claude"):
+    tool = "claude"
+elif agent.startswith("codex"):
+    tool = "codex"
+
+now = datetime.now().astimezone().isoformat(timespec="seconds")
+
+os.umask(0o077)
+root_fd = open_absolute_directory(root)
+try:
+    presence_fd = open_relative_directory(
+        root_fd, ".agents/runtime/coordination/presence", create=True
+    )
+finally:
+    os.close(root_fd)
+
+lock_fd = checked_lock(presence_fd, ".presence.lock")
+target = f"{agent}.json"
+temp_name = None
+exchanged = False
+installed_directly = False
+try:
+    prior_stat, prior_payload = named_regular(presence_fd, target, missing_ok=True)
+    session_start = now
+    if prior_payload is not None:
+        try:
+            prior = json.loads(prior_payload.decode("utf-8"))
+            candidate = prior.get("session_start") if isinstance(prior, dict) else None
+            if isinstance(candidate, str) and len(candidate) <= 64:
+                datetime.fromisoformat(candidate)
+                session_start = candidate
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            # Conteúdo regular corrompido não é autoridade; uma nova sessão é
+            # registrada, mas symlink/hardlink/arquivo enorme falham fechado.
+            pass
+
+    record = {
+        "agent": agent,
+        "tool": tool,
+        "pane": pane,
+        "pid": int(pid),
+        "tty": tty_name,
+        "front": front,
+        "heavy": heavy,
+        "updated_at": now,
+        "session_start": session_start,
+    }
+    payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(payload) > MAX_PRESENCE_BYTES:
+        fail(f"presença serializada excede {MAX_PRESENCE_BYTES} bytes", 2)
+
+    for _ in range(128):
+        candidate = f".{agent}.tmp-{secrets.token_hex(16)}"
+        try:
+            temp_fd = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=presence_fd,
+            )
+            temp_name = candidate
+            break
+        except FileExistsError:
+            continue
+    else:
+        fail("não foi possível reservar temporário imprevisível de presença")
+
+    try:
+        staged_before = os.fstat(temp_fd)
+        if not stat.S_ISREG(staged_before.st_mode) or staged_before.st_nlink != 1:
+            fail("temporário de presença inseguro")
+        written = os.write(temp_fd, payload)
+        if written != len(payload):
+            fail(f"escrita parcial da presença ({written}/{len(payload)} bytes)")
+        tolerant_fsync(temp_fd, "temporário de presença")
+        staged = os.fstat(temp_fd)
+    finally:
+        os.close(temp_fd)
+
+    # Revalida o prestate sob o mesmo lock antes do efeito atômico.
+    current_stat, current_payload = named_regular(presence_fd, target, missing_ok=True)
+    if ((prior_stat is None) != (current_stat is None) or
+            (prior_stat is not None and
+             (not same_snapshot(prior_stat, current_stat) or
+              prior_payload != current_payload))):
+        fail("presença mudou antes da promoção; nenhuma sobrescrita feita")
+
+    if prior_stat is None:
+        try:
+            renameat2(presence_fd, temp_name, target, RENAME_NOREPLACE)
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                fail("presença foi criada concorrentemente; nenhuma sobrescrita feita")
+            if error.errno not in DEGRADE_ERRNOS:
+                raise
+            # Sem RENAME_NOREPLACE não há criação atômica: revalida a ausência
+            # sob o mesmo flock, que é a exclusão mútua entre cooperativos.
+            recheck_stat, _ = named_regular(presence_fd, target, missing_ok=True)
+            if recheck_stat is not None:
+                fail("presença foi criada concorrentemente; nenhuma sobrescrita feita")
+            if degraded_install(
+                    presence_fd, temp_name, target, payload, error) == "rename":
+                temp_name = None
+            else:
+                installed_directly = True
+        else:
+            temp_name = None
+    else:
+        try:
+            renameat2(presence_fd, temp_name, target, RENAME_EXCHANGE)
+        except OSError as error:
+            if error.errno not in DEGRADE_ERRNOS:
+                raise
+            # Sem RENAME_EXCHANGE o deslocado não sobrevive para auditoria —
+            # mas ele já foi lido e conferido acima (prior_stat/prior_payload)
+            # sob o mesmo lock, então a substituição segue verificável.
+            if degraded_install(
+                    presence_fd, temp_name, target, payload, error) == "rename":
+                temp_name = None
+            else:
+                installed_directly = True
+        else:
+            exchanged = True
+            installed_stat, installed_payload = named_regular(presence_fd, target)
+            displaced_stat, displaced_payload = named_regular(presence_fd, temp_name)
+            if (not same_snapshot_after_rename(installed_stat, staged) or
+                    installed_payload != payload or
+                    not same_snapshot_after_rename(displaced_stat, prior_stat) or
+                    displaced_payload != prior_payload):
+                # O lock cobre escritores cooperativos; se houve troca externa,
+                # conserva as duas entradas para reconciliação e falha fechado.
+                fail(f"troca de presença não autenticada; preserve {target} e {temp_name}")
+            if tolerant_unlink(presence_fd, temp_name):
+                temp_name = None
+
+    tolerant_fsync(presence_fd, "diretório de presença")
+    installed_stat, installed_payload = named_regular(presence_fd, target)
+    if installed_payload != payload:
+        fail("presença instalada mudou durante a promoção")
+    # A escrita direta reaproveita o inode do destino, então a identidade do
+    # temporário staged não se aplica; o payload conferido acima é a garantia.
+    if not installed_directly and not same_snapshot_after_rename(installed_stat, staged):
+        fail("presença instalada mudou durante a promoção")
+finally:
+    if temp_name is not None and not exchanged:
+        try:
+            candidate = os.stat(temp_name, dir_fd=presence_fd, follow_symlinks=False)
+            if stat.S_ISREG(candidate.st_mode) and candidate.st_nlink == 1:
+                tolerant_unlink(presence_fd, temp_name)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            # Limpeza é best-effort e NUNCA pode substituir o erro real da
+            # promoção pelo erro do próprio cleanup — era exatamente isso que
+            # acontecia no sandbox Cowork, onde o EPERM do unlink escondia o
+            # EINVAL do renameat2 e deixava a causa-raiz invisível.
+            warn(f"limpeza do temporário {temp_name} falhou "
+                 f"({errno_label(error)}); resíduo preservado")
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    os.close(lock_fd)
+    os.close(presence_fd)
+
+print(f"presença registrada: .agents/runtime/coordination/presence/{target}")
+PYEOF

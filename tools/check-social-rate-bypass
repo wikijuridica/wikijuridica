@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""check-social-rate-bypass — o endpoint de escrita tem balde próprio por IP?
+
+READ-ONLY. Não escreve arquivo nenhum.
+
+O QUE ESTA SONDA NÃO FAZ, E É O PONTO MAIS IMPORTANTE DO ARQUIVO. A trava que
+importa é que uma requisição declarando `User-Agent: Googlebot` contra
+/api/v1/redesocial/ NÃO fique isenta de limite. Medir isso empiricamente
+exigiria forjar User-Agent de bot real — proibido pelo contrato deste
+repositório e barrado por hook de máquina. Escrever o gate por spoofing seria
+violar o anti-fraude para testar o anti-abuso.
+
+A prova correta é POR CONSTRUÇÃO, e é mais forte que a sonda: `cmd/check
+social-rate-bypass` (internal/socialborda) resolve, para cada `limit_req` do
+bloco de escrita, a CHAVE da zona que ela referencia — e exige
+`$binary_remote_addr`. Uma zona chaveada em `$wj_generic_key` fica com chave
+VAZIA para bot valioso, e requisição com chave vazia não é contada por zona
+nenhuma. O gate também exige que o bloco não mencione `$wj_generic_key` nem
+`$wj_bot_allow`: sem essas variáveis, não existe caminho de código que isente
+ninguém — hoje, nem depois de uma refatoração distraída.
+
+O QUE A SONDA ACRESCENTA: que o balde declarado de fato responde 429. Uma
+diretiva sintaticamente correta apontando para uma zona grande demais passa no
+gate estrutural e não limita nada na prática. A rajada sai com User-Agent
+PRÓPRIO e `X-Warming-Request: true`, contra 127.0.0.1, e o tamanho dela é
+derivado do `burst=` declarado — nunca um número inventado que possa virar
+carga.
+
+exit 0 medido e correto · exit 1 medido e errado (ou gate estrutural reprovado)
+· exit 2 não foi possível medir.
+"""
+import importlib.util
+import os
+import re
+import sys
+
+
+def carrega_sonda():
+    """Carrega tools/social_borda_probe.py sem mexer no sys.path.
+
+    O idioma usual aqui seria `sys.path.insert(...)` seguido de import, que
+    obriga a um `# noqa: E402` — e suprimir o diagnostico em vez de resolver a
+    causa e proibido neste repositorio. Carregar por caminho explicito resolve a
+    causa: nao ha import fora de ordem para o lint reclamar.
+    """
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_borda_probe.py")
+    spec = importlib.util.spec_from_file_location("social_borda_probe", caminho)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"nao consegui carregar {caminho}")
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+sonda = carrega_sonda()
+
+NOME = "check-social-rate-bypass"
+NGINX = "ops/nginx/standalone/nginx.conf"
+LOCATION_DE_ESCRITA = "/api/v1/redesocial/"
+
+# Teto duro da rajada. Ele existe porque uma sonda sem teto, apontada para um
+# balde mal dimensionado, vira exatamente a carga que o balde deveria conter.
+TETO_DA_RAJADA = 400
+
+RE_LIMIT_REQ = re.compile(r"\blimit_req\s+zone=([A-Za-z0-9_]+)([^;]*);")
+RE_BURST = re.compile(r"\bburst=(\d+)")
+
+
+def bloco_da_location(texto, caminho):
+    """Recorta o corpo da location por chaves balanceadas.
+
+    É um recorte pequeno de propósito: a ASSERÇÃO sobre a configuração é do gate
+    Go, que tem o leitor completo. Aqui só se lê o `burst=` para dimensionar a
+    rajada, e duplicar o leitor inteiro em Python criaria a segunda fonte da
+    verdade que este projeto passa o tempo todo evitando.
+    """
+    sem_comentario = re.sub(r"(?m)#[^\n]*$", "", texto)
+    for achado in re.finditer(r"location\s+(?:=|~\*?|\^~)?\s*" + re.escape(caminho) + r"\s*\{", sem_comentario):
+        i = achado.end()
+        profundidade = 1
+        while i < len(sem_comentario) and profundidade > 0:
+            if sem_comentario[i] == "{":
+                profundidade += 1
+            elif sem_comentario[i] == "}":
+                profundidade -= 1
+            i += 1
+        return sem_comentario[achado.end():i - 1]
+    return None
+
+
+def dimensiona_rajada():
+    """Devolve (quantidade, zona, erro) a partir do burst declarado."""
+    caminho = os.path.join(sonda.RAIZ, NGINX)
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            texto = f.read()
+    except OSError as erro:
+        return 0, "", f"nao consegui ler {NGINX}: {erro}"
+    corpo = bloco_da_location(texto, LOCATION_DE_ESCRITA)
+    if corpo is None:
+        return 0, "", f"{NGINX} nao declara `location {LOCATION_DE_ESCRITA}`"
+    achado = RE_LIMIT_REQ.search(corpo)
+    if not achado:
+        return 0, "", f"o bloco {LOCATION_DE_ESCRITA} nao declara limit_req"
+    zona = achado.group(1)
+    burst = RE_BURST.search(achado.group(2))
+    if not burst:
+        return 0, zona, f"a limit_req de {LOCATION_DE_ESCRITA} nao declara burst=; nao da para dimensionar a rajada com seguranca"
+    quantidade = int(burst.group(1)) + 2
+    if quantidade > TETO_DA_RAJADA:
+        return 0, zona, (f"o burst declarado e {burst.group(1)}, e a rajada necessaria ({quantidade}) passa do teto "
+                         f"de {TETO_DA_RAJADA} desta sonda: dimensione o balde ou meça-o fora do gate")
+    return quantidade, zona, None
+
+
+def main():
+    codigo, saida = sonda.gate_estrutural("social-rate-bypass")
+    if codigo == sonda.ERRADO:
+        print(saida.rstrip())
+        return sonda.relata(NOME, sonda.ERRADO, [
+            "o gate estrutural social-rate-bypass reprovou: o endpoint de escrita nao tem balde proprio por IP, "
+            "ou o bloco consulta as variaveis que isentam bot valioso. Essa e a prova que importa; "
+            "a sonda so confirmaria o 429 de um balde que ainda nao existe."])
+    if codigo == sonda.INCONCLUSIVO:
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [saida.strip()])
+
+    quantidade, zona, erro = dimensiona_rajada()
+    if erro:
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [erro])
+
+    if not sonda.escuta(sonda.PORTA_NGINX):
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [
+            f"nada escutando em 127.0.0.1:{sonda.PORTA_NGINX} (nginx do wiki): "
+            f"a zona {zona} esta declarada por IP na configuracao, e o 429 nao pode ser medido agora"])
+
+    # A rajada usa GET: `limit_req` dispara ANTES do proxy_pass, então o 429
+    # aparece mesmo que o upstream esteja fora do ar ou responda 404 — e um GET
+    # não escreve nada em lugar nenhum.
+    vistos = {}
+    for _ in range(quantidade):
+        status, _, erro_req = sonda.requisita(sonda.PORTA_NGINX, LOCATION_DE_ESCRITA + "sonda-de-limite")
+        if erro_req:
+            return sonda.relata(NOME, sonda.INCONCLUSIVO, [f"a rajada falhou na requisicao {sum(vistos.values()) + 1}: {erro_req}"])
+        vistos[status] = vistos.get(status, 0) + 1
+        if status == 429:
+            break
+
+    resumo = ", ".join(f"{n}x HTTP {s}" for s, n in sorted(vistos.items()))
+    if 429 not in vistos:
+        return sonda.relata(NOME, sonda.ERRADO, [
+            f"{sum(vistos.values())} requisicoes seguidas de um IP so, contra o burst={quantidade - 2} declarado na zona {zona}, "
+            f"e nenhuma recebeu 429 ({resumo}): a diretiva esta escrita e o balde nao esta limitando nada"])
+    return sonda.relata(NOME, sonda.OK, [
+        f"a zona {zona} e chaveada em $binary_remote_addr (gate estrutural) e respondeu 429 na rajada: {resumo}"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

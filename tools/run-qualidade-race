@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# tools/run-qualidade-race — a sonda de CORRIDA sai da varredura diaria e ganha
+# envelope proprio.
+#
+# ★ POR QUE EXISTE (2026-09-05)
+#
+# `checks-race-real-corpus` era a etapa 2e de tools/run-qualidade-diaria e era a
+# etapa mais cara dela: ~28 min de CPU por dia. Medido no ledger
+# data/ops/qualidade_diaria.jsonl, nas 7 execucoes de 30/08 a 04/09:
+#
+#     30/08  1.700 s  timeout   (nao mediu nada)
+#     31/08  1.359 s  concluiu
+#     01/09    659 s  morto por sinal
+#     02/09  1.678 s  timeout
+#     03/09  1.662 s  timeout
+#     04/09  1.665 s  timeout
+#
+# Quatro dias de sete sem veredito nenhum, e o status "timeout" nem entra na
+# conta de vermelhos do runner: o gate custava caro e era invisivel ao mesmo
+# tempo.
+#
+# ★ O QUE FOI TENTADO ANTES DE SEPARAR, E POR QUE NAO SERVIU
+#
+# Tres reducoes de custo, todas medidas, todas descartadas (o registro completo
+# esta no cabecalho de internal/checks/run_context_parallel_test.go):
+#
+#   1. Pular a fase serial do RunAll. Vaza nove gates pesados para dentro de uma
+#      goroutine da fase paralela, porque `p0-cycle-close-indexable-10k` invoca
+#      as dependencias por checks.go:1384, que chama RunWithContext DIRETO.
+#      Medido: passou de 846 s sem concluir.
+#   2. Rodar so' o fan-in antes do freeze. Corrige o vazamento e puxa
+#      `oss-release-fanin` -> ~44 dependencias, entre elas todos os SCA. Medido:
+#      `gosec` com dois `go list`, load 42 numa maquina de 8 nucleos.
+#   3. `CPUQuota=400%` na unit e `-p 4` no `go test`. As duas etapas mais caras
+#      da varredura ja vivem perto do proprio teto (suite-completa: 1.665 s
+#      contra 1.800 s; esta: 1.359 s contra 1.650 s). Estrangular nao as torna
+#      mais educadas, torna-as "timeout" — que sai da conta de vermelhos.
+#
+# A conclusao e' que o teste nao e' caro por defeito proprio: ele e' caro porque
+# o RunAll e' caro, e toda versao que PRESERVE o comportamento paga o fan-in.
+# Logo o custo se resolve no ESCALONAMENTO, nao dentro do teste.
+#
+# ★ O QUE MUDA COM A SEPARACAO
+#
+# - A varredura diaria deixa de carregar 1.665 s no pior caso. Medido no ledger:
+#   ela usava ate 72% do TimeoutStartSec=90min; sem esta etapa, 41%.
+# - A falha vira alerta PROPRIO. Antes, "a varredura falhou" nao distinguia entre
+#   um gate de SEO reprovado e a sonda de corrida sem responder.
+# - O envelope passa a ser DIMENSIONADO, e nao herdado. O `-timeout=1650s`
+#   antigo nao vinha de medicao nenhuma: vinha de caber nos 1.800 s da parede que
+#   `roda()` dava a etapa. Contra a pior conclusao REAL (1.359 s) a folga era de
+#   21%, insuficiente para variacao de carga — e o trabalho cresce com o acervo.
+#   Aqui a etapa roda sozinha, e o teto sai da medicao.
+#
+#   Isso NAO e' "afrouxar o timeout para acomodar lentidao", que o contrato
+#   proibe: as tres tentativas acima mostram que nao ha lentidao a corrigir
+#   dentro do teste. E' dimensionar um envelope que nunca foi dimensionado.
+#
+# - Cadencia continua DIARIA. O vetor de risco e' diario: medido em 2026-09-05,
+#   `internal/checks` teve 52 commits e 32 checks novos em 30 dias — cerca de um
+#   por dia. Semanal acumularia sete checks novos por execucao, e o dia em que o
+#   vermelho aparecesse traria sete suspeitos em vez de um. Ja a mecanica que o
+#   teste protege (run_context_parallel.go) mudou UMA vez desde julho: o risco
+#   nao esta nela, esta no fluxo de checks que entram.
+#
+# ★ A SERIE DE ESCALA QUE NAO EXISTIA
+#
+# Nenhum artefato do repo cruzava a duracao desta sonda com o TAMANHO do acervo,
+# entao nao havia como responder "ela vai estourar quando?" — so' "ela estourou".
+# Cada execucao passa a gravar `paginas` junto de `duration_ms`. Com duas semanas
+# de serie da' para ver o custo por pagina e prever o estouro ANTES dele.
+#
+# Exit 0 = verde. Exit 1 = reprovou ou nao respondeu. Exit 2 = o runner nao rodou.
+
+set -u -o pipefail
+
+# ---- PROTECAO CRASH->2 (2026-09-16). A unit que chama este script mascara
+# exit 1 (`SuccessExitStatus=0 1`), porque 1 aqui e VEREDITO MEDIDO. Sem esta
+# protecao, um script que MORRE com 1 — violacao de `set -u`, comando ausente —
+# entrega o numero de quem mediu, a mascara o converte em `Result=success` e o
+# OnFailure nunca dispara.
+#
+# `medidor_protege_exit` (e nao a trap ERR) porque este script NAO usa `set -e`:
+# medido em 2026-09-16, a trap ERR nao dispara na violacao de `set -u`, e a trap
+# EXIT dispara. Acrescentar `set -e` aqui mudaria a semantica de falha de todo
+# comando do script, que e regressao proibida.
+#
+# Todo ponto de saida DELIBERADO com codigo 1 passa a chamar `medidor_sai 1`: e
+# assim que a trap distingue "o autor decidiu sair com 1" de "o shell morreu".
+. "$(dirname "${BASH_SOURCE[0]}")/lib/saida_de_medidor.sh"
+medidor_protege_exit
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$RAIZ" || exit 2
+
+GO_MODERN="$RAIZ/tools/go-modern"
+NICE_LEVEL="${WIKI_QUALIDADE_NICE:-19}"
+AGORA="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DIA="$(date -u +%Y-%m-%d)"
+# Ledger PROPRIO, e nao uma segunda linha em qualidade_diaria.jsonl: o leitor
+# cmd/wiki-ops/leitura.go:607 monta um `diaDeQualidade` POR LINHA e ordena por
+# checked_at, entao duas linhas do mesmo dia apareceriam como dois dias na serie.
+# Separar o arquivo custa nada e nao toca o consumidor existente.
+LEDGER="$RAIZ/data/ops/qualidade_race.jsonl"
+DIAGNOSTICO="$RAIZ/.agents/runtime/qualidade-race/$DIA"
+
+# ENVELOPE, EM TRES CAMADAS CRESCENTES, cada uma folgada sobre a de dentro.
+# A pior conclusao medida e' 1.359 s. Rodando sozinha — que e' o ponto desta
+# unit — a etapa nao disputa com o resto da varredura, entao o piso esperado e'
+# esse. Os numeros abaixo dao ~75% de folga sobre ele, o suficiente para
+# variacao de carga e para o crescimento do acervo aparecer na serie antes de
+# virar estouro.
+# ★ OS TRES TETOS SUBIRAM DE ~40min PARA ~4,5h EM 2026-09-05, PARA MEDIR.
+#
+# Os valores antigos (2400/2500/2600) foram dimensionados sobre a suposicao de que
+# a sonda cabia em 40 minutos. Ela nao cabe, e nunca coube: as duas execucoes com
+# -race estouraram em 2.401 s, e a rodada de controle SEM o detector morreu com
+# `panic: test timed out after 28m20s`. Nao existe, ate hoje, uma unica medicao
+# completa desta sonda — e sem ela todo envelope e' palpite.
+#
+# A escada tripla continua sendo o que da' nome ao defeito: o -timeout do go test
+# dispara PRIMEIRO e despeja o stack de todas as goroutines (foi assim que se
+# soube que o estouro acontecia na fase A serial, dentro de
+# checkPerformanceBudgetWithBuild, sem nenhum frame de errgroup). O supervisor vem
+# depois, e a parede e' ultimo recurso. Invertida a ordem, o processo morre sem
+# dizer onde estava, que e' o pior resultado possivel para uma sonda.
+#
+# Estes valores sao PARA DESCOBRIR O NUMERO, nao para acomodar lentidao. Assim que
+# uma rodada completar e gravar duracao_ms em data/ops/qualidade_race.jsonl, o
+# envelope se redimensiona sobre a medicao e estes tetos descem.
+TIMEOUT_GO="${WIKI_RACE_TIMEOUT_GO:-16200}"         # o -timeout do proprio go test (4,5h)
+TIMEOUT_ENV="${WIKI_RACE_TIMEOUT_ENV:-16800}"       # o supervisor do run-heavy-throttled
+TIMEOUT_PAREDE="${WIKI_RACE_TIMEOUT_PAREDE:-17400}" # a parede externa, ultimo recurso
+
+# O `-timeout` do go test e' o MENOR de proposito: quando ELE dispara, o Go
+# despeja o stack de todas as goroutines, e e' assim que se descobre qual teste
+# travou. A parede so' mata. A ordem tem de ser preservada em qualquer ajuste.
+if [ "$TIMEOUT_GO" -ge "$TIMEOUT_ENV" ] || [ "$TIMEOUT_ENV" -ge "$TIMEOUT_PAREDE" ]; then
+	echo "qualidade-race: envelope invalido: exige go($TIMEOUT_GO) < env($TIMEOUT_ENV) < parede($TIMEOUT_PAREDE)" >&2
+	echo "qualidade-race: sem essa ordem o estouro mata sem produzir o stack, e o defeito fica sem nome" >&2
+	exit 2
+fi
+
+# Tamanho do acervo NO MOMENTO DA MEDICAO. `unique_intent_id` e' a chave certa —
+# contar linhas do manifesto conta registros, nao paginas.
+paginas="$(
+	python3 - <<'PY' 2>/dev/null || echo 0
+import json, pathlib
+p = pathlib.Path("data/editorial/published_manifest.jsonl")
+vistos = set()
+if p.exists():
+    with p.open(encoding="utf-8") as fh:
+        for linha in fh:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                reg = json.loads(linha)
+            except Exception:
+                continue
+            chave = reg.get("unique_intent_id")
+            if chave:
+                vistos.add(chave)
+print(len(vistos))
+PY
+)"
+
+echo "qualidade-race: início $AGORA (nice=$NICE_LEVEL, acervo=$paginas paginas)"
+
+inicio=$(date +%s%3N)
+saida=$(timeout "$TIMEOUT_PAREDE" nice -n "$NICE_LEVEL" ionice -c3 env \
+	WIKI_CHECKS_FULL_RACE=1 \
+	WIKI_HEAVY_TIMEOUT_SECONDS="$TIMEOUT_ENV" \
+	WIKI_HEAVY_LOCK_SCOPE="qualidade-race:checks-race-real-corpus" \
+	"$RAIZ/tools/run-heavy-throttled" "$GO_MODERN" test -race -v -count=1 \
+	-timeout="${TIMEOUT_GO}s" \
+	-run '^TestRunAllRealCorpusParallelRace$' ./internal/checks/ 2>&1)
+rc=$?
+fim=$(date +%s%3N)
+ms=$((fim - inicio))
+
+# A PROVA VAI PARA O DISCO SEMPRE QUE NAO FOR VERDE — inclusive no estouro, que e'
+# quando ela mais importa: o `-timeout` do go test despeja o stack de todas as
+# goroutines, e ate 2026-09-05 esse stack morria dentro de uma variavel de shell.
+if [ "$rc" -ne 0 ]; then
+	mkdir -p "$DIAGNOSTICO" 2>/dev/null
+	{
+		printf '# etapa=checks-race-real-corpus exit=%s duracao_ms=%s paginas=%s\n' "$rc" "$ms" "$paginas"
+		printf '# envelope: go=%ss env=%ss parede=%ss\n' "$TIMEOUT_GO" "$TIMEOUT_ENV" "$TIMEOUT_PAREDE"
+		printf '# gravado em %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+		printf '%s\n' "$saida" | tail -4000
+	} >"$DIAGNOSTICO/checks-race-real-corpus.log" 2>/dev/null
+fi
+
+# CORRIDA DETECTADA e' fato diferente de gate reprovado, e a serie tem de
+# distinguir os dois: "WARNING: DATA RACE" e' o achado que esta sonda existe para
+# produzir, e ele merece nome proprio no ledger em vez de sumir dentro de
+# "vermelho" junto com qualquer outra falha do pacote.
+corrida=false
+printf '%s' "$saida" | grep -q "WARNING: DATA RACE" && corrida=true
+
+if [ "$rc" -eq 0 ]; then
+	status=verde
+elif [ "$rc" -eq 124 ]; then
+	status=timeout
+elif printf '%s' "$saida" | grep -q "panic: test timed out"; then
+	# Relogio nao e' defeito — a mesma distincao que tools/run-qualidade-diaria
+	# aprendeu em 2026-08-29 depois de tres falsos vermelhos em internal/v2ingest.
+	status=timeout
+elif [ "$corrida" = true ]; then
+	status=corrida_detectada
+else
+	status=vermelho
+fi
+
+travado=$(printf '%s' "$saida" | grep -oE "^[a-zA-Z0-9_/.]+\.Test[A-Za-z0-9_]+" | head -1)
+detalhe="$(printf '%s' "$saida" | tail -3 | tr -d '"\\' | tr '\000-\037' ' ' | cut -c1-300)"
+
+mkdir -p "$(dirname "$LEDGER")"
+printf '{"data":"%s","checked_at":"%s","status":"%s","exit_code":%s,"duration_ms":%s,"paginas":%s,"corrida_detectada":%s,"travado_em":"%s","detalhe":"%s"}\n' \
+	"$DIA" "$AGORA" "$status" "$rc" "$ms" "${paginas:-0}" "$corrida" "$travado" "$detalhe" >>"$LEDGER"
+
+printf 'qualidade-race: %-24s exit=%s %sms acervo=%s\n' "$status" "$rc" "$ms" "$paginas"
+
+if [ "$status" = "corrida_detectada" ]; then
+	echo "qualidade-race: CORRIDA DETECTADA na regiao paralela do RunAll — prova em $DIAGNOSTICO/" >&2
+	echo "qualidade-race: serie em $LEDGER" >&2
+	medidor_sai 1
+fi
+if [ "$status" = "vermelho" ]; then
+	echo "qualidade-race: VERMELHO${travado:+ (travado em $travado)} — saida completa em $DIAGNOSTICO/" >&2
+	echo "qualidade-race: serie em $LEDGER" >&2
+	medidor_sai 1
+fi
+if [ "$status" = "timeout" ]; then
+	# Nao afirma "verde": nao mediu nada. Mesma regra do runner diario.
+	#
+	# ★ 1 -> 75 EM 2026-09-16, e a linha acima e o motivo. O comentario dizia
+	# "nao mediu nada" e o codigo entregava 1, que NESTE repositorio significa
+	# "MEDI e reprovou". Os dois estados sairam do mesmo numero, e a unit
+	# (ops/systemd/wikijuridica-qualidade-race.service) mascarava esse numero:
+	# um timeout cronico era indistinguivel de uma corrida detectada, e
+	# indistinguivel tambem de tudo ter corrido bem.
+	#
+	# 75 = EX_TEMPFAIL do sysexits.h ("falha temporaria, tente de novo"), que e
+	# exatamente o que um estouro de relogio e. E o mesmo codigo que
+	# wikijuridica-moderacao-transparencia.service ja usa, entao a convencao nao
+	# nasce aqui: ela so passa a valer tambem para esta unit.
+	echo "qualidade-race: NAO MEDIDO (estourou o relogio em ${ms}ms)${travado:+; travado em $travado}" >&2
+	echo "qualidade-race: envelope atual go=${TIMEOUT_GO}s env=${TIMEOUT_ENV}s parede=${TIMEOUT_PAREDE}s" >&2
+	echo "qualidade-race: se isto virar rotina, olhe a coluna paginas do $LEDGER antes de mexer no envelope" >&2
+	echo "qualidade-race: exit 75 (nao medido), e NAO 1 — 1 aqui afirmaria um veredito que esta corrida nao produziu" >&2
+	exit 75
+fi
+echo "qualidade-race: verde (nenhuma corrida na regiao paralela do RunAll)"
+exit 0

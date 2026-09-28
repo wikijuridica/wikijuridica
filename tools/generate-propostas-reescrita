@@ -1,0 +1,796 @@
+#!/usr/bin/env python3
+"""tools/generate-propostas-reescrita — fila de propostas de reescrita com evidencia.
+
+Por que existe: DEC-058 (CLAUDE.md, secao 12) manda a IA local produzir "a
+primeira fila de reescrita com 100 propostas justificadas" (P2 do mandato
+AI-first/B2A). A IA local NUNCA publica: este gerador so ESCREVE
+data/ai/propostas_reescrita.jsonl, que e PROPOSTA com evidencia numerica e
+patch sugerido. Quem aplica e o gerador datado com CAS da cadeia editorial
+(CLAUDE.md secao 5); e proibida edicao manual de JSONL editorial a partir
+desta proposta.
+
+O que e EVIDENCIA (o unico material aceito nesta fila):
+  - contagem de requisicoes por classe de agente na janela de dias, lida de
+    data/ops/eventos/eventos-AAAA-MM-DD.jsonl (schema evento_unificado_v1,
+    campos "agentes_de_ia"/"humano_estimado"/"requisicoes" por (dia, path));
+  - severidade e motivo medio, lidos de
+    data/editorial/v2_publication_severity.jsonl;
+  - aresta citada em data/ai/grafo.sqlite: pagina --cita--> dispositivo
+    --pertence_a--> norma, e acordao --cita--> norma (mesma norma, ementa
+    presente no acordao).
+Toda proposta carrega pelo menos um numero medido em `evidencia`; o gerador
+recusa (AssertionError) qualquer candidato cuja evidencia nao tenha nenhum
+campo numerico -- ver `exige_numero_medido()`.
+
+O que e PALPITE, e por isso NUNCA aparece aqui: texto pronto, promessa de
+resultado, ou qualquer redacao final. `patch_sugerido` descreve O QUE fazer e
+A FONTE a conferir; quem escreve e revisa e o pipeline editorial/juridico de
+CLAUDE.md secoes 5 e 8.
+
+Uso:
+    tools/generate-propostas-reescrita --dias 7 --limite 100 --timings
+    tools/generate-propostas-reescrita --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import hashlib
+import math
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import unicodedata
+
+SCHEMA = "proposta_reescrita_v1"
+
+# Pesos por motivo, documentados: o mandato B2A (CLAUDE.md secao 12) prioriza
+# o descompasso de demanda de agente e o precedente disponivel-e-nao-citado
+# (risco de qualidade juridica, ver secao 5 "citacao legal mal atribuida e P1
+# permanente") acima do debito editorial generico (fonte insuficiente, corpo
+# curto), que ja tem fila propria de severidade (secao 5).
+PESO_MOTIVO = {
+    "agentes_leem_humanos_nao": 1.00,
+    "precedente_disponivel_nao_citado": 0.85,
+    "fonte_insuficiente": 0.65,
+    "corpo_curto": 0.60,
+    "humanos_leem_agentes_nao": 0.55,
+}
+
+MIN_REQUISICOES_AGENTE = 3
+MIN_REQUISICOES_HUMANO = 5
+LIMIAR_PCT_AGENTE = 0.6
+LIMIAR_PCT_HUMANO = 0.9
+LIMIAR_WORD_COUNT_CURTO = 400
+
+MOTIVOS_FONTE_INSUFICIENTE = frozenset({"fonte_insuficiente", "sem_fonte_oficial"})
+
+APLICAR_POR = "gerador datado com CAS; nunca edição manual"
+PUBLICACAO = "passa pela cadeia do §5; --ressemear só se mudar markup"
+
+
+def raiz_padrao():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def exige_numero_medido(evidencia):
+    """Recusa evidencia sem nenhum numero medido -- regra literal do mandato:
+    'nenhuma proposta sem pelo menos um numero medido'."""
+    for valor in evidencia.values():
+        if isinstance(valor, bool):
+            continue
+        if isinstance(valor, (int, float)):
+            return
+    raise AssertionError("evidencia sem numero medido: %r" % (evidencia,))
+
+
+# --------------------------------------------------------------------------
+# Fontes
+# --------------------------------------------------------------------------
+
+def carrega_manifest(root):
+    """unique_intent_id -> {path, title}."""
+    caminho = os.path.join(root, "data", "editorial", "published_manifest.jsonl")
+    out = {}
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            intent_id = d.get("unique_intent_id")
+            if not intent_id or d.get("page_status") != "published":
+                continue
+            out[intent_id] = {"path": d.get("path"), "title": d.get("title")}
+    return out
+
+
+def carrega_severidade(root):
+    """intent_id -> registro (so os campos usados como evidencia)."""
+    caminho = os.path.join(root, "data", "editorial", "v2_publication_severity.jsonl")
+    out = {}
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            intent_id = d.get("intent_id")
+            if not intent_id:
+                continue
+            out[intent_id] = {
+                "severity": d.get("severity"),
+                "medium_reasons": d.get("medium_reasons") or [],
+                "word_count": d.get("word_count"),
+                "sections": d.get("sections"),
+                "official_sources": d.get("official_sources"),
+                "area": d.get("area"),
+            }
+    return out
+
+
+def caminho_pagina_logico(path_bruto):
+    """Dobra a gemea Markdown explicita (".../index.md") no path base --
+    demanda de agente pela gemea e demanda pela MESMA pagina logica
+    (CLAUDE.md secao 7: "mesma pagina, quatro canais")."""
+    if path_bruto.endswith("index.md"):
+        return path_bruto[: -len("index.md")]
+    return path_bruto
+
+
+def carrega_eventos(root, dias_pedidos, hoje=None):
+    """path logico -> {requisicoes, agentes_de_ia, humano_estimado,
+    pct_markdown_soma, dias_com_dado}; e a lista de dias efetivamente lidos.
+
+    `hoje` e injetavel (default: data real em UTC) so para o teste poder
+    fixar a janela sem depender do relogio da maquina."""
+    if hoje is None:
+        hoje = datetime.datetime.now(datetime.timezone.utc).date()
+    dias_alvo = [
+        (hoje - datetime.timedelta(days=i)).isoformat()
+        for i in range(max(1, dias_pedidos))
+    ]
+    dias_lidos = []
+    agregados = {}
+    for dia in dias_alvo:
+        caminho = os.path.join(root, "data", "ops", "eventos", "eventos-%s.jsonl" % dia)
+        if not os.path.isfile(caminho):
+            continue
+        dias_lidos.append(dia)
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                d = json.loads(linha)
+                path_bruto = d.get("path")
+                if not path_bruto or path_bruto == "_dia":
+                    continue
+                if d.get("route_class") not in ("page", "markdown"):
+                    continue
+                path = caminho_pagina_logico(path_bruto)
+                req = int(d.get("requisicoes") or 0)
+                acc = agregados.setdefault(path, {
+                    "requisicoes": 0, "agentes_de_ia": 0, "humano_estimado": 0,
+                    "pct_markdown_soma": 0.0, "dias_com_dado": 0,
+                })
+                acc["requisicoes"] += req
+                acc["agentes_de_ia"] += int(d.get("agentes_de_ia") or 0)
+                acc["humano_estimado"] += int(d.get("humano_estimado") or 0)
+                acc["pct_markdown_soma"] += float(d.get("pct_markdown_da_pagina") or 0.0) * req
+                acc["dias_com_dado"] += 1
+    return agregados, dias_lidos
+
+
+def carrega_paginas(root):
+    """path -> registro completo de content/pages.json (uma unica leitura)."""
+    caminho = os.path.join(root, "content", "pages.json")
+    with open(caminho, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    return {item["path"]: item for item in dados if item.get("path")}
+
+
+def texto_completo_da_pagina(registro):
+    partes = [
+        registro.get("title") or "",
+        registro.get("meta_description") or "",
+        registro.get("heading") or "",
+        registro.get("summary") or "",
+    ]
+    for secao in registro.get("body_sections") or []:
+        partes.append(secao.get("title") or "")
+        partes.append(secao.get("body") or "")
+    for item in registro.get("faq") or []:
+        partes.append(item.get("question") or "")
+        partes.append(item.get("answer") or "")
+    return " ".join(partes)
+
+
+_RE_PARENTESE_FINAL = re.compile(r"^(?P<classe_numero>.+?)\s*\([^)]*\)\s*$")
+_RE_NUMERO_FINAL = re.compile(r"(\d[\d.]*\d|\d)\s*$")
+
+
+def extrai_processo(rotulo):
+    """De 'AgInt no REsp 1953626 (STJ, PRIMEIRA TURMA, 2021-12-13)' devolve
+    ('AgInt no REsp 1953626', '1953626'). Sem numero extraivel, devolve
+    numero vazio -- o chamador entao NAO pode afirmar que a pagina ja cita
+    o acordao, e pula o candidato (corretude > recall)."""
+    m = _RE_PARENTESE_FINAL.match(rotulo or "")
+    classe_numero = m.group("classe_numero").strip() if m else (rotulo or "").strip()
+    m2 = _RE_NUMERO_FINAL.search(classe_numero)
+    numero_digits = re.sub(r"\D", "", m2.group(0)) if m2 else ""
+    return classe_numero, numero_digits
+
+
+def carrega_grafo(root, caminho_db=None):
+    """pagina_normas: path -> lista ordenada de norma_chave citadas via
+    dispositivo. norma_acordaos: norma_chave -> lista ordenada de acordaos
+    (com ementa) que citam essa norma inteira OU um dispositivo dela (o campo
+    `dispositivos` guarda quais). pagina_dispositivos: path -> set de
+    dispositivos citados, para a evidencia `dispositivos_em_comum`.
+    dispositivo_acordaos: dispositivo_chave -> lista ordenada de acordaos que
+    citam AQUELE ARTIGO -- e o indice que `candidato_precedente` percorre.
+
+    POR QUE O INDICE POR DISPOSITIVO EXISTE (2026-09-16). `norma_acordaos` e
+    um indice por NORMA INTEIRA, e norma inteira nao e laco: o CPC sozinho
+    puxa dezenas de milhares de acordaos, e percorre-los por pagina fazia o
+    cosseno TF-IDF rodar ~10^8 vezes. O gerador simplesmente NAO TERMINAVA
+    sobre o corpus atual -- o lote de 2026-09-08 e o unico que existe, e ele
+    foi tirado de um grafo menor. O indice por artigo e o mesmo dado visto
+    pela chave certa.
+    """
+    caminho = caminho_db or os.path.join(root, "data", "ai", "grafo.sqlite")
+    conn = sqlite3.connect("file:%s?mode=ro" % caminho, uri=True)
+    try:
+        pagina_normas = {}
+        pagina_dispositivos = {}
+        for pagina_chave, norma_chave, disp_chave in conn.execute(
+            """
+            SELECT np.chave, nn.chave, nd.chave
+            FROM arestas a
+            JOIN nos np ON np.id = a.origem AND np.tipo = 'pagina'
+            JOIN nos nd ON nd.id = a.destino AND nd.tipo = 'dispositivo'
+            JOIN arestas b ON b.origem = nd.id AND b.tipo = 'pertence_a'
+            JOIN nos nn ON nn.id = b.destino AND nn.tipo = 'norma'
+            WHERE a.tipo = 'cita'
+            """
+        ):
+            pagina_normas.setdefault(pagina_chave, set()).add(norma_chave)
+            pagina_dispositivos.setdefault(pagina_chave, set()).add(disp_chave)
+        pagina_normas = {p: sorted(s) for p, s in pagina_normas.items()}
+
+        norma_acordaos = {}
+        # DUAS rotas ate a norma, de proposito. So a primeira (acordao -> norma
+        # inteira) deixava 296 de 9.199 acordaos no pool -- as 7.089 arestas
+        # acordao -> dispositivo (artigo) nunca viravam candidato, enquanto a
+        # pagina sobe por dispositivo -> pertence_a -> norma. A segunda rota
+        # traz o laco FORTE (mesmo artigo) e o guarda em `dispositivo`.
+        # Refutacao de 2026-09-08.
+        vistos = set()
+        for acordao_chave, acordao_rotulo, atributos_json, norma_chave, dispositivo in conn.execute(
+            """
+            SELECT na.chave, na.rotulo, na.atributos, nn.chave, ''
+            FROM arestas a
+            JOIN nos na ON na.id = a.origem AND na.tipo = 'acordao'
+            JOIN nos nn ON nn.id = a.destino AND nn.tipo = 'norma'
+            WHERE a.tipo = 'cita'
+            UNION ALL
+            SELECT na.chave, na.rotulo, na.atributos, nn.chave, nd.chave
+            FROM arestas a
+            JOIN nos na ON na.id = a.origem AND na.tipo = 'acordao'
+            JOIN nos nd ON nd.id = a.destino AND nd.tipo = 'dispositivo'
+            JOIN arestas b ON b.origem = nd.id AND b.tipo = 'pertence_a'
+            JOIN nos nn ON nn.id = b.destino AND nn.tipo = 'norma'
+            WHERE a.tipo = 'cita'
+            """
+        ):
+            if (acordao_chave, norma_chave) in vistos:
+                if dispositivo:
+                    for r in norma_acordaos.get(norma_chave, ()):
+                        if r["acordao_chave"] == acordao_chave:
+                            r["dispositivos"].add(dispositivo)
+                continue
+            vistos.add((acordao_chave, norma_chave))
+            atributos = json.loads(atributos_json) if atributos_json else {}
+            ementa = (atributos.get("ementa") or "").strip()
+            if not ementa:
+                continue
+            classe_numero, numero_digits = extrai_processo(acordao_rotulo)
+            if not numero_digits:
+                continue
+            norma_acordaos.setdefault(norma_chave, []).append({
+                "norma_chave": norma_chave,
+                "acordao_chave": acordao_chave,
+                "acordao_rotulo": acordao_rotulo,
+                "classe": atributos.get("classe"),
+                "numero_registro": atributos.get("numero_registro"),
+                "relator": atributos.get("relator"),
+                "ementa": ementa,
+                "fonte_url": atributos.get("fonte_url"),
+                "sha256_conteudo": atributos.get("sha256_conteudo"),
+                "classe_numero": classe_numero,
+                "numero_digits": numero_digits,
+                "dispositivos": {dispositivo} if dispositivo else set(),
+            })
+        for norma_chave in norma_acordaos:
+            norma_acordaos[norma_chave].sort(key=lambda r: r["acordao_chave"])
+        dispositivo_acordaos = {}
+        for acordaos in norma_acordaos.values():
+            for ac in acordaos:
+                for disp in ac["dispositivos"]:
+                    dispositivo_acordaos.setdefault(disp, []).append(ac)
+        for disp in dispositivo_acordaos:
+            dispositivo_acordaos[disp].sort(key=lambda r: r["acordao_chave"])
+        return pagina_normas, norma_acordaos, pagina_dispositivos, dispositivo_acordaos
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Motivos
+# --------------------------------------------------------------------------
+
+def candidato_demanda_de_agente(evento, dias_lidos):
+    if not evento or evento["requisicoes"] <= 0:
+        return None
+    req = evento["requisicoes"]
+    ag = evento["agentes_de_ia"]
+    hu = evento["humano_estimado"]
+    pct_ag = ag / req
+    pct_hu = hu / req
+    pct_md = evento["pct_markdown_soma"] / req if req else 0.0
+    if ag >= MIN_REQUISICOES_AGENTE and pct_ag >= LIMIAR_PCT_AGENTE:
+        evidencia = {
+            "janela_dias_lidos": len(dias_lidos), "dias_com_dado": evento["dias_com_dado"],
+            "requisicoes": req, "agentes_de_ia": ag, "humano_estimado": hu,
+            "pct_agentes_de_ia": round(pct_ag, 4), "pct_markdown_da_pagina_medio": round(pct_md, 4),
+        }
+        patch = (
+            "Agentes de IA fizeram %d de %d requisicoes (%.0f%%) nos ultimos %d dia(s); "
+            "humanos, %d. Adicionar contexto mais denso na gemea Markdown (secao "
+            "'Percursos por fundamento legal' e FAQ) sem exceder o teto de 50 KB do HTML "
+            "humano (CLAUDE.md secao 6 e 7)." % (ag, req, pct_ag * 100, len(dias_lidos), hu)
+        )
+        return "agentes_leem_humanos_nao", evidencia, patch
+    if hu >= MIN_REQUISICOES_HUMANO and pct_hu >= LIMIAR_PCT_HUMANO:
+        evidencia = {
+            "janela_dias_lidos": len(dias_lidos), "dias_com_dado": evento["dias_com_dado"],
+            "requisicoes": req, "agentes_de_ia": ag, "humano_estimado": hu,
+            "pct_humano": round(pct_hu, 4), "pct_markdown_da_pagina_medio": round(pct_md, 4),
+        }
+        patch = (
+            "Humanos fizeram %d de %d requisicoes (%.0f%%) nos ultimos %d dia(s); agentes de "
+            "IA, %d. Reforcar estrutura para IA (FAQ com H3 correspondente e secao de "
+            "percursos por fundamento legal na gemea Markdown) sem reduzir o conteudo "
+            "humano." % (hu, req, pct_hu * 100, len(dias_lidos), ag)
+        )
+        return "humanos_leem_agentes_nao", evidencia, patch
+    return None
+
+
+def candidato_corpo_curto(sev):
+    if not sev or sev.get("severity") != "medio":
+        return None
+    wc = sev.get("word_count")
+    if not isinstance(wc, int) or wc >= LIMIAR_WORD_COUNT_CURTO:
+        return None
+    evidencia = {
+        "word_count": wc, "limiar_word_count": LIMIAR_WORD_COUNT_CURTO,
+        "sections": sev.get("sections"), "official_sources": sev.get("official_sources"),
+    }
+    patch = (
+        "Corpo publicado tem %d palavras (abaixo do piso de %d da severidade media), em %s "
+        "secao(oes) com %s fonte(s) oficial(is) ja citada(s). Expandir com contexto autoral "
+        "e fundamentacao adicional apoiada nas mesmas fontes, sem thin content nem "
+        "permutacao de palavra-chave (CLAUDE.md secao 8)."
+        % (wc, LIMIAR_WORD_COUNT_CURTO, sev.get("sections"), sev.get("official_sources"))
+    )
+    return "corpo_curto", evidencia, patch
+
+
+def candidato_fonte_insuficiente(sev):
+    if not sev or sev.get("severity") != "medio":
+        return None
+    motivos_base = {r.split(":")[0] for r in sev.get("medium_reasons") or []}
+    achados = sorted(motivos_base & MOTIVOS_FONTE_INSUFICIENTE)
+    if not achados:
+        return None
+    evidencia = {
+        "medium_reasons": achados, "official_sources": sev.get("official_sources"),
+    }
+    patch = (
+        "Severidade media aponta %s com %s fonte(s) oficial(is) hoje. Pesquisar e "
+        "acrescentar fonte oficial especifica (URL, data de consulta e hash) alem das ja "
+        "citadas, mantendo a separacao entre texto oficial citado e comentario autoral "
+        "(CLAUDE.md secao 8, DEC-032)." % (", ".join(achados), sev.get("official_sources"))
+    )
+    return "fonte_insuficiente", evidencia, patch
+
+
+# --------------------------------------------------------------------------
+# Similaridade lexical ementa x pagina (TF-IDF, stdlib)
+# --------------------------------------------------------------------------
+#
+# POR QUE EXISTE (medido em 2026-09-08 sobre a primeira fila de 100): todas as
+# propostas de precedente nasciam de par (pagina, acordao) que cita a MESMA
+# NORMA — CDC (39), Codigo Civil (35), CF/88 (6) — e a norma inteira e um laco
+# fraco: 43 acordaos "disponiveis" para a CF/88 e o gerador escolhia o primeiro
+# por chave. Um precedente sugerido por norma-inteira e citacao mal atribuida em
+# potencial, o P1 permanente do CLAUDE.md §5. A similaridade abaixo ordena os
+# candidatos pelo texto (ementa x corpo da pagina) e descarta o que fica abaixo
+# do minimo; o numero vai na evidencia, para quem revisa.
+#
+# ponytail: TF-IDF com cosseno em stdlib, sem lematizacao; o indice semantico
+# (data/ai/embeddings, qwen3-embedding) substitui isto quando estiver completo —
+# a interface (cosseno por id) fica a mesma.
+
+_PALAVRAS_VAZIAS = frozenset(
+    unicodedata.normalize("NFKD", w).encode("ascii", "ignore").decode() for w in """
+    a o e de da do das dos em no na nos nas um uma uns umas por para com sem sob sobre ao aos as os que se sua seu suas
+    seus como mais menos muito ja nao ser foi sao era este esta isto esse essa isso aquele aquela ele ela eles elas lhe
+    lhes seja sendo entre ate apos quando onde qual quais cada tambem todo toda todos todas outro outra outros outras
+    mesmo mesma pode podem deve devem ter tem havia ha art arts artigo artigos inciso paragrafo lei leis num numero
+    recurso recursos especial agravo interno regimental embargos declaracao provido improvido desprovido conhecido
+    parcialmente provimento negado dado turma primeira segunda terceira quarta secao stj stf tribunal ministro ministra
+    relator relatora julgado julgada acordao ementa dje publicado data juizo origem instancia decisao sentenca
+    jurisprudencia entendimento sentido firmou orientacao corte superior justica caso hipotese autos processo
+    processual nesta neste desta deste pela pelo pelas pelos sim nos vos
+    habeas corpus writ impetrado impetrante impetracao liminar ordem concedida concedido denegada denegado
+    mandado seguranca paciente agravante agravado agravada recorrente recorrido recorrida embargante embargado
+    autor autora reu apelante apelado apelacao
+    """.split()
+)
+
+
+def _tokens(texto):
+    """Minusculas, sem acento, palavras de 3+ letras fora da lista vazia e
+    numeros de 3+ digitos (sem ponto de milhar: "1.694" -> "n1694") -- o numero
+    do artigo e o portador do tema em texto juridico, e a versao anterior o
+    descartava (refutacao de 2026-09-08)."""
+    folded = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode().lower()
+    folded = re.sub(r"(\d)\.(\d{3})", r"\1\2", folded)
+    saida = []
+    for t in re.findall(r"[a-z]{3,}|\d{3,}", folded):
+        if t.isdigit():
+            saida.append("n" + t)
+        elif t not in _PALAVRAS_VAZIAS:
+            saida.append(t)
+    return saida
+
+
+class SimilaridadeTFIDF:
+    """Vetores TF-IDF (tf logaritmico, idf suavizado, norma L2) sobre os
+    documentos adicionados; cosseno entre dois ids. IDF fecha na primeira
+    consulta — adicionar depois e erro de uso."""
+
+    def __init__(self):
+        self._contagens = {}
+        self._df = collections.Counter()
+        self._vetores = {}
+        self.descartados_por_similaridade = 0
+
+    def adiciona(self, doc_id, texto):
+        if doc_id in self._contagens:
+            return
+        if self._vetores:
+            raise RuntimeError("SimilaridadeTFIDF: idf ja fechado; adicione todos os documentos antes de consultar")
+        toks = collections.Counter(_tokens(texto))
+        self._contagens[doc_id] = toks
+        for t in toks:
+            self._df[t] += 1
+
+    def _vetor(self, doc_id):
+        v = self._vetores.get(doc_id)
+        if v is not None:
+            return v
+        toks = self._contagens.get(doc_id)
+        if not toks:
+            self._vetores[doc_id] = {}
+            return {}
+        n = len(self._contagens)
+        v = {t: (1.0 + math.log(c)) * (math.log((n + 1.0) / (self._df[t] + 1.0)) + 1.0) for t, c in toks.items()}
+        norma = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        v = {t: x / norma for t, x in v.items()}
+        self._vetores[doc_id] = v
+        return v
+
+    def cosseno(self, a, b):
+        va, vb = self._vetor(a), self._vetor(b)
+        if len(va) > len(vb):
+            va, vb = vb, va
+        return round(sum(x * vb.get(t, 0.0) for t, x in va.items()), 4)
+
+
+def monta_similaridade(paginas, pagina_normas, norma_acordaos):
+    """IDF sobre as paginas com norma citada + todas as ementas candidatas."""
+    sim = SimilaridadeTFIDF()
+    for path in pagina_normas:
+        registro = paginas.get(path)
+        if registro:
+            sim.adiciona("p:" + path, texto_completo_da_pagina(registro))
+    for acordaos in norma_acordaos.values():
+        for ac in acordaos:
+            sim.adiciona("a:" + ac["acordao_chave"], ac.get("ementa") or "")
+    return sim
+
+
+# MEDIDO em 2026-09-08 (dry-run, 3 dias, 100 propostas de precedente sem minimo):
+# a MELHOR similaridade de cada pagina com seus candidatos deu min 0,000, p25
+# 0,004, mediana 0,020, p75 0,034, max 0,084 — isto e, a fila inteira de
+# precedentes era par sem vocabulario em comum alem da norma. Com 0,15 sobram 10
+# (0,150–0,186), todas em paginas de jurisprudencia/glossario tributario, que e o
+# que a Primeira Turma julga. O piso e deliberadamente alto: precedente errado
+# custa mais que precedente ausente. O 0,15 e ESCOLHA sobre essa distribuicao
+# medida, nao um numero medido: acima dele so ficou par com vocabulario proprio
+# em comum; mexer aqui exige nova distribuicao.
+SIMILARIDADE_MINIMA_PADRAO = 0.15
+
+# O LACO E O DISPOSITIVO, NUNCA A NORMA INTEIRA (2026-09-16).
+#
+# Ate esta data o candidato vinha de `norma_acordaos`: todo acordao que citasse
+# a mesma NORMA que a pagina cita. Dois defeitos num so indice.
+#
+# (1) DESEMPENHO, e e por isso que o gerador nao terminava. O CPC sozinho reune
+#     dezenas de milhares de acordaos; percorrer isso por pagina punha o cosseno
+#     TF-IDF na casa de 10^8 chamadas. O lote de 2026-09-08 (100 propostas) e o
+#     unico que existe porque o corpus era menor -- nao porque alguem decidiu
+#     parar.
+# (2) ATRIBUICAO, que e o defeito caro. "A pagina cita o Codigo Civil e este
+#     acordao tambem" nao e precedente: e coincidencia de diploma. O piso de
+#     0,20 que este arquivo aplicava aos pares so-norma era remendo sobre o
+#     indice errado, e ainda assim 37 das 100 propostas do lote de 2026-09-08
+#     nasceram sem UM artigo em comum (medido no proprio JSONL). Precedente mal
+#     atribuido e o P1 permanente do CLAUDE.md secao 5.
+#
+# O que ISSO NAO E: poda por area. Toda area do Direito continua elegivel --
+# o filtro e sobre o LACO entre pagina e acordao, nao sobre a materia.
+
+
+def candidato_precedente(path, registro_pagina, dispositivo_acordaos, cache_texto, similaridade=None, similaridade_minima=0.0, pagina_dispositivos=None):
+    disp_pagina = set((pagina_dispositivos or {}).get(path, set()))
+    if not disp_pagina:
+        return None
+    if path not in cache_texto:
+        texto = texto_completo_da_pagina(registro_pagina)
+        cache_texto[path] = (texto.lower(), re.sub(r"\D", "", texto))
+    texto_lower, texto_digits = cache_texto[path]
+    # Um acordao por chave: o mesmo acordao citando duas normas da pagina
+    # entrava duas vezes e inflava candidatos_avaliados (e fazia a "segunda
+    # similaridade" ser ele mesmo — achado do revisor em 2026-09-08).
+    por_acordao = {}
+    for disp_chave in sorted(disp_pagina):
+        for ac in dispositivo_acordaos.get(disp_chave) or []:
+            if ac["numero_digits"] in texto_digits or ac["classe_numero"].lower() in texto_lower:
+                continue
+            chave = ac["acordao_chave"]
+            if chave not in por_acordao:
+                score = similaridade.cosseno("p:" + path, "a:" + chave) if similaridade else 0.0
+                por_acordao[chave] = [score, chave, set(), ac]
+            por_acordao[chave][2].add(ac["norma_chave"])
+    if not por_acordao:
+        return None
+    # Piso unico (amostra por faixa de 2026-09-08, data/ops/precedentes_amostra_por_faixa_daily.jsonl):
+    # com dispositivo em comum, todo par >= 0,15 da amostra era do mesmo tema.
+    # O piso de 0,20 que existia para o par so-norma morreu junto com a rota
+    # so-norma: aqui, por construcao, todo candidato compartilha um artigo.
+    candidatos = sorted(por_acordao.values(), key=lambda c: (-c[0], c[1]))
+    # minimo 0 = so ranquear, sem piso nenhum (uso de biblioteca e teste); a CLI
+    # sempre passa um minimo > 0.
+    if similaridade is not None and similaridade_minima > 0:
+        aptos = [c for c in candidatos if c[0] >= similaridade_minima]
+        if not aptos:
+            similaridade.descartados_por_similaridade += 1
+            return None
+        candidatos = aptos + [c for c in candidatos if c[0] < similaridade_minima]
+    score, _, normas_em_comum, ac = candidatos[0]
+    normas_em_comum = sorted(normas_em_comum)
+    norma_chave = normas_em_comum[0]
+    evidencia = {
+        "norma_citada_pela_pagina": norma_chave,
+        "acordaos_disponiveis_por_dispositivo": sum(
+            len(dispositivo_acordaos.get(d) or []) for d in sorted(disp_pagina)),
+        "acordao_chave": ac["acordao_chave"],
+        "acordao_rotulo": ac["acordao_rotulo"],
+        "acordao_relator": ac["relator"],
+        "fonte_url": ac["fonte_url"],
+        "sha256_conteudo": ac["sha256_conteudo"],
+        "numero_processo_extraido": ac["numero_digits"],
+        "normas_em_comum": normas_em_comum,
+        "dispositivos_em_comum": sorted((ac.get("dispositivos") or set()) & disp_pagina),
+        "similaridade_tfidf": score,
+        "candidatos_avaliados": len(candidatos),
+        "segunda_similaridade": candidatos[1][0] if len(candidatos) > 1 else 0.0,
+    }
+    patch = (
+        "Pagina cita %s mas nao menciona o acordao %s, disponivel no grafo "
+        "(data/ai/grafo.sqlite) com ementa e ja associado a essa norma. Conferir a "
+        "fonte oficial (%s, sha256 %s...) e, se pertinente, citar o acordao como "
+        "precedente identificado, em bloco proprio separado do comentario autoral "
+        "(CLAUDE.md secao 8, DEC-032)."
+        % (norma_chave, ac["acordao_rotulo"], ac["fonte_url"],
+           (ac["sha256_conteudo"] or "")[:12])
+    )
+    patch += (" Similaridade TF-IDF ementa x pagina: %.3f (melhor de %d candidato(s); segunda: %.3f); "
+              "abaixo de %.2f o gerador nem propoe." % (score, len(candidatos), evidencia["segunda_similaridade"], similaridade_minima))
+    return "precedente_disponivel_nao_citado", evidencia, patch
+
+
+
+# --------------------------------------------------------------------------
+# Orquestracao
+# --------------------------------------------------------------------------
+
+def gera_propostas(root, dias_pedidos, limite, grafo_db=None, timings=False, hoje=None, similaridade_minima=0.0):
+    t0 = time.monotonic()
+    manifest = carrega_manifest(root)
+    if timings:
+        print("propostas-reescrita: manifest lido em %.3fs (%d paginas)"
+              % (time.monotonic() - t0, len(manifest)), file=sys.stderr)
+
+    t1 = time.monotonic()
+    severidade = carrega_severidade(root)
+    if timings:
+        print("propostas-reescrita: severidade lida em %.3fs (%d registros)"
+              % (time.monotonic() - t1, len(severidade)), file=sys.stderr)
+
+    t2 = time.monotonic()
+    eventos, dias_lidos = carrega_eventos(root, dias_pedidos, hoje=hoje)
+    if timings:
+        print("propostas-reescrita: eventos lidos em %.3fs (%d paginas com trafego, dias=%s)"
+              % (time.monotonic() - t2, len(eventos), dias_lidos), file=sys.stderr)
+
+    t3 = time.monotonic()
+    paginas = carrega_paginas(root)
+    if timings:
+        print("propostas-reescrita: pages.json lido em %.3fs (%d paginas)"
+              % (time.monotonic() - t3, len(paginas)), file=sys.stderr)
+
+    t4 = time.monotonic()
+    pagina_normas, norma_acordaos, pagina_dispositivos, dispositivo_acordaos = carrega_grafo(root, grafo_db)
+    if timings:
+        pares = sum(len(dispositivo_acordaos.get(d) or set())
+                    for disps in pagina_dispositivos.values() for d in disps)
+        print("propostas-reescrita: grafo lido em %.3fs (%d paginas com norma citada, %d normas com acordao, "
+              "%d dispositivos com acordao, %d pagina(s) com dispositivo citado, %d par(es) a avaliar)"
+              % (time.monotonic() - t4, len(pagina_normas), len(norma_acordaos), len(dispositivo_acordaos),
+                 len(pagina_dispositivos), pares), file=sys.stderr)
+
+    max_agentes_de_ia = max([e["agentes_de_ia"] for e in eventos.values()] or [0]) or 1
+
+    brutos = []  # (path, intent_id, title, motivo, evidencia, patch, demanda_agentes)
+    cache_texto = {}
+    similaridade = monta_similaridade(paginas, pagina_normas, norma_acordaos)
+    for intent_id in sorted(manifest):
+        info = manifest[intent_id]
+        path = info["path"]
+        if not path:
+            continue
+        sev = severidade.get(intent_id)
+        evento = eventos.get(path)
+        demanda_agentes = evento["agentes_de_ia"] if evento else 0
+
+        c = candidato_demanda_de_agente(evento, dias_lidos)
+        if c:
+            motivo, evidencia, patch = c
+            exige_numero_medido(evidencia)
+            brutos.append((path, intent_id, info["title"], motivo, evidencia, patch, demanda_agentes))
+
+        c = candidato_corpo_curto(sev)
+        if c:
+            motivo, evidencia, patch = c
+            exige_numero_medido(evidencia)
+            brutos.append((path, intent_id, info["title"], motivo, evidencia, patch, demanda_agentes))
+
+        c = candidato_fonte_insuficiente(sev)
+        if c:
+            motivo, evidencia, patch = c
+            exige_numero_medido(evidencia)
+            brutos.append((path, intent_id, info["title"], motivo, evidencia, patch, demanda_agentes))
+
+        registro_pagina = paginas.get(path)
+        if registro_pagina:
+            c = candidato_precedente(path, registro_pagina, dispositivo_acordaos, cache_texto, similaridade, similaridade_minima, pagina_dispositivos)
+            if c:
+                motivo, evidencia, patch = c
+                exige_numero_medido(evidencia)
+                brutos.append((path, intent_id, info["title"], motivo, evidencia, patch, demanda_agentes))
+
+    agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    propostas = []
+    for path, intent_id, title, motivo, evidencia, patch, demanda_agentes in brutos:
+        demanda_norm = min(1.0, demanda_agentes / max_agentes_de_ia)
+        prioridade = round(min(1.0, PESO_MOTIVO[motivo] * (0.6 + 0.4 * demanda_norm)), 4)
+        proposta_id = hashlib.sha256(("%s|%s" % (path, motivo)).encode("utf-8")).hexdigest()[:16]
+        propostas.append({
+            "schema_version": SCHEMA,
+            "id": proposta_id,
+            "path": path,
+            "intent_id": intent_id,
+            "title": title,
+            "motivo": motivo,
+            "evidencia": evidencia,
+            "prioridade": prioridade,
+            "patch_sugerido": patch,
+            "aplicar_por": APLICAR_POR,
+            "publicacao": PUBLICACAO,
+            "gerado_em": agora,
+        })
+
+    propostas.sort(key=lambda p: (-p["prioridade"], p["path"], p["motivo"]))
+    selecionadas = propostas[:limite]
+
+    contagem_motivo = {}
+    for p in propostas:
+        contagem_motivo[p["motivo"]] = contagem_motivo.get(p["motivo"], 0) + 1
+
+    print("propostas-reescrita: precedentes descartados por similaridade < %.2f: %d (propostos: %d)"
+          % (similaridade_minima, similaridade.descartados_por_similaridade,
+             sum(1 for b in brutos if b[3] == "precedente_disponivel_nao_citado")), file=sys.stderr)
+    return selecionadas, contagem_motivo, len(propostas)
+
+
+def escreve_atomico(caminho, conteudo_bytes):
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    temporario = caminho + ".tmp"
+    with open(temporario, "wb") as handle:
+        handle.write(conteudo_bytes)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporario, caminho)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=raiz_padrao())
+    ap.add_argument("--dias", type=int, default=7, help="janela de dias dos eventos (padrao 7)")
+    ap.add_argument("--limite", type=int, default=100, help="teto de propostas na saida (padrao 100)")
+    ap.add_argument("--saida", default=None, help="caminho de saida (padrao data/ai/propostas_reescrita.jsonl)")
+    ap.add_argument("--grafo-db", default=None, help="override de data/ai/grafo.sqlite (uso em teste)")
+    ap.add_argument("--similaridade-minima", type=float, default=SIMILARIDADE_MINIMA_PADRAO,
+                    help="cosseno TF-IDF minimo entre ementa e pagina para propor precedente (padrao %.2f, escolhido sobre a distribuicao medida)" % SIMILARIDADE_MINIMA_PADRAO)
+    ap.add_argument("--timings", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    t_geral = time.monotonic()
+    root = args.root
+    saida = args.saida or os.path.join(root, "data", "ai", "propostas_reescrita.jsonl")
+
+    selecionadas, contagem_motivo, total_bruto = gera_propostas(
+        root, args.dias, args.limite, grafo_db=args.grafo_db, timings=args.timings, similaridade_minima=args.similaridade_minima)
+
+    conteudo = "".join(
+        json.dumps(p, ensure_ascii=False, sort_keys=True) + "\n" for p in selecionadas
+    ).encode("utf-8")
+
+    if args.dry_run:
+        print("propostas-reescrita: [dry-run] %d propostas (de %d candidatas) -> %s"
+              % (len(selecionadas), total_bruto, saida))
+    else:
+        escreve_atomico(saida, conteudo)
+        print("propostas-reescrita: %d propostas (de %d candidatas) escritas em %s"
+              % (len(selecionadas), total_bruto, saida))
+
+    print("propostas-reescrita: por motivo (candidatas antes do teto): %s"
+          % json.dumps(contagem_motivo, ensure_ascii=False, sort_keys=True))
+    sims = sorted(p["evidencia"]["similaridade_tfidf"] for p in selecionadas if p["motivo"] == "precedente_disponivel_nao_citado")
+    if sims:
+        print("propostas-reescrita: similaridade TF-IDF dos precedentes propostos: n=%d min=%.3f p25=%.3f mediana=%.3f p75=%.3f max=%.3f (minimo aplicado %.2f)"
+              % (len(sims), sims[0], sims[len(sims) // 4], sims[len(sims) // 2], sims[(3 * len(sims)) // 4], sims[-1], args.similaridade_minima))
+    for p in selecionadas[:5]:
+        print("propostas-reescrita: top -> %s | %s | prioridade=%.4f | %s"
+              % (p["path"], p["motivo"], p["prioridade"],
+                 json.dumps(p["evidencia"], ensure_ascii=False, sort_keys=True)))
+
+    if args.timings:
+        print("propostas-reescrita: total em %.3fs" % (time.monotonic() - t_geral), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

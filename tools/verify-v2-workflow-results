@@ -1,0 +1,2479 @@
+#!/usr/bin/env python3
+"""Autentica claims de Workflow contra os bytes vivos dos shards v2.
+
+O runtime de Workflow só orquestra agentes e não oferece leitura/hash de
+filesystem ao script JavaScript. Por isso o retorno do agente é deliberadamente
+uma claim. Este consumidor relê o arquivo e valida path/hash/estrutura sob o
+lock transacional. Ele apenas atesta: efeitos externos e comandos arbitrários
+não pertencem a esta fronteira.
+
+Exemplo (o JSON é o objeto retornado por Workflow):
+  tools/verify-v2-workflow-results --kind mass --results /tmp/result.json
+
+Claims mass e review continuam sendo autenticação de identidade/estrutura; em
+review, também fecham os bytes do sidecar exigido. Mérito, distinctness global e
+proveniência da seleção corrente pertencem exclusivamente ao consumidor privado
+abaixo, sobre a árvore candidata exata. Nenhuma das rotas afirma gates de
+release/publicação.
+
+Para commit transacional, ``tools/commit-verified-v2-workflow-results`` carrega
+este módulo e consome a projeção autenticada antes do ``finally`` liberar os
+locks. Não existe receipt reutilizável nem callback controlado por argv.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import collections
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any, Callable, Mapping
+
+
+INSTALL_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# The closed plumbing consumer preloads an empty-path synthetic ``tools``
+# package and exact helper bytes. Only the standalone CLI needs repo discovery.
+if "tools" not in sys.modules and str(INSTALL_ROOT) not in sys.path:
+    sys.path.insert(0, str(INSTALL_ROOT))
+
+from tools import generate_v2_review_queue as producer  # noqa: E402
+from tools import audit_v2_pages as auditor_contract  # noqa: E402
+from tools import v2_portfolio_intent_migrations as migrations  # noqa: E402
+
+
+SHA256 = re.compile(r"[0-9a-f]{64}")
+SLUG = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+)+")
+INTENT = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+FAMILY = INTENT
+DEFECT_CLASS = re.compile(r"[a-z][a-z0-9_]*")
+MASS_REQUIRED_KEYS = frozenset({
+    "area", "families", "file", "n", "portfolio_sha256",
+    "preserved_record_sha256", "skip", "slug",
+    "semantic_contract_sha256",
+    "source_hint_catalog_sha256", "source_overrides", "sources",
+    "strict_source_intents", "take", "target_sha256", "writer",
+})
+MASS_OPTIONAL_KEYS = frozenset({
+    "intent_ids", "model", "portfolio_intent_migration",
+    "preserve_extras", "reuse", "semantic_relocation_removals",
+    "writing_recovery",
+})
+SEMANTIC_CONTRACT_REL = pathlib.PurePosixPath(
+    "data/editorial/v2_writing_semantic_contract.json")
+SOURCE_HINT_CATALOG_REL = pathlib.PurePosixPath(
+    "data/editorial/v2_source_hint_catalog.json")
+TARGET_REL = re.compile(
+    r"data/editorial/v2_pages/[a-z0-9_]+(?:-[a-z0-9_]+)+\.jsonl")
+PROVENANCE_EVIDENCE_REL = re.compile(
+    r"data/source-registry/v2_source_provenance_live_evidence_sets/"
+    r"exact-[0-9a-f]{64}\.jsonl")
+RAW_RECOVERY_PREIMAGE_REL = re.compile(
+    r"data/editorial/v2_raw_recovery_preimages/[0-9a-f]{64}\.raw")
+SOURCE_PROVENANCE_LOCK = pathlib.Path(
+    "/tmp/opt-wiki-source-provenance.lock")
+HEAVY_AUDIT_LOCK = pathlib.Path("/tmp/opt-wiki-agent-heavy.lock")
+DISTINCTNESS_INDEX_WRITE_LOCK = pathlib.Path(
+    "/tmp/opt-wiki-v2-distinctness-index-write.lock")
+SEMANTIC_RELOCATION_KEYS = frozenset({
+    "intent_id", "owner_target_rel_path", "record_sha256",
+    "requirement_sha256",
+})
+MAX_RESULTS_BYTES = 16 * 1024 * 1024
+MAX_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_TEST_MERIT_REPORT_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_PROVENANCE_CHECK_OUTPUT_BYTES = 4 * 1024 * 1024
+BASH_BIN = pathlib.Path("/usr/bin/bash")
+TEST_HOOK_EXECUTABLES = {"python3": "/usr/bin/python3"}
+REVIEW_RECEIPT_NAME = "finalizer-receipt.json"
+EXACT_WAVE_RECEIPT_NAME = "exact-component-wave-receipt.json"
+EXACT_WAVE_RECEIPT_SCHEMA = "v2_exact_component_wave_receipt_v1"
+REVIEW_RECEIPT_REQUIRED_KEYS = frozenset({
+    "schema_version", "slug", "file", "paginas", "target_sha256",
+    "staged_sha256", "queue_item_sha256", "corrigidos_por_classe",
+    "audit_ok", "mutation_applied", "publication_allowed", "index_policy",
+    "commands", "queue_artifact_sha256", "promoted_sha256",
+    "post_provenance_sha256", "audited_sha256", "audit_report_sha256",
+    "distinctness_generation_root", "source_provenance_evidence",
+})
+REVIEW_RECEIPT_OPTIONAL_KEYS = frozenset({"pre_provenance_defects"})
+REVIEW_CLAIM_REQUIRED_KEYS = frozenset({
+    "slug", "file", "paginas", "target_sha256", "staged_sha256",
+    "queue_item_sha256", "corrigidos_por_classe", "audit_ok",
+    "mutation_applied", "receipt_path", "receipt_sha256",
+})
+REVIEW_CLAIM_ALLOWED_KEYS = (
+    REVIEW_RECEIPT_REQUIRED_KEYS | REVIEW_RECEIPT_OPTIONAL_KEYS |
+    frozenset({"receipt_path", "receipt_sha256"})
+)
+EXACT_WAVE_CLAIM_KEYS = frozenset({
+    "slug", "file", "paginas", "target_sha256", "staged_sha256",
+    "corrigidos_por_classe", "receipt_path", "receipt_sha256",
+    "queue_item_sha256", "audited_sha256", "audit_ok",
+    "mutation_applied", "wave_id", "queue_artifact_sha256",
+})
+EXACT_WAVE_RECEIPT_KEYS = frozenset({
+    "schema_version", "wave_id", "group_id", "cohort_index",
+    "cohort_count", "member_paths", "component_ids", "preserved_owners",
+    "queue_artifact_sha256", "queue_item_sha256_by_path",
+    "corrigidos_por_classe_by_path", "pre_sha256_by_path",
+    "staged_sha256_by_path", "post_sha256_by_path",
+    "source_provenance_evidence_by_path", "audit_report_sha256_by_path",
+    "distinctness_generation_root_by_path", "journal_path",
+    "journal_sha256", "commands_by_path",
+    "pre_provenance_defects_by_path", "audit_ok", "mutation_applied",
+    "publication_allowed", "index_policy",
+})
+REVIEW_COMMAND_KEYS = frozenset({
+    "label", "returncode", "duration_ms", "stdout_sha256", "stderr_sha256",
+})
+REVIEW_COMMAND_LABELS = frozenset({
+    "staged-local-audit", "source-provenance-plan",
+    "source-provenance-live-incomplete", "source-provenance-apply",
+    "source-provenance-live-all", "source-provenance-check",
+    "final-against-stock-audit",
+})
+
+
+def _minimal_subprocess_environment(
+    root: pathlib.Path, private_root: pathlib.Path | None = None,
+) -> dict[str, str]:
+    """Return the closed environment shared by every verifier subprocess."""
+    if private_root is None:
+        home = pathlib.Path("/nonexistent")
+        temporary = pathlib.Path("/nonexistent")
+    else:
+        home = private_root / "home"
+        temporary = private_root / "tmp"
+        home.mkdir(mode=0o700)
+        temporary.mkdir(mode=0o700)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": os.fspath(home),
+        "XDG_CONFIG_HOME": "/nonexistent",
+        "TMPDIR": os.fspath(temporary),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONSAFEPATH": "1",
+        "GOMAXPROCS": "2",
+        "GOENV": "off",
+        "GOTOOLCHAIN": "local",
+        "GOWORK": "off",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "WIKI_ROOT": os.fspath(root),
+    }
+
+
+def _kill_subprocess_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.communicate()
+
+
+def _run_closed_subprocess(
+    command: list[str], *, cwd: pathlib.Path, environment: Mapping[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        command, cwd=cwd, env=dict(environment), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException:
+        _kill_subprocess_group(process)
+        raise
+    return subprocess.CompletedProcess(
+        command, process.returncode, stdout, stderr)
+
+
+class VerificationError(RuntimeError):
+    """Claim ou bytes vivos não satisfazem o contrato."""
+
+
+class LockBusy(VerificationError):
+    """Outro produtor possui um alvo; o consumidor deve falhar sem esperar."""
+
+
+class VerifiedWorkflowTransaction:
+    """Estado autenticado que só existe enquanto todos os locks estão vivos.
+
+    O verificador público continua sendo read-only.  Um consumidor fechado pode
+    receber esta projeção dentro do mesmo processo para materializar exatamente
+    os blobs já verificados.  Quando ``consume`` retorna (ou falha), o ``finally``
+    de :func:`main` libera os locks; portanto este objeto nunca funciona como um
+    receipt reabrível ou como autorização fora da transação.
+    """
+
+    def __init__(
+        self,
+        *,
+        root: pathlib.Path,
+        kind: str,
+        report: Mapping[str, Any],
+        dependencies: Mapping[pathlib.Path, str],
+        live_targets: Mapping[pathlib.Path, str],
+        semantic_contract: producer.WritingSemanticContract | None,
+        review_stock_membership_watch: tuple[int, tuple[int, ...]] | None,
+    ) -> None:
+        self.root = root
+        self.kind = kind
+        self.report = dict(report)
+        self.dependencies = dict(dependencies)
+        self.live_targets = dict(live_targets)
+        self.semantic_contract = semantic_contract
+        self.review_stock_membership_watch = review_stock_membership_watch
+
+    def revalidate(self) -> None:
+        """Recheck every live bind after a closed consumer's finalizer/hook."""
+        if self.review_stock_membership_watch is not None:
+            _assert_review_stock_membership_unchanged(
+                self.root, self.review_stock_membership_watch)
+        _assert_dependencies_unchanged(self.dependencies)
+        _assert_dependencies_unchanged(self.live_targets)
+        if self.semantic_contract is not None:
+            producer.verify_writing_semantic_contract_dependencies(
+                self.root, self.semantic_contract)
+
+
+def _canonical_queue(root: pathlib.Path, kind: str) -> pathlib.Path:
+    name = "writing-mass-todo.js" if kind == "mass" else "writing-review-todo.js"
+    return root / "scripts" / "workflows" / name
+
+
+def _read_json(path: str) -> Any:
+    if path == "-":
+        payload = sys.stdin.buffer.read(MAX_RESULTS_BYTES + 1)
+    else:
+        candidate = pathlib.Path(path)
+        if not candidate.is_absolute():
+            candidate = pathlib.Path.cwd() / candidate
+        try:
+            snapshot = producer.read_regular_file_snapshot(
+                candidate, max_bytes=MAX_RESULTS_BYTES)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise VerificationError(
+                "resultado do Workflow não é arquivo regular seguro") from error
+        payload = snapshot.payload
+    if len(payload) > MAX_RESULTS_BYTES:
+        raise VerificationError("resultado do Workflow excede limite")
+    try:
+        return producer.decode_json_no_duplicate_keys(
+            payload, "resultado do Workflow")
+    except ValueError as error:
+        raise VerificationError(
+            "resultado do Workflow não é JSON canônico") from error
+
+
+def _load_queue(
+    root: pathlib.Path,
+    kind: str,
+    requested: pathlib.Path | None,
+) -> tuple[list[dict[str, Any]], dict[pathlib.Path, str]]:
+    canonical = _canonical_queue(root, kind)
+    if requested is None:
+        queue = canonical
+    else:
+        candidate = requested if requested.is_absolute() else root / requested
+        # Identity is lexical and the safe snapshot below rejects every
+        # symbolic parent/final component with O_NOFOLLOW.  resolve() here
+        # would turn a symlink alias into the canonical path before validation.
+        queue = pathlib.Path(os.path.abspath(os.fspath(candidate)))
+    if queue != canonical:
+        raise VerificationError(
+            f"fila deve ser o artefato canônico {canonical}, recebido {queue}")
+    try:
+        snapshot = producer.read_regular_file_snapshot(queue)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise VerificationError(
+            f"fila canônica não é arquivo regular seguro: {queue}") from error
+    try:
+        text = snapshot.payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerificationError("fila não é UTF-8") from error
+    prefix = "const batches = " if kind == "mass" else "const files = "
+    if kind == "review":
+        rca_prefix = "const REVIEW_QUEUE_OPERATIONAL_RCA = "
+        encoded_rca = [line[len(rca_prefix):] for line in text.splitlines()
+                       if line.startswith(rca_prefix)]
+        if len(encoded_rca) != 1:
+            raise VerificationError(
+                "fila de revisão não possui RCA operacional canônico único")
+        try:
+            queue_rca = producer.decode_json_no_duplicate_keys(
+                encoded_rca[0], "RCA operacional da fila")
+        except ValueError as error:
+            raise VerificationError(
+                "RCA operacional da fila não é JSON fechado") from error
+        if queue_rca is not None:
+            raise VerificationError(
+                "fila de revisão está desabilitada por RCA operacional")
+    encoded = [line[len(prefix):] for line in text.splitlines()
+               if line.startswith(prefix)]
+    if len(encoded) != 1:
+        raise VerificationError(
+            f"fila deve conter exatamente uma linha {prefix!r}")
+    try:
+        entries = producer.decode_json_no_duplicate_keys(
+            encoded[0], "fila canônica")
+    except ValueError as error:
+        raise VerificationError("array JSON embutido da fila é inválido") from error
+    if not isinstance(entries, list) or not entries:
+        raise VerificationError("fila canônica está vazia ou não é array")
+    return entries, {queue: snapshot.digest}
+
+
+def _canonical_intent_list(value: Any) -> bool:
+    return (isinstance(value, list) and
+            all(isinstance(intent, str) and
+                INTENT.fullmatch(intent) is not None
+                for intent in value) and
+            len(set(value)) == len(value))
+
+
+def _canonical_hash_map(value: Any) -> bool:
+    return (isinstance(value, dict) and
+            all(isinstance(intent, str) and intent and intent.strip() == intent and
+                isinstance(digest, str) and SHA256.fullmatch(digest) is not None
+                for intent, digest in value.items()))
+
+
+def _canonical_semantic_relocation_removals(
+    entry: Mapping[str, Any],
+    slug: str,
+) -> list[dict[str, str]]:
+    """Valida o campo opcional fechado; presença vazia nunca é semântica."""
+    if "semantic_relocation_removals" not in entry:
+        return []
+    value = entry["semantic_relocation_removals"]
+    if not isinstance(value, list) or not value:
+        raise VerificationError(
+            f"remoções semânticas vazias/inválidas: {slug}")
+    removals: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value, 1):
+        if (not isinstance(item, dict) or
+                set(item) != SEMANTIC_RELOCATION_KEYS or
+                not isinstance(item.get("intent_id"), str) or
+                INTENT.fullmatch(item["intent_id"]) is None or
+                item["intent_id"] in seen or
+                not isinstance(item.get("owner_target_rel_path"), str) or
+                TARGET_REL.fullmatch(item["owner_target_rel_path"]) is None or
+                any(not isinstance(item.get(field), str) or
+                    SHA256.fullmatch(item[field]) is None
+                    for field in ("record_sha256", "requirement_sha256"))):
+            raise VerificationError(
+                f"remoção semântica inválida: {slug}:{index}")
+        seen.add(item["intent_id"])
+        removals.append(dict(item))
+    return removals
+
+
+def _validate_semantic_relocation_binding(
+    entry: Mapping[str, Any],
+    removals: list[dict[str, str]],
+    contract: producer.WritingSemanticContract | None,
+) -> None:
+    if not removals:
+        return
+    slug = entry["slug"]
+    if contract is None:
+        raise VerificationError(
+            f"contrato semântico não autenticado para remoções: {slug}")
+    target_rel = f"data/editorial/v2_pages/{slug}.jsonl"
+    protected = (set(entry.get("intent_ids", [])) |
+                 set(entry.get("reuse", [])) |
+                 set(entry.get("preserve_extras", [])))
+    for removal in removals:
+        intent_id = removal["intent_id"]
+        if (intent_id in protected or
+                contract.superseded_target_rel_paths.get(intent_id) != target_rel or
+                contract.target_rel_paths.get(intent_id) == target_rel or
+                contract.target_rel_paths.get(intent_id) !=
+                removal["owner_target_rel_path"] or
+                contract.superseded_page_record_sha256.get(intent_id) !=
+                removal["record_sha256"] or
+                contract.requirement_fingerprints.get(intent_id) !=
+                removal["requirement_sha256"]):
+            raise VerificationError(
+                f"metadados de relocação divergem do contrato: {slug}:{intent_id}")
+        if intent_id in contract.unresolved_intents:
+            raise VerificationError(
+                f"remoção semântica prematura, owner não resolvido: "
+                f"{slug}:{intent_id}")
+
+
+def _queue_by_slug(
+    kind: str,
+    entries: list[dict[str, Any]],
+    semantic_digest: str | None = None,
+    semantic_contract: producer.WritingSemanticContract | None = None,
+) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise VerificationError("item da fila não é objeto")
+        slug = entry.get("slug")
+        digest = entry.get("target_sha256")
+        pages = entry.get("n")
+        if (not isinstance(slug, str) or SLUG.fullmatch(slug) is None or
+                not isinstance(digest, str) or SHA256.fullmatch(digest) is None or
+                not isinstance(pages, int) or isinstance(pages, bool) or pages < 1):
+            raise VerificationError(f"item de fila inseguro: {slug!r}")
+        if slug in indexed:
+            raise VerificationError(f"slug duplicado na fila: {slug}")
+        preserved = entry.get("preserved_record_sha256")
+        if not _canonical_hash_map(preserved):
+            raise VerificationError(f"mapa de preservação inválido: {slug}")
+        if kind == "mass":
+            keys = set(entry)
+            reuse = entry.get("reuse", [])
+            extras = entry.get("preserve_extras", [])
+            families = entry.get("families")
+            skip = entry.get("skip")
+            take = entry.get("take")
+            pinned = "intent_ids" in entry
+            intent_ids = entry.get("intent_ids")
+            removals = _canonical_semantic_relocation_removals(entry, slug)
+            sources = entry.get("sources")
+            if (not MASS_REQUIRED_KEYS.issubset(keys) or
+                    not keys.issubset(MASS_REQUIRED_KEYS | MASS_OPTIONAL_KEYS) or
+                    not isinstance(entry.get("writer"), str) or
+                    INTENT.fullmatch(entry["writer"]) is None or
+                    ("model" in entry and (
+                        not isinstance(entry["model"], str) or
+                        INTENT.fullmatch(entry["model"]) is None)) or
+                    not isinstance(families, list) or not families or
+                    len(set(families)) != len(families) or
+                    not all(isinstance(family, str) and
+                            FAMILY.fullmatch(family) is not None
+                            for family in families) or
+                    not isinstance(skip, int) or isinstance(skip, bool) or
+                    skip < 0 or
+                    not isinstance(take, int) or isinstance(take, bool) or
+                    take < 0 or
+                    (take > 0 and (pinned or len(families) != 1 or
+                                   take != pages)) or
+                    (take == 0 and (skip != 0 or not pinned or
+                                    not _canonical_intent_list(intent_ids) or
+                                    len(intent_ids) != pages)) or
+                    not _canonical_intent_list(reuse) or
+                    not _canonical_intent_list(extras) or
+                    "reuse_partial" in entry or
+                    set(preserved) != set(reuse) | set(extras) or
+                    not isinstance(
+                        entry.get("semantic_contract_sha256"), str) or
+                    SHA256.fullmatch(
+                        entry["semantic_contract_sha256"]) is None or
+                    entry["semantic_contract_sha256"] != semantic_digest or
+                    not isinstance(entry.get("portfolio_sha256"), str) or
+                    SHA256.fullmatch(entry["portfolio_sha256"]) is None or
+                    not isinstance(
+                        entry.get("source_hint_catalog_sha256"), str) or
+                    SHA256.fullmatch(
+                        entry["source_hint_catalog_sha256"]) is None or
+                    not isinstance(sources, list) or len(sources) > 64):
+                raise VerificationError(
+                    f"compromissos de escrita inválidos: {slug}")
+            try:
+                for source_index, source in enumerate(sources, 1):
+                    producer._canonical_candidate_source(
+                        source, f"sources:{slug}:{source_index}")
+            except ValueError as error:
+                raise VerificationError(
+                    f"fontes candidatas inválidas: {slug}: {error}") from error
+            migration = entry.get("portfolio_intent_migration")
+            if migration is not None and (
+                    reuse or extras or preserved or removals):
+                raise VerificationError(
+                    f"migração integral coexistiu com preservação/relocação: {slug}")
+            recovery = entry.get("writing_recovery")
+            if recovery is not None:
+                expected_recovery_intents = (
+                    intent_ids if take == 0 else None)
+                try:
+                    canonical_recovery = (
+                        producer.validate_writing_raw_recovery_projection(
+                            recovery,
+                            target_rel_path=(
+                                f"data/editorial/v2_pages/{slug}.jsonl"),
+                            target_sha256=entry["target_sha256"],
+                            expected_intents=expected_recovery_intents,
+                        ))
+                except (TypeError, ValueError) as error:
+                    raise VerificationError(
+                        f"writing_recovery inválido: {slug}: {error}") from error
+                if (canonical_recovery.get("expected_n") != pages or
+                        canonical_recovery.get("reuse") != reuse or
+                        canonical_recovery.get(
+                            "preserved_record_sha256") != preserved or
+                        "preserve_extras" in entry or
+                        "semantic_relocation_removals" in entry or
+                        "portfolio_intent_migration" in entry):
+                    raise VerificationError(
+                        f"writing_recovery coexistiu com rota divergente: {slug}")
+            _validate_semantic_relocation_binding(
+                entry, removals, semantic_contract)
+        else:
+            queue_item_sha256 = entry.get("queue_item_sha256")
+            try:
+                computed_queue_item_sha256 = (
+                    producer.review_queue_item_sha256(entry))
+            except (TypeError, ValueError) as error:
+                raise VerificationError(
+                    f"item de revisão não é serializável canonicamente: {slug}"
+                ) from error
+            if (not isinstance(queue_item_sha256, str) or
+                    SHA256.fullmatch(queue_item_sha256) is None or
+                    queue_item_sha256 != computed_queue_item_sha256):
+                raise VerificationError(
+                    f"queue_item_sha256 diverge do item canônico: {slug}")
+            target_intents = entry.get("target_intent_ids")
+            review_target_intents = entry.get("review_target_intent_ids")
+            targets_by_class = entry.get("alvos")
+            defect_counts = entry.get("defeitos")
+            dependency_sha256 = entry.get(
+                "distinctness_dependency_sha256")
+            if (not _canonical_intent_list(target_intents) or
+                    len(target_intents) != pages or
+                    not _canonical_intent_list(review_target_intents) or
+                    not review_target_intents or
+                    type(entry.get("file_wide_review")) is not bool or
+                    not isinstance(targets_by_class, dict) or
+                    not targets_by_class or
+                    not isinstance(defect_counts, dict) or
+                    set(defect_counts) != set(targets_by_class) or
+                    not all(isinstance(targets, list) and targets and
+                            len(targets) == len(set(targets)) and
+                            all(isinstance(target, str) and target
+                                for target in targets) and
+                            type(defect_counts.get(defect_class)) is int and
+                            defect_counts[defect_class] == len(targets)
+                            for defect_class, targets in
+                            targets_by_class.items()) or
+                    not isinstance(dependency_sha256, dict) or
+                    len(dependency_sha256) > 50_000 or
+                    any(TARGET_REL.fullmatch(path) is None or
+                        path == f"data/editorial/v2_pages/{slug}.jsonl" or
+                        not isinstance(digest, str) or
+                        SHA256.fullmatch(digest) is None
+                        for path, digest in dependency_sha256.items())):
+                raise VerificationError(
+                    f"compromissos de revisão inválidos: {slug}")
+            target_rel_path = f"data/editorial/v2_pages/{slug}.jsonl"
+            locations = {
+                (target_rel_path, intent): line_number
+                for line_number, intent in enumerate(target_intents, 1)
+            }
+            try:
+                scope = producer.validate_review_scopes(
+                    {"files": {target_rel_path: {
+                        "defects": targets_by_class,
+                        "pages": pages,
+                    }}},
+                    locations,
+                )[target_rel_path]
+            except (TypeError, ValueError) as error:
+                raise VerificationError(
+                    f"escopo fechado de revisão inválido: {slug}: {error}"
+                ) from error
+            expected_review = (
+                list(target_intents) if scope.file_wide else
+                list(scope.target_intents))
+            if (entry["file_wide_review"] != scope.file_wide or
+                    review_target_intents != expected_review):
+                raise VerificationError(
+                    f"escopo editável diverge da projeção fechada: {slug}")
+            expected_preserved = (
+                set(target_intents) - set(expected_review))
+            if set(preserved) != expected_preserved:
+                raise VerificationError(
+                    f"mapa de preservação incompleto em revisão: {slug}")
+        indexed[slug] = entry
+    return indexed
+
+
+def _validate_result_envelope(
+    kind: str,
+    result: Any,
+    queue_size: int,
+) -> list[Mapping[str, Any]]:
+    if not isinstance(result, Mapping):
+        raise VerificationError("resultado do Workflow não é objeto")
+    if result.get("external_verification_required") is not True:
+        raise VerificationError("resultado não declara verificação externa obrigatória")
+    claims = result.get("claims")
+    if not isinstance(claims, list) or not claims:
+        raise VerificationError("nenhuma claim estruturada para verificar")
+    count_key = "claimed_batches" if kind == "mass" else "claimed_reviews"
+    claimed_count = result.get(count_key)
+    if (not isinstance(claimed_count, int) or
+            isinstance(claimed_count, bool) or
+            claimed_count != len(claims)):
+        raise VerificationError(f"{count_key} diverge da lista de claims")
+    attempted_key = "attempted_batches" if kind == "mass" else "attempted_reviews"
+    unattempted_key = (
+        "unattempted_batches" if kind == "mass" else "unattempted_reviews")
+    attempted = result.get(attempted_key)
+    unattempted = result.get(unattempted_key)
+    failed = result.get("failed_claims")
+    halted = result.get("halted")
+    if (not isinstance(attempted, int) or isinstance(attempted, bool) or
+            attempted < len(claims) or attempted > queue_size or
+            not isinstance(unattempted, int) or isinstance(unattempted, bool) or
+            unattempted != queue_size - attempted or
+            not isinstance(failed, int) or isinstance(failed, bool) or
+            failed != attempted - len(claims) or
+            not isinstance(halted, bool) or
+            (unattempted > 0 and not halted)):
+        raise VerificationError(
+            "contadores attempted/failed/unattempted divergem da fila canônica")
+    if kind == "mass":
+        claimed_pages = sum(
+            claim.get("written", -1) if isinstance(claim, Mapping) else -1
+            for claim in claims)
+        declared_pages = result.get("claimed_written")
+        if (not isinstance(declared_pages, int) or
+                isinstance(declared_pages, bool) or
+                declared_pages != claimed_pages):
+            raise VerificationError("claimed_written diverge das claims")
+    return claims
+
+
+def _expected_mass_intents(
+    root: pathlib.Path,
+    entry: Mapping[str, Any],
+) -> tuple[list[str], list[str], pathlib.Path, str]:
+    relative = entry.get("file")
+    families = entry.get("families")
+    skip = entry.get("skip")
+    take = entry.get("take")
+    if (not isinstance(relative, str) or
+            re.fullmatch(
+                r"data/editorial/portfolio_v2/[a-z0-9_]+(?:-[a-z0-9_]+)*\.jsonl",
+                relative,
+            ) is None or
+            not isinstance(families, list) or not families or
+            not all(isinstance(family, str) for family in families) or
+            not isinstance(skip, int) or isinstance(skip, bool) or skip < 0 or
+            not isinstance(take, int) or isinstance(take, bool) or take < 0):
+        raise VerificationError(f"seleção de portfolio inválida: {entry.get('slug')}")
+    portfolio_path = (root / relative).resolve(strict=True)
+    portfolio_root = (root / "data" / "editorial" / "portfolio_v2").resolve()
+    if portfolio_path.parent != portfolio_root:
+        raise VerificationError("portfolio escapou do diretório canônico")
+    snapshot = producer.read_regular_file_snapshot(portfolio_path)
+    if snapshot.digest != entry.get("portfolio_sha256"):
+        raise VerificationError(
+            f"portfolio diverge da fila em {entry.get('slug')}")
+    by_family: dict[str, list[str]] = collections.defaultdict(list)
+    records_by_intent: dict[str, str] = {}
+    for line_number, raw in enumerate(snapshot.payload.splitlines(), start=1):
+        try:
+            record = producer.decode_json_no_duplicate_keys(
+                raw, f"{relative}:{line_number}")
+        except ValueError as error:
+            raise VerificationError(
+                f"portfolio inválido {relative}:{line_number}") from error
+        if not isinstance(record, Mapping):
+            raise VerificationError(
+                f"portfolio não contém objeto {relative}:{line_number}")
+        family = record.get("family")
+        intent = record.get("intent_id")
+        if (not isinstance(family, str) or FAMILY.fullmatch(family) is None or
+                not isinstance(intent, str) or INTENT.fullmatch(intent) is None):
+            raise VerificationError(
+                f"family/intent_id inválido {relative}:{line_number}")
+        if intent in records_by_intent:
+            raise VerificationError(
+                f"intent_id duplicado no portfolio {relative}:{intent}")
+        records_by_intent[intent] = family
+        by_family[family].append(intent)
+    if take > 0:
+        selected = by_family[families[0]][skip:skip + take]
+    else:
+        selected = list(entry["intent_ids"])
+        observed_families: list[str] = []
+        seen_families: set[str] = set()
+        for intent in selected:
+            family = records_by_intent.get(intent)
+            if family is None:
+                raise VerificationError(
+                    f"pin ausente do portfolio em {entry.get('slug')}: {intent}")
+            if family not in families:
+                raise VerificationError(
+                    f"pin fora das famílias declaradas em "
+                    f"{entry.get('slug')}: {intent}:{family}")
+            if not observed_families or observed_families[-1] != family:
+                if family in seen_families:
+                    raise VerificationError(
+                        f"famílias intercaladas no pin em {entry.get('slug')}")
+                observed_families.append(family)
+                seen_families.add(family)
+        if observed_families != families:
+            raise VerificationError(
+                f"ordem/cobertura de famílias diverge do pin em "
+                f"{entry.get('slug')}")
+    if len(selected) != entry.get("n") or len(set(selected)) != len(selected):
+        raise VerificationError(
+            f"seleção viva diverge de n em {entry.get('slug')}")
+    extras = entry.get("preserve_extras", [])
+    if (not isinstance(extras, list) or
+            not all(isinstance(intent, str) and intent.strip() == intent
+                    for intent in extras) or
+            len(set(extras)) != len(extras) or set(extras) & set(selected)):
+        raise VerificationError(
+            f"preserve_extras inválido em {entry.get('slug')}")
+    return selected, selected + extras, portfolio_path, snapshot.digest
+
+
+def _canonical_review_corrections(
+    value: Any,
+    entry: Mapping[str, Any],
+) -> dict[str, int]:
+    defects = entry.get("defeitos")
+    if (not isinstance(value, dict) or not value or
+            not isinstance(defects, dict)):
+        raise VerificationError(
+            f"correções de revisão vazias/inválidas: {entry.get('slug')}")
+    corrections: dict[str, int] = {}
+    for code, count in value.items():
+        expected = defects.get(code)
+        if (not isinstance(code, str) or
+                DEFECT_CLASS.fullmatch(code) is None or
+                type(expected) is not int or expected < 1 or
+                type(count) is not int or count < 1 or count > expected):
+            raise VerificationError(
+                f"correções não correspondem ao item da fila: "
+                f"{entry.get('slug')}:{code}")
+        corrections[code] = count
+    return dict(sorted(corrections.items()))
+
+
+def _validate_claim_shape(
+    kind: str,
+    claim: Mapping[str, Any],
+    entry: Mapping[str, Any],
+) -> None:
+    slug = entry["slug"]
+    count_key = "written" if kind == "mass" else "paginas"
+    if (claim.get("slug") != slug or
+            claim.get("file") != f"data/editorial/v2_pages/{slug}.jsonl" or
+            claim.get("target_sha256") != entry["target_sha256"] or
+            claim.get("audit_ok") is not True or
+            not isinstance(claim.get("audited_sha256"), str) or
+            SHA256.fullmatch(claim["audited_sha256"]) is None or
+            not isinstance(claim.get(count_key), int) or
+            isinstance(claim.get(count_key), bool) or
+            claim[count_key] != entry["n"]):
+        raise VerificationError(f"claim estruturalmente divergente: {slug}")
+    if kind == "mass":
+        expected = claim.get("expected")
+        if (not isinstance(expected, int) or isinstance(expected, bool) or
+                expected != entry["n"]):
+            raise VerificationError(f"claim expected divergente: {slug}")
+    if kind == "mass":
+        claimed_intents = claim.get("intent_ids")
+        if (not _canonical_intent_list(claimed_intents) or
+                len(claimed_intents) != entry["n"] or
+                (entry["take"] == 0 and
+                 claimed_intents != entry["intent_ids"])):
+            raise VerificationError(
+                f"claim intent_ids divergente do lote: {slug}")
+        recovery_evidence = claim.get("raw_recovery_preimage_evidence")
+        if entry.get("writing_recovery") is not None:
+            expected_path = (
+                "data/editorial/v2_raw_recovery_preimages/" +
+                entry["target_sha256"] + ".raw")
+            if (not isinstance(recovery_evidence, Mapping) or
+                    set(recovery_evidence) != {"path", "sha256"} or
+                    recovery_evidence.get("path") != expected_path or
+                    recovery_evidence.get("sha256") !=
+                    entry["target_sha256"]):
+                raise VerificationError(
+                    f"claim raw-recovery perdeu preimagem permanente: {slug}")
+        elif recovery_evidence is not None:
+            raise VerificationError(
+                f"claim comum injetou evidência raw-recovery: {slug}")
+    else:
+        keys = set(claim)
+        wave = entry.get("exact_component_wave")
+        if wave is not None:
+            if (keys != EXACT_WAVE_CLAIM_KEYS or
+                    not isinstance(wave, Mapping) or
+                    claim.get("wave_id") != wave.get("wave_id") or
+                    not isinstance(claim.get("queue_artifact_sha256"), str) or
+                    SHA256.fullmatch(claim["queue_artifact_sha256"]) is None or
+                    claim.get("mutation_applied") is not True or
+                    claim["audited_sha256"] == entry["target_sha256"] or
+                    not isinstance(claim.get("staged_sha256"), str) or
+                    SHA256.fullmatch(claim["staged_sha256"]) is None or
+                    claim["staged_sha256"] == entry["target_sha256"] or
+                    claim.get("queue_item_sha256") !=
+                    entry.get("queue_item_sha256") or
+                    not isinstance(claim.get("receipt_path"), str) or
+                    not claim["receipt_path"] or
+                    not isinstance(claim.get("receipt_sha256"), str) or
+                    SHA256.fullmatch(claim["receipt_sha256"]) is None):
+                raise VerificationError(
+                    f"claim de exact wave não carrega receipt autenticável: {slug}")
+            _canonical_review_corrections(
+                claim.get("corrigidos_por_classe"), entry)
+            return
+        if (not REVIEW_CLAIM_REQUIRED_KEYS.issubset(keys) or
+                not keys.issubset(REVIEW_CLAIM_ALLOWED_KEYS) or
+                claim.get("mutation_applied") is not True or
+                claim["audited_sha256"] == entry["target_sha256"] or
+                not isinstance(claim.get("staged_sha256"), str) or
+                SHA256.fullmatch(claim["staged_sha256"]) is None or
+                claim["staged_sha256"] == entry["target_sha256"] or
+                claim.get("queue_item_sha256") !=
+                entry.get("queue_item_sha256") or
+                not isinstance(claim.get("receipt_path"), str) or
+                not claim["receipt_path"] or
+                not isinstance(claim.get("receipt_sha256"), str) or
+                SHA256.fullmatch(claim["receipt_sha256"]) is None):
+            raise VerificationError(
+                f"claim de revisão não carrega receipt autenticável: {slug}")
+        _canonical_review_corrections(
+            claim.get("corrigidos_por_classe"), entry)
+
+
+def _canonical_review_receipt_payload(receipt: Mapping[str, Any]) -> bytes:
+    try:
+        return (json.dumps(
+            receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise VerificationError(
+            "receipt de revisão não é JSON canônico") from error
+
+
+def _validate_review_command_receipts(
+    value: Any, slug: str, *, provenance_pending: bool,
+) -> None:
+    if not isinstance(value, list):
+        raise VerificationError(f"commands do receipt não é lista: {slug}")
+    labels: list[str] = []
+    for index, command in enumerate(value, 1):
+        if (not isinstance(command, dict) or
+                set(command) != REVIEW_COMMAND_KEYS or
+                not isinstance(command.get("label"), str) or
+                command["label"] not in REVIEW_COMMAND_LABELS or
+                type(command.get("returncode")) is not int or
+                (command["returncode"] != 0 and not (
+                    index == 1 and command["label"] ==
+                    "staged-local-audit" and
+                    command["returncode"] == 1 and provenance_pending)) or
+                type(command.get("duration_ms")) is not int or
+                command["duration_ms"] < 0 or
+                any(not isinstance(command.get(key), str) or
+                    SHA256.fullmatch(command[key]) is None
+                    for key in ("stdout_sha256", "stderr_sha256"))):
+            raise VerificationError(
+                f"command receipt inválido: {slug}:{index}")
+        labels.append(command["label"])
+    minimal = [
+        "staged-local-audit",
+        "source-provenance-plan",
+        "source-provenance-live-all",
+        "source-provenance-check",
+        "final-against-stock-audit",
+    ]
+    with_incomplete = [
+        "staged-local-audit",
+        "source-provenance-plan",
+        "source-provenance-live-incomplete",
+        "source-provenance-apply",
+        "source-provenance-live-all",
+        "source-provenance-check",
+        "final-against-stock-audit",
+    ]
+    if labels not in (minimal, with_incomplete):
+        raise VerificationError(
+            f"sequência de command receipts divergente: {slug}")
+    local_returncode = value[0]["returncode"]
+    if local_returncode != (1 if provenance_pending else 0):
+        raise VerificationError(
+            f"staged-local-audit diverge do estado de proveniência: {slug}")
+
+
+def _workspace_identity(path: pathlib.Path, slug: str) -> tuple[int, ...]:
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise VerificationError(
+            f"workspace do receipt está ausente: {slug}") from error
+    if (not stat.S_ISDIR(info.st_mode) or
+            stat.S_IMODE(info.st_mode) != 0o700 or
+            info.st_uid != os.geteuid()):
+        raise VerificationError(
+            f"workspace do receipt não é diretório privado 0700: {slug}")
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+        info.st_nlink, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _validate_exact_wave_commands(
+    value: Any, entry: Mapping[str, Any], pre_provenance: Any,
+) -> None:
+    slug = entry["slug"]
+    if not isinstance(value, list):
+        raise VerificationError(f"commands da exact wave não é lista: {slug}")
+    labels: list[str] = []
+    allowed = {
+        "wave-staged-local-audit", "source-provenance-plan",
+        "source-provenance-live-incomplete", "source-provenance-apply",
+        "source-provenance-live-all", "source-provenance-check",
+        "wave-final-against-stock-audit",
+    }
+    pending = isinstance(pre_provenance, Mapping) and bool(pre_provenance)
+    for index, command in enumerate(value):
+        if (not isinstance(command, Mapping) or
+                set(command) != REVIEW_COMMAND_KEYS or
+                command.get("label") not in allowed or
+                type(command.get("returncode")) is not int or
+                (command["returncode"] != 0 and not (
+                    index == 0 and
+                    command["label"] == "wave-staged-local-audit" and
+                    command["returncode"] == 1 and pending)) or
+                type(command.get("duration_ms")) is not int or
+                command["duration_ms"] < 0 or
+                any(not isinstance(command.get(key), str) or
+                    SHA256.fullmatch(command[key]) is None
+                    for key in ("stdout_sha256", "stderr_sha256"))):
+            raise VerificationError(
+                f"command da exact wave inválido: {slug}:{index}")
+        labels.append(command["label"])
+    minimal = [
+        "wave-staged-local-audit", "source-provenance-plan",
+        "source-provenance-live-all", "source-provenance-check",
+        "wave-final-against-stock-audit",
+    ]
+    with_incomplete = [
+        "wave-staged-local-audit", "source-provenance-plan",
+        "source-provenance-live-incomplete", "source-provenance-apply",
+        "source-provenance-live-all", "source-provenance-check",
+        "wave-final-against-stock-audit",
+    ]
+    if labels not in (minimal, with_incomplete) or value[0]["returncode"] != (
+            1 if pending else 0):
+        raise VerificationError(
+            f"sequência de commands da exact wave diverge: {slug}")
+
+
+def _validate_exact_wave_pre_provenance(
+    value: Any, entry: Mapping[str, Any],
+) -> None:
+    if not isinstance(value, Mapping):
+        raise VerificationError(
+            f"pre_provenance da exact wave não é objeto: {entry['slug']}")
+    if not value:
+        return
+    allowed = {
+        "official_source_verified_at_invalid",
+        "official_source_http_status_invalid",
+    }
+    editable = set(entry.get("review_target_intent_ids") or [])
+    if (not set(value).issubset(allowed) or
+            any(not isinstance(intents, list) or not intents or
+                len(intents) != len(set(intents)) or
+                any(not isinstance(intent, str) or
+                    INTENT.fullmatch(intent) is None or
+                    intent not in editable for intent in intents)
+                for intents in value.values())):
+        raise VerificationError(
+            f"pre_provenance da exact wave inválido: {entry['slug']}")
+
+
+def _verify_exact_wave_receipt(
+    claim: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    queue_artifact_sha256: str,
+    root: pathlib.Path,
+    queue_by_slug: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[pathlib.Path, str], dict[str, str]]:
+    """Authenticate one collective receipt and this claim's projection."""
+    slug = entry["slug"]
+    contract = entry.get("exact_component_wave")
+    if not isinstance(contract, Mapping):
+        raise VerificationError(f"item perdeu exact_component_wave: {slug}")
+    paths = contract.get("member_paths")
+    if (not isinstance(paths, list) or not paths or
+            paths != sorted(set(paths)) or len(paths) > 31 or
+            any(TARGET_REL.fullmatch(path) is None for path in paths)):
+        raise VerificationError(f"member_paths da exact wave inválido: {slug}")
+    entries_by_path: dict[str, Mapping[str, Any]] = {}
+    for path in paths:
+        member_slug = pathlib.PurePosixPath(path).stem
+        member = queue_by_slug.get(member_slug)
+        if (member is None or
+                f"data/editorial/v2_pages/{member['slug']}.jsonl" != path or
+                member.get("exact_component_wave") != contract):
+            raise VerificationError(
+                f"exact wave não cobre membro canônico: {path}")
+        entries_by_path[path] = member
+
+    raw_receipt_path = claim["receipt_path"]
+    if (not isinstance(raw_receipt_path, str) or
+            "\x00" in raw_receipt_path or
+            not os.path.isabs(raw_receipt_path) or
+            os.path.abspath(raw_receipt_path) != raw_receipt_path):
+        raise VerificationError(
+            f"receipt_path da exact wave não é canônico: {slug}")
+    receipt_path = pathlib.Path(raw_receipt_path)
+    workspace = receipt_path.parent
+    coordinator_path = paths[0]
+    coordinator = entries_by_path[coordinator_path]
+    prefix = (
+        f"wiki-v2-{coordinator['slug']}-"
+        f"{coordinator['target_sha256'][:12]}-")
+    suffix = (workspace.name[len(prefix):]
+              if workspace.name.startswith(prefix) else "")
+    # Pai do workspace: fonte única no produtor (ver
+    # generate_v2_review_queue.workflow_workspace_parent). ``/tmp`` era cópia
+    # desatualizada desde 92c6a7f8 (2026-08-04), quando o produtor migrou.
+    if (receipt_path.name != EXACT_WAVE_RECEIPT_NAME or
+            workspace.parent != producer.workflow_workspace_parent() or
+            not 6 <= len(suffix) <= 64 or
+            re.fullmatch(r"[a-z0-9_]+", suffix) is None):
+        raise VerificationError(
+            f"receipt da exact wave não pertence ao coordinator: {slug}")
+    workspace_before = _workspace_identity(workspace, slug)
+    try:
+        snapshot = producer.read_regular_file_snapshot(
+            receipt_path, max_bytes=MAX_RECEIPT_BYTES)
+        receipt = producer.decode_json_no_duplicate_keys(
+            snapshot.payload, f"exact-wave-receipt:{slug}")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise VerificationError(
+            f"receipt da exact wave ausente/inseguro: {slug}") from error
+    if (_workspace_identity(workspace, slug) != workspace_before or
+            snapshot.digest != claim["receipt_sha256"] or
+            not isinstance(receipt, Mapping) or
+            set(receipt) != EXACT_WAVE_RECEIPT_KEYS or
+            _canonical_review_receipt_payload(receipt) != snapshot.payload):
+        raise VerificationError(
+            f"schema/digest do receipt da exact wave diverge: {slug}")
+
+    mapping_fields = {
+        "queue_item_sha256_by_path", "corrigidos_por_classe_by_path",
+        "pre_sha256_by_path", "staged_sha256_by_path",
+        "post_sha256_by_path", "source_provenance_evidence_by_path",
+        "audit_report_sha256_by_path",
+        "distinctness_generation_root_by_path", "commands_by_path",
+        "pre_provenance_defects_by_path",
+    }
+    if (receipt.get("schema_version") != EXACT_WAVE_RECEIPT_SCHEMA or
+            receipt.get("wave_id") != contract.get("wave_id") or
+            receipt.get("group_id") != contract.get("group_id") or
+            receipt.get("cohort_index") != contract.get("cohort_index") or
+            receipt.get("cohort_count") != contract.get("cohort_count") or
+            receipt.get("member_paths") != paths or
+            receipt.get("component_ids") != contract.get("component_ids") or
+            receipt.get("preserved_owners") !=
+            contract.get("preserved_owners") or
+            receipt.get("queue_artifact_sha256") != queue_artifact_sha256 or
+            claim.get("queue_artifact_sha256") != queue_artifact_sha256 or
+            any(not isinstance(receipt.get(field), Mapping) or
+                set(receipt[field]) != set(paths) for field in mapping_fields) or
+            receipt.get("audit_ok") is not True or
+            receipt.get("mutation_applied") is not True or
+            receipt.get("publication_allowed") is not False or
+            receipt.get("index_policy") != "noindex"):
+        raise VerificationError(f"bind coletivo da exact wave diverge: {slug}")
+
+    dependencies: dict[pathlib.Path, str] = {receipt_path: snapshot.digest}
+    selected_provenance: dict[str, str] | None = None
+    for path in paths:
+        member = entries_by_path[path]
+        pre = receipt["pre_sha256_by_path"].get(path)
+        staged = receipt["staged_sha256_by_path"].get(path)
+        post = receipt["post_sha256_by_path"].get(path)
+        audit_digest = receipt["audit_report_sha256_by_path"].get(path)
+        generation_root = receipt[
+            "distinctness_generation_root_by_path"].get(path)
+        corrections = _canonical_review_corrections(
+            receipt["corrigidos_por_classe_by_path"].get(path), member)
+        if (pre != member["target_sha256"] or
+                receipt["queue_item_sha256_by_path"].get(path) !=
+                member["queue_item_sha256"] or
+                any(not isinstance(value, str) or
+                    SHA256.fullmatch(value) is None
+                    for value in (staged, post, audit_digest,
+                                  generation_root)) or
+                staged == pre or post == pre):
+            raise VerificationError(
+                f"bind por membro da exact wave diverge: {path}")
+        live = producer.read_regular_file_snapshot(
+            root / path, max_bytes=64 * 1024 * 1024)
+        if live.digest != post:
+            raise VerificationError(
+                f"receipt da exact wave está stale: {path}")
+        dependencies[root / path] = live.digest
+        pre_provenance = receipt[
+            "pre_provenance_defects_by_path"][path]
+        _validate_exact_wave_pre_provenance(pre_provenance, member)
+        _validate_exact_wave_commands(
+            receipt["commands_by_path"][path], member, pre_provenance)
+        evidence = receipt["source_provenance_evidence_by_path"][path]
+        if (not isinstance(evidence, Mapping) or
+                set(evidence) != {"path", "sha256"} or
+                not isinstance(evidence.get("path"), str) or
+                PROVENANCE_EVIDENCE_REL.fullmatch(evidence["path"]) is None or
+                not isinstance(evidence.get("sha256"), str) or
+                SHA256.fullmatch(evidence["sha256"]) is None):
+            raise VerificationError(
+                f"sidecar da exact wave inválido: {path}")
+        evidence_path = root / evidence["path"]
+        evidence_snapshot = producer.read_regular_file_snapshot(
+            evidence_path, max_bytes=16 * 1024 * 1024)
+        if evidence_snapshot.digest != evidence["sha256"]:
+            raise VerificationError(
+                f"sidecar da exact wave diverge: {path}")
+        prior = dependencies.get(evidence_path)
+        if prior is not None and prior != evidence_snapshot.digest:
+            raise VerificationError(
+                f"sidecar compartilhado contraditório: {path}")
+        dependencies[evidence_path] = evidence_snapshot.digest
+        if path == f"data/editorial/v2_pages/{slug}.jsonl":
+            selected_provenance = {
+                "file": evidence["path"],
+                "sha256": evidence["sha256"],
+            }
+            expected_claim = {
+                "slug": member["slug"], "file": path,
+                "paginas": member["n"], "target_sha256": pre,
+                "staged_sha256": staged,
+                "corrigidos_por_classe": corrections,
+                "receipt_path": str(receipt_path),
+                "receipt_sha256": snapshot.digest,
+                "queue_item_sha256": member["queue_item_sha256"],
+                "audited_sha256": post, "audit_ok": True,
+                "mutation_applied": True,
+                "wave_id": contract["wave_id"],
+                "queue_artifact_sha256": queue_artifact_sha256,
+            }
+            if dict(claim) != expected_claim:
+                raise VerificationError(
+                    f"claim diverge da projeção coletiva: {slug}")
+
+    raw_journal = receipt.get("journal_path")
+    expected_journal = workspace / "exact-component-wave-journal.jsonl"
+    if (raw_journal != str(expected_journal) or
+            not isinstance(receipt.get("journal_sha256"), str) or
+            SHA256.fullmatch(receipt["journal_sha256"]) is None):
+        raise VerificationError(f"journal da exact wave escapou: {slug}")
+    journal = producer.read_regular_file_snapshot(
+        expected_journal, max_bytes=MAX_RECEIPT_BYTES)
+    if journal.digest != receipt["journal_sha256"]:
+        raise VerificationError(f"journal da exact wave diverge: {slug}")
+    dependencies[expected_journal] = journal.digest
+    if selected_provenance is None:
+        raise VerificationError(
+            f"receipt da exact wave perdeu sidecar do claim: {slug}")
+    return dependencies, selected_provenance
+
+
+def _verify_review_receipt(
+    claim: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    queue_artifact_sha256: str,
+    live_sha256: str,
+    root: pathlib.Path,
+    queue_by_slug: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[pathlib.Path, str], dict[str, str]]:
+    """Autentica o receipt privado e todos os seus binds sob o lock do alvo."""
+    slug = entry["slug"]
+    if entry.get("exact_component_wave") is not None:
+        return _verify_exact_wave_receipt(
+            claim, entry, queue_artifact_sha256, root, queue_by_slug)
+    raw_receipt_path = claim["receipt_path"]
+    if (not isinstance(raw_receipt_path, str) or
+            "\x00" in raw_receipt_path or
+            not os.path.isabs(raw_receipt_path) or
+            os.path.abspath(raw_receipt_path) != raw_receipt_path):
+        raise VerificationError(f"receipt_path não é absoluto canônico: {slug}")
+    receipt_path = pathlib.Path(raw_receipt_path)
+    workspace = receipt_path.parent
+    expected_prefix = (
+        f"wiki-v2-{slug}-{entry['target_sha256'][:12]}-")
+    suffix = (workspace.name[len(expected_prefix):]
+              if workspace.name.startswith(expected_prefix) else "")
+    # Mesmo pai único do produtor que o receipt de exact wave exige acima.
+    if (receipt_path.name != REVIEW_RECEIPT_NAME or
+            workspace.parent != producer.workflow_workspace_parent() or
+            not 6 <= len(suffix) <= 64 or
+            re.fullmatch(r"[a-z0-9_]+", suffix) is None):
+        raise VerificationError(
+            f"receipt não pertence ao workspace privado canônico: {slug}")
+
+    workspace_before = _workspace_identity(workspace, slug)
+    try:
+        snapshot = producer.read_regular_file_snapshot(
+            receipt_path, max_bytes=MAX_RECEIPT_BYTES)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise VerificationError(
+            f"receipt não é arquivo regular único: {slug}") from error
+    workspace_after = _workspace_identity(workspace, slug)
+    if workspace_after != workspace_before:
+        raise VerificationError(
+            f"workspace do receipt mudou durante a captura: {slug}")
+    if snapshot.digest != claim["receipt_sha256"]:
+        raise VerificationError(f"receipt_sha256 diverge dos bytes: {slug}")
+    try:
+        receipt = producer.decode_json_no_duplicate_keys(
+            snapshot.payload, f"receipt:{slug}")
+    except ValueError as error:
+        raise VerificationError(
+            f"receipt não é JSON fechado: {slug}") from error
+    if (not isinstance(receipt, dict) or
+            set(receipt) not in {
+                REVIEW_RECEIPT_REQUIRED_KEYS,
+                REVIEW_RECEIPT_REQUIRED_KEYS | REVIEW_RECEIPT_OPTIONAL_KEYS,
+            } or
+            _canonical_review_receipt_payload(receipt) != snapshot.payload):
+        raise VerificationError(f"schema do receipt diverge: {slug}")
+
+    pre_provenance = receipt.get("pre_provenance_defects")
+    if pre_provenance is not None:
+        allowed_codes = {
+            "official_source_verified_at_invalid",
+            "official_source_http_status_invalid",
+        }
+        editable = set(entry.get("review_target_intent_ids") or [])
+        if (not isinstance(pre_provenance, dict) or not pre_provenance or
+                not set(pre_provenance).issubset(allowed_codes) or
+                any(not isinstance(values, list) or not values or
+                    len(values) != len(set(values)) or
+                    any(not isinstance(intent, str) or
+                        INTENT.fullmatch(intent) is None or
+                        intent not in editable for intent in values)
+                    for values in pre_provenance.values())):
+            raise VerificationError(
+                f"pre_provenance_defects inválido: {slug}")
+
+    corrections = _canonical_review_corrections(
+        receipt.get("corrigidos_por_classe"), entry)
+    hash_fields = (
+        "target_sha256", "staged_sha256", "queue_item_sha256",
+        "queue_artifact_sha256", "promoted_sha256",
+        "post_provenance_sha256", "audited_sha256",
+        "audit_report_sha256", "distinctness_generation_root",
+    )
+    if (any(not isinstance(receipt.get(field), str) or
+            SHA256.fullmatch(receipt[field]) is None
+            for field in hash_fields) or
+            type(receipt.get("schema_version")) is not int or
+            receipt["schema_version"] != 1 or
+            receipt.get("slug") != slug or
+            receipt.get("file") !=
+            f"data/editorial/v2_pages/{slug}.jsonl" or
+            type(receipt.get("paginas")) is not int or
+            receipt["paginas"] != entry["n"] or
+            receipt["target_sha256"] != entry["target_sha256"] or
+            receipt["staged_sha256"] == entry["target_sha256"] or
+            receipt["queue_item_sha256"] !=
+            entry["queue_item_sha256"] or
+            receipt["queue_artifact_sha256"] != queue_artifact_sha256 or
+            receipt["promoted_sha256"] != receipt["staged_sha256"] or
+            receipt["post_provenance_sha256"] !=
+            receipt["audited_sha256"] or
+            receipt["audited_sha256"] == entry["target_sha256"] or
+            receipt["audited_sha256"] != live_sha256 or
+            receipt.get("audit_ok") is not True or
+            receipt.get("mutation_applied") is not True or
+            receipt.get("publication_allowed") is not False or
+            receipt.get("index_policy") != "noindex"):
+        raise VerificationError(f"bind do receipt diverge: {slug}")
+    provenance = receipt.get("source_provenance_evidence")
+    if (not isinstance(provenance, dict) or
+            set(provenance) != {"path", "sha256"} or
+            not isinstance(provenance.get("path"), str) or
+            PROVENANCE_EVIDENCE_REL.fullmatch(provenance["path"]) is None or
+            not isinstance(provenance.get("sha256"), str) or
+            SHA256.fullmatch(provenance["sha256"]) is None):
+        raise VerificationError(
+            f"binding da evidence de proveniência inválido: {slug}")
+    evidence_path = root / provenance["path"]
+    try:
+        evidence_snapshot = producer.read_regular_file_snapshot(
+            evidence_path, max_bytes=16 * 1024 * 1024)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise VerificationError(
+            f"evidence de proveniência ausente/insegura: {slug}") from error
+    if evidence_snapshot.digest != provenance["sha256"]:
+        raise VerificationError(
+            f"evidence de proveniência diverge do receipt: {slug}")
+    _validate_review_command_receipts(
+        receipt.get("commands"), slug,
+        provenance_pending=pre_provenance is not None)
+
+    # Todo campo que o Workflow encaminhou precisa ser a projeção literal do
+    # receipt capturado; não aceitamos uma claim que combine dois receipts.
+    for key in set(claim) - {"receipt_path", "receipt_sha256"}:
+        if claim[key] != receipt.get(key):
+            raise VerificationError(
+                f"claim diverge do receipt em {slug}:{key}")
+    if claim["corrigidos_por_classe"] != corrections:
+        raise VerificationError(
+            f"correções da claim divergem do receipt: {slug}")
+    return ({
+        receipt_path: snapshot.digest,
+        evidence_path: evidence_snapshot.digest,
+    }, {
+        "file": provenance["path"],
+        "sha256": provenance["sha256"],
+    })
+
+
+def _verify_raw_recovery_preimage_evidence(
+    root: pathlib.Path,
+    claim: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    semantic_contract: producer.WritingSemanticContract | None = None,
+) -> dict[pathlib.Path, str]:
+    """Authenticate the content-addressed invalid preimage kept after CAS."""
+    slug = entry["slug"]
+    evidence = claim.get("raw_recovery_preimage_evidence")
+    expected_digest = entry["target_sha256"]
+    expected_relative = (
+        "data/editorial/v2_raw_recovery_preimages/" +
+        expected_digest + ".raw")
+    if (not isinstance(evidence, Mapping) or
+            set(evidence) != {"path", "sha256"} or
+            evidence.get("path") != expected_relative or
+            evidence.get("sha256") != expected_digest or
+            RAW_RECOVERY_PREIMAGE_REL.fullmatch(expected_relative) is None):
+        raise VerificationError(
+            f"evidence raw-recovery possui bind inválido: {slug}")
+    evidence_path = root / expected_relative
+    raw_parent = root / "data" / "editorial" / "v2_raw_recovery_preimages"
+    try:
+        expected_parent = raw_parent.resolve(strict=True)
+        if (expected_parent != raw_parent or
+                evidence_path.resolve(strict=True).parent != expected_parent):
+            raise VerificationError(
+                f"evidence raw-recovery escapou do diretório: {slug}")
+        snapshot = producer.read_regular_file_snapshot(
+            evidence_path, max_bytes=64 * 1024 * 1024)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise VerificationError(
+            f"preimagem raw-recovery permanente ausente/insegura: {slug}"
+        ) from error
+    if snapshot.digest != expected_digest:
+        raise VerificationError(
+            f"preimagem raw-recovery permanente diverge do target SHA: {slug}")
+    expected_intents = entry["writing_recovery"]["expected_intent_ids"]
+    semantically_blocked = (
+        set(expected_intents) & semantic_contract.unresolved_intents
+        if semantic_contract is not None else set())
+    try:
+        live_projection = producer.derive_writing_raw_recovery_projection(
+            snapshot.payload,
+            f"data/editorial/v2_pages/{slug}.jsonl",
+            expected_digest,
+            expected_intents,
+            semantically_blocked_intents=semantically_blocked,
+        )
+    except (TypeError, ValueError) as error:
+        raise VerificationError(
+            f"preimagem raw-recovery não gera projeção canônica: {slug}"
+        ) from error
+    if live_projection != entry["writing_recovery"]:
+        raise VerificationError(
+            f"preimagem raw-recovery diverge da projeção da fila: {slug}")
+    return {evidence_path: snapshot.digest}
+
+
+def _acquire_lock_path(lock_path: pathlib.Path, label: str) -> int:
+    existing_flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    create_flags = existing_flags | os.O_CREAT | os.O_EXCL
+    descriptor = -1
+    for _ in range(3):
+        try:
+            descriptor = os.open(lock_path, existing_flags)
+            break
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(lock_path, create_flags, 0o600)
+                break
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise VerificationError(
+                    f"lock inseguro para {label}: {error}") from error
+        except OSError as error:
+            raise VerificationError(
+                f"lock inseguro para {label}: {error}") from error
+    if descriptor < 0:
+        raise VerificationError(
+            f"lock mudou repetidamente durante abertura: {label}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise VerificationError(
+                f"lock não é arquivo regular único: {label}")
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise LockBusy(f"lock ocupado para {label}; fail-fast") from error
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _acquire_lock(slug: str) -> int:
+    return _acquire_lock_path(
+        pathlib.Path("/tmp") / f"opt-wiki-v2-{slug}.transaction.lock",
+        slug,
+    )
+
+
+def _verify_live_file(
+    root: pathlib.Path,
+    kind: str,
+    claim: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    semantic_contract: producer.WritingSemanticContract | None = None,
+) -> tuple[str, int, dict[pathlib.Path, str]]:
+    slug = entry["slug"]
+    target_root = (root / "data" / "editorial" / "v2_pages").resolve(strict=True)
+    target = target_root / f"{slug}.jsonl"
+    if target.resolve(strict=True).parent != target_root:
+        raise VerificationError(f"target escapou do diretório canônico: {slug}")
+    snapshot = producer.read_regular_file_snapshot(target)
+    if snapshot.digest != claim["audited_sha256"]:
+        raise VerificationError(
+            f"hash vivo diverge da claim em {slug}: "
+            f"claim={claim['audited_sha256']} vivo={snapshot.digest}")
+    if kind == "mass" and entry.get("writing_recovery") is not None:
+        if (snapshot.digest == entry["target_sha256"] or
+                not snapshot.payload or
+                not snapshot.payload.endswith(b"\n") or
+                b"\r" in snapshot.payload):
+            raise VerificationError(
+                f"writing_recovery não prova CAS para JSONL LF canônico: {slug}")
+    records: list[Mapping[str, Any]] = []
+    raw_record_sha256: dict[str, str] = {}
+    for line_number, raw in enumerate(snapshot.payload.splitlines(), start=1):
+        if not raw.strip():
+            raise VerificationError(f"linha vazia interna em {slug}:{line_number}")
+        try:
+            record = producer.decode_json_no_duplicate_keys(
+                raw, f"{slug}:{line_number}")
+        except ValueError as error:
+            raise VerificationError(
+                f"JSON inválido em {slug}:{line_number}") from error
+        if not isinstance(record, Mapping):
+            raise VerificationError(f"registro não é objeto em {slug}:{line_number}")
+        records.append(record)
+    intents = [record.get("intent_id") for record in records]
+    if (any(not isinstance(intent, str) or intent.strip() != intent or not intent
+            for intent in intents) or len(set(intents)) != len(intents)):
+        raise VerificationError(f"intent_ids ausentes/duplicados em {slug}")
+    for raw, intent in zip(snapshot.payload.splitlines(), intents):
+        raw_record_sha256[intent] = hashlib.sha256(raw).hexdigest()
+    dependencies: dict[pathlib.Path, str] = {}
+    if kind == "mass":
+        if semantic_contract is not None:
+            try:
+                live_removals = producer.semantic_relocation_removals_for_target(
+                    f"data/editorial/v2_pages/{slug}.jsonl",
+                    tuple(zip(snapshot.payload.splitlines(), records)),
+                    semantic_contract,
+                )
+            except (TypeError, ValueError) as error:
+                raise VerificationError(
+                    f"remoção semântica viva inválida em {slug}: {error}") from error
+            if live_removals:
+                stale = ",".join(item["intent_id"] for item in live_removals)
+                raise VerificationError(
+                    f"baseline semanticamente relocada permaneceu no vivo: "
+                    f"{slug}:{stale}")
+        relocation_ids = {
+            item["intent_id"]
+            for item in entry.get("semantic_relocation_removals", [])
+        }
+        if relocation_ids & set(intents):
+            raise VerificationError(
+                f"baseline semanticamente relocada reapareceu no vivo: {slug}")
+        selected, expected, portfolio_path, portfolio_digest = (
+            _expected_mass_intents(root, entry))
+        dependencies[portfolio_path] = portfolio_digest
+        recovery = entry.get("writing_recovery")
+        if recovery is not None:
+            try:
+                producer.validate_writing_raw_recovery_projection(
+                    recovery,
+                    target_rel_path=(
+                        f"data/editorial/v2_pages/{slug}.jsonl"),
+                    target_sha256=entry["target_sha256"],
+                    expected_intents=selected,
+                )
+            except (TypeError, ValueError) as error:
+                raise VerificationError(
+                    f"writing_recovery diverge do slice vivo: {slug}: {error}"
+                ) from error
+        if semantic_contract is not None:
+            target_rel = f"data/editorial/v2_pages/{slug}.jsonl"
+            unchanged_semantic = sorted(
+                intent for intent in selected
+                if (intent in semantic_contract.unresolved_intents and
+                    semantic_contract.target_rel_paths.get(intent) == target_rel and
+                    semantic_contract.superseded_page_record_sha256.get(intent)
+                    is not None and
+                    raw_record_sha256.get(intent) ==
+                    semantic_contract.superseded_page_record_sha256[intent])
+            )
+            if unchanged_semantic:
+                raise VerificationError(
+                    "página viva repetiu bytes semanticamente superados: " +
+                    f"{slug}:{','.join(unchanged_semantic[:8])}")
+        migration = entry.get("portfolio_intent_migration")
+        if migration is not None:
+            try:
+                migration_dependencies = (
+                    migrations.verify_post_replacement_queue_authorization(
+                        root,
+                        migration,
+                        f"data/editorial/v2_pages/{slug}.jsonl",
+                        entry["file"],
+                        selected,
+                        entry["families"],
+                        entry["skip"],
+                        entry["take"],
+                        entry["n"],
+                        entry.get("intent_ids"),
+                    )
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise VerificationError(
+                    f"migração integral não autenticada em {slug}: {error}") from error
+            for relative, digest in migration_dependencies.items():
+                dependencies[root / relative] = digest
+        if claim["intent_ids"] != selected:
+            raise VerificationError(
+                f"claim intent_ids diverge do portfolio pinado em {slug}")
+        if intents != expected:
+            raise VerificationError(
+                f"ordem/conjunto vivo diverge do portfolio+extras em {slug}")
+    elif intents != entry["target_intent_ids"]:
+        raise VerificationError(
+            f"ordem/conjunto vivo diverge da preimagem de revisão em {slug}")
+    if kind == "review":
+        for relative, expected_digest in entry[
+                "distinctness_dependency_sha256"].items():
+            dependencies[root / relative] = expected_digest
+    for intent, expected_digest in entry["preserved_record_sha256"].items():
+        if raw_record_sha256.get(intent) != expected_digest:
+            raise VerificationError(
+                f"registro que deveria ser byte-estável mudou: {slug}:{intent}")
+    return snapshot.digest, len(records), dependencies
+
+
+def _assert_dependencies_unchanged(
+    dependencies: Mapping[pathlib.Path, str],
+) -> None:
+    changed = []
+    for path, expected_digest in dependencies.items():
+        actual = producer.read_regular_file_snapshot(path).digest
+        if actual != expected_digest:
+            changed.append(str(path))
+    if changed:
+        raise VerificationError(
+            f"fila/portfolio mudou durante a verificação: {changed[:8]}")
+
+
+def _canonical_review_stock(
+    root: pathlib.Path,
+) -> dict[str, tuple[pathlib.Path, producer.RegularFileSnapshot]]:
+    """Capture every finalized shard that the authenticated batch must bind."""
+    expected_pages_root = root / "data" / "editorial" / "v2_pages"
+    try:
+        pages_root = expected_pages_root.resolve(strict=True)
+    except OSError as error:
+        raise VerificationError("estoque v2 canônico está ausente") from error
+    if pages_root != expected_pages_root or not pages_root.is_dir():
+        raise VerificationError("estoque v2 canônico não é diretório real")
+    stock: dict[str, tuple[pathlib.Path, producer.RegularFileSnapshot]] = {}
+    for path in sorted(pages_root.glob("*.jsonl")):
+        if not auditor_contract.is_finalized_v2_path(os.fspath(path)):
+            continue
+        relative = path.relative_to(root).as_posix()
+        if TARGET_REL.fullmatch(relative) is None:
+            raise VerificationError(
+                f"shard finalizado possui path não canônico: {relative}")
+        try:
+            snapshot = producer.read_regular_file_snapshot(
+                path, max_bytes=64 * 1024 * 1024)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise VerificationError(
+                f"shard finalizado não é snapshot seguro: {relative}") from error
+        stock[relative] = (path, snapshot)
+    if not stock:
+        raise VerificationError("estoque v2 finalizado está vazio")
+    return stock
+
+
+def _review_stock_directory_epoch(root: pathlib.Path) -> tuple[int, ...]:
+    """O(1) membership epoch: create/unlink/rename changes dir ctime/mtime."""
+    pages_root = root / "data" / "editorial" / "v2_pages"
+    try:
+        parent_fd, name, _ = producer._open_parent_directory(pages_root)
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+    except OSError as error:
+        raise VerificationError(
+            "diretório do estoque v2 não possui identidade segura") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode):
+            raise VerificationError(
+                "estoque v2 canônico não é diretório real")
+        return (
+            info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+            info.st_nlink, info.st_mtime_ns, info.st_ctime_ns,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _open_review_stock_membership_watch(
+    root: pathlib.Path,
+) -> tuple[int, tuple[int, ...]]:
+    """Arm an inotify epoch without a gap around the initial directory stat."""
+    before = _review_stock_directory_epoch(root)
+    init = getattr(producer._LIBC, "inotify_init1", None)
+    add = getattr(producer._LIBC, "inotify_add_watch", None)
+    if init is None or add is None:
+        raise VerificationError("inotify indisponível para epoch do estoque")
+    descriptor = init(os.O_CLOEXEC | os.O_NONBLOCK)
+    if descriptor < 0:
+        number = ctypes.get_errno()
+        raise VerificationError(
+            "não foi possível abrir epoch inotify do estoque: " +
+            os.strerror(number))
+    # Membership plus watch invalidation. Existing-file bytes are bound by
+    # their own safe snapshots; watching IN_MODIFY here would only create an
+    # avoidable event storm on a 10M inventory.
+    mask = (0x00000040 | 0x00000080 | 0x00000100 | 0x00000200 |
+            0x00000400 | 0x00000800)
+    pages_root = root / "data" / "editorial" / "v2_pages"
+    try:
+        watch = add(descriptor, os.fsencode(pages_root), mask)
+        if watch < 0:
+            number = ctypes.get_errno()
+            raise VerificationError(
+                "não foi possível observar membership do estoque: " +
+                os.strerror(number))
+        after = _review_stock_directory_epoch(root)
+        if after != before:
+            raise VerificationError(
+                "membership do diretório v2 mudou ao abrir epoch")
+        return descriptor, before
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _assert_review_stock_membership_unchanged(
+    root: pathlib.Path, watch: tuple[int, tuple[int, ...]],
+) -> None:
+    descriptor, expected = watch
+    try:
+        event = os.read(descriptor, 1024 * 1024)
+    except BlockingIOError:
+        event = b""
+    if event or _review_stock_directory_epoch(root) != expected:
+        raise VerificationError(
+            "membership do diretório v2 mudou durante a verificação")
+
+
+def _catch_up_review_distinctness(root: pathlib.Path) -> dict[str, Any]:
+    """Create one exact private index epoch for the whole verified prefix.
+
+    Finalizers deliberately use bounded read-only overlays so several waves can
+    finish without invalidating one another's receipts.  The consumer owns the
+    single exact catch-up after every claimed wave is visible and before the
+    independent global audit.  This mutates only the private Pebble index and
+    carries no publication authority.
+    """
+    binary_error = auditor_contract.cached_factory_binary_error()
+    if binary_error:
+        raise VerificationError(
+            "factory cache inválido para catch-up exact: " + binary_error)
+    command = [
+        auditor_contract.FACTORY_BINARY, "index-distinctness",
+        "--require-exact", "--root", os.fspath(root),
+    ]
+    if auditor_contract.FACTORY_DISTINCTNESS_STORE:
+        command.extend([
+            "--distinctness-store",
+            auditor_contract.FACTORY_DISTINCTNESS_STORE,
+        ])
+    descriptor = _acquire_lock_path(
+        DISTINCTNESS_INDEX_WRITE_LOCK, "catch-up exact de distinctness")
+    try:
+        try:
+            with tempfile.TemporaryDirectory(
+                    prefix="wiki-v2-distinctness-", dir="/tmp",
+                    ignore_cleanup_errors=True) as raw_private:
+                private_root = pathlib.Path(raw_private)
+                os.chmod(private_root, 0o700)
+                environment = _minimal_subprocess_environment(
+                    root, private_root)
+                process = subprocess.Popen(
+                    command, cwd=root, env=environment,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, bufsize=0,
+                    start_new_session=True)
+                stdout, stderr, read_status = (
+                    auditor_contract._read_process_output_bounded(
+                        process, 1800,
+                        auditor_contract.FACTORY_QUERY_STDOUT_MAX_BYTES,
+                        auditor_contract.FACTORY_QUERY_STDERR_MAX_BYTES))
+        except OSError as error:
+            raise VerificationError(
+                "catch-up exact não pôde iniciar: "
+                f"{type(error).__name__}") from error
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    if read_status:
+        raise VerificationError(
+            "catch-up exact excedeu limite: " + read_status)
+    if process.returncode != 0:
+        detail = " ".join(
+            stderr.decode("utf-8", errors="replace").strip().split())
+        raise VerificationError(
+            "catch-up exact falhou fechado: " + detail[:500])
+    try:
+        payload = producer.decode_json_no_duplicate_keys(
+            stdout, "catch-up exact de distinctness")
+    except ValueError as error:
+        raise VerificationError(
+            "catch-up exact não devolveu JSON fechado") from error
+    index = payload.get("distinctness_index") if isinstance(payload, Mapping) else None
+    if (not isinstance(payload, Mapping) or
+            payload.get("mode") !=
+            "incremental-distinctness-index-write-no-publication" or
+            payload.get("status") != "ready-exact" or
+            payload.get("publication_allowed") is not False or
+            payload.get("index_policy") != "noindex" or
+            not isinstance(index, Mapping) or
+            index.get("generation_atomic") is not True or
+            index.get("exact_required") is not True or
+            index.get("live_assessment_complete") is not True or
+            index.get("inventory_stable") is not True or
+            index.get("publication_allowed") is not False or
+            index.get("index_policy") != "noindex" or
+            any(type(index.get(field)) is not int or index[field] < 0
+                for field in ("shards", "pages", "parsed_shards",
+                              "reused_shards", "metadata_scanned")) or
+            not isinstance(index.get("stock_root"), str) or
+            SHA256.fullmatch(index["stock_root"]) is None):
+        raise VerificationError(
+            "catch-up não fechou inventário exact/noindex")
+    return {
+        "mode": payload["mode"],
+        "status": payload["status"],
+        "stock_root": index["stock_root"],
+        "stock_shards": index["shards"],
+        "stock_pages": index["pages"],
+        "parsed_shards": index["parsed_shards"],
+        "reused_shards": index["reused_shards"],
+        "report_sha256": hashlib.sha256(stdout).hexdigest(),
+        "publication_allowed": False,
+        "index_policy": "noindex",
+    }
+
+
+def _load_global_review_merit_report(
+    root: pathlib.Path,
+) -> tuple[
+        Mapping[str, Any], dict[pathlib.Path, str], dict[str, Any] | None]:
+    """Run one independent global audit, never trusting receipt commands.
+
+    A synthetic report is accepted only for an explicitly enabled temporary
+    contract-test root.  The installed repository always executes the live
+    auditor and its authenticated global distinctness batch.
+    """
+    test_report = os.environ.get("WIKI_VERIFY_V2_TEST_REVIEW_MERIT_REPORT")
+    if root == INSTALL_ROOT:
+        if test_report:
+            raise VerificationError(
+                "override de auditoria de mérito proibido no repositório canônico")
+        catchup = _catch_up_review_distinctness(root)
+        descriptor = _acquire_lock_path(
+            HEAVY_AUDIT_LOCK, "auditoria global de mérito")
+        try:
+            try:
+                report = auditor_contract.audit_global()
+            except Exception as error:
+                raise VerificationError(
+                    "auditoria global independente falhou fechada: "
+                    f"{type(error).__name__}: {error}") from error
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        if not isinstance(report, Mapping):
+            raise VerificationError(
+                "auditoria global independente não retornou objeto")
+        return report, {}, catchup
+
+    if os.environ.get("WIKI_VERIFY_V2_TEST_ROOT") != "1" or not test_report:
+        raise VerificationError(
+            "root de teste exige atestação global de mérito explícita")
+    candidate = pathlib.Path(test_report)
+    if (not candidate.is_absolute() or
+            candidate.resolve(strict=True).parent !=
+            (root / "data" / "ops").resolve(strict=True)):
+        raise VerificationError(
+            "atestação global de teste escapou de data/ops")
+    try:
+        snapshot = producer.read_regular_file_snapshot(
+            candidate, max_bytes=MAX_TEST_MERIT_REPORT_BYTES)
+        report = producer.decode_json_no_duplicate_keys(
+            snapshot.payload, "atestação global de mérito de teste")
+    except (OSError, RuntimeError, ValueError) as error:
+        raise VerificationError(
+            "atestação global de mérito de teste inválida") from error
+    if not isinstance(report, Mapping):
+        raise VerificationError(
+            "atestação global de mérito de teste não é objeto")
+    return report, {candidate: snapshot.digest}, None
+
+
+def _validate_global_review_merit(
+    root: pathlib.Path,
+    report: Mapping[str, Any],
+    claim_by_slug: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[pathlib.Path, str]]:
+    """Bind one whole-stock audit to live bytes and every review receipt."""
+    files = report.get("files")
+    stock = _canonical_review_stock(root)
+    if not isinstance(files, Mapping) or set(files) != set(stock):
+        raise VerificationError(
+            "auditoria global não cobre exatamente o estoque v2 vivo")
+    total_pages = report.get("total_pages")
+    if (type(total_pages) is not int or total_pages < 1 or
+            type(report.get("max_heading_reuse")) is not int or
+            report["max_heading_reuse"] < 1):
+        raise VerificationError(
+            "contadores da auditoria global são inválidos")
+
+    dependencies: dict[pathlib.Path, str] = {}
+    generation_roots: set[str] = set()
+    stock_roots: set[str] = set()
+    active_pages_total = 0
+    failed: list[str] = []
+    claimed_relatives = {
+        f"data/editorial/v2_pages/{slug}.jsonl"
+        for slug in claim_by_slug
+    }
+    for relative in sorted(stock):
+        path, snapshot = stock[relative]
+        dependencies[path] = snapshot.digest
+        result = files[relative]
+        if (not isinstance(result, Mapping) or
+                result.get("file") != relative or
+                type(result.get("active_pages")) is not int or
+                result["active_pages"] < 0 or
+                not isinstance(result.get("defects"), Mapping) or
+                type(result.get("ok")) is not bool):
+            raise VerificationError(
+                f"resultado global possui forma inválida: {relative}")
+        active_pages_total += result["active_pages"]
+        index = result.get("distinctness_index")
+        if (not isinstance(index, Mapping) or
+                index.get("status") != "ready" or
+                index.get("mode") != "global-distinctness-v3-read-only" or
+                index.get("schema_version") !=
+                auditor_contract.GLOBAL_BATCH_SCHEMA_VERSION or
+                index.get("algorithm_fingerprint") !=
+                auditor_contract.INCREMENTAL_ALGORITHM_FINGERPRINT or
+                index.get("batch_fingerprint") !=
+                auditor_contract.GLOBAL_BATCH_ALGORITHM_FINGERPRINT or
+                index.get("target_digest") != snapshot.digest or
+                index.get("target_snapshot_bound") is not True or
+                index.get("inventory_complete") is not True or
+                index.get("inventory_stable") is not True or
+                index.get("candidate_routing_complete") is not True or
+                index.get("local_routing_complete") is not True or
+                index.get("visible_surface_scope_complete") is not True or
+                index.get("visible_surfaces") !=
+                list(auditor_contract.INCREMENTAL_VISIBLE_SURFACES) or
+                index.get("publication_allowed") is not False or
+                index.get("index_policy") != "noindex" or
+                index.get("stock_shards") != len(stock) or
+                index.get("stock_pages") != total_pages or
+                not isinstance(index.get("generation_root"), str) or
+                SHA256.fullmatch(index["generation_root"]) is None or
+                not isinstance(index.get("stock_root"), str) or
+                SHA256.fullmatch(index["stock_root"]) is None):
+            raise VerificationError(
+                f"atestação global de distinctness diverge: {relative}")
+        generation_roots.add(index["generation_root"])
+        stock_roots.add(index["stock_root"])
+        if relative in claimed_relatives and result["ok"] is not True:
+            failed.append(relative)
+    if (active_pages_total != total_pages or
+            len(generation_roots) != 1 or len(stock_roots) != 1):
+        raise VerificationError(
+            "auditoria global não fecha contagem/epoch do estoque")
+
+    generation_root = next(iter(generation_roots))
+    stock_root = next(iter(stock_roots))
+    for slug, claim in claim_by_slug.items():
+        relative = f"data/editorial/v2_pages/{slug}.jsonl"
+        if relative not in stock:
+            raise VerificationError(
+                f"claim de review ficou fora do estoque atestado: {slug}")
+        receipt_path = pathlib.Path(claim["receipt_path"])
+        try:
+            receipt_snapshot = producer.read_regular_file_snapshot(
+                receipt_path, max_bytes=MAX_RECEIPT_BYTES)
+            receipt = producer.decode_json_no_duplicate_keys(
+                receipt_snapshot.payload, f"receipt epoch:{slug}")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise VerificationError(
+                f"receipt mudou antes do bind de epoch: {slug}") from error
+        receipt_generation = (
+            receipt.get("distinctness_generation_root_by_path", {}).get(
+                relative)
+            if isinstance(receipt, Mapping) and "wave_id" in claim else
+            receipt.get("distinctness_generation_root")
+            if isinstance(receipt, Mapping) else None)
+        if (not isinstance(receipt_generation, str) or
+                SHA256.fullmatch(receipt_generation) is None or
+                receipt_generation != generation_root):
+            raise VerificationError(
+                f"receipt diverge do generation root global vivo: {slug}")
+    if failed:
+        raise VerificationError(
+            "mérito global reprovou a wave: " + ",".join(failed[:16]))
+
+    try:
+        canonical_report = json.dumps(
+            report, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise VerificationError(
+            "relatório global não é serializável canonicamente") from error
+    return {
+        "mode": "global-distinctness-v3-read-only",
+        "generation_root": generation_root,
+        "stock_root": stock_root,
+        "stock_shards": len(stock),
+        "stock_pages": total_pages,
+        "report_sha256": hashlib.sha256(canonical_report).hexdigest(),
+    }, dependencies
+
+
+def _validate_source_provenance_check_stdout(
+    payload: bytes,
+    expected_relative: str,
+    slug: str,
+) -> None:
+    if (not isinstance(payload, bytes) or
+            not payload or
+            len(payload) > MAX_SOURCE_PROVENANCE_CHECK_OUTPUT_BYTES or
+            not payload.endswith(b"\n") or b"\r" in payload or
+            payload.count(b"\n") != 1):
+        raise VerificationError(
+            f"check independente de proveniência perdeu forma/limite: {slug}")
+    try:
+        line = payload[:-1].decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise VerificationError(
+            f"check independente de proveniência não é UTF-8: {slug}"
+        ) from error
+    matches = re.findall(r"(?:^| )path=([^ ]+)(?: |$)", line)
+    if (not line or line != line.strip() or
+            len(matches) != 1 or matches[0] != expected_relative or
+            "check=current-selection-pass" not in line or
+            "release_eligible=false" not in line or
+            not line.endswith(" publication=false")):
+        raise VerificationError(
+            f"check independente de proveniência divergiu: {slug}")
+
+
+def _revalidate_review_source_provenance(
+    root: pathlib.Path,
+    claim_by_slug: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Re-run the deterministic current-selection check for every receipt."""
+    attestations: list[dict[str, str]] = []
+    test_root = (
+        root != INSTALL_ROOT and
+        os.environ.get("WIKI_VERIFY_V2_TEST_ROOT") == "1")
+    for slug in sorted(claim_by_slug):
+        claim = claim_by_slug[slug]
+        try:
+            receipt_snapshot = producer.read_regular_file_snapshot(
+                pathlib.Path(claim["receipt_path"]),
+                max_bytes=MAX_RECEIPT_BYTES)
+            receipt = producer.decode_json_no_duplicate_keys(
+                receipt_snapshot.payload, f"receipt provenance:{slug}")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise VerificationError(
+                f"receipt mudou antes do check de proveniência: {slug}"
+            ) from error
+        if not isinstance(receipt, Mapping):
+            raise VerificationError(
+                f"receipt de proveniência não é objeto: {slug}")
+        evidence = (
+            receipt.get("source_provenance_evidence_by_path", {}).get(
+                f"data/editorial/v2_pages/{slug}.jsonl")
+            if "wave_id" in claim else
+            receipt.get("source_provenance_evidence")
+        )
+        if not isinstance(evidence, Mapping):
+            raise VerificationError(
+                f"receipt perdeu evidence de proveniência: {slug}")
+        relative = evidence.get("path")
+        digest = evidence.get("sha256")
+        if (not isinstance(relative, str) or
+                PROVENANCE_EVIDENCE_REL.fullmatch(relative) is None or
+                not isinstance(digest, str) or SHA256.fullmatch(digest) is None):
+            raise VerificationError(
+                f"receipt perdeu bind de proveniência: {slug}")
+        if not test_root:
+            script_path = root / "tools" / "audit-v2-source-provenance"
+            if not BASH_BIN.is_absolute() or not BASH_BIN.is_file():
+                raise VerificationError(
+                    "bash absoluto confiável não está disponível")
+            command = [
+                os.fspath(BASH_BIN), os.fspath(script_path),
+                "--root", os.fspath(root), "--check", "--file",
+                f"data/editorial/v2_pages/{slug}.jsonl",
+            ]
+            try:
+                with tempfile.TemporaryDirectory(
+                        prefix="wiki-v2-provenance-", dir="/tmp",
+                        ignore_cleanup_errors=True) as raw_private:
+                    private_root = pathlib.Path(raw_private)
+                    os.chmod(private_root, 0o700)
+                    environment = _minimal_subprocess_environment(
+                        root, private_root)
+                    completed = _run_closed_subprocess(
+                        command, cwd=root, environment=environment,
+                        timeout=300)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise VerificationError(
+                    f"check independente de proveniência falhou: {slug}: "
+                    f"{type(error).__name__}") from error
+            if (len(completed.stdout) >
+                    MAX_SOURCE_PROVENANCE_CHECK_OUTPUT_BYTES or
+                    len(completed.stderr) >
+                    MAX_SOURCE_PROVENANCE_CHECK_OUTPUT_BYTES or
+                    completed.returncode != 0):
+                detail = " ".join(completed.stderr.decode(
+                    "utf-8", errors="replace").split())[:500]
+                raise VerificationError(
+                    f"check independente de proveniência reprovou: "
+                    f"{slug}: rc={completed.returncode} {detail}")
+            _validate_source_provenance_check_stdout(
+                completed.stdout, relative, slug)
+        attestations.append({
+            "file": f"data/editorial/v2_pages/{slug}.jsonl",
+            "evidence_path": relative,
+            "evidence_sha256": digest,
+            "verdict": "current-selection-pass",
+        })
+    return attestations
+
+
+def _emit_review_wave_quarantine(
+    claim_by_slug: Mapping[str, Mapping[str, Any]],
+    reason: BaseException,
+) -> None:
+    """Make a failed post-CAS wave explicitly forward-only/non-committable."""
+    print(json.dumps({
+        "identity_verified": True,
+        "audit_merit_verified": False,
+        "wave_commit_allowed": False,
+        "quarantine_policy": "edit_forward_only_no_reset_revert",
+        "quarantined_files": [
+            f"data/editorial/v2_pages/{slug}.jsonl"
+            for slug in sorted(claim_by_slug)
+        ],
+        "reason": str(reason),
+    }, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _validate_exact_wave_claim_coverage(
+    claim_by_slug: Mapping[str, Mapping[str, Any]],
+    queue_by_slug: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """A collective mutation is claimable only as the complete cohort."""
+    checked_waves: set[str] = set()
+    for slug in claim_by_slug:
+        contract = queue_by_slug[slug].get("exact_component_wave")
+        if not isinstance(contract, Mapping):
+            continue
+        wave_id = contract["wave_id"]
+        if wave_id in checked_waves:
+            continue
+        checked_waves.add(wave_id)
+        member_slugs = {
+            pathlib.PurePosixPath(path).stem
+            for path in contract["member_paths"]
+        }
+        if (set(claim_by_slug) & member_slugs) != member_slugs:
+            raise VerificationError(
+                "claims não cobrem a exact wave inteira: " + wave_id)
+        receipts = {
+            (claim_by_slug[member]["receipt_path"],
+             claim_by_slug[member]["receipt_sha256"],
+             claim_by_slug[member]["wave_id"])
+            for member in member_slugs
+        }
+        if len(receipts) != 1:
+            raise VerificationError(
+                "membros da exact wave misturam receipts: " + wave_id)
+
+
+def main(
+    argv: list[str] | None = None,
+    verified_consumer: Callable[[VerifiedWorkflowTransaction], int] | None = None,
+) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kind", choices=("mass", "review"), required=True)
+    parser.add_argument("--root", type=pathlib.Path, default=INSTALL_ROOT)
+    parser.add_argument("--queue", type=pathlib.Path)
+    parser.add_argument("--results", default="-",
+                        help="JSON retornado pelo Workflow; '-' lê stdin")
+    parser.add_argument(
+        "--exec", dest="action", nargs=argparse.REMAINDER,
+        help="ação executada somente após verificação, com locks mantidos",
+    )
+    arguments = parser.parse_args(argv)
+    if arguments.action is not None:
+        raise VerificationError(
+            "--exec arbitrário foi desativado: o verificador apenas atesta; "
+            "commit deve usar wrapper fechado com pathspec autenticado")
+    root = arguments.root.resolve(strict=True)
+    if (root != INSTALL_ROOT and
+            os.environ.get("WIKI_VERIFY_V2_TEST_ROOT") != "1"):
+        raise VerificationError(
+            f"root não é o repositório canônico instalado: {root}")
+    queue, dependencies = _load_queue(
+        root, arguments.kind, arguments.queue)
+    queue_path = _canonical_queue(root, arguments.kind)
+    queue_artifact_sha256 = dependencies[queue_path]
+    semantic_contract: producer.WritingSemanticContract | None = None
+    semantic_digest: str | None = None
+    if arguments.kind == "mass":
+        semantic_path = root / SEMANTIC_CONTRACT_REL
+        semantic_contract = producer.load_writing_semantic_contract(root)
+        semantic_digest = semantic_contract.digest
+        dependencies[semantic_path] = semantic_digest
+        for entry in queue:
+            if (isinstance(entry, Mapping) and
+                    "semantic_relocation_removals" in entry):
+                _canonical_semantic_relocation_removals(
+                    entry, str(entry.get("slug")))
+        producer.verify_writing_semantic_contract_dependencies(
+            root, semantic_contract)
+    by_slug = _queue_by_slug(
+        arguments.kind, queue, semantic_digest, semantic_contract)
+    if arguments.kind == "mass":
+        catalog_path = root / SOURCE_HINT_CATALOG_REL
+        catalog_snapshot = producer.read_regular_file_snapshot(
+            catalog_path, max_bytes=8 * 1024 * 1024)
+        dependencies[catalog_path] = catalog_snapshot.digest
+        for entry in queue:
+            if entry["source_hint_catalog_sha256"] != catalog_snapshot.digest:
+                raise VerificationError(
+                    f"catálogo de fontes diverge da fila em {entry['slug']}")
+    result = _read_json(arguments.results)
+    claims = _validate_result_envelope(
+        arguments.kind, result, len(queue))
+
+    attempted_key = (
+        "attempted_batches" if arguments.kind == "mass" else
+        "attempted_reviews")
+    attempted = result[attempted_key]
+    claim_slugs = [claim.get("slug") if isinstance(claim, Mapping) else None
+                   for claim in claims]
+    claimed_set = set(claim_slugs)
+    expected_claim_order = [
+        entry["slug"] for entry in queue[:attempted]
+        if entry["slug"] in claimed_set
+    ]
+    if claim_slugs != expected_claim_order:
+        raise VerificationError(
+            "claims não formam subsequência ordenada do prefixo tentado")
+
+    claim_by_slug: dict[str, Mapping[str, Any]] = {}
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            raise VerificationError("claim não é objeto")
+        slug = claim.get("slug")
+        if not isinstance(slug, str) or slug not in by_slug:
+            raise VerificationError(f"claim não pertence à fila: {slug!r}")
+        if slug in claim_by_slug:
+            raise VerificationError(f"claim duplicada: {slug}")
+        _validate_claim_shape(arguments.kind, claim, by_slug[slug])
+        claim_by_slug[slug] = claim
+
+    if arguments.kind == "mass":
+        # A projeção de fontes relê o catálogo (~50MB) por entrada; iterar a
+        # fila inteira custa 250×/wave. A coerência global do catálogo já foi
+        # ligada acima para toda a fila; só as claims efetivamente atestadas
+        # precisam ter a projeção de fontes reautenticada — verdict inalterado
+        # (apenas o conjunto commitado é atestado).
+        for slug in sorted(claim_by_slug):
+            entry = by_slug[slug]
+            projection = base64.b64encode(json.dumps(
+                {
+                    "source_overrides": entry["source_overrides"],
+                    "strict_source_intents": entry["strict_source_intents"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")).decode("ascii")
+            try:
+                producer.verify_writing_source_resolution(
+                    root,
+                    entry["file"],
+                    entry["portfolio_sha256"],
+                    str(SOURCE_HINT_CATALOG_REL),
+                    entry["source_hint_catalog_sha256"],
+                    entry["families"],
+                    entry["skip"],
+                    entry["take"],
+                    entry["n"],
+                    entry.get("intent_ids"),
+                    projection,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise VerificationError(
+                    f"projeção de fontes diverge em {entry['slug']}: {error}") from error
+
+    if arguments.kind == "review":
+        _validate_exact_wave_claim_coverage(claim_by_slug, by_slug)
+
+    descriptors: list[int] = []
+    verified: list[dict[str, Any]] = []
+    required_artifacts: dict[str, tuple[str, str]] = {}
+    live_targets: dict[pathlib.Path, str] = {}
+    review_stock_membership_watch: tuple[int, tuple[int, ...]] | None = None
+    try:
+        # O lock do par impede que relaunch-writing/review troque a fila
+        # durante a atestação. Em review, cada peer relacional recebe o mesmo
+        # lock transacional do finalizer, em ordem global e sem espera.
+        descriptors.append(_acquire_lock_path(
+            pathlib.Path("/tmp/opt-wiki-relaunch-writing-pair.lock"),
+            "fila writing/review",
+        ))
+        locked_slugs = set(claim_by_slug)
+        if arguments.kind == "review":
+            attempted_entries = queue[:attempted]
+            locked_slugs.update(entry["slug"] for entry in attempted_entries)
+            for entry in attempted_entries:
+                for relative in entry[
+                        "distinctness_dependency_sha256"]:
+                    locked_slugs.add(pathlib.PurePosixPath(relative).stem)
+        for slug in sorted(locked_slugs):
+            descriptors.append(_acquire_lock(slug))
+        if arguments.kind == "review" and claim_by_slug:
+            descriptors.append(_acquire_lock_path(
+                SOURCE_PROVENANCE_LOCK, "source provenance"))
+            review_stock_membership_watch = (
+                _open_review_stock_membership_watch(root))
+        for slug in sorted(claim_by_slug):
+            digest, lines, file_dependencies = _verify_live_file(
+                root, arguments.kind, claim_by_slug[slug], by_slug[slug],
+                semantic_contract)
+            dependencies.update(file_dependencies)
+            if (arguments.kind == "mass" and
+                    by_slug[slug].get("writing_recovery") is not None):
+                recovery_dependencies = (
+                    _verify_raw_recovery_preimage_evidence(
+                        root, claim_by_slug[slug], by_slug[slug],
+                        semantic_contract))
+                dependencies.update(recovery_dependencies)
+                for path, artifact_digest in recovery_dependencies.items():
+                    relative = path.relative_to(root).as_posix()
+                    required_artifacts[relative] = (
+                        artifact_digest, "raw_recovery_preimage_evidence")
+            provenance_binding: dict[str, str] | None = None
+            if arguments.kind == "review":
+                (receipt_dependencies,
+                 provenance_binding) = _verify_review_receipt(
+                    claim_by_slug[slug],
+                    by_slug[slug],
+                    queue_artifact_sha256,
+                    digest,
+                    root,
+                    by_slug,
+                )
+                dependencies.update(receipt_dependencies)
+                for path, artifact_digest in receipt_dependencies.items():
+                    try:
+                        relative = path.relative_to(root).as_posix()
+                    except ValueError:
+                        continue
+                    if PROVENANCE_EVIDENCE_REL.fullmatch(relative):
+                        artifact = (
+                            artifact_digest, "source_provenance_evidence")
+                        previous = required_artifacts.get(relative)
+                        if previous is not None and previous != artifact:
+                            raise VerificationError(
+                                "sidecar de proveniência mudou entre claims: "
+                                f"{relative}")
+                        required_artifacts[relative] = artifact
+            live_targets[
+                root / "data" / "editorial" / "v2_pages" / f"{slug}.jsonl"
+            ] = digest
+            verified_item: dict[str, Any] = {
+                "file": f"data/editorial/v2_pages/{slug}.jsonl",
+                "sha256": digest,
+                "lines": lines,
+            }
+            if provenance_binding is not None:
+                verified_item["source_provenance_evidence"] = (
+                    provenance_binding)
+            verified.append(verified_item)
+        if arguments.kind == "review" and claim_by_slug:
+            if result["failed_claims"] != 0:
+                failure = VerificationError(
+                    "wave de review possui tentativa reprovada; nenhuma "
+                    "claim do prefixo é comitável")
+                _emit_review_wave_quarantine(
+                    {entry["slug"]: entry for entry in queue[:attempted]},
+                    failure,
+                )
+                raise failure
+            # Identity, receipt and content-addressed sidecar bytes are this
+            # verifier's boundary. Merit and current-selection provenance are
+            # deferred to the closed consumer over the exact candidate tree.
+            # Mutable worktree scripts and factory/cache output cannot grant
+            # review authorization here.
+        test_hook = os.environ.get("WIKI_VERIFY_V2_TEST_BEFORE_RECHECK")
+        if test_hook and root != INSTALL_ROOT:
+            hook_argv = json.loads(test_hook)
+            if (not isinstance(hook_argv, list) or not hook_argv or
+                    not all(isinstance(part, str) for part in hook_argv)):
+                raise VerificationError("hook de teste inválido")
+            executable = TEST_HOOK_EXECUTABLES.get(
+                hook_argv[0], hook_argv[0])
+            if not os.path.isabs(executable):
+                raise VerificationError("hook de teste inválido")
+            hook_argv[0] = executable
+            with tempfile.TemporaryDirectory(
+                    prefix="wiki-v2-test-hook-", dir="/tmp",
+                    ignore_cleanup_errors=True) as raw_private:
+                private_root = pathlib.Path(raw_private)
+                os.chmod(private_root, 0o700)
+                completed = _run_closed_subprocess(
+                    hook_argv, cwd=root,
+                    environment=_minimal_subprocess_environment(
+                        root, private_root),
+                    timeout=300)
+            if completed.returncode != 0:
+                raise VerificationError(
+                    "hook de teste falhou rc=" + str(completed.returncode))
+        # Releitura imediatamente antes de aceitar/acionar fecha drift da fila,
+        # dos portfolios e até de escritor não cooperativo que ignore os locks.
+        if review_stock_membership_watch is not None:
+            _assert_review_stock_membership_unchanged(
+                root, review_stock_membership_watch)
+        _assert_dependencies_unchanged(dependencies)
+        _assert_dependencies_unchanged(live_targets)
+        if semantic_contract is not None:
+            producer.verify_writing_semantic_contract_dependencies(
+                root, semantic_contract)
+        report = {
+            "identity_verified": True,
+            "audit_merit_verified": False,
+            "wave_commit_allowed": False,
+            "private_candidate_audit_required": True,
+            "kind": arguments.kind,
+            "claims": len(verified),
+            "files": verified,
+            "required_artifacts": [
+                {"file": file, "sha256": digest, "role": role}
+                for file, (digest, role) in sorted(
+                    required_artifacts.items())
+            ],
+        }
+        if verified_consumer is not None:
+            transaction = VerifiedWorkflowTransaction(
+                root=root,
+                kind=arguments.kind,
+                report=report,
+                dependencies=dependencies,
+                live_targets=live_targets,
+                semantic_contract=semantic_contract,
+                review_stock_membership_watch=review_stock_membership_watch,
+            )
+            consumer_status = verified_consumer(transaction)
+            if type(consumer_status) is not int:
+                raise VerificationError(
+                    "consumidor fechado não retornou status inteiro")
+            return consumer_status
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
+        return 0
+    finally:
+        if review_stock_membership_watch is not None:
+            os.close(review_stock_membership_watch[0])
+        for descriptor in reversed(descriptors):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except LockBusy as error:
+        print(f"verify-v2-workflow-results: {error}", file=sys.stderr)
+        raise SystemExit(75)
+    except (VerificationError, ValueError, OSError, json.JSONDecodeError) as error:
+        print(f"verify-v2-workflow-results: {error}", file=sys.stderr)
+        raise SystemExit(1)

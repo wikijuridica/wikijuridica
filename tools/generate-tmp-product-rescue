@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""generate-tmp-product-rescue — copia para o repo o produto que está em /tmp.
+
+Contraparte de `tools/check-tmp-product-leak`. O check aponta; este resgata.
+
+O que faz: COPIA (nunca move, nunca apaga a origem) cada arquivo classificado
+como produto para `.agents/runtime/tmp_rescue/<AAAAMMDD>/`, preservando o
+caminho de origem na estrutura de destino, e grava um manifesto com origem,
+tamanho, mtime e SHA-256. A origem permanece intacta: se o processo que a criou
+ainda estiver rodando, ele continua funcionando.
+
+Por que copiar e não mover: o dono já perdeu (quase) 115 páginas por confiar em
+/tmp. Resgate tem que ser aditivo e idempotente — rodar duas vezes não duplica
+nem destrói; arquivo cujo conteúdo já foi resgatado com o mesmo hash é pulado.
+
+Uso:
+    ./tools/generate-tmp-product-rescue            # resgata tudo que o check aponta
+    ./tools/generate-tmp-product-rescue --dry-run  # mostra o que faria
+    ./tools/generate-tmp-product-rescue --root /tmp/algum/lugar
+
+Depois de rodar: LEIA o que foi resgatado e commite por pathspec. Commit cego de
+resgate é proibido — o conteúdo pode ser lixo de agente ou pode ser uma onda de
+páginas.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+_TRAVA = None
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+RESCUE_BASE = REPO_ROOT / ".agents" / "runtime" / "tmp_rescue"
+
+
+def sha256_de(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for bloco in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(bloco)
+    return digest.hexdigest()
+
+
+def produto_em_risco(roots: list[str] | None) -> list[dict]:
+    """Reusa a classificação do check — uma única definição de 'produto'."""
+    comando = [sys.executable, str(REPO_ROOT / "tools" / "check-tmp-product-leak"), "--json"]
+    for root in roots or []:
+        comando.extend(["--root", root])
+    resultado = subprocess.run(comando, capture_output=True, text=True, check=False)
+    if not resultado.stdout.strip():
+        raise SystemExit(f"check-tmp-product-leak não devolveu saída: {resultado.stderr.strip()}")
+    return json.loads(resultado.stdout)["product_at_risk"]
+
+
+def destino_para(origem: pathlib.Path, dia: pathlib.Path) -> pathlib.Path:
+    """Espelha o caminho de origem sob o diretório do dia, com contenção.
+
+    lstrip("/") sozinho não neutraliza "..": um --root relativo produziria
+    destino fora de tmp_rescue, sobrescrevendo arquivo do repositório. Aqui o
+    caminho é normalizado e a contenção é verificada antes de qualquer escrita.
+    """
+    relativo = os.path.normpath(str(origem)).lstrip("/")
+    relativo = relativo.replace("../", "").lstrip("./")
+    destino = (dia / relativo).resolve()
+    dia_resolvido = dia.resolve()
+    if not str(destino).startswith(str(dia_resolvido) + os.sep):
+        raise ValueError(f"destino escaparia do diretório de resgate: {destino}")
+    return destino
+
+
+def hashes_ja_resgatados(base: pathlib.Path) -> set[str]:
+    """Todos os hashes já resgatados, de TODOS os dias.
+
+    Ler só o manifesto do dia fazia o mesmo arquivo ser recopiado a cada
+    execução em data nova — o scratchpad de uma sessão longa viraria dezenas de
+    MB de duplicatas dentro do repositório.
+    """
+    conhecidos: set[str] = set()
+    if not base.exists():
+        return conhecidos
+    for manifesto in sorted(base.glob("*/MANIFESTO.jsonl")):
+        try:
+            linhas = manifesto.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for linha in linhas:
+            if not linha.strip():
+                continue
+            try:
+                conhecidos.add(json.loads(linha)["sha256"])
+            except (ValueError, KeyError):
+                continue
+    return conhecidos
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", action="append", default=None,
+                        help="caminho a varrer (repetível); padrão: o mesmo do check")
+    parser.add_argument("--dry-run", action="store_true", help="não escreve nada")
+    args = parser.parse_args()
+
+    # UMA INSTÂNCIA POR VEZ (2026-09-05). Este script é disparado por hook em
+    # `.claude/settings.json` a cada chamada de ferramenta, e a varredura de
+    # /tmp que ele faz (via check-tmp-product-leak) leva minutos quando a
+    # máquina está carregada. Medido hoje: DUAS cópias sobrepostas, de 152 s e
+    # 129 s, cada uma com seu filho consumindo CPU — e sob carga o hook dispara
+    # mais rápido do que o trabalho termina, então o acúmulo é garantido, não
+    # eventual.
+    #
+    # Sair em silêncio é o comportamento certo aqui, e não uma desistência: o
+    # resgate é IDEMPOTENTE por hash (ver docstring), então o que esta execução
+    # deixaria de copiar a instância que já está rodando copia igual. O hook já
+    # descarta a saída e ignora o código de retorno.
+    #
+    # Lock em /tmp é legítimo: o contrato manda produto ficar no repo, e
+    # permite lock, pipe e cache regenerável em volátil. O descritor fica vivo
+    # até o processo sair — daí o `global`, sem o qual o coletor de lixo
+    # fecharia o arquivo e soltaria o lock no meio da varredura.
+    import fcntl
+
+    global _TRAVA
+    try:
+        _TRAVA = open("/tmp/wiki-tmp-product-rescue.lock", "w")
+        fcntl.flock(_TRAVA.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("generate-tmp-product-rescue: outra instância já está resgatando — saindo")
+        return 0
+
+    itens = produto_em_risco(args.root)
+    if not itens:
+        print("generate-tmp-product-rescue: nada a resgatar — nenhum produto em diretório volátil")
+        return 0
+
+    hoje = datetime.datetime.now().strftime("%Y%m%d")
+    dia = RESCUE_BASE / hoje
+    manifesto_path = dia / "MANIFESTO.jsonl"
+
+    ja_resgatados = hashes_ja_resgatados(RESCUE_BASE)
+
+    copiados, pulados, falhas, grandes = 0, 0, 0, 0
+    for item in itens:
+        origem = pathlib.Path(item["path"])
+        # Arquivo acima do teto é registrado pelo check e NÃO copiado: um dump
+        # de centenas de MB entupiria o repositório e estouraria o orçamento do
+        # hook de fim de turno. O operador decide manualmente.
+        if "GRANDE DEMAIS" in item["reason"]:
+            print(f"  IGNORADO (grande demais): {origem} — {item['reason']}")
+            grandes += 1
+            continue
+        try:
+            digest = sha256_de(origem)
+        except OSError as erro:
+            print(f"  FALHA ao ler {origem}: {erro}")
+            falhas += 1
+            continue
+        if digest in ja_resgatados:
+            pulados += 1
+            continue
+        try:
+            destino = destino_para(origem, dia)
+        except ValueError as erro:
+            print(f"  FALHA de contenção: {erro}")
+            falhas += 1
+            continue
+        if args.dry_run:
+            print(f"  [dry-run] {origem} -> {destino}")
+            copiados += 1
+            continue
+        try:
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(origem, destino)
+        except OSError as erro:
+            print(f"  FALHA ao copiar {origem}: {erro}")
+            falhas += 1
+            continue
+        estatistica = origem.stat()
+        # Manifesto por arquivo, não no fim do laço: se o hook de fim de turno
+        # for morto no timeout, o que já foi copiado fica registrado e a próxima
+        # execução não recopia nem deixa cópia órfã sem procedência.
+        linha_manifesto = json.dumps({
+            "origem": str(origem),
+            "destino": str(destino.relative_to(REPO_ROOT)),
+            "bytes": estatistica.st_size,
+            "mtime": datetime.datetime.fromtimestamp(estatistica.st_mtime).isoformat(timespec="seconds"),
+            "sha256": digest,
+            "motivo": item["reason"],
+            "resgatado_em": datetime.datetime.now().isoformat(timespec="seconds"),
+        }, ensure_ascii=False)
+        manifesto_path.parent.mkdir(parents=True, exist_ok=True)
+        with manifesto_path.open("a", encoding="utf-8") as handle:
+            handle.write(linha_manifesto + "\n")
+        ja_resgatados.add(digest)
+        copiados += 1
+        print(f"  resgatado: {origem}")
+
+    print()
+    print(f"generate-tmp-product-rescue: copiados={copiados} ja_resgatados={pulados} "
+          f"grandes_ignorados={grandes} falhas={falhas}")
+    if copiados and not args.dry_run:
+        print(f"destino: {dia.relative_to(REPO_ROOT)}")
+        print("A origem NÃO foi apagada. Agora LEIA o resgatado e commite por pathspec — "
+              "commit cego de resgate é proibido.")
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

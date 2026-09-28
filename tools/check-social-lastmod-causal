@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""check-social-lastmod-causal — o `lastmod` do sitemap social muda só com o que muda o HTML?
+
+READ-ONLY. Não escreve arquivo nenhum, não toca em content/, data/, public/ nem
+em serviço. Toda asserção sai de medição própria sobre o sitemap SERVIDO agora
+por `cmd/social` e sobre o fonte versionado que o monta.
+
+POR QUE ELE EXISTE. `content/redesocial_entregas.json`, entrega
+`F2-lastmod-causal`, declara como prova o gate `social-lastmod-causal`. Ele não
+existia. `cmd/social/indexacao.go` já monta o `lastmod` a partir do fato que
+altera o documento — criação da dúvida, resposta publicada mais recente,
+`vigente_desde` da política — e o cabeçalho daquele arquivo descreve a
+propriedade em três parágrafos. Descrição não é medição: nada impedia que a
+próxima correção pendurasse o relógio ali, e um sitemap que se re-data a cada
+requisição ensina o crawler a ignorar o campo — o dano aparece semanas depois,
+no relatório de cobertura, quando já não há como saber qual commit o causou.
+
+★ O QUE "CAUSAL" QUER DIZER, E COMO CADA METADE É MEDIDA
+
+`lastmod` causal é o que só anda quando o BYTE SERVIDO ao leitor mudou. Duas
+metades, e nenhuma das duas prova a outra:
+
+  1. METADE DINÂMICA — o documento servido é estável sob leitura. O gate lê o
+     índice e todos os shards, VISITA cada URL anunciada (uma visita é
+     exatamente a "visualização" que não pode contar) e relê tudo. Byte
+     diferente entre as duas passadas é `lastmod` que anda sozinho. Esta metade
+     pega o relógio, o `time.Now()` no boot e o contador de acesso.
+
+  2. METADE ESTÁTICA — a consulta que alimenta o sitemap não olha para
+     engajamento. `internal/socialdb/esquema.go` tem a tabela `reacoes` (a
+     curtida existe, e o comentário dela diz que não entra em ordenação) e
+     `orcamento_diario` (contadores). O SELECT de `duvidasIndexaveis` é lido do
+     fonte e reprovado se citar qualquer uma delas. Curtida não se exercita sem
+     sessão autenticada, e um gate que só medisse o que consegue clicar deixaria
+     justamente este caso de fora — por isso a asserção aqui é sobre o código
+     que decide, não sobre um clique que o gate não pode dar.
+
+★ E O SHARD É POR MÊS DE CRIAÇÃO, QUE É CHAVE ESTÁVEL
+
+A segunda metade da mesma entrega. `criada_em` nunca muda, então a dúvida fica
+no mesmo shard enquanto existir e o nome do arquivo nunca precisa de carência —
+ao contrário do ordinal posicional do sitemap do acervo, que some quando o plano
+encolhe e deixa o Googlebot num buraco por oito dias. O gate confere que todo
+nome anunciado casa `superficie.xml`, `temas.xml` ou `duvidas-AAAA-MM[-N].xml`,
+e que o padrão aceito aqui é o MESMO que `internal/socialrender.NomeDeShardValido`
+aceita — o regex sai do fonte Go, não é redigitado neste arquivo.
+
+★ TRÊS DESFECHOS
+
+    0  medido e correto
+    1  medido e ERRADO
+    2  NÃO deu para medir (serviço fora do ar, fonte ilegível). Indisponibilidade
+       nunca é reprovação.
+
+Sondagem sem fraude: User-Agent próprio e `X-Warming-Request: true`, contra
+127.0.0.1. Nenhuma requisição daqui forja User-Agent de bot real.
+"""
+import datetime
+import http.client
+import importlib.util
+import json
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+NOME = "check-social-lastmod-causal"
+
+ESPACO_SITEMAP = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+
+CAMINHO_DO_INDICE = "/redesocial/sitemap.xml"
+
+# Teto de URLs visitadas na metade dinâmica. Existe para que o gate não vire
+# carga: hoje a superfície anuncia algumas dezenas de URLs, e um teto folgado
+# que nunca é atingido ainda impede que um acervo de dúvidas transforme o gate
+# num crawler. Estourar o teto NÃO reprova — a metade dinâmica passa a rodar
+# sobre uma amostra determinística (as primeiras, na ordem do documento), e o
+# fato é registrado nos achados.
+TETO_DE_VISITAS = 120
+
+# As tabelas de engajamento de internal/socialdb/esquema.go. Elas não são
+# digitadas como "palavras suspeitas": são os nomes reais das duas tabelas cujo
+# conteúdo muda sem que uma vírgula do HTML mude.
+TABELAS_DE_ENGAJAMENTO = ("reacoes", "orcamento_diario")
+
+
+def carrega_base():
+    """Carrega tools/social_borda_probe.py por caminho explícito.
+
+    O idioma usual (`sys.path.insert` + import) obrigaria a suprimir o
+    diagnóstico do lint sobre import fora de ordem, e mascarar diagnóstico é
+    proibido neste repositório. Carregar por caminho resolve a causa.
+    """
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_borda_probe.py")
+    spec = importlib.util.spec_from_file_location("social_borda_probe", caminho)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"não consegui carregar {caminho}")
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+base = carrega_base()
+
+
+def requisita_corpo(porta, caminho, timeout=10):
+    """Devolve (status, corpo, erro) de uma requisição a 127.0.0.1.
+
+    `social_borda_probe.requisita` descarta o corpo, e este gate compara bytes.
+    A duplicação de oito linhas fica aqui de propósito, pelo mesmo motivo
+    registrado em tools/check-social-indexavel: promover a função para o módulo
+    compartilhado é mudança em arquivo que outras frentes usam.
+
+    O `Host` vai como o domínio público porque o nginx casa server_name e monta
+    a chave de cache com `$host`.
+    """
+    cabecalhos = dict(base.CABECALHOS_BASE)
+    cabecalhos["Host"] = base.HOST_PUBLICO
+    conexao = None
+    try:
+        conexao = http.client.HTTPConnection("127.0.0.1", porta, timeout=timeout)
+        conexao.request("GET", caminho, headers=cabecalhos)
+        resposta = conexao.getresponse()
+        corpo = resposta.read()
+        return resposta.status, corpo, None
+    except (OSError, http.client.HTTPException) as erro:
+        return None, b"", f"{type(erro).__name__}: {erro}"
+    finally:
+        if conexao is not None:
+            conexao.close()
+
+
+def padrao_de_shard(raiz):
+    """Deriva o padrão de nome de shard do fonte Go, em vez de redigitá-lo.
+
+    `internal/socialrender/sitemap.go` declara as três formas: o shard fixo, o
+    de temas e o mensal de dúvidas. Copiar o regex para cá criaria a segunda
+    fonte da verdade que diverge na primeira correção — e o gate passaria a
+    aprovar um nome que o servidor recusa, ou o contrário.
+    """
+    caminho = os.path.join(raiz, "internal", "socialrender", "sitemap.go")
+    with open(caminho, encoding="utf-8") as f:
+        texto = f.read()
+    valores = {}
+    for chave in ("NomeDoShardFixo", "NomeDoShardDeTemas", "PrefixoDoShardDeDuvidas", "sufixoDeShard"):
+        achado = re.search(r"\b" + chave + r'\s*=\s*"([^"]*)"', texto)
+        if not achado:
+            raise ValueError(f"internal/socialrender/sitemap.go não declara {chave}")
+        valores[chave] = achado.group(1)
+    fixo = re.escape(valores["NomeDoShardFixo"])
+    temas = re.escape(valores["NomeDoShardDeTemas"])
+    prefixo = re.escape(valores["PrefixoDoShardDeDuvidas"])
+    sufixo = re.escape(valores["sufixoDeShard"])
+    # AAAA-MM, e o ordinal só a partir de 2: a primeira fatia do mês sai sem
+    # sufixo, e é isso que mantém o nome estável quando o mês estoura o teto.
+    mensal = prefixo + r"\d{4}-(?:0[1-9]|1[0-2])(?:-[2-9]|-[1-9]\d+)?" + sufixo
+    return re.compile(r"^(?:" + fixo + "|" + temas + "|" + mensal + r")$"), valores
+
+
+def consulta_do_sitemap(raiz):
+    """Devolve o texto da função que decide quais dúvidas entram no sitemap.
+
+    O recorte é a função `duvidasIndexaveis` de cmd/social/indexacao.go — é ela
+    que monta o SELECT e o predicado. Ler o arquivo inteiro faria o gate acusar
+    qualquer menção em comentário; ler só a função mede o código que decide.
+    """
+    caminho = os.path.join(raiz, "cmd", "social", "indexacao.go")
+    with open(caminho, encoding="utf-8") as f:
+        texto = f.read()
+    inicio = texto.find("func (s *superficie) duvidasIndexaveis(")
+    if inicio < 0:
+        raise ValueError("cmd/social/indexacao.go não declara duvidasIndexaveis")
+    fim = texto.find("\nfunc ", inicio + 1)
+    if fim < 0:
+        fim = len(texto)
+    return texto[inicio:fim]
+
+
+def sem_comentario(texto):
+    """Tira os comentários de linha do Go.
+
+    O corpo de `duvidasIndexaveis` documenta, em comentário, por que a curtida
+    não entra. Medir com o comentário dentro faria o gate reprovar exatamente o
+    arquivo que explica a propriedade que ele guarda.
+    """
+    return "\n".join(linha.split("//", 1)[0] for linha in texto.split("\n"))
+
+
+def falhas_da_consulta(corpo_da_funcao):
+    """A consulta que alimenta o sitemap não olha para engajamento."""
+    codigo = sem_comentario(corpo_da_funcao)
+    falhas = []
+    for tabela in TABELAS_DE_ENGAJAMENTO:
+        if re.search(r"\b" + re.escape(tabela) + r"\b", codigo):
+            falhas.append(
+                f"a consulta de `duvidasIndexaveis` cita a tabela `{tabela}`: visualização, curtida e "
+                "contador mudam sem que um byte do HTML mude, e um lastmod derivado deles re-data a "
+                "página para o crawler sem que haja o que reler")
+    return falhas
+
+
+def carimbo_valido(valor):
+    """Aceita as duas formas canônicas de `internal/content.ValidRevisionStamp`.
+
+    Dia puro (`2026-09-05`) e instante UTC (`2026-09-05T10:00:00Z`). Qualquer
+    outra forma é recusada: o protocolo de sitemap admite mais variações de
+    W3C Datetime, mas este portal emite estas duas, e aceitar uma terceira aqui
+    esconderia o dia em que o formato mudar sozinho.
+    """
+    for formato in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            instante = datetime.datetime.strptime(valor, formato)
+        except ValueError:
+            continue
+        # A VOLTA IMPORTA, e é o que `content.ValidRevisionStamp` faz do lado
+        # Go: `strptime` aceita `2026-9-5` para `%Y-%m-%d`, e `time.Parse`
+        # também aceitaria — o que recusa a forma sem zero à esquerda nos dois
+        # lados é exigir que o carimbo REESCRITO seja idêntico ao lido.
+        if instante.strftime(formato) == valor:
+            return True
+    return False
+
+
+def dia_do_carimbo(valor):
+    """Devolve a parte do dia de um carimbo já validado."""
+    return valor[:10]
+
+
+def falhas_do_plano(indice, shards, hoje, padrao):
+    """As asserções puras sobre o plano lido do serviço.
+
+    `indice` é {nome_do_shard: lastmod}; `shards` é {nome_do_shard: [(loc, lastmod)]}.
+    `hoje` é o dia UTC corrente, em texto — parâmetro, e não `date.today()` lá
+    dentro, para que o teste exercite a borda do futuro sem depender do relógio
+    de quem roda.
+    """
+    falhas = []
+    for nome in sorted(indice):
+        if not padrao.match(nome):
+            falhas.append(
+                f"o índice anuncia o shard {nome!r}, que não casa o padrão de nome estável do fonte "
+                "(superficie.xml, temas.xml ou duvidas-AAAA-MM[-N].xml): nome derivado de posição some "
+                "quando o plano encolhe, e o crawler cai num buraco")
+        if nome not in shards:
+            falhas.append(f"o índice anuncia o shard {nome!r} e ele não foi lido")
+
+    for nome in sorted(shards):
+        urls = shards[nome]
+        if not urls:
+            falhas.append(f"o shard {nome!r} respondeu sem nenhuma URL: documento que anuncia não ter o que anunciar")
+        for loc, lastmod in urls:
+            if not lastmod:
+                falhas.append(f"{loc} (shard {nome}) não traz lastmod: sem data, o crawler decide o frescor sozinho")
+                continue
+            if not carimbo_valido(lastmod):
+                falhas.append(f"{loc} (shard {nome}) traz lastmod {lastmod!r}, que não é carimbo canônico do portal")
+                continue
+            if dia_do_carimbo(lastmod) > hoje:
+                falhas.append(
+                    f"{loc} (shard {nome}) traz lastmod {lastmod!r}, no FUTURO em relação a {hoje}: "
+                    "data no futuro não é fato causado, é relógio errado")
+        validos = [lastmod for _, lastmod in urls if lastmod and carimbo_valido(lastmod)]
+        if not validos or nome not in indice:
+            continue
+        maior = max(validos)
+        if indice[nome] != maior:
+            falhas.append(
+                f"o índice data o shard {nome!r} em {indice[nome]!r} e o maior lastmod dos filhos dele é "
+                f"{maior!r}: quem relê o índice não descobre que uma URL do shard mudou")
+    return falhas
+
+
+def falhas_de_estabilidade(antes, depois, visitadas):
+    """O documento servido não muda por ter sido lido.
+
+    `antes` e `depois` são {caminho: bytes}. `visitadas` entra na mensagem para
+    que a reprovação já diga QUAL leitura moveu a data — sem isso o achado seria
+    "mudou" sem o fato que o causou.
+    """
+    falhas = []
+    for caminho in sorted(antes):
+        if caminho not in depois:
+            falhas.append(f"{caminho} respondia antes das {visitadas} visita(s) e não respondeu depois")
+            continue
+        if antes[caminho] != depois[caminho]:
+            falhas.append(
+                f"{caminho} mudou entre duas leituras separadas por {visitadas} visita(s) às URLs que ele "
+                "anuncia: visualização não altera o HTML servido e não pode alterar o lastmod")
+    return falhas
+
+
+def le_indice(corpo):
+    """Devolve {nome_do_shard: lastmod} a partir do XML do índice."""
+    raiz = ET.fromstring(corpo)
+    plano = {}
+    for entrada in raiz.findall(ESPACO_SITEMAP + "sitemap"):
+        loc = (entrada.findtext(ESPACO_SITEMAP + "loc") or "").strip()
+        lastmod = (entrada.findtext(ESPACO_SITEMAP + "lastmod") or "").strip()
+        plano[loc.rsplit("/", 1)[-1]] = lastmod
+    return plano
+
+
+def le_urlset(corpo):
+    """Devolve [(loc, lastmod)] a partir do XML de um shard."""
+    raiz = ET.fromstring(corpo)
+    urls = []
+    for entrada in raiz.findall(ESPACO_SITEMAP + "url"):
+        loc = (entrada.findtext(ESPACO_SITEMAP + "loc") or "").strip()
+        lastmod = (entrada.findtext(ESPACO_SITEMAP + "lastmod") or "").strip()
+        urls.append((loc, lastmod))
+    return urls
+
+
+def caminho_de(loc, base_url):
+    """Converte o <loc> absoluto no caminho servido; devolve None se for de outro host."""
+    if not loc.startswith(base_url + "/"):
+        return None
+    return loc[len(base_url):]
+
+
+def le_plano(porta, nomes_dos_shards):
+    """Lê índice e shards do serviço; devolve (corpos, erro)."""
+    corpos = {}
+    status, corpo, erro = requisita_corpo(porta, CAMINHO_DO_INDICE)
+    if erro is not None:
+        return None, f"{CAMINHO_DO_INDICE}: {erro}"
+    if status != 200:
+        return None, f"{CAMINHO_DO_INDICE} respondeu {status}"
+    corpos[CAMINHO_DO_INDICE] = corpo
+    for caminho in nomes_dos_shards:
+        status, corpo, erro = requisita_corpo(porta, caminho)
+        if erro is not None:
+            return None, f"{caminho}: {erro}"
+        if status != 200:
+            return None, f"{caminho} respondeu {status}"
+        corpos[caminho] = corpo
+    return corpos, None
+
+
+def main():
+    raiz = base.RAIZ
+    try:
+        padrao, nomes = padrao_de_shard(raiz)
+        corpo_da_consulta = consulta_do_sitemap(raiz)
+    except (OSError, ValueError) as erro:
+        return base.relata(NOME, base.INCONCLUSIVO, [f"não consegui ler o fonte versionado: {erro}"])
+
+    try:
+        with open(os.path.join(raiz, "content", "site.json"), encoding="utf-8") as f:
+            base_url = str(json.load(f).get("base_url", "")).strip().rstrip("/")
+    except (OSError, ValueError) as erro:
+        return base.relata(NOME, base.INCONCLUSIVO, [f"não consegui ler content/site.json: {erro}"])
+    if not base_url.startswith("https://"):
+        return base.relata(NOME, base.INCONCLUSIVO, [f"content/site.json tem base_url={base_url!r}, que não é HTTPS absoluto"])
+
+    porta = base.PORTA_SOCIAL
+    if not base.escuta(porta):
+        return base.relata(NOME, base.INCONCLUSIVO, [
+            f"nada escutando em 127.0.0.1:{porta}: o cmd/social está parado, e indisponibilidade nunca é reprovação"])
+
+    # PRIMEIRA PASSADA.
+    status, corpo_do_indice, erro = requisita_corpo(porta, CAMINHO_DO_INDICE)
+    if erro is not None:
+        return base.relata(NOME, base.INCONCLUSIVO, [f"o índice do sitemap social não respondeu: {erro}"])
+    if status != 200:
+        return base.relata(NOME, base.ERRADO, [f"{CAMINHO_DO_INDICE} respondeu {status}, e não 200"])
+    try:
+        indice = le_indice(corpo_do_indice)
+    except ET.ParseError as erro:
+        return base.relata(NOME, base.ERRADO, [f"o índice do sitemap social não é XML válido: {erro}"])
+    if not indice:
+        return base.relata(NOME, base.ERRADO, ["o índice do sitemap social não anuncia nenhum shard"])
+
+    arvore_do_indice = ET.fromstring(corpo_do_indice)
+    caminhos_dos_shards = []
+    for entrada in arvore_do_indice.findall(ESPACO_SITEMAP + "sitemap"):
+        loc = (entrada.findtext(ESPACO_SITEMAP + "loc") or "").strip()
+        caminho = caminho_de(loc, base_url)
+        if caminho is None:
+            return base.relata(NOME, base.ERRADO, [
+                f"o índice anuncia {loc!r}, que não é do host de content/site.json ({base_url}): "
+                "URL de host errado é ignorada em silêncio pelo buscador"])
+        caminhos_dos_shards.append(caminho)
+
+    corpos, erro = le_plano(porta, caminhos_dos_shards)
+    if erro is not None:
+        return base.relata(NOME, base.ERRADO, [f"o plano do sitemap social não pôde ser lido inteiro: {erro}"])
+
+    shards = {}
+    urls_anunciadas = []
+    for caminho in caminhos_dos_shards:
+        try:
+            urls = le_urlset(corpos[caminho])
+        except ET.ParseError as erro:
+            return base.relata(NOME, base.ERRADO, [f"{caminho} não é XML válido: {erro}"])
+        shards[caminho.rsplit("/", 1)[-1]] = urls
+        for loc, _ in urls:
+            destino = caminho_de(loc, base_url)
+            if destino is not None:
+                urls_anunciadas.append(destino)
+
+    hoje = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    falhas = falhas_do_plano(indice, shards, hoje, padrao)
+    falhas += falhas_da_consulta(corpo_da_consulta)
+
+    # SEGUNDA PASSADA, DEPOIS DE VISITAR. Cada GET numa URL anunciada é a
+    # "visualização" que a entrega proíbe de contar. Se alguma delas incrementar
+    # um contador que alimenta o lastmod, o documento relido sai diferente.
+    amostra = urls_anunciadas[:TETO_DE_VISITAS]
+    for destino in amostra:
+        status, _, erro = requisita_corpo(porta, destino)
+        if erro is not None:
+            return base.relata(NOME, base.INCONCLUSIVO, [f"a visita a {destino} falhou no meio: {erro}"])
+
+    depois, erro = le_plano(porta, caminhos_dos_shards)
+    if erro is not None:
+        return base.relata(NOME, base.INCONCLUSIVO, [f"a releitura do plano falhou: {erro}"])
+    falhas += falhas_de_estabilidade(corpos, depois, len(amostra))
+
+    achados = [
+        f"plano lido: {len(indice)} shard(s) — {', '.join(sorted(indice))}",
+        f"{len(urls_anunciadas)} URL(s) anunciada(s); {len(amostra)} visitada(s) entre as duas leituras"
+        + (f" (teto de {TETO_DE_VISITAS})" if len(urls_anunciadas) > TETO_DE_VISITAS else ""),
+        f"padrão de nome derivado do fonte: {nomes['NomeDoShardFixo']}, {nomes['NomeDoShardDeTemas']}, "
+        f"{nomes['PrefixoDoShardDeDuvidas']}AAAA-MM[-N]{nomes['sufixoDeShard']}",
+        "a consulta de duvidasIndexaveis não cita "
+        + " nem ".join(f"`{t}`" for t in TABELAS_DE_ENGAJAMENTO),
+    ]
+    if falhas:
+        return base.relata(NOME, base.ERRADO, falhas + ["--- medido junto ---"] + achados)
+    return base.relata(NOME, base.OK, achados)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

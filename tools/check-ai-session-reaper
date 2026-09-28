@@ -1,0 +1,316 @@
+#!/bin/bash
+# check-ai-session-reaper — prova que o reaper mata o que deve e só o que deve.
+#
+# Encerrar sessão é irreversível, então o predicado é testado contra casos
+# sintéticos antes de rodar com --apply. Cada caso abaixo veio de um erro real
+# desta máquina em 2026-08-19 — os marcados [red-team] foram achados pela
+# revisão adversarial, e três deles teriam destruído trabalho:
+#
+#   1. attached com Claude            -> a janela do dono. NUNCA encerrar.
+#   2. detached com Claude, recente   -> ele fechou agora e vai voltar. Aguardar.
+#   3. detached com Claude, parado    -> o caso que deixou 4 GB pendurados.
+#   4. detached com trabalho em voo   -> build/agente rodando. NUNCA encerrar.
+#   5. @ai_keep                       -> opt-out explícito. NUNCA encerrar.
+#   6. fora do prefixo ai-            -> sessão de terceiro. NUNCA encerrar.
+#   7. daemon sem --spawned-by        -> [red-team] orfandade não provada.
+#   8. trabalho cujo argv diz "semgrep"/"playwright"/"convex"
+#                                     -> [red-team] o filtro por NOME lia isso
+#                                        como MCP e ainda rebaixava a sessão para
+#                                        a carência curta. É trabalho.
+#   9. série de observações           -> uma única amostra "parada" não basta;
+#                                        entre dois tool calls um Claude ativo
+#                                        parece parado.
+#
+# Read-only sobre o estado do dono: usa state-dir próprio e sessões descartáveis,
+# removidas ao sair mesmo em falha.
+
+set -uo pipefail
+REAPER="${REAPER:-$HOME/.local/bin/ai-session-reaper}"
+[ -x "$REAPER" ] || {
+	echo "reaper não encontrado em $REAPER"
+	exit 2
+}
+
+SUF="reapertest-$$"
+STATE=$(mktemp -d "/tmp/reaper-state-$$-XXXX")
+CRIADAS=()
+ISCAS=()
+falhas=0
+
+limpar() {
+	for s in "${CRIADAS[@]:-}"; do [ -n "$s" ] && tmux kill-session -t "=$s" 2>/dev/null; done
+	for p in "${ISCAS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+	rm -rf "$STATE" 2>/dev/null
+}
+trap limpar EXIT INT TERM
+
+# --min-gap-seconds=0 em todas as chamadas: o espaçamento real é 300s, pensado
+# para o timer de 15 min, e tornaria cada caso um teste de paciência. O gap tem
+# caso próprio, abaixo, que o exercita com o valor de produção.
+R() { "$REAPER" --state-dir "$STATE" --min-gap-seconds=0 "$@" 2>/dev/null; }
+
+nova() {
+	local nome="$1"
+	shift
+	tmux new-session -d -s "$nome" -x 200 -y 50 "$*" 2>/dev/null || return 1
+	CRIADAS+=("$nome")
+}
+
+# veredito <sessao> <args...> -> ENCERRARIA | MANTEM | AUSENTE
+veredito() {
+	local sess="$1"
+	shift
+	local linha
+	linha=$(R "$@" | grep -F "$sess" | head -1)
+	case "$linha" in
+	*ENCERRARIA*) echo "ENCERRARIA" ;;
+	*MANTÉM*) echo "MANTEM" ;;
+	*) echo "AUSENTE" ;;
+	esac
+}
+
+confere() {
+	if [ "$2" = "$3" ]; then
+		printf '  ok    %-48s %s\n' "$1" "$3"
+	else
+		printf '  FALHA %-48s esperado=%s obtido=%s\n' "$1" "$2" "$3"
+		falhas=$((falhas + 1))
+	fi
+}
+
+# Uma sessão só é candidata depois de MIN_OBS observações de parada. Roda o
+# reaper as vezes necessárias para formar a série.
+observar() {
+	local n="${1:-3}"
+	local restantes="$n"
+	# Contador LIDO a cada volta, em vez de `for i in $(seq ...)` com `i` que
+	# ninguem le: a variavel de laco nao usada e a mesma coisa que o contrato
+	# proibe marcar com `_`, e aqui ela nem era necessaria.
+	while [ "$restantes" -gt 0 ]; do
+		R --claude-grace-minutes=0 --shell-grace-minutes=0 >/dev/null
+		restantes=$((restantes - 1))
+	done
+}
+
+echo "=== casos sintéticos ==="
+
+# 2/3. detached com Claude
+S_CLAUDE="ai-$SUF-claude"
+if nova "$S_CLAUDE" "cd /opt/wiki && claude --permission-mode bypassPermissions"; then
+	# O startup do Claude Code leva ~45s: hooks de semgrep e lumen, `rg --files`
+	# indexando o repositório, `dpkg-query`, o venv do security-guidance. Durante
+	# esse período a sessão TEM trabalho em voo e o reaper corretamente a mantém —
+	# avaliar antes disso não testa a carência, testa o startup. Espera até duas
+	# observações seguidas concordarem que parou.
+	seguidas=0
+	for _ in $(seq 1 90); do
+		if R --claude-grace-minutes=0 --shell-grace-minutes=0 | grep -F "$S_CLAUDE" | grep -q 'viva:'; then
+			seguidas=0
+		else
+			seguidas=$((seguidas + 1))
+			[ "$seguidas" -ge 2 ] && break
+		fi
+		command sleep 1
+	done
+	confere "detached + claude, dentro da carência" MANTEM \
+		"$(veredito "$S_CLAUDE" --claude-grace-minutes=90)"
+
+	# Observa até a série de paradas se formar, em vez de um número fixo de
+	# rodadas. O startup do Claude varia de dezenas de segundos a mais de um
+	# minuto conforme a carga da máquina, e qualquer atividade residual ZERA a
+	# série — com `observar 3` fixo, o caso passava ou falhava conforme o dia.
+	v=""
+	for _ in $(seq 1 25); do
+		v=$(veredito "$S_CLAUDE" --claude-grace-minutes=0 --shell-grace-minutes=0)
+		[ "$v" = "ENCERRARIA" ] && break
+		command sleep 2
+	done
+	confere "detached + claude, carência vencida" ENCERRARIA "$v"
+else
+	echo "  (não foi possível subir sessão com claude)"
+	falhas=$((falhas + 1))
+fi
+
+# 10. Claude TRABALHANDO nunca é encerrado, nem com carência zero.
+#
+# É o caso que decide se o automatismo pode existir. Um subagente não vira
+# processo (roda dentro do TUI) e o CPU de uma sessão com agente ativo mediu 6
+# jiffies/s — abaixo do limiar de vida. O que salva é o repaint: medido em
+# tools/check-claude-working-repaint, um Claude gerando resposta avança
+# window_activity em tempo real e muda o hash da tela em toda amostra, enquanto o
+# TUI parado no prompt fica mudo por 120s. Este caso trava essa garantia.
+if [ -n "${S_CLAUDE:-}" ] && tmux has-session -t "=$S_CLAUDE" 2>/dev/null; then
+	tmux send-keys -t "$S_CLAUDE" 'Explique em tres paragrafos o que e o teorema de Godel, sem pressa.' 2>/dev/null
+	command sleep 1
+	tmux send-keys -t "$S_CLAUDE" Enter 2>/dev/null
+	command sleep 6
+	observar 3
+	confere "claude TRABALHANDO (nunca encerrar)" MANTEM \
+		"$(veredito "$S_CLAUDE" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+fi
+
+# 9. série curta demais não basta, mesmo com carência zero
+S_SERIE="ai-$SUF-serie"
+if nova "$S_SERIE" "bash"; then
+	command sleep 2
+	R --claude-grace-minutes=0 --shell-grace-minutes=0 >/dev/null # 1 observação
+	confere "1 observação não basta (exige série)" MANTEM \
+		"$(veredito "$S_SERIE" --claude-grace-minutes=0 --shell-grace-minutes=0 --min-observations=5)"
+fi
+
+# 11. atividade ZERA a série já formada.
+#
+# É a garantia central do desenho: uma sessão pode acumular observações de parada
+# e voltar a trabalhar — o dono reata, um agente termina e imprime, um /loop
+# acorda. Se a série sobrevivesse à atividade, o reaper encerraria uma sessão que
+# acabou de produzir. O arquivo de observações é truncado a cada sinal de vida
+# justamente para isso; este caso prova que o truncamento funciona de ponta a
+# ponta, e não só na leitura do código.
+S_ZERA="ai-$SUF-zera"
+if nova "$S_ZERA" "bash"; then
+	command sleep 2
+	observar 3
+	antes=$(veredito "$S_ZERA" --claude-grace-minutes=0 --shell-grace-minutes=0)
+	# produz saída no pane: muda a tela e o window_activity
+	tmux send-keys -t "$S_ZERA" 'echo atividade-real' Enter 2>/dev/null
+	command sleep 2
+	R --claude-grace-minutes=0 --shell-grace-minutes=0 >/dev/null # observação que vê a vida
+	depois=$(veredito "$S_ZERA" --claude-grace-minutes=0 --shell-grace-minutes=0)
+	confere "série formada, ANTES da atividade" ENCERRARIA "$antes"
+	confere "atividade zera a série" MANTEM "$depois"
+fi
+
+# 12. [red-team] resíduo de crash no arquivo de observações.
+#
+# A gravação era append → truncate → regrava; morrer entre os dois comandos
+# deixava `[1, 1, 0]`, e a contagem por `grep -c ' 1$'` somava linhas NÃO
+# consecutivas — o red-team obteve "cobrindo 117min" com 63s de evidência real,
+# atravessando uma observação que registrava a sessão VIVA. A contagem agora lê
+# do fim para trás e para na primeira linha que não seja parada.
+S_RES="ai-$SUF-residuo"
+if nova "$S_RES" "bash"; then
+	command sleep 2
+	observar 1
+	arq_res="$STATE/$(printf '%s' "$S_RES" | tr -c 'A-Za-z0-9_.-' '_').obs"
+	# forja o resíduo: duas paradas antigas e uma observação VIVA no fim
+	antigo=$(($(date +%s) - 7200))
+	{
+		echo "$antigo hashvelho 2 0 111 1"
+		echo "$((antigo + 1800)) hashvelho 2 0 111 1"
+		echo "$(date +%s) hashnovo 2 0 222 0"
+	} >"$arq_res"
+	confere "resíduo de crash não vira série válida" MANTEM \
+		"$(veredito "$S_RES" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+fi
+
+# 13. [red-team] `claude -p` é TRABALHO, não o TUI.
+#
+# `e_claude_tui` isentava qualquer cmdline começando em claude, em qualquer ponto
+# da árvore. Um `claude -p 'tarefa' > saida.json` — que é como `ai-pane run` e os
+# subagentes se materializam — ficava invisível: sem filhos, CPU sob o limiar,
+# tela quieta. O red-team demonstrou um a 4,8 jiffies/s sendo encerrado.
+S_HL="ai-$SUF-headless"
+if nova "$S_HL" "claude -p 'responda apenas ok' --permission-mode bypassPermissions"; then
+	command sleep 3
+	observar 3
+	confere "claude -p (headless) conta como trabalho" MANTEM \
+		"$(veredito "$S_HL" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+fi
+
+# 14. [red-team] espaçamento mínimo entre observações.
+#
+# Sem ele, três execuções em nove segundos satisfaziam MIN_OBS e a carência era o
+# único gate temporal — o cabeçalho prometia "~45 min de evidência" e entregava 9
+# segundos. Este caso usa o gap de produção e exige que a rajada NÃO forme série.
+S_GAP="ai-$SUF-gap"
+if nova "$S_GAP" "bash"; then
+	command sleep 2
+	for _ in 1 2 3 4; do "$REAPER" --state-dir "$STATE" --min-gap-seconds=300 \
+		--claude-grace-minutes=0 --shell-grace-minutes=0 >/dev/null 2>&1; done
+	linha=$("$REAPER" --state-dir "$STATE" --min-gap-seconds=300 \
+		--claude-grace-minutes=0 --shell-grace-minutes=0 2>/dev/null | grep -F "$S_GAP" | head -1)
+	case "$linha" in
+	*ENCERRARIA*)
+		printf '  FALHA %-48s rajada formou série\n' "espaçamento mínimo barra rajada"
+		falhas=$((falhas + 1))
+		;;
+	*) printf '  ok    %-48s MANTEM\n' "espaçamento mínimo barra rajada" ;;
+	esac
+fi
+
+# 4. trabalho em voo
+S_BUSY="ai-$SUF-busy"
+if nova "$S_BUSY" "sleep 300"; then
+	command sleep 2
+	observar 3
+	confere "detached + trabalho em voo" MANTEM \
+		"$(veredito "$S_BUSY" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+fi
+
+# 8. [red-team] trabalho real cujo argv contém nome de produto de MCP
+for nome in semgrep playwright convex lumen; do
+	S_N="ai-$SUF-argv-$nome"
+	if nova "$S_N" "python3 -c \"import time; time.sleep(300)\" $nome scan /opt/wiki"; then
+		command sleep 2
+		observar 3
+		confere "trabalho com '$nome' no argv" MANTEM \
+			"$(veredito "$S_N" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+	fi
+done
+
+# 5. opt-out
+S_KEEP="ai-$SUF-keep"
+if nova "$S_KEEP" "bash"; then
+	tmux set-option -t "$S_KEEP" @ai_keep 1 2>/dev/null
+	command sleep 1
+	observar 3
+	confere "@ai_keep" MANTEM \
+		"$(veredito "$S_KEEP" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+fi
+
+# 6. fora do prefixo
+S_OUT="outro-$SUF"
+if nova "$S_OUT" "bash"; then
+	command sleep 1
+	observar 3
+	confere "fora do prefixo ai-" AUSENTE \
+		"$(veredito "$S_OUT" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+fi
+
+# 7. [red-team] daemon sem --spawned-by: orfandade não provada, não se mata
+ISCA=""
+if command -v setsid >/dev/null 2>&1; then
+	setsid bash -c 'exec -a "claude daemon run --origin transient" sleep 120' >/dev/null 2>&1 &
+	command sleep 2
+	ISCA=$(pgrep -f 'claude daemon run --origin transient' 2>/dev/null | head -1)
+fi
+if [ -n "$ISCA" ]; then
+	ISCAS+=("$ISCA")
+	linha=$(R | grep -E "daemon $ISCA" | head -1)
+	case "$linha" in
+	*MANTÉM*) printf '  ok    %-48s MANTEM\n' "daemon sem --spawned-by" ;;
+	*)
+		printf '  FALHA %-48s esperado=MANTEM obtido=%s\n' "daemon sem --spawned-by" "${linha:-AUSENTE}"
+		falhas=$((falhas + 1))
+		;;
+	esac
+else
+	echo "  (não foi possível montar a isca de daemon)"
+fi
+
+# 1. a sessão attached de verdade
+S_ATT=$(tmux list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null | grep '|1$' | cut -d'|' -f1 | head -1)
+if [ -n "$S_ATT" ]; then
+	confere "attached (sessão real do operador)" MANTEM \
+		"$(veredito "$S_ATT" --claude-grace-minutes=0 --shell-grace-minutes=0)"
+else
+	echo "  (nenhuma sessão attached para testar — rode de dentro do tmux)"
+fi
+
+echo
+if [ "$falhas" -eq 0 ]; then
+	echo "check-ai-session-reaper: todos os casos passaram."
+	exit 0
+fi
+echo "check-ai-session-reaper: $falhas caso(s) falharam."
+exit 1

@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""generate-v2-anchor-claim-do-corpus-20260812 — o campo prometia conferencia e entregava rotulo.
+
+O DEFEITO. `official_sources[].anchor_claim` existe para carregar o TEXTO DO
+DISPOSITIVO, copiado do documento oficial: e o que permite a qualquer pessoa
+conferir que a fonte sustenta o que a pagina afirma. Em 148 ocorrencias da
+string — 138 campos, 132 paginas publicadas, 35 shards — ele traz o
+preenchimento "texto oficial vigente da norma no Planalto". Quem audita a pagina
+encontra um rotulo generico onde deveria estar o dispositivo. Nao e fraude de
+metrica, mas e da mesma familia: campo de evidencia escrito sem a evidencia
+correspondente, o que o contrato do dado real proibe.
+
+DE ONDE VEM O TEXTO NOVO. De `data/legal-corpus/`, que guarda os artigos
+extraidos com URL oficial, data de coleta e sha256 do documento. O claim sai do
+TEXTO DE CONFERENCIA (`conference_url`), nao do link que o leitor recebe
+(`citation_url`) — sao perguntas diferentes, e `generate-legal-corpus` passou a
+distingui-las em 2026-08-12. O claim continua METADADO de proveniencia: nao vai
+para o corpo da pagina, e o contrato do corpus
+(`uso: referencia_de_conferencia_nunca_corpo_de_pagina`) segue respeitado.
+Texto de lei e dominio publico (Lei 9.610/1998, art. 8º, IV).
+
+QUAL DISPOSITIVO. O que o CORPO daquela pagina efetivamente invoca, lido de
+`data/ops/citation_inventory.jsonl` — nao um artigo qualquer da lei. Quando o
+corpo invoca um paragrafo ou inciso especifico, o claim carrega AQUELE trecho, e
+nao o caput: devolver o caput no lugar do § pedido repetiria o defeito.
+
+FAIL-CLOSED. Onde nao da para provar, nao se inventa e nao se deixa o
+preenchimento: a linha fica intocada e vira pendencia nominal de coleta, com o
+motivo. Claim errado e pior que claim ausente.
+
+CONTRATO DE ESCRITA (o mesmo de generate-v2-atribuicao-dispositivo-repair-20260812,
+caminho sancionado para correcao pontual): lease de epoca do estoque canonico,
+lock exclusivo proprio, CAS pelo sha256 da LINHA viva, CAS por TRECHO (o
+preenchimento tem de estar exatamente onde o plano viu), demais linhas
+preservadas byte a byte, forma de serializacao da linha preservada, escrita
+atomica com fsync, idempotente. `word_count` NAO muda: ele soma opening, secoes
+e FAQ, e `anchor_claim` nao entra nessa conta. NAO commita e NAO republica.
+
+TEXTO REDIGIDO NUNCA SE PERDE: o `anchor_claim` anterior de cada campo tocado
+fica gravado na evidencia, e o campo em forma MISTA (preenchimento colado a
+texto real, com "|") tem o texto real PRESERVADO — remove-se so o rotulo.
+
+Uso:
+    tools/generate-v2-anchor-claim-do-corpus-20260812 --dry-run
+    tools/generate-v2-anchor-claim-do-corpus-20260812
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.anchor-claim-do-corpus-20260812.lock"
+PAGES = ROOT / "data/editorial/v2_pages"
+EVIDENCIA = ROOT / "data/source-audit/anchor_claim_do_corpus_20260812.jsonl"
+PENDENCIAS = ROOT / "data/source-audit/anchor_claim_pendencia_de_coleta_20260812.jsonl"
+MEDIDOR = ROOT / "tools/measure-anchor-claim-placeholder-20260812"
+
+
+def carregar_medidor():
+    """O plano vem do MESMO codigo que enumera; plano e aplicacao nao divergem."""
+    spec = importlib.util.spec_from_loader(
+        "medidor", importlib.machinery.SourceFileLoader("medidor", os.fspath(MEDIDOR)))
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def dump_como_a_linha(record: dict, linha_viva: str) -> str | None:
+    """Reemite na MESMA forma de serializacao da linha viva, ou desiste.
+
+    Quando a forma nao e reconhecida, a linha inteira sairia reemitida na forma
+    padrao — um diff muito maior do que a correcao exige, num shard que outra
+    frente acabou de publicar. Risco sem retorno: devolve None e a linha fica
+    intocada, registrada como pulada.
+    """
+    original = json.loads(linha_viva)
+    for separadores in ((", ", ": "), (",", ":")):
+        if json.dumps(original, ensure_ascii=False,
+                      separators=separadores) == linha_viva:
+            return json.dumps(record, ensure_ascii=False, separators=separadores)
+    return None
+
+
+def planejar(medidor):
+    """Recomputa o censo e devolve (aplicaveis por shard, pendencias)."""
+    diplomas, por_url = medidor.carregar_corpus()
+    invent, frases = medidor.carregar_inventario()
+    publicadas = medidor.carregar_publicadas()
+    linhas = medidor.enumerar(diplomas, por_url, invent, frases, publicadas)[0]
+
+    por_shard, pendencias = {}, []
+    for registro in linhas:
+        if registro["claim_novo"]:
+            por_shard.setdefault(registro["shard"], []).append(registro)
+        else:
+            pendencias.append(registro)
+    return por_shard, pendencias, diplomas
+
+
+def novo_claim(registro: dict) -> str:
+    """O dispositivo. Texto real ja presente no campo NAO se perde."""
+    if registro["texto_real_preservar"]:
+        return f"{registro['claim_novo']} | {registro['texto_real_preservar']}"
+    return registro["claim_novo"]
+
+
+def aplicar(shard_rel: str, registros: list, diplomas: dict,
+            dry_run: bool) -> tuple[int, int]:
+    caminho = PAGES / shard_rel
+    linhas_vivas = caminho.read_text(encoding="utf-8").splitlines(keepends=True)
+    porlinha = {}
+    for registro in registros:
+        porlinha.setdefault(registro["linha"], []).append(registro)
+
+    tocadas = puladas = 0
+    saida = list(linhas_vivas)
+    evidencia = []
+
+    for numero, pendentes in sorted(porlinha.items()):
+        crua = linhas_vivas[numero - 1]
+        linha = crua.rstrip("\n")
+        vivo_sha = hashlib.sha256(linha.encode("utf-8")).hexdigest()
+
+        # CAS DE LINHA. A linha tem de estar EXATAMENTE como o plano a viu.
+        # Entre planejar() e aplicar(), a frente que publica pode reescrever o
+        # corpo desta pagina — e o dispositivo que o corpo invoca muda com ele,
+        # sem que o preenchimento nem a URL da fonte mudem. Sem esta comparacao
+        # o claim novo poderia descrever um artigo que a pagina nao invoca mais.
+        planejado_sha = pendentes[0].get("linha_sha256")
+        if planejado_sha and planejado_sha != vivo_sha:
+            print(f"  CAS DE LINHA: {shard_rel}:{numero} mudou desde o plano; "
+                  f"nao tocada", file=sys.stderr)
+            puladas += len(pendentes)
+            continue
+
+        record = json.loads(linha)
+        mudou = False
+
+        for registro in pendentes:
+            indice = registro["source_index"]
+            fontes = record.get("official_sources") or []
+            if indice >= len(fontes):
+                print(f"  CAS FALHOU {shard_rel}:{numero} indice {indice} sumiu",
+                      file=sys.stderr)
+                puladas += 1
+                continue
+            fonte = fontes[indice]
+            atual = fonte.get("anchor_claim") or ""
+
+            # CAS DE TRECHO: o preenchimento tem de estar exatamente onde o
+            # plano viu. Se outra frente ja corrigiu, a linha fica como esta —
+            # e isso torna o gerador idempotente.
+            if medidor_placeholder not in atual:
+                puladas += 1
+                continue
+            if fonte.get("url") != registro["source_url"]:
+                print(f"  CAS FALHOU {shard_rel}:{numero} url mudou", file=sys.stderr)
+                puladas += 1
+                continue
+
+            evidencia.append({
+                "shard": shard_rel, "linha": numero,
+                "intent_id": registro["intent_id"], "path": registro["path"],
+                "source_index": indice, "source_url": registro["source_url"],
+                "diploma": registro["diploma"],
+                "dispositivo": registro["dispositivo"],
+                "anchor_claim_anterior": atual,
+                "anchor_claim_novo": novo_claim(registro),
+                "conference_url": diplomas[registro["diploma"]].get("conference_url"),
+                "document_sha256": diplomas[registro["diploma"]].get("document_sha256"),
+                "corpus_fetched_at": diplomas[registro["diploma"]].get("fetched_at"),
+            })
+
+            fonte["anchor_claim"] = novo_claim(registro)
+            # O nome passa a declarar o dispositivo conferido, quando ainda nao
+            # declarava. E o que torna o claim conferivel por quem le a fonte.
+            nome = fonte.get("name") or ""
+            if registro["dispositivo"] and not re.search(r"\bart", nome, re.I):
+                fonte["name"] = f"{nome}, {registro['dispositivo']}".strip(", ")
+            # `verified_at` recebe a data REAL de coleta do documento de onde o
+            # texto saiu. Datar de hoje o que nao foi rebaixado hoje seria
+            # fraude de evidencia.
+            coleta = (diplomas[registro["diploma"]].get("fetched_at") or "")[:10]
+            if coleta:
+                fonte["verified_at"] = coleta
+            mudou = True
+
+        if not mudou:
+            continue
+        nova = dump_como_a_linha(record, linha)
+        if nova is None:
+            print(f"  forma de serializacao nao reconhecida em {shard_rel}:{numero} "
+                  f"({record.get('intent_id')}); linha NAO tocada", file=sys.stderr)
+            puladas += len(pendentes)
+            # a evidencia desta linha nao vale: nada foi escrito
+            evidencia = [e for e in evidencia
+                         if not (e["shard"] == shard_rel and e["linha"] == numero)]
+            continue
+        saida[numero - 1] = nova + ("\n" if crua.endswith("\n") else "")
+        tocadas += 1
+
+    if not dry_run and tocadas:
+        with exclusive_lock(LOCK):
+            atomic_write(caminho, "".join(saida).encode("utf-8"))
+    if evidencia:
+        modo = "a" if EVIDENCIA.exists() else "w"
+        if not dry_run:
+            EVIDENCIA.parent.mkdir(parents=True, exist_ok=True)
+            with open(EVIDENCIA, modo, encoding="utf-8") as handle:
+                for item in evidencia:
+                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+    return tocadas, puladas
+
+
+def main() -> int:
+    global medidor_placeholder
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    medidor = carregar_medidor()
+    medidor_placeholder = medidor.PLACEHOLDER
+    por_shard, pendencias, diplomas = planejar(medidor)
+
+    aplicaveis = sum(len(v) for v in por_shard.values())
+    print(f"campos com claim provado ...... {aplicaveis}")
+    print(f"pendencias de coleta .......... {len(pendencias)}")
+    print(f"shards a tocar ................ {len(por_shard)}")
+
+    if not args.dry_run:
+        PENDENCIAS.parent.mkdir(parents=True, exist_ok=True)
+        with open(PENDENCIAS, "w", encoding="utf-8") as handle:
+            for item in pendencias:
+                handle.write(json.dumps({
+                    "intent_id": item["intent_id"], "path": item["path"],
+                    "shard": item["shard"], "linha": item["linha"],
+                    "source_index": item["source_index"],
+                    "source_name": item["source_name"],
+                    "source_url": item["source_url"],
+                    "diploma": item["diploma"],
+                    "motivo": item["fail_closed"],
+                }, ensure_ascii=False) + "\n")
+
+    def varrer_shards():
+        tocadas_total = puladas_total = 0
+        for shard_rel in sorted(por_shard):
+            tocadas, puladas = aplicar(shard_rel, por_shard[shard_rel],
+                                       diplomas, args.dry_run)
+            tocadas_total += tocadas
+            puladas_total += puladas
+        return tocadas_total, puladas_total
+
+    total_t = total_p = 0
+    if args.dry_run:
+        # O ensaio NAO toma o lease do estoque canonico: ele so le, e tomar o
+        # lease atrapalharia a frente que estiver publicando agora.
+        total_t, total_p = varrer_shards()
+    else:
+        try:
+            with canonical_stock_write_lease(ROOT):
+                total_t, total_p = varrer_shards()
+        except StockEpochBusy as erro:
+            print(f"estoque canonico ocupado por outra frente: {erro}", file=sys.stderr)
+            return 2
+
+    print(f"\nlinhas {'que mudariam' if args.dry_run else 'alteradas'}: {total_t}")
+    print(f"campos pulados por CAS/idempotencia: {total_p}")
+    if not args.dry_run:
+        print(f"evidencia:  {EVIDENCIA}")
+        print(f"pendencias: {PENDENCIAS}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

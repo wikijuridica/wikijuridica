@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""measure-official-source-content-evidence-20260812 — a fonte responde 200, mas ENTREGA norma?
+
+POR QUE EXISTE: `tools/verify-official-sources` conclui "verificada" a partir do
+STATUS HTTP. Status não é conteúdo. Medido em 2026-08-12, ao vivo, com o mesmo
+User-Agent da auditoria:
+
+    https://www.bcb.gov.br/estabilidadefinanceira/exibenormativo?numero=4949&tipo=RESOLUÇÃO
+        -> HTTP 200, 2.871 bytes, texto visível INTEIRO: "Banco Central do Brasil"
+
+São 2.871 bytes de casca JavaScript. O articulado da Resolução 4.949 nunca chega
+ao cliente sem executar script. Carimbar `verified_at` nisso é escrever campo de
+evidência sem a evidência correspondente — a classe que o contrato do dado real
+proíbe.
+
+O QUE ESTA FERRAMENTA NÃO FAZ, e por quê:
+
+1. NÃO reaproveita `classe_de_evidencia` do baseline de impressão normativa.
+   Aquele campo conta âncoras `id`/`name` do HTML — é medida de ESTRUTURA, não de
+   TEXTO. Sobre o acervo, 2.124 URLs respondem 200 e caem em `nula` lá; a maioria
+   esmagadora é página de serviço legítima do gov.br, com texto de verdade, que
+   simplesmente não usa `id="art1"`. Traduzir `nula` para "não verificada"
+   desverificaria dois terços do acervo com base num falso positivo.
+
+2. NÃO reprova PDF por falta de âncora. PDF não tem marcação HTML: `%PDF-` nos
+   cinco primeiros bytes já é entrega de documento, e o baseline trata PDF por
+   identidade de bytes. Um extrator que exigisse âncora HTML marcaria 357 PDFs
+   oficiais como mortos.
+
+A PARTIÇÃO, em três faixas e não em duas — porque "sem articulado" e "sem
+conteúdo" são coisas diferentes:
+
+    documento_pdf             corpo começa em %PDF-            -> evidência de conteúdo
+    articulado_no_texto       >=3 marcas normativas no texto   -> evidência de conteúdo
+    conteudo_sem_articulado   texto visível >= PISO_TEXTO      -> conteúdo, sem norma
+    casca_sem_conteudo        texto visível <  PISO_TEXTO      -> SEM evidência
+
+O PISO_TEXTO=500 não é chute: a distribuição do texto visível dos 2.881 corpos
+HTML em cache é bimodal, medida nesta ferramenta — percentis 1 e 5 valem 22 e 23
+caracteres (as cascas), e o percentil 10 já salta para 1.770. Entre 500 e 1.770
+não há praticamente ninguém. O piso corta no vale, não no meio de uma população.
+
+MARCA NORMATIVA é multilíngue de propósito: o acervo cita normattiva.it,
+boe.es, eur-lex e gesetze-im-internet, e um detector só-português classificaria
+lei estrangeira viva como casca.
+
+CONTRAPROVA REGISTRADA (2026-08-12): a auditoria que originou esta frente
+afirmou que normattiva.it devolve "200 com ~5.818 caracteres e nenhum
+articulado". Refetch controlado das 4 URLs de normattiva citadas pelo acervo
+devolveu 81.793 a 160.740 bytes, 4.390 a 20.175 caracteres de texto visível e 2 a
+47 marcas normativas — a Legge 91/1992 chega com "Art. 1 ... È cittadino per
+nascita" no primeiro response, e os bytes batem com o cache. A premissa não se
+confirmou nessas URLs; o defeito de classe existe, e está no bcb.gov.br.
+
+Saída: data/ops/official_source_content_evidence_20260812.jsonl (uma linha por
+URL + linha de esquema e de resumo). NÃO escreve em data/editorial/v2_pages/.
+
+Uso:
+    tools/measure-official-source-content-evidence-20260812
+        # mede tudo que houver em cache local, sem tocar a rede
+    tools/measure-official-source-content-evidence-20260812 --rede --limite 200
+        # busca o que falta, 1 req/s por host
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import glob
+import hashlib
+import json
+import os
+import queue
+import re
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ESTOQUE = str(ROOT / "data/editorial/v2_pages/*.jsonl")
+SAIDA = ROOT / "data/ops/official_source_content_evidence_20260812.jsonl"
+CACHE = Path(os.environ.get("PLANALTO_CACHE", "/tmp/wiki-planalto-cache-20260812"))
+
+ESQUEMA = "official_source_content_evidence_v1"
+PISO_TEXTO = 500
+MINIMO_MARCAS = 3
+STATUS_ACEITOS = (200, 203, 206)
+
+# Identidade canonica (CLAUDE.md secao 11). Medido em 2026-09-05 com este UA:
+# www.bcb.gov.br 200/2.871 B, www.normattiva.it 200/91.138 B (Legge 91/1992),
+# www.planalto.gov.br 200/230.913 B.
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+    "+https://wikijuridica.com.br/bot/; conferencia de conteudo normativo de "
+    "fonte citada, contato https://wikijuridica.com.br/contato/advogado/)"
+)
+
+SEM_TEXTO = re.compile(rb"(?is)<(script|style|noscript|template)\b.*?</\1>")
+TAG = re.compile(rb"(?s)<[^>]*>")
+ENTIDADE = re.compile(r"&[a-zA-Z]+;|&#\d+;")
+ESPACO = re.compile(r"\s+")
+
+# Marca de dispositivo normativo no TEXTO VISÍVEL, em pt/it/es/en/de.
+MARCA_NORMATIVA = re.compile(
+    r"(?i)\bart(?:\.|igos?|icolos?|ículos?|icles?)?\s*\.?\s*\d"
+    r"|§\s*\d"
+    r"|\bparágrafo único\b"
+    r"|\bincis[oa]\b"
+    r"|\bcaput\b"
+    r"|\bcomma\s+\d"
+    r"|\bapartado\s+\d"
+    r"|\babsatz\s+\d")
+
+
+def texto_visivel(bruto: bytes) -> str:
+    """Texto que o leitor (e o crawler sem JS) realmente recebe."""
+    limpo = TAG.sub(b" ", SEM_TEXTO.sub(b" ", bruto))
+    try:
+        texto = limpo.decode("utf-8")
+    except UnicodeDecodeError:
+        texto = limpo.decode("latin-1", "replace")
+    return ESPACO.sub(" ", ENTIDADE.sub(" ", texto)).strip()
+
+
+def classifica(bruto: bytes) -> dict:
+    if not bruto:
+        return {"midia": "", "faixa": "corpo_ausente", "tem_evidencia_de_conteudo": False,
+                "texto_visivel_chars": 0, "marcas_normativas": 0}
+    if bruto[:5] == b"%PDF-":
+        return {"midia": "pdf", "faixa": "documento_pdf", "tem_evidencia_de_conteudo": True,
+                "texto_visivel_chars": -1, "marcas_normativas": -1}
+    texto = texto_visivel(bruto)
+    marcas = len(MARCA_NORMATIVA.findall(texto))
+    if marcas >= MINIMO_MARCAS:
+        faixa, evidencia = "articulado_no_texto", True
+    elif len(texto) >= PISO_TEXTO:
+        faixa, evidencia = "conteudo_sem_articulado", True
+    else:
+        faixa, evidencia = "casca_sem_conteudo", False
+    return {"midia": "html", "faixa": faixa, "tem_evidencia_de_conteudo": evidencia,
+            "texto_visivel_chars": len(texto), "marcas_normativas": marcas}
+
+
+def caminho_cache(url: str) -> Path:
+    return CACHE / (hashlib.sha256(url.encode()).hexdigest()[:24] + ".htm")
+
+
+def host_de(url: str) -> str:
+    return (urllib.parse.urlparse(url).netloc or "").lower()
+
+
+def fontes_do_acervo() -> tuple[dict, dict]:
+    """{url: ocorrências} e {url: {páginas}} — leitura, nunca escrita."""
+    ocorrencias: collections.Counter = collections.Counter()
+    paginas: dict[str, set] = collections.defaultdict(set)
+    for caminho in sorted(glob.glob(ESTOQUE)):
+        with open(caminho, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                try:
+                    registro = json.loads(linha)
+                except ValueError:
+                    continue
+                # `intent_id` entra na identidade porque boa parte do acervo não
+                # traz `slug`: sem ele, dezenas de páginas distintas do mesmo
+                # arquivo colapsavam numa chave só e a contagem de impacto saía
+                # três vezes menor do que é (113 contra 372, medido).
+                identidade = (registro.get("slug") or registro.get("route")
+                              or registro.get("page_id") or registro.get("intent_id") or "")
+                for fonte in registro.get("official_sources") or []:
+                    url = fonte.get("url")
+                    if not url:
+                        continue
+                    ocorrencias[url] += 1
+                    paginas[url].add(os.path.basename(caminho) + "#" + identidade)
+    return ocorrencias, paginas
+
+
+def busca(url: str, timeout: int = 30) -> tuple[bytes, int, str]:
+    contexto = ssl.create_default_context()
+    cabecalhos = {"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf,*/*"}
+    try:
+        pedido = urllib.request.Request(url, method="GET", headers=cabecalhos)
+        with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+            return resposta.read(), resposta.status, ""
+    except urllib.error.HTTPError as erro:
+        try:
+            corpo = erro.read()
+        except Exception:
+            corpo = b""
+        return corpo, erro.code, ""
+    except Exception as erro:
+        # `URLError` sozinho não diz se o problema é DNS, TLS ou timeout — e a
+        # diferença decide o veredito editorial. portal.stf.jus.br (98 URLs do
+        # acervo) resolve DNS e responde, mas serve a folha duas vezes e nenhuma
+        # intermediária: "Verify return code: 21", reproduzido por curl e por
+        # Python em 2026-08-12. A fonte está de pé; quebrada está a cadeia TLS do
+        # órgão. Chamar isso de "fonte morta" seria medição mentirosa.
+        motivo = getattr(erro, "reason", erro)
+        return b"", 0, ("%s: %s" % (type(erro).__name__, motivo))[:200]
+
+
+def coleta_pela_rede(urls: list[str], rps_por_host: float, hosts_paralelos: int) -> dict:
+    por_host: dict[str, list[str]] = collections.defaultdict(list)
+    for url in urls:
+        por_host[host_de(url)].append(url)
+    fila: queue.Queue = queue.Queue()
+    for host in por_host:
+        fila.put(host)
+    intervalo = 1.0 / max(rps_por_host, 0.01)
+    resultado: dict = {}
+    trava = threading.Lock()
+
+    def trabalhar():
+        while True:
+            try:
+                host = fila.get_nowait()
+            except queue.Empty:
+                return
+            proximo = time.monotonic()
+            for url in por_host[host]:
+                agora = time.monotonic()
+                if agora < proximo:
+                    time.sleep(proximo - agora)
+                proximo = max(proximo, agora) + intervalo
+                bruto, status, erro = busca(url)
+                if bruto and status in STATUS_ACEITOS:
+                    CACHE.mkdir(parents=True, exist_ok=True)
+                    caminho_cache(url).write_bytes(bruto)
+                with trava:
+                    resultado[url] = (bruto, status, erro)
+
+    threads = [threading.Thread(target=trabalhar, daemon=True)
+               for _ in range(max(1, min(hosts_paralelos, len(por_host))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return resultado
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--rede", action="store_true", help="busca o que não estiver em cache")
+    parser.add_argument("--limite", type=int, default=0, help="teto de URLs buscadas pela rede")
+    parser.add_argument("--rps-por-host", type=float, default=1.0)
+    parser.add_argument("--hosts-paralelos", type=int, default=8)
+    args = parser.parse_args()
+
+    ocorrencias, paginas = fontes_do_acervo()
+    print("URLs distintas citadas pelo acervo: %d (%d ocorrências)"
+          % (len(ocorrencias), sum(ocorrencias.values())))
+
+    faltantes = [u for u in ocorrencias if not (caminho_cache(u).is_file()
+                                                and caminho_cache(u).stat().st_size > 0)]
+    da_rede: dict = {}
+    if args.rede and faltantes:
+        alvo = faltantes[: args.limite] if args.limite else faltantes
+        print("buscando %d URLs pela rede a %.1f req/s por host..." % (len(alvo), args.rps_por_host))
+        da_rede = coleta_pela_rede(alvo, args.rps_por_host, args.hosts_paralelos)
+
+    # Veredito de rede não se perde numa execução offline. URL recusada por
+    # status, por WAF ou por cadeia TLS incompleta NUNCA entra em cache (só corpo
+    # 200 entra), então re-rodar sem rede rebaixaria 234 vereditos medidos de
+    # `http_recusado` para `sem_medicao` — apagando medição que custou rede e
+    # fingindo que nada se sabe sobre elas.
+    anterior: dict = {}
+    if SAIDA.is_file():
+        with open(SAIDA, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                try:
+                    registro = json.loads(linha)
+                except ValueError:
+                    continue
+                if registro.get("tipo") or not registro.get("url"):
+                    continue
+                if registro.get("faixa") not in ("sem_medicao", None):
+                    anterior[registro["url"]] = registro
+
+    hoje = datetime.date.today().isoformat()
+    registros = []
+    por_faixa: collections.Counter = collections.Counter()
+    ocorrencias_por_faixa: collections.Counter = collections.Counter()
+    sem_evidencia_por_host: collections.Counter = collections.Counter()
+    paginas_sem_evidencia: set = set()
+
+    for url in sorted(ocorrencias):
+        caminho = caminho_cache(url)
+        if url in da_rede:
+            bruto, status, erro = da_rede[url]
+            origem = "rede"
+        elif caminho.is_file() and caminho.stat().st_size > 0:
+            bruto, status, erro, origem = caminho.read_bytes(), 200, "", "cache"
+        else:
+            bruto, status, erro, origem = b"", 0, "sem cache e sem rede", "ausente"
+
+        if origem == "ausente" and url in anterior:
+            passada = anterior[url]
+            origem = "evidencia_anterior:" + str(passada.get("medido_em", ""))
+            status = passada.get("http_status", 0)
+            erro = passada.get("erro", "")
+            classe = {chave: passada.get(chave) for chave in
+                      ("midia", "faixa", "tem_evidencia_de_conteudo",
+                       "texto_visivel_chars", "marcas_normativas")}
+        elif origem == "ausente":
+            classe = {"midia": "", "faixa": "sem_medicao", "tem_evidencia_de_conteudo": None,
+                      "texto_visivel_chars": 0, "marcas_normativas": 0}
+        elif status not in STATUS_ACEITOS:
+            faixa = ("tls_cadeia_incompleta"
+                     if "CERTIFICATE_VERIFY_FAILED" in erro else "http_recusado")
+            classe = {"midia": "", "faixa": faixa, "tem_evidencia_de_conteudo": False,
+                      "texto_visivel_chars": 0, "marcas_normativas": 0}
+        else:
+            classe = classifica(bruto)
+
+        por_faixa[classe["faixa"]] += 1
+        ocorrencias_por_faixa[classe["faixa"]] += ocorrencias[url]
+        if classe["tem_evidencia_de_conteudo"] is False:
+            sem_evidencia_por_host[host_de(url)] += 1
+            paginas_sem_evidencia |= paginas[url]
+
+        registros.append({
+            "schema_version": ESQUEMA,
+            "url": url,
+            "host": host_de(url),
+            "medido_em": hoje,
+            "origem_do_corpo": origem,
+            "http_status": status,
+            "erro": erro,
+            "bytes": len(bruto),
+            "sha256_documento": hashlib.sha256(bruto).hexdigest() if bruto else "",
+            "ocorrencias_no_acervo": ocorrencias[url],
+            "paginas_no_acervo": len(paginas[url]),
+            **classe,
+        })
+
+    SAIDA.parent.mkdir(parents=True, exist_ok=True)
+    with open(SAIDA, "w", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps({
+            "tipo": "esquema",
+            "schema_version": ESQUEMA,
+            "ferramenta": os.path.basename(__file__),
+            "gerado_em": hoje,
+            "piso_texto_visivel_chars": PISO_TEXTO,
+            "minimo_marcas_normativas": MINIMO_MARCAS,
+            "faixas": {
+                "documento_pdf": "corpo começa em %PDF- — entrega de documento, sem exigir âncora HTML",
+                "articulado_no_texto": "texto visível traz >=3 marcas de dispositivo normativo",
+                "conteudo_sem_articulado": "texto visível >= piso, sem marca normativa — fonte viva, sem norma no corpo",
+                "casca_sem_conteudo": "texto visível abaixo do piso — 200 sem conteúdo (casca JS ou soft-404)",
+                "http_recusado": "status fora de (200,203,206)",
+                "sem_medicao": "sem corpo em cache e sem rede — NUNCA presumido verificado",
+            },
+            "auditoria_por_terceiro": "baixar a URL com o User-Agent registrado, remover script/style/tags e recontar",
+        }, ensure_ascii=False, sort_keys=True) + "\n")
+        for registro in registros:
+            arquivo.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+        arquivo.write(json.dumps({
+            "tipo": "resumo",
+            "schema_version": ESQUEMA,
+            "urls": len(registros),
+            "por_faixa": dict(por_faixa),
+            "ocorrencias_por_faixa": dict(ocorrencias_por_faixa),
+            "sem_evidencia_de_conteudo_por_host": dict(sem_evidencia_por_host.most_common(30)),
+            "paginas_afetadas_por_falta_de_evidencia": len(paginas_sem_evidencia),
+        }, ensure_ascii=False, sort_keys=True) + "\n")
+
+    print("\nfaixa                       URLs   ocorrências")
+    for faixa, quantas in por_faixa.most_common():
+        print("  %-24s %6d %10d" % (faixa, quantas, ocorrencias_por_faixa[faixa]))
+    print("\nsem evidência de conteúdo, por host:")
+    for host, quantas in sem_evidencia_por_host.most_common(12):
+        print("  %5d  %s" % (quantas, host))
+    print("\npáginas do acervo tocadas por fonte sem evidência: %d" % len(paginas_sem_evidencia))
+    print("evidência: %s" % os.path.relpath(SAIDA, ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""report-access-traffic — relatório de tráfego do portal a partir do access log.
+
+O contrato de HTML leve proíbe <script> na página, então não existe (e não pode
+existir) analytics de terceiro medindo o portal. A medição real vem do que o
+nginx JÁ grava com `log_format wj_main` (ops/nginx/wikijuridica.conf) — este
+relatório só lê e agrega esse log.
+
+REUSO, NÃO DUPLICAÇÃO: o parser da linha (regex `LINE`) e o `parse_request` são
+importados de tools/check-access-log-bots, que é o dono do formato. Existe uma
+divisão clara de papéis entre os dois:
+
+  check-access-log-bots  — GATE. Reprova (exit 1) quando o tráfego contradiz a
+                           política de bots da DEC-022.
+  report-access-traffic  — RELATÓRIO. Nunca reprova por volume de tráfego; só
+                           descreve o que aconteceu (exit 0). Sai diferente de
+                           zero apenas se não conseguir LER o log.
+
+O QUE ESTE RELATÓRIO NÃO MEDE (e por que) — leia antes de citar números:
+
+  * "visitantes únicos" e "sessões" NÃO são mensuráveis aqui, e este relatório
+    não inventa esse número. Sem JavaScript e sem cookie não há identificador de
+    sessão; e o `$remote_addr` do wj_main é sempre 127.0.0.1, porque quem entrega
+    a requisição ao nginx é o cloudflared em loopback — o IP do visitante real
+    não está no formato de log atual. O que se conta aqui é REQUISIÇÃO, e a
+    aproximação mais honesta de público é "requisições prováveis de humano"
+    (sem marca de bot no log e com User-Agent de navegador).
+  * Para chegar a visitante único seria preciso registrar `$http_cf_connecting_ip`
+    (o IP real que o Cloudflare repassa) no log_format — mudança em produção que
+    este relatório não faz. Ver ops/proposed/prometheus/README.md.
+
+CLASSIFICAÇÃO DE BOT: usa `content/crawl_policy.json` (access_rules), a MESMA
+fonte que o servidor Go carrega em crawl.NewBotAccessMatcher, com a mesma
+semântica de casamento (token com fronteira, candidato mais longo vence, "*" só
+decide na ausência de match). Assim o relatório e o /metrics do binário contam a
+mesma coisa, sem uma segunda tabela de bots para desincronizar.
+
+Uso:
+    ./tools/report-access-traffic
+    ./tools/report-access-traffic --log /var/log/nginx/wikijuridica/access.log
+    ./tools/report-access-traffic --incluir-rotacionados --top 20
+    ./tools/report-access-traffic --json
+
+Códigos de saída:
+    0  relatório emitido (mesmo com zero linhas de log)
+    1  nenhum log legível encontrado
+    2  erro de uso / dependência do repo ausente
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import gzip
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+LOG_PADRAO = pathlib.Path("/var/log/nginx/wikijuridica/access.log")
+POLITICA = RAIZ / "content" / "crawl_policy.json"
+
+
+def carregar_parser_do_check():
+    """Importa o parser de tools/check-access-log-bots (o dono do formato).
+
+    O arquivo não tem extensão .py, então o import é por caminho. O script tem
+    guarda `if __name__ == "__main__"`, então importá-lo não executa o check.
+    """
+    caminho = RAIZ / "tools" / "check-access-log-bots"
+    if not caminho.exists():
+        print(f"report-access-traffic: dependência ausente: {caminho} — este relatório "
+              f"reusa o parser de lá, não duplica o formato do log.", file=sys.stderr)
+        raise SystemExit(2)
+    spec = importlib.util.spec_from_loader(
+        "wj_check_access_log_bots",
+        importlib.machinery.SourceFileLoader("wj_check_access_log_bots", str(caminho)),
+    )
+    if spec is None or spec.loader is None:
+        print(f"report-access-traffic: não foi possível carregar {caminho}", file=sys.stderr)
+        raise SystemExit(2)
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+class ClassificadorDeBot:
+    """Espelho em Python de crawl.BotAccessMatcher (internal/crawl/crawl.go).
+
+    Mesma fonte de dados (content/crawl_policy.json) e mesma regra de decisão:
+    casamento por token com fronteira, candidato mais longo vence, "*" só entra
+    quando nenhum específico casa.
+    """
+
+    CLASSE_DESCONHECIDA = "unknown_or_standard_user_agent"
+
+    def __init__(self, regras: list[dict]):
+        self.especificos: list[tuple[str, str]] = []
+        self.curinga: str | None = None
+        for regra in regras:
+            candidato = str(regra.get("user_agent", "")).strip().lower()
+            if not candidato:
+                continue
+            classe = str(regra.get("class", "")).strip() or self.CLASSE_DESCONHECIDA
+            if candidato == "*":
+                self.curinga = classe
+                continue
+            self.especificos.append((candidato, classe))
+
+    @staticmethod
+    def _fronteira(caractere: str) -> bool:
+        """Espelha isUserAgentTokenBoundary: nem letra minúscula, nem dígito."""
+        return not ("a" <= caractere <= "z" or "0" <= caractere <= "9")
+
+    @classmethod
+    def _casa_token(cls, ua: str, candidato: str) -> bool:
+        """Espelha userAgentTokenMatches."""
+        if ua == candidato:
+            return True
+        inicio = 0
+        while True:
+            indice = ua.find(candidato, inicio)
+            if indice < 0:
+                return False
+            antes_ok = indice == 0 or cls._fronteira(ua[indice - 1])
+            fim = indice + len(candidato)
+            depois_ok = fim == len(ua) or cls._fronteira(ua[fim])
+            if antes_ok and depois_ok:
+                return True
+            inicio = indice + 1
+
+    def classificar_detalhado(self, user_agent: str) -> tuple[str, bool]:
+        """Devolve (classe, casou_regra_especifica).
+
+        O segundo valor separa "casou um bot nomeado no registro" de "caiu no
+        curinga '*'". Sem essa distinção, todo tráfego não reconhecido pareceria
+        igual ao de um navegador.
+        """
+        ua = user_agent.strip().lower()
+        melhor_classe = ""
+        melhor_tamanho = -1
+        for candidato, classe in self.especificos:
+            if self._casa_token(ua, candidato) and len(candidato) > melhor_tamanho:
+                melhor_classe, melhor_tamanho = classe, len(candidato)
+        if melhor_tamanho >= 0:
+            return melhor_classe, True
+        if self.curinga:
+            return self.curinga, False
+        return self.CLASSE_DESCONHECIDA, False
+
+    def classificar(self, user_agent: str) -> str:
+        return self.classificar_detalhado(user_agent)[0]
+
+
+# Marcas de navegador real. Não é identificação de pessoa: é só o sinal mais
+# honesto disponível de "não é crawler declarado". Nunca chamamos isso de
+# "visitante".
+MARCAS_DE_NAVEGADOR = ("mozilla/", "opera/", "safari/")
+
+# Robô que se identifica como robô. Praticamente todo crawler comercial carrega
+# "Mozilla/5.0" no User-Agent — Ahrefs, Semrush, MJ12, DotBot, Bytespider e
+# companhia —, então "tem Mozilla/" NÃO significa navegador. Sem esta lista, um
+# rastreador de SEO entraria na conta de tráfego humano e inflaria a medição:
+# exatamente a fraude de métrica que o contrato do projeto proíbe. O sufixo
+# "+http" cobre a convenção de crawler que publica a própria URL de política no
+# User-Agent.
+MARCAS_DE_ROBO = (
+    "bot", "crawler", "spider", "scraper", "+http", "http://", "https://",
+    "curl/", "wget", "python-requests", "python-urllib", "scrapy", "libwww",
+    "java/", "go-http-client", "okhttp", "headlesschrome", "phantomjs",
+    "monitoring", "uptime", "pingdom", "statuscake",
+)
+
+
+def abrir_log(caminho: pathlib.Path):
+    """Abre log texto ou rotacionado .gz."""
+    if caminho.suffix == ".gz":
+        return gzip.open(caminho, "rt", encoding="utf-8", errors="replace")
+    return caminho.open("r", encoding="utf-8", errors="replace")
+
+
+def descobrir_logs(base: pathlib.Path, incluir_rotacionados: bool) -> list[pathlib.Path]:
+    encontrados = [base] if base.exists() else []
+    if incluir_rotacionados:
+        for irmao in sorted(base.parent.glob(base.name + ".*")):
+            if irmao.is_file():
+                encontrados.append(irmao)
+    return encontrados
+
+
+def agregar(caminhos: list[pathlib.Path], parser, classificador: ClassificadorDeBot,
+            top: int) -> dict:
+    total = 0
+    malformadas = 0
+    de_ensaio = 0
+    # DENOMINADOR LÍQUIDO (BUG-070, 2026-08-29). Este relatório descontava só o
+    # `bot_sim`, e por isso `requisicoes` — o denominador de TUDO que ele
+    # publica — continha o aquecimento de borda desta casa. Medido no mesmo dia:
+    # 95,7% do log de origem é ferramenta interna, então a diferença entre o
+    # bruto e o líquido é de mais de vinte vezes, não de arredondamento.
+    #
+    # A agregação NÃO muda: `por_status`, `rotas_5xx` e as latências continuam
+    # cobrindo tudo que a origem serviu, porque para operar o host isso é o que
+    # importa. O que muda é que o par vai publicado, com o critério nomeado, e
+    # ninguém mais precisa adivinhar qual dos dois denominadores está lendo.
+    descontadas_por_motivo: collections.Counter = collections.Counter()
+    ilegiveis: list[str] = []
+    bytes_servidos = 0
+    duracoes: list[float] = []
+
+    por_status: collections.Counter = collections.Counter()
+    por_classe_status: collections.Counter = collections.Counter()
+    por_rota: collections.Counter = collections.Counter()
+    por_metodo: collections.Counter = collections.Counter()
+    por_host: collections.Counter = collections.Counter()
+    por_classe_de_bot: collections.Counter = collections.Counter()
+    por_agente: collections.Counter = collections.Counter()
+    por_dia: collections.Counter = collections.Counter()
+    rotas_404: collections.Counter = collections.Counter()
+    rotas_5xx: collections.Counter = collections.Counter()
+    provaveis_humanos = 0
+    bloqueados_no_ingress = 0
+    via_cloudflare = 0
+
+    for caminho in caminhos:
+        try:
+            manipulador = abrir_log(caminho)
+        except PermissionError:
+            ilegiveis.append(f"{caminho} (sem permissão de leitura)")
+            continue
+        except OSError as erro:
+            ilegiveis.append(f"{caminho} ({erro})")
+            continue
+        with manipulador as arquivo:
+            for bruta in arquivo:
+                linha = bruta.rstrip("\n")
+                if not linha.strip():
+                    continue
+                total += 1
+                casado = parser.LINE.match(linha)
+                if not casado:
+                    malformadas += 1
+                    continue
+                campos = casado.groupdict()
+                # Requisição de ENSAIO (smoke de rastreio, verificação de
+                # cabeçalho, pré-voo de deploy) carrega X-Bot-Simulation e é
+                # registrada em bot_sim= pelo log_format. Ela NÃO é audiência:
+                # contá-la infla métrica com tráfego que o próprio projeto
+                # gerou, que é exatamente a fraude que a política proíbe. Sai da
+                # contagem antes de qualquer agregação, e é reportada à parte.
+                motivo_interno = botagents.motivo_de_desconto(
+                    bot_sim=campos["bot_sim"],
+                    warm=campos.get("warm"),
+                    ip=campos["addr"],
+                    user_agent=campos["agent"],
+                )
+                if motivo_interno:
+                    descontadas_por_motivo[motivo_interno] += 1
+                if (campos["bot_sim"] or "").strip() not in ("", "-"):
+                    de_ensaio += 1
+                    continue
+                status = campos["status"]
+                metodo, caminho_req = parser.parse_request(campos["request"])
+                agente = campos["agent"]
+
+                por_status[status] += 1
+                por_classe_status[f"{status[0]}xx"] += 1
+                por_rota[caminho_req] += 1
+                por_metodo[metodo or "(vazio)"] += 1
+                por_host[campos["host"] or "(vazio)"] += 1
+                por_agente[(agente or "(vazio)")[:80]] += 1
+
+                # "04/Aug/2026:14:18:32 -0300" -> "04/Aug/2026"
+                por_dia[campos["time"].split(":", 1)[0]] += 1
+
+                try:
+                    bytes_servidos += int(campos["bytes"])
+                except ValueError:
+                    pass
+                try:
+                    duracoes.append(float(campos["rt"]))
+                except ValueError:
+                    pass
+
+                if campos["ray"].strip() not in ("", "-"):
+                    via_cloudflare += 1
+
+                classe, casou_bot_conhecido = classificador.classificar_detalhado(agente)
+                por_classe_de_bot[classe] += 1
+
+                # deny/block só existem nas linhas anteriores à DEC-023; o
+                # log_format atual não emite os campos e o grupo opcional vem
+                # None. Acesso direto derrubaria o relatório na primeira linha
+                # moderna do arquivo.
+                deny = (campos["deny"] or "").strip()
+                allow = (campos["allow"] or "").strip()
+                block = (campos["block"] or "").strip()
+                if (deny and deny != "0") or (block and block != "0"):
+                    bloqueados_no_ingress += 1
+
+                # Quatro filtros, todos necessários. Nenhum sozinho basta:
+                #  1. sem marca de bot nos maps do nginx (deny=/allow=);
+                #  2. não casou nenhum bot nomeado em content/crawl_policy.json
+                #     — pega o robô que o nginx deixou passar por drift de map;
+                #  3. não se autodeclara robô no User-Agent — pega o crawler
+                #     comercial (Ahrefs, Semrush, MJ12…) que não está em nenhuma
+                #     das duas listas e ainda assim carrega "Mozilla/5.0";
+                #  4. tem cara de navegador.
+                agente_minusculo = agente.lower()
+                sem_marca_de_bot = (not deny or deny == "0") and (not allow or allow == "0")
+                autodeclara_robo = any(m in agente_minusculo for m in MARCAS_DE_ROBO)
+                parece_navegador = any(m in agente_minusculo for m in MARCAS_DE_NAVEGADOR)
+                if (sem_marca_de_bot and not casou_bot_conhecido
+                        and not autodeclara_robo and parece_navegador):
+                    provaveis_humanos += 1
+
+                if status == "404":
+                    rotas_404[caminho_req] += 1
+                elif status.startswith("5"):
+                    rotas_5xx[caminho_req] += 1
+
+    duracoes.sort()
+
+    def percentil(fracao: float) -> float | None:
+        if not duracoes:
+            return None
+        indice = min(len(duracoes) - 1, int(round(fracao * (len(duracoes) - 1))))
+        return duracoes[indice]
+
+    return {
+        "logs_lidos": [str(c) for c in caminhos],
+        "logs_ilegiveis": ilegiveis,
+        "requisicoes": total,
+        "linhas_malformadas": malformadas,
+        # Excluídas da audiência por serem requisições do próprio projeto
+        # (X-Bot-Simulation). Reportadas, nunca somadas ao tráfego real.
+        "requisicoes_de_ensaio_excluidas": de_ensaio,
+        "denominador": botagents.denominador(total, sum(descontadas_por_motivo.values())),
+        "descontadas_por_motivo": dict(sorted(descontadas_por_motivo.items())),
+        "bytes_servidos": bytes_servidos,
+        "requisicoes_via_cloudflare": via_cloudflare,
+        # Nome deliberadamente descritivo do CRITÉRIO, não da conclusão: é o que
+        # o dado sustenta. Chamar isto de "humanos" ou "visitantes" seria
+        # afirmar mais do que o log permite.
+        "requisicoes_navegador_sem_marca_de_robo": provaveis_humanos,
+        "requisicoes_bloqueadas_no_ingress": bloqueados_no_ingress,
+        "latencia_s": {
+            "p50": percentil(0.50),
+            "p95": percentil(0.95),
+            "p99": percentil(0.99),
+            "max": duracoes[-1] if duracoes else None,
+        },
+        "por_classe_de_status": dict(sorted(por_classe_status.items())),
+        "por_status": dict(por_status.most_common()),
+        "por_metodo": dict(por_metodo.most_common()),
+        "por_host": dict(por_host.most_common(top)),
+        "por_classe_de_bot": dict(por_classe_de_bot.most_common()),
+        "por_dia": dict(sorted(por_dia.items())),
+        "rotas_mais_pedidas": dict(por_rota.most_common(top)),
+        "agentes_mais_vistos": dict(por_agente.most_common(top)),
+        "rotas_404": dict(rotas_404.most_common(top)),
+        "rotas_5xx": dict(rotas_5xx.most_common(top)),
+    }
+
+
+def formatar_bytes(quantidade: int) -> str:
+    valor = float(quantidade)
+    for unidade in ("B", "KB", "MB", "GB"):
+        if valor < 1024 or unidade == "GB":
+            return f"{valor:.1f} {unidade}"
+        valor /= 1024
+    return f"{valor:.1f} GB"
+
+
+def imprimir_bloco(titulo: str, dados: dict, largura: int = 46) -> None:
+    if not dados:
+        return
+    print(f"\n  {titulo}")
+    for chave, valor in dados.items():
+        rotulo = str(chave)
+        if len(rotulo) > largura:
+            rotulo = rotulo[: largura - 1] + "…"
+        print(f"    {rotulo:<{largura}} {valor}")
+
+
+def main() -> int:
+    parser_cli = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser_cli.add_argument("--log", default=str(LOG_PADRAO),
+                            help="access log do nginx (padrão: %(default)s)")
+    parser_cli.add_argument("--incluir-rotacionados", action="store_true",
+                            help="também lê os rotacionados (.1, .2.gz, …)")
+    parser_cli.add_argument("--top", type=int, default=12,
+                            help="quantos itens listar por seção (padrão: %(default)s)")
+    parser_cli.add_argument("--json", action="store_true", help="saída estruturada")
+    args = parser_cli.parse_args()
+
+    if args.top <= 0:
+        print("report-access-traffic: --top precisa ser maior que zero", file=sys.stderr)
+        return 2
+
+    modulo_check = carregar_parser_do_check()
+
+    if not POLITICA.exists():
+        print(f"report-access-traffic: {POLITICA} ausente — sem ela não há como "
+              f"classificar bot com a mesma regra do servidor.", file=sys.stderr)
+        return 2
+    try:
+        politica = json.loads(POLITICA.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as erro:
+        print(f"report-access-traffic: falha ao ler {POLITICA}: {erro}", file=sys.stderr)
+        return 2
+    classificador = ClassificadorDeBot(politica.get("access_rules", []))
+
+    base = pathlib.Path(args.log)
+    caminhos = descobrir_logs(base, args.incluir_rotacionados)
+    if not caminhos:
+        print(f"report-access-traffic: nenhum log encontrado em {base} — o portal pode "
+              f"ainda não ter recebido tráfego (a publicação está em zero).", file=sys.stderr)
+        return 1
+
+    relatorio = agregar(caminhos, modulo_check, classificador, args.top)
+
+    if relatorio["logs_ilegiveis"] and relatorio["requisicoes"] == 0:
+        print("report-access-traffic: nenhum log legível:", file=sys.stderr)
+        for item in relatorio["logs_ilegiveis"]:
+            print(f"  - {item}", file=sys.stderr)
+        print("  rode como usuário do grupo 'adm' (dono do log do nginx).", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(relatorio, ensure_ascii=False, indent=1))
+        return 0
+
+    print("report-access-traffic — tráfego real medido no access log do nginx")
+    print(f"  logs: {', '.join(relatorio['logs_lidos'])}")
+    for item in relatorio["logs_ilegiveis"]:
+        print(f"  AVISO: log ignorado — {item}")
+    print(f"  requisições: {relatorio['requisicoes']}"
+          f"  (malformadas: {relatorio['linhas_malformadas']})")
+    print("  " + botagents.denominador_em_uma_linha(
+        relatorio["denominador"], "denominador do log de origem"))
+    if relatorio["descontadas_por_motivo"]:
+        print("  desconto por motivo: " + ", ".join(
+            f"{m}={n}" for m, n in relatorio["descontadas_por_motivo"].items()))
+    print(f"  tráfego servido: {formatar_bytes(relatorio['bytes_servidos'])}")
+    print(f"  com UA de navegador e sem marca de robô: "
+          f"{relatorio['requisicoes_navegador_sem_marca_de_robo']}"
+          f"  |  via Cloudflare: {relatorio['requisicoes_via_cloudflare']}"
+          f"  |  bloqueadas no ingress: {relatorio['requisicoes_bloqueadas_no_ingress']}")
+
+    latencia = relatorio["latencia_s"]
+    if latencia["p50"] is not None:
+        print(f"  latência (s): p50={latencia['p50']:.3f} p95={latencia['p95']:.3f} "
+              f"p99={latencia['p99']:.3f} max={latencia['max']:.3f}")
+
+    imprimir_bloco("classes de status", relatorio["por_classe_de_status"])
+    imprimir_bloco("status", relatorio["por_status"])
+    imprimir_bloco("método", relatorio["por_metodo"])
+    imprimir_bloco("por dia", relatorio["por_dia"])
+    imprimir_bloco("classe de bot (content/crawl_policy.json)", relatorio["por_classe_de_bot"])
+    imprimir_bloco(f"rotas mais pedidas (top {args.top})", relatorio["rotas_mais_pedidas"])
+    imprimir_bloco(f"404 por rota (top {args.top})", relatorio["rotas_404"])
+    imprimir_bloco(f"5xx por rota (top {args.top})", relatorio["rotas_5xx"])
+    imprimir_bloco(f"user agents (top {args.top})", relatorio["agentes_mais_vistos"])
+
+    print("\n  Nota de honestidade: os números acima são REQUISIÇÕES, não visitantes.")
+    print("  Sem JavaScript e sem o IP real no log (o $remote_addr é sempre o loopback")
+    print("  do cloudflared), visitante único e sessão não são mensuráveis — e este")
+    print("  relatório não estima esse número.")
+    print("  'UA de navegador e sem marca de robô' é um CRITÉRIO, não uma contagem de")
+    print("  pessoas: um rastreador novo, que não esteja nos maps do nginx nem em")
+    print("  content/crawl_policy.json e que não se identifique como robô, cairia aqui.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

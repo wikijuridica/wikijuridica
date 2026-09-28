@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""generate-escolha-de-serializacao — série diária de QUE FORMATO cada agente pede.
+
+POR QUE EXISTE, e por que não é o `generate-funil-de-maquina`. Aquele mede o que
+acontece DENTRO das portas de máquina, e `porta_de()` devolve `None` para HTML de
+propósito — então ele tem numerador e não tem denominador. A pergunta que ficou
+sem resposta é a de trás: **de tudo o que um agente pede, quanto ele escolhe pedir
+em formato de máquina?** Sem isso, "16 `tools/call`" não se distingue de "ninguém
+veio" nem de "vieram aos milhares e preferiram o HTML".
+
+O QUE A PRIMEIRA PASSADA MEDIU (2026-09-08 a 11, 66.676 requisições de agente
+identificado, fora aquecimento e simulação):
+
+    html          40.070   60,10%
+    gemea .md     14.572   21,85%
+    sitemap/feed   9.763   14,64%
+    mcp            2.230    3,34%
+
+E a leitura que ela permite, que nenhuma série anterior permitia:
+
+    gptbot         37.437 req, 61,06% não-HTML (13.792 `.md`) — TREINAMENTO
+    perplexitybot   7.234 req,  0,07% não-HTML (4 `.md`)      — RESPOSTA
+    chatgpt-user      786 req,  0,00% não-HTML                — RESPOSTA
+
+O bot de treinamento consome a gêmea Markdown em escala; o bot que responde ao
+usuário final pega o HTML e vai embora. Os dois mercados do §12 se separam por
+FUNÇÃO do agente, não por preferência de formato — e isso muda o que vale
+construir de cada lado. A afirmação para aqui: 786 requisições em 4 dias é
+denominador pequeno, e a série existe para que ele cresça antes de qualquer
+decisão se apoiar nele.
+
+★ FONTE ÚNICA, DECLARADA, PARA NÃO CONTAR DUAS VEZES
+
+Só `nginx-*.jsonl` entra. O nginx é o proxy de origem e vê TODA requisição
+externa, inclusive as que ele encaminha ao Go; `access-*.jsonl` (o ledger do Go)
+vê o mesmo subconjunto dinâmico e somá-los duplicaria `/mcp`, `/api/v1` e a
+gêmea. Conferido na janela: `/mcp` dá 5.016 pelo nginx e 5.084 pelo Go, 1,4% de
+diferença — as duas séries concordam, e é justamente por concordarem que somar
+seria erro. O ledger do Go continua sendo a fonte certa para `mcp_method`, que só
+existe nele, e é o que `generate-funil-de-maquina` usa.
+
+★ LINHA ILEGÍVEL SE CONTA, NUNCA SE DESCARTA EM SILÊNCIO
+
+Medido em 2026-09-11: 173 linhas de `access-*.jsonl` não são JSON válido, em
+rajadas (65 em 08-29, 31 em 09-10). A causa está corrigida em
+`httpserver.NewParaVerificacao` — `internal/checks` subia um SEGUNDO accessLogger
+sobre o ledger vivo dentro do processo `cmd/check`, e dois `bufio.Writer` de
+64 KiB em O_APPEND rasgavam a linha um do outro. Mas ledger antigo não se
+reescreve, e consumidor que engole linha ilegível sem contá-la esconde a próxima
+rajada. `linhas_ilegiveis` sai em toda linha da série, ao lado de `descartados`.
+
+DERIVADO: função pura dos ledgers, sem estado. O arquivo inteiro se reescreve a
+cada passada — regenerar, nunca filtrar.
+
+Uso:
+    tools/generate-escolha-de-serializacao
+    tools/generate-escolha-de-serializacao --json          # imprime, não grava
+    tools/generate-escolha-de-serializacao --desde 2026-09-08
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LEDGERS = os.path.join(RAIZ, "data/ops/access")
+SAIDA = os.path.join(RAIZ, "data/ops/escolha_de_serializacao_daily.jsonl")
+SCHEMA = "escolha_de_serializacao_v1"
+
+# Teto de agentes por linha. A cauda de scanner e de UA único é longa e não
+# informa nada; o total NUNCA sai do teto, só a lista nominal.
+TETO_DE_AGENTES = 25
+
+
+# A REGUA DAS PORTAS DE MAQUINA E IMPORTADA, NAO REESCRITA.
+#
+# `tools/generate-funil-de-maquina` ja define `porta_de()`, e as duas series
+# medem o MESMO funil por lados distintos: ele o numerador (o que acontece dentro
+# das portas), esta o denominador (de tudo o que o agente pede, quanto ele escolhe
+# pedir em formato de maquina). Se cada uma tivesse a propria definicao de
+# "isto e /mcp", uma divergencia de REGUA apareceria como fato do mundo — e esse e
+# o erro que ja custou sete detectores num dia neste repositorio.
+#
+# Importar tambem acopla de proposito: se o arquivo sumir, esta ferramenta quebra
+# ALTO, em vez de divergir em silencio da que ficou.
+def _porta_de_importada():
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "generate-funil-de-maquina")
+    carregador = importlib.machinery.SourceFileLoader("funil_de_maquina", caminho)
+    especificacao = importlib.util.spec_from_loader("funil_de_maquina", carregador)
+    modulo = importlib.util.module_from_spec(especificacao)
+    especificacao.loader.exec_module(modulo)
+    return modulo.porta_de
+
+
+porta_de = _porta_de_importada()
+
+
+def canal_de(rota: str) -> str:
+    """Classifica a rota no formato que o agente ESCOLHEU receber.
+
+    `porta_de` (importada) e a AUTORIDADE sobre qual porta de maquina a rota e.
+    Esta funcao faz duas coisas que ela nao faz, e so essas duas:
+
+    1. SUBDIVIDE o balde `api`. `/api/v1/citacoes` e o POST em que o agente MANDA
+       texto para verificar citacao — e o sinal de adocao mais forte que existe
+       sem clique, porque exige que o agente escolha nos entregar dado. Somado a
+       `/api/v1/pages` num balde so, ele desaparece.
+    2. CLASSIFICA o que ela devolve `None`. Para ela, `None` e "nao e porta"; para
+       esta serie, o que sobra e o denominador, e precisa de nome: html, robots,
+       sitemap-feed, changes, well-known.
+
+    A DIVERGENCIA QUE ESTA FUNCAO TINHA ACABOU EM 2026-09-11, e o registro fica
+    porque ele e a prova de que o acoplamento funciona. `/changes.json` e
+    `/.well-known/*` sao porta de maquina na pratica — feed incremental com cursor
+    e descritor de agente, nenhum dos dois serve leitor humano — e `porta_de` os
+    devolvia `None`. Esta funcao os classificava por fora, com nomes proprios
+    (`changes`, `well-known`), e o docstring declarava a divergencia.
+    O par absorveu os dois em `6a1d0654`, com nomes melhores: `feed` e `descritor`
+    dizem o que a porta E, em vez de repetir o path. No minuto seguinte o caso
+    `canal_por_rota` REPROVOU aqui — que e exatamente o que a delegacao existe para
+    fazer. Sem ela as duas series passariam a contar a mesma rota com nomes
+    diferentes, em silencio, e alguem leria a divergencia como fato do mundo.
+    """
+    rota = (rota or "").split("?")[0]
+    porta = porta_de(rota)
+    if porta == "api":
+        if rota.startswith("/api/v1/citacoes"):
+            return "api:citacoes"
+        if rota.startswith("/api/v1/citar"):
+            return "api:citar"
+        if rota.startswith("/api/v1/lote"):
+            return "api:lote"
+        return "api:outro"
+    if porta is not None:
+        return porta
+    if rota.startswith("/robots"):
+        return "robots"
+    if rota.endswith(".xml") or rota.startswith("/sitemap") or rota.startswith("/feed"):
+        return "sitemap-feed"
+    return "html"
+
+
+# Os canais que NÃO são HTML de leitura humana. `robots` e `sitemap-feed` ficam
+# de fora da conta de "formato de máquina" porque todo crawler os pede por
+# protocolo, independentemente de saber que existe uma porta de máquina — contá-los
+# como adoção inflaria o número com o que o bot faria de qualquer jeito.
+CANAIS_DE_MAQUINA = ("mcp", "a2a", "api:citacoes", "api:citar", "api:lote",
+                     "api:outro", "feed", "descritor", "gemea")
+
+
+def sha256_do_arquivo(caminho: str) -> str:
+    """Hash do arquivo, ou string VAZIA quando não deu para ler.
+
+    Vazio DIZ que não foi lido; o hash de conteúdo vazio passaria por medição
+    válida, e é essa mentira que este campo existe para não contar.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(caminho, "rb") as arquivo:
+            for bloco in iter(lambda: arquivo.read(1 << 20), b""):
+                digest.update(bloco)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def ledgers_de(diretorio: str) -> list[str]:
+    """Os ledgers que entram na conta: SO os do nginx.
+
+    Fonte unica, e a funcao existe separada para que o teste possa exercitar
+    ESTA linha. Enquanto o glob morava dentro de main(), o teste montava a lista
+    de caminhos por conta propria e a escolha de fonte ficava sem cobertura --
+    trocar `nginx-*` por `*-*` (que somaria o ledger do Go e duplicaria /mcp,
+    /api e a gemea) passava verde.
+    """
+    return sorted(glob.glob(os.path.join(diretorio, "nginx-*.jsonl")))
+
+
+class DiaDeEscolha:
+    def __init__(self, dia: str):
+        self.dia = dia
+        self.canais = collections.Counter()
+        self.por_agente = collections.defaultdict(collections.Counter)
+        self.descartados = collections.Counter()
+        self.linhas_ilegiveis = 0
+        self.sem_agente = 0
+
+    def registra(self, linha: dict) -> None:
+        if linha.get("warming"):
+            self.descartados["aquecimento"] += 1
+            return
+        if linha.get("bot_simulation"):
+            self.descartados["sonda_interna"] += 1
+            return
+        agente = (linha.get("agent_key") or "").strip()
+        canal = canal_de(linha.get("path"))
+        self.canais[canal] += 1
+        if not agente:
+            self.sem_agente += 1
+            return
+        self.por_agente[agente][canal] += 1
+
+    def linha(self) -> dict:
+        total = sum(self.canais.values())
+        de_maquina = sum(self.canais[c] for c in CANAIS_DE_MAQUINA)
+        agentes = []
+        for agente, contas in sorted(self.por_agente.items(),
+                                     key=lambda kv: (-sum(kv[1].values()), kv[0]))[:TETO_DE_AGENTES]:
+            soma = sum(contas.values())
+            maquina = sum(contas[c] for c in CANAIS_DE_MAQUINA)
+            agentes.append({
+                "agente": agente,
+                "requisicoes": soma,
+                "de_maquina": maquina,
+                "fracao_de_maquina": round(maquina / soma, 4) if soma else 0.0,
+                "por_canal": dict(contas.most_common()),
+            })
+        return {
+            "schema_version": SCHEMA,
+            "dia": self.dia,
+            "requisicoes": total,
+            "de_maquina": de_maquina,
+            "fracao_de_maquina": round(de_maquina / total, 4) if total else 0.0,
+            "por_canal": dict(self.canais.most_common()),
+            "agentes_no_teto": len(self.por_agente),
+            "agentes": agentes,
+            "requisicoes_sem_agente_identificado": self.sem_agente,
+            "descartados": dict(self.descartados),
+            "linhas_ilegiveis": self.linhas_ilegiveis,
+        }
+
+
+def agrega(caminhos: list[str], desde: str | None) -> tuple[list[dict], int]:
+    dias: dict[str, DiaDeEscolha] = {}
+    ilegiveis_sem_dia = 0
+    for caminho in sorted(caminhos):
+        dia_do_arquivo = os.path.basename(caminho).split("-", 1)[1][:10]
+        if desde and dia_do_arquivo < desde:
+            continue
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            for bruto in arquivo:
+                bruto = bruto.strip()
+                if not bruto:
+                    continue
+                try:
+                    linha = json.loads(bruto)
+                except ValueError:
+                    # CONTADA, nunca engolida: a rajada de 2026-08-29 (65 linhas)
+                    # teria passado invisível por um `except: continue`.
+                    alvo = dias.get(dia_do_arquivo)
+                    if alvo is None:
+                        ilegiveis_sem_dia += 1
+                    else:
+                        alvo.linhas_ilegiveis += 1
+                    continue
+                dia = (linha.get("ts") or "")[:10] or dia_do_arquivo
+                if desde and dia < desde:
+                    continue
+                dias.setdefault(dia, DiaDeEscolha(dia)).registra(linha)
+    # Ilegível que apareceu antes da primeira linha válida do arquivo pertence ao
+    # dia do arquivo; só aqui isso se sabe.
+    if ilegiveis_sem_dia and dias:
+        primeiro = dias[sorted(dias)[0]]
+        primeiro.linhas_ilegiveis += ilegiveis_sem_dia
+    return [dias[dia].linha() for dia in sorted(dias)], ilegiveis_sem_dia
+
+
+def cabecalho(caminhos: list[str], agora: str) -> dict:
+    fontes = []
+    for caminho in sorted(caminhos):
+        try:
+            tamanho = os.path.getsize(caminho)
+        except OSError:
+            tamanho = 0
+        fontes.append({
+            "caminho": os.path.relpath(caminho, RAIZ),
+            "sha256": sha256_do_arquivo(caminho),
+            "bytes": tamanho,
+        })
+    return {
+        "schema_version": SCHEMA + "_cabecalho",
+        "gerado_em": agora,
+        "fonte_unica": "data/ops/access/nginx-*.jsonl",
+        "por_que_fonte_unica": ("o nginx e o proxy de origem e ve toda requisicao externa; "
+                                "somar o ledger do Go duplicaria /mcp, /api e a gemea "
+                                "(conferido: 5.016 x 5.084 em 4 dias, 1,4% de diferenca)"),
+        "fontes": fontes,
+    }
+
+
+def main(argv: list[str]) -> int:
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--json", action="store_true", help="imprime, nao grava")
+    analisador.add_argument("--desde", default=None, help="AAAA-MM-DD")
+    argumentos = analisador.parse_args(argv)
+
+    caminhos = ledgers_de(LEDGERS)
+    if not caminhos:
+        print("generate-escolha-de-serializacao: nenhum ledger em %s" % LEDGERS,
+              file=sys.stderr)
+        return 1
+
+    agora = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+    linhas, _ = agrega(caminhos, argumentos.desde)
+    saida = [cabecalho(caminhos, agora)] + linhas
+
+    if argumentos.json:
+        for registro in saida:
+            print(json.dumps(registro, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    temporario = SAIDA + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        for registro in saida:
+            arquivo.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+        arquivo.flush()
+        os.fsync(arquivo.fileno())
+    os.replace(temporario, SAIDA)
+
+    ultimo = linhas[-1] if linhas else {}
+    print("escolha-de-serializacao: %d dia(s) -> %s" % (len(linhas),
+                                                        os.path.relpath(SAIDA, RAIZ)))
+    if ultimo:
+        print("  %s: %d req · de maquina %d (%.2f%%) · ilegiveis %d · %s"
+              % (ultimo["dia"], ultimo["requisicoes"], ultimo["de_maquina"],
+                 100.0 * ultimo["fracao_de_maquina"], ultimo["linhas_ilegiveis"],
+                 " · ".join("%s %d" % (k, v) for k, v in
+                            list(ultimo["por_canal"].items())[:4])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

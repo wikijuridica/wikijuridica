@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""generate-websub-ping — o feed anuncia um hub que nunca foi avisado.
+
+O DEFEITO (medido em 2026-08-12). `public/feed.xml` é um Atom válido com 1.000
+entradas, servido em https://wikijuridica.com.br/feed.xml, anunciado no <head>
+de todas as páginas e — desde `internal/feed/feed.go:36` — declarando
+`<link rel="hub" href="https://pubsubhubbub.appspot.com/">`.
+
+Declarar o hub é metade do protocolo. A outra metade é o publicador AVISAR o hub
+quando o tópico muda; sem esse aviso o hub nunca busca o feed, nunca distribui
+nada aos assinantes, e o `<link rel="hub">` fica sendo uma promessa que o site
+faz e não cumpre. Em 2026-08-12 o histórico de avisos era um arquivo que não
+existia: zero pings desde que o feed passou a existir.
+
+POR QUE ISSO IMPORTA AGORA, e não é canal decorativo. O ping de sitemap do
+Google foi DESCONTINUADO em junho de 2023 (developers.google.com/search/blog/
+2023/06/sitemaps-lastmod-ping) — o botão de "avisei que mudou" que este projeto
+tinha para o Google simplesmente deixou de existir. A documentação viva de
+sitemaps do Google continua listando WebSub, para Atom/RSS, entre os métodos de
+submissão suportados. Ou seja: dos canais de PUSH que o Google ainda documenta,
+este é o que temos publicado e não estávamos usando. O contexto torna isso caro
+— o Googlebot pediu 7.156 das 9.835 URLs e o rastreio despencou depois de o host
+devolver 530/502; 2.679 URLs nunca foram pedidas por crawler nenhum.
+
+O FORMATO, e por que `hub.url` e não `hub.topic`. A especificação W3C WebSub
+(https://www.w3.org/TR/websub/, seção 6 "Publishing") deliberadamente NÃO define
+como o publicador fala com o hub: "The hub and the publisher can agree on any
+mechanism". Quem define é o hub. O hub declarado aqui é o pubsubhubbub, cuja
+convenção é a do PubSubHubbub Core 0.3, seção 7.1 "New Content Notification":
+
+    POST para a URL do hub
+    Content-Type: application/x-www-form-urlencoded
+    hub.mode = "publish"        (literal, obrigatório)
+    hub.url  = URL do tópico    (obrigatório, pode repetir para vários tópicos)
+    resposta de sucesso: 204 No Content
+
+`hub.topic` NÃO é parâmetro de publicação: ele existe no fluxo de ASSINATURA
+(subscriber → hub) e nas notificações do hub. Mandar `hub.topic` no publish
+seria copiar o campo do fluxo errado. Esta ferramenta manda `hub.url`.
+
+ANTI-SINAL-FALSO: o hash é do feed VIVO, não do arquivo em disco. Quando o hub
+recebe o aviso, ele vai buscar https://wikijuridica.com.br/feed.xml através da
+Cloudflare — e a borda serve o conteúdo antigo até a purga. Avisar com base no
+arquivo local enquanto a borda ainda entrega os bytes velhos seria anunciar uma
+mudança que o hub não vai encontrar: sinal de frescor falso, que é a classe de
+fraude que este projeto proíbe. Então o estado é o sha256 do que a rede devolve.
+Borda velha ⇒ nenhum ping ⇒ o ping sai sozinho quando a purga passar.
+
+E POR ISSO O DISPARO É POR MUDANÇA, NÃO POR RELÓGIO. Um hub que recebe aviso de
+publicação a cada hora sem que nada tenha mudado aprende a descredenciar o
+publicador — o aviso passa a custar reputação em vez de render rastreio. O timer
+acorda com frequência, mas só faz POST quando o sha256 do feed vivo mudou desde
+o último aviso ACEITO. A taxa efetiva de ping é a taxa de publicação.
+
+EVIDÊNCIA: data/ops/websub_pings.jsonl guarda a resposta REAL — hub, status HTTP
+e corpo resumido. Ping que falhou é gravado como falha, e o estado NÃO avança:
+o feed continua marcado como não anunciado e a próxima execução tenta de novo.
+
+Uso:
+    tools/generate-websub-ping --dry-run
+    tools/generate-websub-ping
+    tools/generate-websub-ping --forcar      # avisa mesmo sem mudança
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SITE = os.path.join(ROOT, "content/site.json")
+FEED_LOCAL = os.path.join(ROOT, "public/feed.xml")
+ESTADO = os.path.join(ROOT, "data/ops/websub_ping_state.json")
+EVIDENCIA = os.path.join(ROOT, "data/ops/websub_pings.jsonl")
+
+# Único hub autorizado pelo contrato do projeto (CLAUDE.md, "SELF-HOSTED FIRST":
+# WebSub público = pubsubhubbub.appspot.com). Se o feed algum dia declarar outro
+# hub, esta ferramenta PARA em vez de falar com ele — a allowlist é de política,
+# não de conveniência, e um hub trocado por engano mandaria o acervo inteiro
+# para um terceiro não autorizado.
+HUBS_AUTORIZADOS = {"https://pubsubhubbub.appspot.com/", "https://pubsubhubbub.appspot.com"}
+
+# DUAS identidades, porque são dois destinos diferentes.
+#
+# USER_AGENT é a sonda do PRÓPRIO portal: baixar o feed vivo em
+# wikijuridica.com.br para conferir o que a borda entrega. Sai com
+# X-Warming-Request e o contrato a mantém fora da métrica de audiência.
+USER_AGENT = "wikijuridica-websub/1.0 (+interno; nao-indexar)"
+# USER_AGENT_SAIDA é a identidade de quem SAI para a rede: o POST vai ao hub
+# WebSub, host de terceiro. Aí vale a identidade única do portal — o
+# WikijuridicaBot, com URL de documentação e propósito (CLAUDE.md §11 e
+# internal/wikijuridicabot).
+#
+# MEDIDO em 2026-09-05, GET em https://pubsubhubbub.appspot.com/ (nunca POST,
+# que publicaria um aviso de verdade): canônico HTTP 200 com 6.074 bytes,
+# idêntico ao do User-Agent antigo. O hub não discrimina por User-Agent.
+USER_AGENT_SAIDA = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+                    "+https://wikijuridica.com.br/bot/; anuncio-de-publicacao)")
+
+
+def baixar(url, timeout):
+    """Baixa a URL e devolve (status, corpo). Nunca levanta: erro vira status."""
+    pedido = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        # Requisição interna se identifica como tal: o contrato proíbe requisição
+        # nossa se disfarçar de crawler e contaminar a métrica de tráfego real.
+        "X-Warming-Request": "true",
+        "Accept-Encoding": "identity",
+    })
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return resposta.status, resposta.read()
+    except urllib.error.HTTPError as erro:
+        return erro.code, erro.read()[:400]
+    except Exception as erro:
+        return 0, str(erro)[:200].encode()
+
+
+def hub_declarado(xml):
+    """Extrai o href do <link rel="hub"> do Atom. Devolve "" se não houver."""
+    for atributos in re.findall(r"<link\b([^>]*)>", xml):
+        if re.search(r'rel\s*=\s*"hub"', atributos):
+            href = re.search(r'href\s*=\s*"([^"]+)"', atributos)
+            if href:
+                return href.group(1).strip()
+    return ""
+
+
+def ler_estado():
+    if not os.path.isfile(ESTADO):
+        return {}
+    try:
+        with open(ESTADO, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (ValueError, OSError):
+        # Estado corrompido não pode virar silêncio: sem baseline confiável o
+        # certo é tratar o feed como não anunciado e avisar de novo.
+        print("AVISO: estado ilegível em %s — tratando o feed como não anunciado."
+              % os.path.relpath(ESTADO, ROOT), file=sys.stderr)
+        return {}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Notifica o hub WebSub declarado no feed de que o Atom mudou.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="verifica e mostra o que seria feito, sem POST")
+    parser.add_argument("--forcar", action="store_true",
+                        help="avisa o hub mesmo que o feed não tenha mudado")
+    parser.add_argument("--timeout", type=float, default=30.0)
+    args = parser.parse_args()
+
+    with open(SITE, encoding="utf-8") as handle:
+        base = json.load(handle)["base_url"].rstrip("/")
+    feed_url = "%s/feed.xml" % base
+
+    print("=== PING WEBSUB ===")
+    print("feed            : %s" % feed_url)
+
+    # 1. O feed tem de existir como artefato. Anunciar tópico que não temos em
+    #    public/ seria mandar o hub buscar um 404.
+    if not os.path.isfile(FEED_LOCAL):
+        print("REPROVADO: %s não existe — nada a anunciar."
+              % os.path.relpath(FEED_LOCAL, ROOT), file=sys.stderr)
+        return 1
+
+    # 2. O feed VIVO é a verdade: é ele que o hub vai buscar.
+    status, corpo = baixar(feed_url, args.timeout)
+    if status != 200 or not corpo:
+        print("REPROVADO: o feed vivo respondeu HTTP %s (%d bytes) — não se anuncia"
+              " tópico que o hub não conseguirá buscar." % (status, len(corpo)), file=sys.stderr)
+        return 1
+    xml = corpo.decode("utf-8", "replace")
+    feed_sha256 = hashlib.sha256(corpo).hexdigest()
+    print("feed vivo       : HTTP 200, %d bytes, sha256 %s…" % (len(corpo), feed_sha256[:12]))
+
+    # 3. O hub é o que o FEED declara — nunca um valor inventado aqui.
+    hub = hub_declarado(xml)
+    if not hub:
+        print("REPROVADO: o feed vivo não declara <link rel=\"hub\"> — sem hub declarado"
+              " o ping é inócuo (assinante nenhum descobriria o hub).", file=sys.stderr)
+        return 1
+    if hub not in HUBS_AUTORIZADOS:
+        print("REPROVADO: o feed declara o hub %r, que não está na allowlist do contrato"
+              " (%s)." % (hub, ", ".join(sorted(HUBS_AUTORIZADOS))), file=sys.stderr)
+        print("  Não vou falar com hub não autorizado. Corrija internal/feed/feed.go"
+              " ou a política antes de rodar de novo.", file=sys.stderr)
+        return 1
+    print("hub declarado   : %s (autorizado)" % hub)
+
+    # 4. Coerência entre o que está em disco e o que a borda serve. Divergir não
+    #    é erro desta ferramenta — é cache de borda ainda não purgado —, mas
+    #    muda o significado do ping, então fica dito em voz alta.
+    with open(FEED_LOCAL, "rb") as handle:
+        sha_local = hashlib.sha256(handle.read()).hexdigest()
+    if sha_local != feed_sha256:
+        print("nota            : o feed em disco (%s…) difere do servido (%s…)."
+              % (sha_local[:12], feed_sha256[:12]))
+        print("                  o ping anuncia o que a borda entrega HOJE; a versão nova"
+              " será anunciada quando a purga passar.")
+
+    estado = ler_estado()
+    anterior = estado.get("feed_sha256", "")
+    mudou = feed_sha256 != anterior
+    if not anterior:
+        print("estado          : primeira execução — nenhum ping registrado até hoje")
+    elif mudou:
+        print("estado          : feed MUDOU desde o último aviso aceito (%s…)" % anterior[:12])
+    else:
+        print("estado          : feed inalterado desde o último aviso aceito (%s…)" % anterior[:12])
+
+    if not mudou and not args.forcar:
+        print("\nnada a anunciar: o hub já foi avisado desta versão exata do feed.")
+        print("  (avisar de novo sem mudança é ruído que faz o hub descredenciar o publicador)")
+        return 0
+    gatilho = "forcado" if (not mudou and args.forcar) else ("mudanca_de_feed" if anterior else "primeiro_anuncio")
+
+    # 5. O POST, no formato do hub (PubSubHubbub 0.3 §7.1).
+    dados = urllib.parse.urlencode([("hub.mode", "publish"), ("hub.url", feed_url)]).encode()
+    print("\nPOST %s" % hub)
+    print("  Content-Type: application/x-www-form-urlencoded")
+    print("  hub.mode=publish  hub.url=%s" % feed_url)
+
+    if args.dry_run:
+        print("\n--dry-run: nenhum POST foi feito, nenhum estado avançou.")
+        return 0
+
+    pedido = urllib.request.Request(hub, data=dados, method="POST", headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT_SAIDA,
+    })
+    try:
+        with urllib.request.urlopen(pedido, timeout=args.timeout) as resposta:
+            status, resposta_corpo = resposta.status, resposta.read()[:400]
+    except urllib.error.HTTPError as erro:
+        status, resposta_corpo = erro.code, erro.read()[:400]
+    except Exception as erro:
+        status, resposta_corpo = 0, str(erro)[:200].encode()
+    texto = resposta_corpo.decode("utf-8", "replace").strip()
+
+    # 204 No Content é o que a especificação do hub MANDA devolver quando o aviso
+    # é aceito — inclusive quando não há nenhum assinante do tópico. Outros 2xx
+    # são aceitos como sucesso, mas ficam marcados, porque fugir do 204 é sinal
+    # de que o hub mudou de comportamento e a ferramenta precisa ser revista.
+    sucesso = 200 <= status < 300
+    if status == 204:
+        veredito = "204 No Content — aviso ACEITO pelo hub (resposta que a especificação exige)"
+    elif sucesso:
+        veredito = "HTTP %s — aceito, mas a especificação prevê 204; conferir o hub" % status
+    elif status == 400:
+        veredito = "400 — o hub recusou os parâmetros (hub.mode/hub.url malformados)"
+    elif status == 0:
+        veredito = "falha de rede/TLS — o hub não foi alcançado: %s" % texto
+    else:
+        veredito = "HTTP %s — o hub NÃO aceitou o aviso" % status
+
+    agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    registro = {
+        "schema_version": "websub_ping_v1",
+        "pinged_at": agora,
+        "hub_url": hub,
+        "topic_url": feed_url,
+        "hub_mode": "publish",
+        "feed_sha256": feed_sha256,
+        "feed_bytes": len(corpo),
+        "feed_source": "live_https",
+        "trigger": gatilho,
+        "http_status": status,
+        "response_excerpt": texto[:400],
+        "success": sucesso,
+    }
+    os.makedirs(os.path.dirname(EVIDENCIA), exist_ok=True)
+    with open(EVIDENCIA, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+    print("\nresposta        : %s" % veredito)
+    if texto:
+        print("corpo           : %s" % texto[:200].replace("\n", " ")[:200])
+    print("evidência       : %s" % os.path.relpath(EVIDENCIA, ROOT))
+
+    if not sucesso:
+        # O estado NÃO avança: o feed continua contando como não anunciado, e a
+        # próxima execução tenta de novo. Gravar sucesso aqui seria inventar
+        # evidência de uma ação que não aconteceu.
+        print("\nestado NÃO avançou — a próxima execução tentará anunciar de novo.", file=sys.stderr)
+        return 1
+
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    tmp = ESTADO + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump({
+            "schema_version": "websub_ping_state_v1",
+            "topic_url": feed_url,
+            "hub_url": hub,
+            "feed_sha256": feed_sha256,
+            "feed_bytes": len(corpo),
+            "last_accepted_ping_at": agora,
+            "last_accepted_http_status": status,
+        }, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, ESTADO)
+    print("estado          : %s (só avança em aviso aceito)" % os.path.relpath(ESTADO, ROOT))
+    print("\nOK: hub avisado. Ele buscará o feed e distribuirá aos assinantes.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

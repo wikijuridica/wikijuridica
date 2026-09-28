@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""generate-source-hint-catalog-from-normas-legbr-20260807 — resolve hint pela API pública do normas.leg.br.
+
+POR QUE EXISTE. Sobraram 1.312 `source_hint` sem entrada no catálogo, e eu havia
+classificado boa parte como "sem canal". Estava errado: existe API pública,
+sem credencial, que resolve norma federal por URN LexML — e ela documenta a si
+mesma.
+
+COMO FOI DESCOBERTA, porque isso vale para a próxima vez: a SPA de
+`normas.leg.br` declara `publicApiUrl: "/api/public/"` no bundle, sem chave. Os
+caminhos adivinhados davam 404, mas o 404 vinha em JSON no formato do Spring
+Boot — logo, havia uma API atrás. `GET /v3/api-docs` devolve a especificação
+OpenAPI inteira. Endpoint usado aqui:
+
+    GET /api/public/metadados/gerais?urn=<urn lexml>
+
+Devolve JSON-LD `schema.org/Legislation` com `name`, `datePublished`,
+`legislationIdentifier` e `encoding[].contentUrl`.
+
+A URL QUE ENTRA NO CATÁLOGO é a do binário:
+
+    https://normas.leg.br/api/binario/<uuid>/texto
+
+https, host `.leg.br`, **path documental específico**, sem fragmento e sem
+query — passa no gate `canonical_official_source`. A URL de navegação
+(`normas.leg.br/?urn=…`) NÃO passa, e com razão: carrega o documento em query
+sobre o path raiz. Licença declarada pela própria API: CC-BY 4.0.
+
+COBERTURA REAL, medida contra `/api/public/legislation-types` (77 tipos): lei,
+lei complementar, decreto, decreto-lei, emenda constitucional, medida provisória
+e decreto legislativo federais, além de acórdãos do STF em controle concentrado.
+**NÃO cobre súmula nem resolução de agência** (ANS, CONTRAN, RFB, CVM, ANPD) —
+para esses o canal continua sendo o portal de cada órgão.
+
+NADA É INVENTADO. A entrada só é gravada quando a API devolve `name` não-nulo
+(ela responde 200 mesmo para URN inexistente, com `name: null` — por isso o
+critério é o campo, não o código HTTP) E o `contentUrl` responde 200. Hint que
+não resolver fica intacto.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, escrita atômica com fsync,
+idempotente, intents protegidos pulados. Uma requisição por hint, com pausa.
+NÃO commita.
+
+Uso:
+    tools/generate-source-hint-catalog-from-normas-legbr-20260807 --dry-run
+    tools/generate-source-hint-catalog-from-normas-legbr-20260807 --limite 40
+    tools/generate-source-hint-catalog-from-normas-legbr-20260807
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import fcntl
+import glob
+import gzip
+import http.client
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.source-hint-normas-legbr-20260807.lock"
+CATALOGO = ROOT / "data/editorial/v2_source_hint_catalog.json"
+PORTFOLIO = ROOT / "data/editorial/portfolio_v2"
+SUPERSEDED = ROOT / "data/editorial/v2_superseded"
+CONTRATO = ROOT / "data/editorial/v2_writing_semantic_contract.json"
+EVIDENCIA = ROOT / "data/source-audit/normas_legbr_resolution.jsonl"
+# Ledger PRÓPRIO do modo de reparo: a evidência da passada de resolução é
+# reescrita inteira a cada execução do modo normal, e gravar o reparo lá
+# apagaria as 49 linhas de 2026-08-07. Reparo APENDA no seu próprio arquivo.
+EVIDENCIA_REPARO = ROOT / "data/source-audit/normas_legbr_url_repair.jsonl"
+
+API = "https://normas.leg.br/api/public/metadados/gerais"
+# Identidade única de saída (CLAUDE.md §11 e internal/wikijuridicabot): fora da
+# rede o portal é o WikijuridicaBot, com URL de documentação e propósito no
+# próprio User-Agent. MEDIDO em 2026-09-05 contra
+# normas.leg.br/api/public/metadados/gerais?urn=...lei:2001;10192 — canônico
+# HTTP 200 com 3.690 bytes, idêntico ao antigo "wikijuridica-corpus/1.0".
+CABECALHOS = {
+    "User-Agent": ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+                   "+https://wikijuridica.com.br/bot/; verificacao-de-fonte)"),
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip",
+}
+SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+# TUDO que a rede pode lançar. `http.client.IncompleteRead` herda de
+# HTTPException, NÃO de OSError — capturar só (URLError, OSError) deixou o
+# processo morrer no meio do lote, antes de gravar qualquer coisa.
+REDE = (urllib.error.URLError, http.client.HTTPException, ValueError,
+        OSError, TimeoutError)
+
+# Espécie citada no hint -> tipo na URN LexML. Só entra o que a base cobre.
+# O separador pode ser espaço OU hífen: o hint tanto vem em prosa ("Lei
+# Complementar 214/2025") quanto em slug ("lei-complementar-214-2025"). Exigir
+# espaço fazia "lei-complementar-214-2025" cair na regra genérica de "lei" e
+# gerar URN de espécie errada, que nunca resolveria.
+ESPECIE = [
+    (r"\blei[-\s]+complementar\b|\blc\b", "lei.complementar"),
+    (r"\bemenda[-\s]+constitucional\b|\bec\b", "emenda.constitucional"),
+    (r"\bmedida[-\s]+provis[óo]ria\b|\bmp\b", "medida.provisoria"),
+    (r"\bdecreto[-\s]+lei\b", "decreto.lei"),
+    (r"\bdecreto[-\s]+legislativo\b", "decreto.legislativo"),
+    (r"\bdecreto\b", "decreto"),
+    (r"\blei\b", "lei"),
+]
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def slugify(valor: str) -> str:
+    dobrado = unicodedata.normalize("NFKD", valor)
+    dobrado = "".join(c for c in dobrado if not unicodedata.combining(c))
+    dobrado = re.sub(r"[^A-Za-z0-9]+", "-", dobrado).strip("-").lower()
+    return re.sub(r"-{2,}", "-", dobrado)
+
+
+def sem_acento(valor: str) -> str:
+    dobrado = unicodedata.normalize("NFKD", (valor or "").lower())
+    return "".join(c for c in dobrado if not unicodedata.combining(c))
+
+
+def buscar(url: str, timeout: float = 25.0, aceita: str = "application/json"):
+    """O binário responde 406 a `Accept: application/json` — ele serve HTML."""
+    cabecalhos = dict(CABECALHOS, Accept=aceita)
+    pedido = urllib.request.Request(url, headers=cabecalhos)
+    with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+        bruto = resposta.read()
+        if resposta.headers.get("Content-Encoding") == "gzip":
+            bruto = gzip.decompress(bruto)
+        return bruto
+
+
+def urns_candidatas(hint: str) -> list[str]:
+    """URNs LexML plausíveis para o hint, da mais específica para a menos.
+
+    O hint traz o número e, quase sempre, o ano ("Lei 14.382/2021"). A URN
+    aceita `ano;numero`; quando o hint traz data completa, ela também serve.
+    """
+    baixo = sem_acento(hint)
+    tipo = None
+    for padrao, especie in ESPECIE:
+        if re.search(padrao, baixo):
+            tipo = especie
+            break
+    if not tipo:
+        return []
+    numero = re.search(r"\bn?[ºo°]?\s*(\d{1,3}(?:\.\d{3})*|\d{2,6})\s*(?:/|,?\s*de\s+)", baixo)
+    if not numero:
+        numero = re.search(r"\b(\d{1,3}(?:\.\d{3})+|\d{3,6})\b", baixo)
+    if not numero:
+        return []
+    numero = numero.group(1).replace(".", "")
+    ano = re.search(r"\b(19\d{2}|20\d{2})\b", baixo)
+    if not ano:
+        return []
+    ano = ano.group(1)
+    data = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", baixo)
+    candidatas = []
+    if data:
+        candidatas.append(f"urn:lex:br:federal:{tipo}:{data.group(0)};{numero}")
+    candidatas.append(f"urn:lex:br:federal:{tipo}:{ano};{numero}")
+    return candidatas
+
+
+def objetos_de_encoding(dados: dict) -> list:
+    """`encoding` da API vem LISTA ou OBJETO — as duas formas são oficiais.
+
+    Medido em 2026-08-29 no Decreto 35.851/1954: quando a norma tem uma única
+    publicação, `metadados/gerais` devolve `encoding` como OBJETO. O laço
+    original iterava `dados.get("encoding") or []` direto, e iterar um dict
+    rende as CHAVES (str) — o `isinstance(objeto, dict)` recusava todas e a
+    norma saía classificada como "urn nao resolveu" mesmo com `name` e
+    `contentUrl` presentes. Foi assim que o decreto ficou entre os 11 não
+    resolvidos da passada de 2026-08-07 e manteve no catálogo a URL de
+    resolvedor (`normas.leg.br/?urn=…`) que o gate documental reprova.
+    """
+    bruto = dados.get("encoding")
+    if isinstance(bruto, list):
+        return bruto
+    if isinstance(bruto, dict):
+        return [bruto]
+    return []
+
+
+def resolver_urns(urns: list, pausa: float):
+    """(entrada, urn, motivo). Entrada None quando nenhuma URN resolve."""
+    for urn in urns:
+        alvo = API + "?urn=" + urllib.parse.quote(urn, safe=":;")
+        try:
+            dados = json.loads(buscar(alvo).decode("utf-8", "replace"))
+        except REDE as erro:
+            time.sleep(pausa)
+            continue
+        time.sleep(pausa)
+        if not isinstance(dados, dict) or not dados.get("name"):
+            continue
+        conteudo = None
+        for objeto in objetos_de_encoding(dados):
+            if isinstance(objeto, dict) and objeto.get("contentUrl"):
+                conteudo = objeto["contentUrl"]
+                break
+        # A API devolve o contentUrl SEM o segmento `/public/`, e essa forma dá
+        # 404. O caminho que serve é o documentado no OpenAPI:
+        # /api/public/binario/{id}/texto. Corrigido aqui, não adivinhado —
+        # conferido contra /v3/api-docs e testado nos dois formatos.
+        if conteudo and "/api/binario/" in conteudo:
+            conteudo = conteudo.replace("/api/binario/", "/api/public/binario/")
+        if not conteudo or not conteudo.startswith("https://"):
+            continue
+        partes = urllib.parse.urlsplit(conteudo)
+        if partes.query or partes.fragment or len(partes.path.strip("/").split("/")) < 2:
+            continue
+        # O binário tem que existir de verdade.
+        try:
+            corpo = buscar(conteudo, timeout=30.0, aceita="*/*")
+        except REDE:
+            time.sleep(pausa)
+            continue
+        time.sleep(pausa)
+        if len(corpo) < 400:
+            continue
+        publicado = (dados.get("datePublished") or "")[:10]
+        entrada = {
+            "anchor_claim": (
+                f"texto oficial de {dados['name']} na base LexML/Senado "
+                f"(normas.leg.br), publicado em {publicado or 'data não informada'}"),
+            "name": dados["name"],
+            "source_kind": "legal_act",
+            "url": conteudo,
+        }
+        return entrada, urn, None
+    return None, None, "urn nao resolveu"
+
+
+def resolver(hint: str, pausa: float):
+    """(entrada, urn, motivo) para um hint ainda ausente do catálogo."""
+    return resolver_urns(urns_candidatas(hint), pausa)
+
+
+def protegidos() -> set:
+    alvo = set()
+    for caminho in sorted(SUPERSEDED.glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if linha.strip():
+                    intent = json.loads(linha).get("intent_id")
+                    if intent:
+                        alvo.add(intent)
+    with open(CONTRATO, encoding="utf-8") as handle:
+        contrato = json.load(handle)
+    for chave in ("requirements", "forward_candidates",
+                  "adopt_existing_targets", "resolutions"):
+        for registro in contrato.get(chave, []):
+            if registro.get("intent_id"):
+                alvo.add(registro["intent_id"])
+    return alvo
+
+
+def urn_da_url(url) -> str | None:
+    """URN LexML que a própria URL de resolvedor carrega na query.
+
+    A entrada quebrada não precisa ser re-derivada do id do hint: ela já traz a
+    URN datada e completa (`?urn=urn:lex:br:federal:decreto:1954-07-16;35851`),
+    que é mais específica do que qualquer palpite feito a partir do slug — e o
+    palpite por slug de fato falha, porque `urns_candidatas` só produz a forma
+    `ano;numero` quando o texto não traz data.
+    """
+    if not isinstance(url, str):
+        return None
+    achado = re.search(r"[?&]urn=([^&#]+)", url)
+    if not achado:
+        return None
+    urn = urllib.parse.unquote(achado.group(1))
+    return urn if urn.startswith("urn:lex:br:") else None
+
+
+def reparar_urls(args) -> int:
+    """Troca URL de catálogo que o gate documental reprova pela URL do binário.
+
+    Não é o mesmo trabalho do modo normal: aqui a entrada JÁ EXISTE no
+    catálogo (por isso o modo normal nunca a alcança — ele só considera hint
+    ausente) e o defeito está na URL, não na falta. O critério de "quebrada" é
+    o gate REAL do produtor (`_canonical_official_source_url`), nunca uma
+    heurística própria: `tools/generate-catalog-url-repair` usa
+    "tem query ou path raiz" e acusa 82 entradas onde o gate reprova 1 — as
+    outras 81 têm query sobre path específico, que o gate aceita.
+    """
+    from tools import generate_v2_review_queue as producer
+
+    with open(CATALOGO, encoding="utf-8") as handle:
+        catalogo = json.load(handle)
+    hints = catalogo["source_hints"]
+    quebradas = [
+        (chave, valor) for chave, valor in sorted(hints.items())
+        if isinstance(valor, dict)
+        and not producer._canonical_official_source_url(valor.get("url"))
+    ]
+    print(f"entradas reprovadas pelo gate documental: {len(quebradas)} "
+          f"de {len(hints)}")
+    if args.limite:
+        quebradas = quebradas[:args.limite]
+
+    plano = {}
+    evidencia = []
+    for indice, (chave, valor) in enumerate(quebradas, 1):
+        urn = urn_da_url(valor.get("url"))
+        registro = {
+            "hint": chave, "urn": urn, "url_anterior": valor.get("url"),
+            "resolvido": False,
+        }
+        if not urn:
+            registro["motivo"] = "url sem urn lexml"
+            evidencia.append(registro)
+            continue
+        entrada, urn_usada, motivo = resolver_urns([urn], args.pausa)
+        if not entrada:
+            registro["motivo"] = motivo or "urn nao resolveu"
+            evidencia.append(registro)
+            continue
+        if not producer._canonical_official_source_url(entrada["url"]):
+            registro["motivo"] = "url resolvida ainda reprova no gate"
+            evidencia.append(registro)
+            continue
+        plano[chave] = entrada
+        registro.update({"resolvido": True, "urn": urn_usada,
+                         "url": entrada["url"], "name": entrada["name"]})
+        evidencia.append(registro)
+        print(f"  [{indice}/{len(quebradas)}] {chave}: "
+              f"{valor.get('url')} -> {entrada['url']}")
+
+    print(f"\nreparadas: {len(plano)} de {len(quebradas)}")
+    if not plano:
+        print("--dry-run: nada escrito." if args.dry_run
+              else "nada a reparar.")
+        return 0
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+        return 0
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for chave, entrada in plano.items():
+                    hints[chave] = entrada
+                catalogo["source_hints"] = dict(sorted(hints.items()))
+                atomic_write(CATALOGO, (json.dumps(
+                    catalogo, ensure_ascii=False, indent=1,
+                    sort_keys=True) + "\n").encode("utf-8"))
+                anterior = (EVIDENCIA_REPARO.read_bytes()
+                            if EVIDENCIA_REPARO.exists() else b"")
+                if anterior and not anterior.endswith(b"\n"):
+                    anterior += b"\n"
+                atomic_write(EVIDENCIA_REPARO, anterior + ("\n".join(
+                    json.dumps(r, ensure_ascii=False) for r in evidencia
+                ) + "\n").encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}",
+              file=sys.stderr)
+        return 75
+
+    print(f"\nCatálogo reparado: {len(plano)} entrada(s). Evidência: "
+          f"{os.path.relpath(EVIDENCIA_REPARO, ROOT)}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--reparar-urls", action="store_true",
+                        help="re-resolve entradas JA catalogadas cuja URL o "
+                             "gate documental reprova (URL de resolvedor)")
+    parser.add_argument("--limite", type=int, default=0)
+    parser.add_argument("--pausa", type=float, default=0.35,
+                        help="segundos entre requisições (educação com a API)")
+    args = parser.parse_args()
+    if args.reparar_urls:
+        return reparar_urls(args)
+
+    with open(CATALOGO, encoding="utf-8") as handle:
+        catalogo = json.load(handle)
+    hints = catalogo["source_hints"]
+    bloqueados = protegidos()
+
+    ausentes = collections.Counter()
+    for caminho in sorted(glob.glob(os.fspath(PORTFOLIO / "*.jsonl"))):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                registro = json.loads(linha)
+                if registro.get("needs_source_research"):
+                    continue
+                if registro.get("intent_id") in bloqueados:
+                    continue
+                for hint in registro.get("source_hints") or []:
+                    if hint not in hints:
+                        ausentes[hint] += 1
+
+    candidatos = [h for h in ausentes if urns_candidatas(h)]
+    candidatos.sort(key=lambda h: (-ausentes[h], h))
+    if args.limite:
+        candidatos = candidatos[:args.limite]
+    print(f"hints ausentes: {len(ausentes)} | com URN plausível: {len(candidatos)}")
+
+    plano = {}
+    evidencia = []
+    for indice, hint in enumerate(candidatos, 1):
+        entrada, urn, motivo = resolver(hint, args.pausa)
+        registro = {"hint": hint, "referencias": ausentes[hint], "urn": urn,
+                    "resolvido": bool(entrada)}
+        if entrada:
+            chave = slugify(hint)
+            if SLUG_RE.fullmatch(chave):
+                plano[hint] = (chave, entrada)
+                registro["url"] = entrada["url"]
+                registro["name"] = entrada["name"]
+                print(f"  [{indice}/{len(candidatos)}] {hint} -> {entrada['name']}")
+        else:
+            registro["motivo"] = motivo
+        evidencia.append(registro)
+
+    print(f"\nresolvidos pela API: {len(plano)} de {len(candidatos)}")
+    if not plano:
+        return 0
+
+    problemas = []
+    por_chave = collections.defaultdict(set)
+    for hint, (chave, entrada) in plano.items():
+        por_chave[chave].add(entrada["url"])
+        if chave in hints and hints[chave].get("url") != entrada["url"]:
+            problemas.append(f"{chave!r} colide com entrada de URL diferente")
+    for chave, urls in por_chave.items():
+        if len(urls) > 1:
+            problemas.append(f"{chave!r} receberia {len(urls)} URLs")
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(por_chave)} chaves novas, 0 conflito")
+
+    renomeio = {hint: chave for hint, (chave, _) in plano.items()}
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for hint, (chave, entrada) in plano.items():
+                    hints[chave] = entrada
+                catalogo["source_hints"] = dict(sorted(hints.items()))
+                referencias = 0
+                tocados = 0
+                for caminho in sorted(glob.glob(os.fspath(PORTFOLIO / "*.jsonl"))):
+                    linhas = Path(caminho).read_bytes().decode("utf-8").split("\n")
+                    fim = bool(linhas) and linhas[-1] == ""
+                    if fim:
+                        linhas = linhas[:-1]
+                    saida = []
+                    mudou = False
+                    for raw in linhas:
+                        if not raw.strip():
+                            saida.append(raw)
+                            continue
+                        registro = json.loads(raw)
+                        if registro.get("intent_id") in bloqueados:
+                            saida.append(raw)
+                            continue
+                        atuais = registro.get("source_hints") or []
+                        if not any(h in renomeio for h in atuais):
+                            saida.append(raw)
+                            continue
+                        vistos = []
+                        for h in atuais:
+                            destino = renomeio.get(h, h)
+                            if destino not in vistos:
+                                vistos.append(destino)
+                            if h in renomeio:
+                                referencias += 1
+                        registro["source_hints"] = vistos
+                        saida.append(json.dumps(registro, ensure_ascii=False,
+                                                sort_keys=True))
+                        mudou = True
+                    if mudou:
+                        tocados += 1
+                        if not args.dry_run:
+                            payload = "\n".join(saida) + ("\n" if fim else "")
+                            atomic_write(Path(caminho), payload.encode("utf-8"))
+                print(f"  catálogo: +{len(por_chave)} | portfólio: {referencias} "
+                      f"referência(s) em {tocados} arquivo(s)")
+                if not args.dry_run:
+                    atomic_write(CATALOGO, (json.dumps(
+                        catalogo, ensure_ascii=False, indent=1,
+                        sort_keys=True) + "\n").encode("utf-8"))
+                    atomic_write(EVIDENCIA, ("\n".join(
+                        json.dumps(r, ensure_ascii=False) for r in evidencia
+                    ) + "\n").encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    print("\n--dry-run: nada escrito." if args.dry_run
+          else f"\nCatálogo populado. Evidência: {os.path.relpath(EVIDENCIA, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

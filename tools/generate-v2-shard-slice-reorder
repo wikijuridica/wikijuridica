@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""generate-v2-shard-slice-reorder — permutação determinística CAS de shard.
+
+Resolve SEM agente a família MECÂNICA de raw-recovery da fila de escrita
+(``writing_recovery_mechanical_only``): shards de ``data/editorial/v2_pages``
+cujo único defeito é de ENQUADRAMENTO — ordem das linhas divergente do slice
+pinado do portfólio (``intent_order_mismatch``) e/ou LF terminal ausente
+(``missing_terminal_lf``) — com TODAS as linhas do slice presentes, únicas,
+endereçáveis e preservadas byte a byte. Um redator LLM nesse lote é
+desperdício garantido: o contrato o proíbe de alterar qualquer byte
+preservado, ele reporta ``written=0``, reprova o ``wellFormedBatchProgress``
+do consumidor e alimenta o circuit breaker da onda.
+
+Entrada: o manifesto ``data/ops/writing_mechanical_reorder_todo.jsonl``
+emitido por ``ops/relaunch-writing.sh`` (autoridade sobre slice/pins). A
+ferramenta NÃO confia no manifesto: re-deriva ao vivo a projeção raw-recovery
+(``capture_writing_raw_recovery_projection``, que reaplica o contrato
+semântico), exige o predicado mecânico do produtor, confere cada linha contra
+``preserved_record_sha256`` ANTES e DEPOIS, prova que o novo payload é
+permutação exata (multiset de linhas idêntico) e só então aplica via
+``atomic_replace_cas`` — qualquer drift do shard (redator vivo, fila stale)
+reprova com erro alto, nunca escreve. Depois de aplicar, rode
+``ops/relaunch-writing.sh`` de novo: os lotes viram no-op/prontos e o
+manifesto é reescrito vazio.
+
+Uso:
+    tools/generate-v2-shard-slice-reorder            # dry-run (só verifica)
+    tools/generate-v2-shard-slice-reorder --apply    # aplica sob flock+CAS
+    tools/generate-v2-shard-slice-reorder --slug familia-04 --apply
+
+Escreve dado (data/editorial/v2_pages/*.jsonl) — por isso é generate-*, não
+check-*. Evidência: append em
+``data/ops/writing_mechanical_reorder_ledger.jsonl`` por shard aplicado; a
+preimagem permanente já foi arquivada pelo relaunch
+(``persist_writing_raw_recovery_preimage``) antes do manifesto existir.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from tools import generate_v2_review_queue as producer  # noqa: E402
+
+MANIFEST_REL_PATH = "data/ops/writing_mechanical_reorder_todo.jsonl"
+LEDGER_REL_PATH = "data/ops/writing_mechanical_reorder_ledger.jsonl"
+# Mesmo lock do par produtor (ops/relaunch-writing.sh): reordenar um shard no
+# meio de uma geração de fila invalidaria os snapshots dela; o produtor, por
+# sua vez, não pode emitir fila enquanto um reorder muda o estoque.
+PAIR_LOCK_PATH = "/tmp/opt-wiki-relaunch-writing-pair.lock"
+_TARGET_REL = re.compile(r"data/editorial/v2_pages/[a-z0-9_.-]+\.jsonl")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MANIFEST_FIELDS = {
+    "schema_version", "slug", "target_rel_path", "target_sha256",
+    "expected_n", "expected_intent_ids", "reason_codes",
+    "preserved_record_sha256", "recovery_item_sha256",
+}
+
+
+class ReorderRefused(RuntimeError):
+    """Qualquer condição fora da família mecânica pura recusa o shard."""
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_manifest(manifest_path: pathlib.Path) -> list[dict]:
+    if not manifest_path.exists():
+        raise SystemExit(
+            f"generate-v2-shard-slice-reorder: manifesto ausente "
+            f"({manifest_path}); rode ops/relaunch-writing.sh primeiro — ele "
+            "autentica os slices e emite as ordens de serviço mecânicas")
+    records: list[dict] = []
+    payload = manifest_path.read_bytes()
+    if not payload:
+        return records
+    if not payload.endswith(b"\n"):
+        raise SystemExit(
+            "generate-v2-shard-slice-reorder: manifesto sem LF terminal — "
+            "regenere com ops/relaunch-writing.sh")
+    for line_number, raw_line in enumerate(payload[:-1].split(b"\n"), 1):
+        try:
+            record = producer.decode_json_no_duplicate_keys(
+                raw_line, f"{MANIFEST_REL_PATH}:{line_number}")
+        except ValueError as error:
+            raise SystemExit(
+                f"generate-v2-shard-slice-reorder: manifesto inválido na "
+                f"linha {line_number}: {error}")
+        if (not isinstance(record, dict) or
+                set(record) != _MANIFEST_FIELDS or
+                record.get("schema_version") !=
+                "v2_writing_mechanical_reorder_v1"):
+            raise SystemExit(
+                f"generate-v2-shard-slice-reorder: manifesto linha "
+                f"{line_number} perdeu o schema fechado "
+                "v2_writing_mechanical_reorder_v1")
+        records.append(record)
+    return records
+
+
+def plan_reorder(
+    payload: bytes,
+    expected_intent_ids: list[str],
+    preserved_record_sha256: dict[str, str],
+) -> bytes:
+    """Monta o payload reordenado provando permutação byte a byte.
+
+    Função pura (sem I/O). Levanta ``ReorderRefused`` para QUALQUER estado
+    fora da família mecânica: linha ausente/duplicada/não-endereçável, hash
+    divergente do CAS ``preserved_record_sha256``, CR, linha vazia ou linha
+    excedente. É proibido "consertar" conteúdo aqui — só permutar as MESMAS
+    linhas e fechar com LF terminal.
+    """
+    if b"\r" in payload:
+        raise ReorderRefused("payload contém CR — não é família mecânica")
+    raw_lines = payload.split(b"\n")
+    if payload.endswith(b"\n"):
+        raw_lines = raw_lines[:-1]
+    if len(raw_lines) != len(expected_intent_ids):
+        raise ReorderRefused(
+            f"cardinalidade divergente: {len(raw_lines)} linha(s) vs "
+            f"{len(expected_intent_ids)} esperada(s) — exige autoria")
+    by_intent: dict[str, bytes] = {}
+    for line_number, raw_line in enumerate(raw_lines, 1):
+        if not raw_line:
+            raise ReorderRefused(
+                f"linha {line_number} vazia — exige autoria")
+        try:
+            row = producer.decode_json_no_duplicate_keys(
+                raw_line, f"reorder:{line_number}")
+        except ValueError as error:
+            raise ReorderRefused(
+                f"linha {line_number} não é JSON canônico ({error}) — "
+                "exige autoria") from error
+        if not isinstance(row, dict):
+            raise ReorderRefused(
+                f"linha {line_number} não é objeto — exige autoria")
+        intent_id = row.get("intent_id")
+        if not isinstance(intent_id, str) or intent_id not in set(
+                expected_intent_ids):
+            raise ReorderRefused(
+                f"linha {line_number} sem identidade dentro do slice "
+                f"({intent_id!r}) — exige autoria/migração")
+        if intent_id in by_intent:
+            raise ReorderRefused(
+                f"intent duplicado {intent_id} — exige autoria")
+        digest = _sha256_bytes(raw_line)
+        expected_digest = preserved_record_sha256.get(intent_id)
+        if digest != expected_digest:
+            raise ReorderRefused(
+                f"linha de {intent_id} diverge do CAS preservado "
+                f"({digest} != {expected_digest}) — recusa tocar")
+        by_intent[intent_id] = raw_line
+    if set(by_intent) != set(expected_intent_ids):
+        raise ReorderRefused("cobertura incompleta do slice — exige autoria")
+    new_payload = b"\n".join(
+        by_intent[intent] for intent in expected_intent_ids) + b"\n"
+    # Prova final de permutação: mesmo multiset de linhas, byte a byte.
+    if sorted(raw_lines) != sorted(
+            new_payload[:-1].split(b"\n")):
+        raise ReorderRefused(
+            "pós-condição violada: novo payload não é permutação exata")
+    for intent, raw_line in by_intent.items():
+        if _sha256_bytes(raw_line) != preserved_record_sha256[intent]:
+            raise ReorderRefused(
+                f"pós-condição violada: linha de {intent} mudou")
+    return new_payload
+
+
+# Contrato semântico memoizado POR EXECUÇÃO. Carregá-lo custa ~1,5 s porque o
+# epoch v3 autentica o estoque inteiro (731 dependências, 42 MB lidos e
+# parseados); process_record roda por linha do manifesto, então recarregar era
+# O(lote × estoque) — o custo cresce junto com o corpus, exatamente no cenário
+# de uso desenhado (lote de shards mecânicos).
+#
+# Reuso NÃO é hoist ingênuo. Duas guardas, nesta ordem:
+#   1. `_semantic_contract_epoch` (barata, ~ms): digest exato do arquivo de
+#      contrato + (tamanho, mtime_ns, inode) de cada dependência e de todo o
+#      glob de v2_pages — pega shard alterado, criado, removido ou que
+#      reapareceu. Divergiu, recarrega.
+#   2. A reautenticação CAS dentro de capture_writing_raw_recovery_projection,
+#      que continua obrigatória e roda sobre os bytes vivos. Se a guarda barata
+#      errasse (exigiria tamanho, mtime em ns E inode idênticos), o contrato
+#      vencido levantaria CASMismatch — o pior caso é recusar o shard, nunca
+#      aceitar um estoque não autenticado.
+# Escrita própria invalida na hora (_invalidate_semantic_contract), porque
+# reordenar um shard muda os bytes que o contrato autenticou.
+_SEMANTIC_CONTRACT_MEMO: tuple[tuple, object] | None = None
+
+
+def _semantic_contract_epoch(
+    root: pathlib.Path, contract: object,
+) -> tuple:
+    """Epoch barato do que o contrato autenticou (stat-only + digest do sidecar)."""
+    canonical = pathlib.Path(os.path.abspath(os.fspath(root)))
+    contract_digest = producer.snapshot_sha256(
+        canonical / producer._WRITING_SEMANTIC_CONTRACT_REL_PATH,
+        max_bytes=producer._MAX_WRITING_SEMANTIC_CONTRACT_BYTES)
+    rel_paths = set(contract.dependency_sha256)
+    rel_paths |= set(contract.absent_dependency_paths)
+    rel_paths |= {
+        path.relative_to(canonical).as_posix()
+        for path in (canonical / "data/editorial/v2_pages").glob("*.jsonl")
+    }
+    stamps = []
+    for rel_path in sorted(rel_paths):
+        try:
+            info = os.stat(canonical / rel_path)
+        except FileNotFoundError:
+            stamps.append((rel_path, "missing"))
+            continue
+        stamps.append(
+            (rel_path, info.st_size, info.st_mtime_ns, info.st_ino))
+    return (contract_digest, tuple(stamps))
+
+
+def _semantic_contract(root: pathlib.Path):
+    """Carrega o contrato uma vez por execução; recarrega se o epoch mudou."""
+    global _SEMANTIC_CONTRACT_MEMO
+    if _SEMANTIC_CONTRACT_MEMO is not None:
+        cached_epoch, cached_contract = _SEMANTIC_CONTRACT_MEMO
+        if _semantic_contract_epoch(root, cached_contract) == cached_epoch:
+            return cached_contract
+        _SEMANTIC_CONTRACT_MEMO = None
+    contract = producer.load_writing_semantic_contract(root)
+    _SEMANTIC_CONTRACT_MEMO = (
+        _semantic_contract_epoch(root, contract), contract)
+    return contract
+
+
+def _invalidate_semantic_contract() -> None:
+    """Toda escrita própria no estoque vence o contrato memoizado."""
+    global _SEMANTIC_CONTRACT_MEMO
+    _SEMANTIC_CONTRACT_MEMO = None
+
+
+def process_record(
+    record: dict, *, apply: bool, root: pathlib.Path,
+) -> dict:
+    slug = record["slug"]
+    rel_path = record["target_rel_path"]
+    if (_TARGET_REL.fullmatch(rel_path) is None or
+            rel_path != f"data/editorial/v2_pages/{slug}.jsonl"):
+        raise ReorderRefused(f"path fora do estoque v2_pages: {rel_path!r}")
+    expected_ids = record["expected_intent_ids"]
+    expected_n = record["expected_n"]
+    preserved = record["preserved_record_sha256"]
+    target_sha256 = record["target_sha256"]
+    if (not isinstance(expected_ids, list) or
+            not isinstance(expected_n, int) or
+            len(expected_ids) != expected_n or
+            len(set(expected_ids)) != expected_n or
+            not isinstance(preserved, dict) or
+            set(preserved) != set(expected_ids) or
+            not isinstance(target_sha256, str) or
+            _SHA256.fullmatch(target_sha256) is None or
+            any(not isinstance(d, str) or _SHA256.fullmatch(d) is None
+                for d in preserved.values())):
+        raise ReorderRefused(f"manifesto inconsistente para {slug}")
+
+    # Captura VIVA: reaplica identidade CAS, contrato semântico e a projeção
+    # raw-recovery contra os bytes atuais. Shard que evoluiu desde o manifesto
+    # (ex.: redator vivo) reprova aqui via CASMismatch, nunca é sobrescrito.
+    projection = producer.capture_writing_raw_recovery_projection(
+        root, rel_path, target_sha256, expected_ids,
+        semantic_contract_loader=lambda: _semantic_contract(root))
+    if projection is None:
+        raise ReorderRefused(
+            f"{slug}: preimagem já é canônica — manifesto stale; regenere a "
+            "fila com ops/relaunch-writing.sh")
+    if not producer.writing_recovery_mechanical_only(projection, expected_n):
+        raise ReorderRefused(
+            f"{slug}: recovery ao vivo NÃO é 100% mecânica "
+            f"(reason_codes={projection.get('reason_codes')!r}, "
+            f"invalid_rows={projection.get('invalid_rows')!r}, "
+            f"unaddressable_rows={projection.get('unaddressable_rows')!r}) — "
+            "este lote exige autoria e pertence ao redator")
+    if (projection["reason_codes"] != record["reason_codes"] or
+            projection["preserved_record_sha256"] != preserved or
+            projection["recovery_item_sha256"] !=
+            record["recovery_item_sha256"]):
+        raise ReorderRefused(
+            f"{slug}: projeção viva diverge do manifesto — regenere a fila")
+
+    snapshot = producer.read_regular_file_snapshot(
+        root / rel_path, max_bytes=64 * 1024 * 1024)
+    if snapshot.digest != target_sha256:
+        raise ReorderRefused(
+            f"{slug}: shard evoluiu depois da captura ({snapshot.digest} != "
+            f"{target_sha256}) — regenere a fila")
+    new_payload = plan_reorder(snapshot.payload, expected_ids, preserved)
+    if new_payload == snapshot.payload:
+        raise ReorderRefused(
+            f"{slug}: payload novo idêntico ao antigo — manifesto stale")
+    new_digest = _sha256_bytes(new_payload)
+    # Pós-condição forte: o payload reordenado tem de ser CANÔNICO — a
+    # projeção derivada dele precisa ser None (nenhuma razão residual).
+    residual = producer.derive_writing_raw_recovery_projection(
+        new_payload, rel_path, new_digest, expected_ids)
+    if residual is not None:
+        raise ReorderRefused(
+            f"{slug}: payload reordenado ainda tem razões "
+            f"{residual.get('reason_codes')!r} — abortando sem escrever")
+
+    result = {
+        "slug": slug,
+        "target_rel_path": rel_path,
+        "before_sha256": target_sha256,
+        "after_sha256": new_digest,
+        "expected_n": expected_n,
+        "reason_codes": list(record["reason_codes"]),
+        "recovery_item_sha256": record["recovery_item_sha256"],
+        "applied": False,
+    }
+    if not apply:
+        return result
+    producer.atomic_replace_cas(root / rel_path, new_payload, target_sha256)
+    # O estoque acabou de mudar por escrita nossa: o contrato memoizado está
+    # vencido para o próximo registro do lote.
+    _invalidate_semantic_contract()
+    final_digest = producer.snapshot_sha256(
+        root / rel_path, max_bytes=64 * 1024 * 1024)
+    if final_digest != new_digest:
+        raise ReorderRefused(
+            f"{slug}: digest final {final_digest} != esperado {new_digest} "
+            "após CAS — investigar antes de qualquer nova escrita")
+    result["applied"] = True
+    return result
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="generate-v2-shard-slice-reorder",
+        description=(
+            "Reordena linhas de shards v2_pages para a ordem do slice pinado,"
+            " byte a byte, sob CAS — família mecânica da raw-recovery."),
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="aplica a permutação (default: dry-run que só verifica)")
+    parser.add_argument(
+        "--slug", action="append", default=[],
+        help="restringe aos slugs dados (repetível)")
+    parser.add_argument(
+        "--manifest", default=str(ROOT / MANIFEST_REL_PATH),
+        help="caminho do manifesto (default: emitido pelo relaunch)")
+    args = parser.parse_args(argv)
+
+    records = load_manifest(pathlib.Path(args.manifest))
+    if args.slug:
+        wanted = set(args.slug)
+        known = {record["slug"] for record in records}
+        missing = wanted - known
+        if missing:
+            raise SystemExit(
+                "generate-v2-shard-slice-reorder: slug(s) fora do manifesto: "
+                + ", ".join(sorted(missing)))
+        records = [r for r in records if r["slug"] in wanted]
+    if not records:
+        print("generate-v2-shard-slice-reorder: 0 lote(s) mecânico(s) no "
+              "manifesto — nada a reordenar")
+        return 0
+
+    lock_handle = None
+    if args.apply:
+        lock_handle = open(PAIR_LOCK_PATH, "w")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(
+                "generate-v2-shard-slice-reorder: lock do par produtor "
+                f"ocupado ({PAIR_LOCK_PATH}) — relaunch-writing rodando; "
+                "tentar depois (exit 75)") from None
+
+    failures: list[str] = []
+    results: list[dict] = []
+    try:
+        for record in records:
+            try:
+                result = process_record(
+                    record, apply=args.apply, root=ROOT)
+            except (ReorderRefused, producer.CASMismatch,
+                    producer.DistinctnessOperationalError, OSError,
+                    RuntimeError, ValueError) as error:
+                failures.append(f"{record.get('slug')}: {error}")
+                print(f"RECUSADO {record.get('slug')}: {error}")
+                continue
+            results.append(result)
+            verb = "reordenado" if result["applied"] else "verificado"
+            print(f"{verb} {result['slug']}: n={result['expected_n']} "
+                  f"razoes={','.join(result['reason_codes'])} "
+                  f"{result['before_sha256'][:12]} -> "
+                  f"{result['after_sha256'][:12]}")
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
+
+    if args.apply and results:
+        ledger_path = ROOT / LEDGER_REL_PATH
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with open(ledger_path, "a", encoding="utf-8") as handle:
+            for result in results:
+                if not result["applied"]:
+                    continue
+                entry = dict(result)
+                entry["ts"] = stamp
+                handle.write(json.dumps(
+                    entry, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+
+    applied = sum(1 for r in results if r["applied"])
+    pages = sum(r["expected_n"] for r in results)
+    mode = "apply" if args.apply else "dry-run"
+    print(f"generate-v2-shard-slice-reorder [{mode}]: "
+          f"{len(results)} lote(s) ok ({applied} aplicado(s), "
+          f"{pages} pagina(s) preservada(s) byte a byte), "
+          f"{len(failures)} recusado(s)")
+    if failures:
+        print("generate-v2-shard-slice-reorder: recusas exigem decisão "
+              "humana/redator — NUNCA relaxar para passar:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    if args.apply:
+        print("generate-v2-shard-slice-reorder: rode ops/relaunch-writing.sh "
+              "para reconciliar a fila (lotes viram no-op) e esvaziar o "
+              "manifesto")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""generate-evento-unificado — humano e bot na MESMA linha, por (dia, página).
+
+Ver o cabeçalho completo (fontes, armadilhas medidas, regra de agente de IA,
+cursor/idempotência) sendo escrito em cima deste esqueleto, função por função,
+cada uma nascendo do próximo teste vermelho em tools/test_evento_unificado.py.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import json
+import os
+import statistics
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import accessledger  # noqa: E402
+import botagents  # noqa: E402
+import edgetelemetry  # noqa: E402
+
+SCHEMA_EVENTO = "evento_unificado_v1"
+SCHEMA_CURSOR = "evento_unificado_cursor_v1"
+
+# GA4 não tem coletor da Data API neste repositório e não há credencial em
+# .env.local (só CLOUDFLARE_* e WIKI_CLARITY_API_TOKEN). Pedir credencial nova
+# é proibido pelo contrato ("Self-hosted first"). Isto é uma verdade declarada
+# — não um zero fingindo medição.
+GA4_INDISPONIVEL = {
+    "disponivel": False,
+    "motivo": (
+        "sem credencial da GA4 Data API configurada; os eventos que a pagina "
+        "emite (whatsapp_click, fonte_oficial, indice_click, relacionado_click, "
+        "busca_interna) so sao observaveis no painel"
+    ),
+}
+
+# "Agente de IA": conjunto curado, não adivinhado por regex — reusa a mesma
+# separação já revisada em tools/measure-ai-citation (tabela CAMADA), nunca a
+# lista inteira de botagents.FUNCAO (que também marca Googlebot/Bingbot como
+# "search", e isso NÃO é o que "agente de IA" quer dizer aqui).
+AGENTES_DE_IA = frozenset({
+    # crawl específico de IA — alimentam o índice de onde o assistente cita.
+    "oai-searchbot", "claude-searchbot", "perplexitybot", "mistralai-index",
+    "amzn-searchbot",
+    # fetch ao vivo — o assistente busca a página no instante da pergunta.
+    "chatgpt-user", "claude-user", "perplexity-user", "duckassistbot",
+    "mistralai-user", "meta-externalfetcher", "amzn-user",
+    # treinamento de modelo — não é citação hoje, mas ainda é agente de IA.
+    "gptbot", "claudebot", "ccbot", "bytespider", "amazonbot",
+    "meta-externalagent", "mistralai-training", "google-extended",
+    "applebot-extended",
+})
+
+HUMANO_OU_NAO_IDENTIFICADO = "humano_ou_nao_identificado"
+
+STATUS_BALDES = ("2xx", "3xx", "4xx", "5xx", "outro")
+
+
+def agent_key_de(user_agent):
+    """Identidade canônica do agente — mesma chave de edge_bot_agents_daily."""
+    return botagents.agente_de(user_agent) or HUMANO_OU_NAO_IDENTIFICADO
+
+
+def status_bucket(status):
+    try:
+        codigo = int(status)
+    except (TypeError, ValueError):
+        return "outro"
+    if 200 <= codigo < 300:
+        return "2xx"
+    if 300 <= codigo < 400:
+        return "3xx"
+    if 400 <= codigo < 500:
+        return "4xx"
+    if 500 <= codigo < 600:
+        return "5xx"
+    return "outro"
+
+
+def caminho_access_do_dia(root, dia):
+    return os.path.join(root, "data", "ops", "access", "access-%s.jsonl" % dia)
+
+
+def caminho_evento_do_dia(root, dia):
+    return os.path.join(root, "data", "ops", "eventos", "eventos-%s.jsonl" % dia)
+
+
+def caminho_cursor(root):
+    return os.path.join(root, "data", "ops", "eventos", "cursor.json")
+
+
+def _novo_acumulador():
+    return {
+        "requisicoes": 0,
+        "por_bot_class": collections.Counter(),
+        "por_agente": collections.Counter(),
+        "por_ferramenta_mcp": collections.Counter(),
+        "por_cliente_oauth": collections.Counter(),
+        "por_ferramenta_mcp_agente": collections.Counter(),
+        "por_metodo_mcp": collections.Counter(),
+        "status": collections.Counter(),
+        "bytes": 0,
+        "duracoes": [],
+        "route_classes": collections.Counter(),
+        "markdown_hits": 0,
+        "page_hits": 0,
+        "humano_estimado": 0,
+        "agentes_de_ia": 0,
+    }
+
+
+def processar_arquivo_do_dia(caminho, quarentena_hashes):
+    """Lê UM access-<dia>.jsonl e devolve (acumuladores_por_path, resumo, fonte).
+
+    `resumo` carrega os MESMOS três motivos de exclusão que
+    `accessledger.linhas_saneadas` já declara (quarentena, aquecimento,
+    simulação) — número excluído em silêncio é a mesma classe de problema que
+    número inflado (ver accessledger.py, linhas 27-29).
+    """
+    acumuladores = {}
+    resumo = {
+        "origem_total": 0,
+        "origem_descontado_quarentena": 0,
+        "origem_descontado_warming": 0,
+        "origem_descontado_simulacao": 0,
+        "linhas_invalidas": 0,
+    }
+    ultima_linha_bruta = ""
+    for _numero, bruto, registro in accessledger.ler(caminho):
+        ultima_linha_bruta = bruto
+        resumo["origem_total"] += 1
+        if registro is None:
+            resumo["linhas_invalidas"] += 1
+            continue
+        if accessledger.sha_linha(bruto) in quarentena_hashes:
+            resumo["origem_descontado_quarentena"] += 1
+            continue
+        aquecimento = bool(registro.get("warming"))
+        simulacao = bool(registro.get("bot_simulation"))
+        if aquecimento:
+            resumo["origem_descontado_warming"] += 1
+        if simulacao:
+            resumo["origem_descontado_simulacao"] += 1
+        if aquecimento or simulacao:
+            continue
+
+        caminho_pagina = registro.get("path") or ""
+        acc = acumuladores.setdefault(caminho_pagina, _novo_acumulador())
+        acc["requisicoes"] += 1
+
+        bot_class = registro.get("bot_class") or "desconhecido"
+        acc["por_bot_class"][bot_class] += 1
+
+        agente = agent_key_de(registro.get("user_agent"))
+        acc["por_agente"][agente] += 1
+        # POST /mcp: desde 2026-09-08 o ledger do Go grava mcp_method e
+        # mcp_tool. E o que transforma "/mcp" em uso POR FERRAMENTA (buscar,
+        # ler, contexto...) e por agente -- a metrica do mandato AI-first.
+        ferramenta = registro.get("mcp_tool") or ""
+        if ferramenta:
+            acc["por_ferramenta_mcp"][ferramenta] += 1
+            acc["por_ferramenta_mcp_agente"][ferramenta + "|" + agente] += 1
+        elif registro.get("mcp_method"):
+            acc["por_metodo_mcp"][registro["mcp_method"]] += 1
+        # oauth_client (ledger do Go, 2026-09-08): client_id do Bearer valido em
+        # qualquer rota. Identidade declarada pelo proprio agente, sem depender
+        # do User-Agent — e o retorno POR CLIENTE que o mandato AI-first pede.
+        if registro.get("oauth_client"):
+            acc["por_cliente_oauth"][registro["oauth_client"]] += 1
+
+        acc["status"][status_bucket(registro.get("status"))] += 1
+
+        try:
+            acc["bytes"] += int(registro.get("bytes") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            acc["duracoes"].append(float(registro.get("duration_ms") or 0))
+        except (TypeError, ValueError):
+            acc["duracoes"].append(0.0)
+
+        rota = registro.get("route_class") or "desconhecida"
+        acc["route_classes"][rota] += 1
+        if rota == "markdown":
+            acc["markdown_hits"] += 1
+        elif rota == "page":
+            acc["page_hits"] += 1
+
+        if bot_class == "unknown_or_standard_user_agent":
+            acc["humano_estimado"] += 1
+        if agente in AGENTES_DE_IA:
+            acc["agentes_de_ia"] += 1
+
+    fonte = {
+        "linhas": resumo["origem_total"],
+        "sha256_ultima_linha": (
+            accessledger.sha_linha(ultima_linha_bruta) if ultima_linha_bruta else None
+        ),
+    }
+    return acumuladores, resumo, fonte
+
+
+def montar_linhas_do_dia(dia, acumuladores):
+    """Uma linha JSON por path, ordenada — determinismo é o que sustenta a
+    idempotência do cursor (mesma entrada tem de produzir os mesmos bytes)."""
+    linhas = []
+    for caminho_pagina in sorted(acumuladores):
+        acc = acumuladores[caminho_pagina]
+        rota_dominante = None
+        if acc["route_classes"]:
+            rota_dominante = acc["route_classes"].most_common(1)[0][0]
+        total_pagina_ou_gemea = acc["markdown_hits"] + acc["page_hits"]
+        pct_md = 0.0
+        if rota_dominante in ("page", "markdown") and total_pagina_ou_gemea:
+            pct_md = acc["markdown_hits"] / total_pagina_ou_gemea
+        status = {balde: acc["status"].get(balde, 0) for balde in STATUS_BALDES}
+        linhas.append({
+            "schema_version": SCHEMA_EVENTO,
+            "date": dia,
+            "path": caminho_pagina,
+            "route_class": rota_dominante,
+            "requisicoes": acc["requisicoes"],
+            "por_bot_class": dict(acc["por_bot_class"]),
+            "por_agente": dict(acc["por_agente"].most_common(10)),
+            "por_ferramenta_mcp": dict(sorted(acc["por_ferramenta_mcp"].items())),
+            "por_cliente_oauth": dict(acc["por_cliente_oauth"].most_common(10)),
+            "por_ferramenta_mcp_agente": dict(sorted(acc["por_ferramenta_mcp_agente"].items())),
+            "por_metodo_mcp": dict(sorted(acc["por_metodo_mcp"].items())),
+            "status": status,
+            "bytes": acc["bytes"],
+            "duration_ms_p50": (
+                statistics.median(acc["duracoes"]) if acc["duracoes"] else 0.0
+            ),
+            "markdown": caminho_pagina.endswith("index.md"),
+            "pct_markdown_da_pagina": round(pct_md, 4),
+            "humano_estimado": acc["humano_estimado"],
+            "agentes_de_ia": acc["agentes_de_ia"],
+        })
+    return linhas
+
+
+def carrega_clarity(root):
+    caminho = os.path.join(root, "data", "ops", "clarity_insights_daily.jsonl")
+    registros = []
+    if not os.path.isfile(caminho):
+        return registros
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registros.append(json.loads(linha))
+            except json.JSONDecodeError:
+                continue
+    return registros
+
+
+def caminho_nginx_do_dia(root, dia):
+    return os.path.join(root, "data", "ops", "access", "nginx-%s.jsonl" % dia)
+
+
+# VALORES de ip_verificacao gravados pelo ledger do nginx (origin_access_nginx_v2):
+# "authentic" (IP dentro da faixa publicada pelo operador), "forged" (UA de bot
+# conhecido vindo de IP fora da faixa), "unverifiable" (operador sem faixa
+# publicada) e ausente (linha sem checagem). O rotulo "nao_verificado" cobre o
+# ausente para o bloco nunca ter chave None.
+IDENTIDADE_BUCKETS = ("authentic", "forged", "unverifiable", "nao_verificado")
+
+
+def identidade_por_agente_do_dia(root, dia):
+    """Bloco `identidade_por_agente` da linha `_dia`: por agent_key, quantas
+    requisicoes do nginx cairam em cada ip_verificacao.
+
+    POR QUE EXISTE (medido em 2026-09-08): por_agente e classificado so pelo
+    User-Agent, e um scanner de segredos varreu /env.json, /id_rsa/, /.claude/
+    settings.json etc. as 00:33Z trocando o UA a cada requisicao — GPTBot,
+    Claude-User, PerplexityBot, Amazonbot... 100 linhas de 404 que a metrica do
+    mandato contava como "agentes de IA". O ledger do Go nao carrega IP; o do
+    nginx carrega `ip_verificacao` por faixa publicada. Este bloco e o que
+    permite ler por_agente com a identidade conferida ao lado, e
+    `agentes_de_ia_forjados` e o desconto que a contagem por UA nao enxerga.
+    Aquecimento e simulacao ficam de fora, como em toda contagem deste arquivo.
+    """
+    caminho = caminho_nginx_do_dia(root, dia)
+    if not os.path.isfile(caminho):
+        return {"disponivel": False, "motivo": "sem ledger do nginx para o dia (data/ops/access/nginx-<dia>.jsonl)"}
+    # O LEDGER SO CARREGA O VEREDITO NA REDE SOCIAL (onde o IP vira pseudonimo);
+    # no acervo o IP fica em claro e "quem consome verifica direto"
+    # (tools/generate-origin-access-ledger, versao_publica). Este e o consumidor:
+    # linha com bot declarado, IP em claro e sem veredito e conferida aqui
+    # contra as faixas publicadas (data/ops/bot_ip_ranges), com a MESMA regra
+    # de tres palavras — authentic / forged / unverifiable.
+    faixas = botagents.ler_faixas(root)
+    por_agente = {}
+    forjados = 0
+    linhas = 0
+    conferidas_aqui = 0
+    with open(caminho, encoding="utf-8") as handle:
+        for bruto in handle:
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registro = json.loads(bruto)
+            except json.JSONDecodeError:
+                continue
+            if registro.get("warming") or registro.get("bot_simulation"):
+                continue
+            agente = registro.get("agent_key")
+            if not agente:
+                continue
+            linhas += 1
+            bucket = registro.get("ip_verificacao")
+            if not bucket and registro.get("remote_addr_forma") == "ip" and registro.get("remote_addr"):
+                redes = (faixas or {}).get(agente.strip().lower())
+                if redes:
+                    bucket = "authentic" if botagents.em_faixa(registro["remote_addr"], redes) else "forged"
+                else:
+                    bucket = "unverifiable"
+                conferidas_aqui += 1
+            bucket = bucket or "nao_verificado"
+            if bucket not in IDENTIDADE_BUCKETS:
+                bucket = "nao_verificado"
+            contagem = por_agente.setdefault(agente, {chave: 0 for chave in IDENTIDADE_BUCKETS})
+            contagem[bucket] += 1
+            if bucket == "forged" and agente in AGENTES_DE_IA:
+                forjados += 1
+    return {
+        "disponivel": True,
+        "linhas_de_bot": linhas,
+        "conferidas_pelo_consumidor": conferidas_aqui,
+        "agentes_de_ia_forjados": forjados,
+        "por_agente": {agente: por_agente[agente] for agente in sorted(por_agente)},
+    }
+
+
+def compacta_clarity(registro):
+    """A coleta por URL do Clarity (desde 2026-09-09) traz ~223 KB de `metricas`
+    cruas por dia; embuti-la inteira na linha diária multiplicaria o evento
+    unificado por 30. Da linha de URL só interessa o derivado (`top_urls`,
+    `derivacao_urls`, `truncado_1000`); o cru continua no ledger do Clarity,
+    que é a fonte. As linhas por Device seguem inteiras, como sempre foram."""
+    dimensoes = registro.get("dimensoes") or []
+    if "URL" not in dimensoes:
+        return registro
+    compacta = {
+        chave: registro.get(chave)
+        for chave in ("schema", "coletado_em", "project_id", "janela_dias", "dimensoes",
+                      "http_status", "fuso", "top_urls", "derivacao_urls", "truncado_1000")
+        if chave in registro
+    }
+    compacta["metricas_omitidas"] = "cru em data/ops/clarity_insights_daily.jsonl (linha por URL)"
+    return compacta
+
+
+def montar_linha_dia_agregada(dia, resumo_arquivo, borda_por_chave, clarity_registros, identidade=None):
+    """A linha `_dia`: borda por agente, Clarity do dia (se houver), GA4 e os
+    contadores de exclusão da origem — nada some em silêncio."""
+    borda_do_dia = {}
+    for (data_serie, agente), registro in borda_por_chave.items():
+        if data_serie != dia:
+            continue
+        borda_do_dia[agente] = {
+            "function": registro.get("function"),
+            "authenticity": registro.get("authenticity"),
+            "requests_estimated": registro.get("requests_estimated"),
+        }
+
+    clarity_do_dia = [
+        compacta_clarity(registro) for registro in clarity_registros
+        if (registro.get("coletado_em") or "")[:10] == dia
+    ]
+    if clarity_do_dia:
+        clarity_bloco = {"disponivel": True, "coletas": clarity_do_dia}
+    else:
+        clarity_bloco = {
+            "disponivel": False,
+            "motivo": "nenhuma coleta da Clarity Data Export API registrada para este dia",
+        }
+
+    liquidas = (
+        resumo_arquivo["origem_total"]
+        - resumo_arquivo["origem_descontado_quarentena"]
+        - resumo_arquivo["origem_descontado_warming"]
+        - resumo_arquivo["origem_descontado_simulacao"]
+        - resumo_arquivo["linhas_invalidas"]
+    )
+
+    return {
+        "schema_version": SCHEMA_EVENTO,
+        "date": dia,
+        "path": "_dia",
+        "origem_total": resumo_arquivo["origem_total"],
+        "origem_descontado_warming": resumo_arquivo["origem_descontado_warming"],
+        "origem_descontado_simulacao": resumo_arquivo["origem_descontado_simulacao"],
+        "origem_descontado_quarentena": resumo_arquivo["origem_descontado_quarentena"],
+        "origem_linhas_invalidas": resumo_arquivo["linhas_invalidas"],
+        "requisicoes_liquidas": max(0, liquidas),
+        "borda_por_agente": borda_do_dia,
+        "identidade_por_agente": identidade if identidade is not None else {"disponivel": False, "motivo": "nao calculado"},
+        "clarity": clarity_bloco,
+        "ga4": GA4_INDISPONIVEL,
+    }
+
+
+def carrega_cursor(root):
+    caminho = caminho_cursor(root)
+    if not os.path.isfile(caminho):
+        return None
+    try:
+        with open(caminho, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def dia_inicial(hoje, dias, desde, ultimo_dia_fechado):
+    """Onde a janela desta execução começa.
+
+    Sem `--desde`: nunca antes de `ultimo_dia_fechado + 1` (dia já fechado só
+    se mexe com pedido explícito) NEM antes de `hoje - (dias - 1)` (o teto da
+    janela pedida por `--dias`) — o que for MAIS PERTO de hoje vence.
+    """
+    if desde:
+        return desde
+    pela_janela = (hoje - datetime.timedelta(days=max(0, dias - 1))).isoformat()
+    if not ultimo_dia_fechado:
+        return pela_janela
+    pelo_cursor = (
+        datetime.date.fromisoformat(ultimo_dia_fechado) + datetime.timedelta(days=1)
+    ).isoformat()
+    return max(pelo_cursor, pela_janela)
+
+
+def dias_alvo(hoje, inicio_iso):
+    inicio = datetime.date.fromisoformat(inicio_iso)
+    dias = []
+    cursor_data = inicio
+    while cursor_data <= hoje:
+        dias.append(cursor_data.isoformat())
+        cursor_data += datetime.timedelta(days=1)
+    return dias
+
+
+def escreve_atomico_se_mudou(caminho, conteudo_bytes):
+    """True se escreveu (conteúdo novo ou arquivo ainda não existia); False se
+    o conteúdo já era exatamente este — é o que torna a segunda execução, sem
+    dado novo, um no-op de verdade (nenhum mtime muda)."""
+    if os.path.isfile(caminho):
+        with open(caminho, "rb") as handle:
+            if handle.read() == conteudo_bytes:
+                return False
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    temporario = caminho + ".tmp"
+    with open(temporario, "wb") as handle:
+        handle.write(conteudo_bytes)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporario, caminho)
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--dias", type=int, default=3, help="janela de dias retroativa (padrão 3)")
+    ap.add_argument("--desde", help="AAAA-MM-DD — reprocessa a partir deste dia, mesmo já fechado")
+    ap.add_argument("--timings", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    relogio_geral = time.monotonic()
+    root = args.root
+    hoje = datetime.datetime.now(datetime.timezone.utc).date()
+
+    if args.desde:
+        try:
+            datetime.date.fromisoformat(args.desde)
+        except ValueError:
+            print("generate-evento-unificado: --desde invalido: %s" % args.desde, file=sys.stderr)
+            return 2
+
+    cursor_anterior = carrega_cursor(root) or {}
+    ultimo_dia_fechado_anterior = cursor_anterior.get("ultimo_dia_fechado")
+
+    inicio = dia_inicial(hoje, max(1, args.dias), args.desde, ultimo_dia_fechado_anterior)
+    dias = dias_alvo(hoje, inicio)
+
+    t_borda = time.monotonic()
+    borda_por_chave, borda_descartadas = edgetelemetry.serie_saneada(root)
+    if args.timings:
+        print("generate-evento-unificado: borda lida em %.3fs (%d chaves saneadas, %d descartadas)"
+              % (time.monotonic() - t_borda, len(borda_por_chave), len(borda_descartadas)),
+              file=sys.stderr)
+
+    clarity_registros = carrega_clarity(root)
+    _entradas_quarentena, quarentena_hashes, problemas_quarentena = \
+        accessledger.carregar_quarentena(root)
+
+    fontes = {}
+    novo_ultimo_dia_fechado = ultimo_dia_fechado_anterior
+    hoje_iso = hoje.isoformat()
+    total_linhas_evento = 0
+    dias_processados = 0
+    dias_gravados = 0
+
+    for dia in dias:
+        t_dia = time.monotonic()
+        caminho_origem = caminho_access_do_dia(root, dia)
+        if not os.path.isfile(caminho_origem):
+            continue
+        dias_processados += 1
+
+        acumuladores, resumo, fonte = processar_arquivo_do_dia(caminho_origem, quarentena_hashes)
+        fontes[os.path.relpath(caminho_origem, root)] = fonte
+
+        linhas = montar_linhas_do_dia(dia, acumuladores)
+        linhas.append(montar_linha_dia_agregada(dia, resumo, borda_por_chave, clarity_registros,
+                                                identidade_por_agente_do_dia(root, dia)))
+        total_linhas_evento += len(linhas)
+
+        conteudo = "".join(
+            json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n" for linha in linhas
+        ).encode("utf-8")
+        destino = caminho_evento_do_dia(root, dia)
+
+        if args.dry_run:
+            print("generate-evento-unificado: [dry-run] %s -> %d linha(s)" % (destino, len(linhas)))
+        else:
+            if escreve_atomico_se_mudou(destino, conteudo):
+                dias_gravados += 1
+
+        if dia < hoje_iso:
+            if novo_ultimo_dia_fechado is None or dia > novo_ultimo_dia_fechado:
+                novo_ultimo_dia_fechado = dia
+
+        if args.timings:
+            print("generate-evento-unificado: %s processado em %.3fs (%d requisicoes brutas, %d linhas)"
+                  % (dia, time.monotonic() - t_dia, resumo["origem_total"], len(linhas)),
+                  file=sys.stderr)
+
+    if not args.dry_run:
+        cursor_novo = {
+            "schema": SCHEMA_CURSOR,
+            "ultimo_dia_fechado": novo_ultimo_dia_fechado,
+            "gerado_em": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "fontes": fontes,
+        }
+        conteudo_cursor = (
+            json.dumps(cursor_novo, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        escreve_atomico_se_mudou(caminho_cursor(root), conteudo_cursor)
+
+    for problema in problemas_quarentena:
+        print("generate-evento-unificado: quarentena: %s" % problema, file=sys.stderr)
+
+    print("generate-evento-unificado: %d dia(s) na janela, %d processado(s), %d gravado(s), "
+          "%d linha(s) de evento, cursor.ultimo_dia_fechado=%s"
+          % (len(dias), dias_processados, dias_gravados, total_linhas_evento,
+             novo_ultimo_dia_fechado))
+    if args.timings:
+        print("generate-evento-unificado: total %.3fs" % (time.monotonic() - relogio_geral),
+              file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

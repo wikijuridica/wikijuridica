@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""generate-institucional-source-verification — confere de verdade a fonte
+oficial das páginas institucionais, e só grava evidência do que aconteceu.
+
+O DEFEITO (medido em 2026-09-05 por tools/check-checked-at-coerente)
+----------------------------------------------------------------------
+Cinco rótulos "Verificado em" de páginas institucionais (/aviso-legal/,
+/contato/advogado/, /fontes/planalto/, /metodologia/, /sobre/) não têm
+NENHUMA conferência registrada em lugar nenhum — nem no estoque v2
+(official_sources[].verified_at), nem em content/source_registry.json, que não
+guarda data. O gate reprova e aponta o caminho: "ou a fonte é conferida de
+verdade e a conferência ganha registro com verified_at, ou checked_at fica
+vazio". Este gerador é o primeiro braço desse caminho: ele faz a conferência
+real e grava só o que aconteceu de fato.
+
+POR QUE NÃO HAVIA COMO CONSERTAR ANTES: páginas institucionais não têm shard no
+v2 (data/editorial/v2_pages/*.jsonl) — são preservadas de content/pages.json
+pelo publicador (loadInstitutionalPages). A evidência delas não tinha onde
+morar. Este gerador escreve em data/source-audit/, uma SEGUNDA origem de lastro
+legítimo que o gate (ensinado a lê-la) soma ao estoque v2, com a mesma régua.
+
+O QUE ESTE GERADOR FAZ
+-----------------------
+1. Lê content/pages.json e o published_manifest: uma página institucional, para
+   este gerador, é qualquer página do pages.json cuja ROTA não está no
+   manifesto — a mesma definição que tools/check-checked-at-coerente usa para
+   separar o que o gate do Go alcança do que só ele vê.
+2. Para cada fonte citada (source_provenance[].source_url) com checked_at
+   preenchido, calcula o DOCUMENTO (URL sem fragmento) e verifica se ele já tem
+   lastro — no estoque v2 OU no próprio ledger deste gerador (execução
+   anterior). Só os documentos SEM lastro nenhum entram na lista de conferência
+   — rodar de novo não repete requisição para o que já foi conferido.
+3. Para cada documento faltante, faz UM GET real com a identidade honesta do
+   portal (internal/wikijuridicabot.UserAgentComProposito(PropositoVerificacaoDeFonte),
+   espelhada aqui porque este é um script Python e não pode importar o pacote
+   Go). Grava uma linha em data/source-audit/institucional_source_verification.jsonl
+   SE E SOMENTE SE a resposta prova ser o documento, nunca por status 200 sozinho.
+
+O CRITÉRIO QUE RECUSA O INTERSTITIAL (medido em 2026-09-05, mesma sessão)
+--------------------------------------------------------------------------
+A raiz do Planalto (https://www.planalto.gov.br/) responde 200 com 1.783 bytes
+— não é a home, é um interstitial do WAF F5 (BIG-IP): um `<meta http-equiv=
+"REFRESH" content="0;url=http://www.gov.br/planalto">` mais um script
+`f5_cspm`. Gravar isso como conferência seria fabricar evidência — exatamente o
+que o gate existe para pegar. Contra o mesmo request real, o Provimento OAB
+205/2021 respondeu 200 com 73.589 bytes (documento de verdade). Duas defesas,
+não uma:
+  a) ASSINATURA: corpo com `http-equiv="refresh"` é reconhecido como
+     interstitial e recusado, qualquer que seja o tamanho. NÃO se usa
+     `f5_cspm` sozinho como assinatura — medido nesta mesma sessão contra
+     `https://www.planalto.gov.br/ccivil_03/` (índice real, 8.092 bytes) e
+     `.../ccivil_03/leis/l8906.htm` (194.129 bytes, documento real): o mesmo
+     WAF F5 injeta o script `f5_cspm` em TODA página que serve, não só no
+     interstitial — ele é o cookie de telemetria do BIG-IP, presente em
+     conteúdo genuíno. Um detector que o usasse sozinho reprovaria o próprio
+     Estatuto da OAB. Só a REFRESH é exclusiva do interstitial (confirmado:
+     ausente nos dois documentos reais, presente só na raiz que redireciona).
+  b) PISO DE BYTES: corpo abaixo de PISO_BYTES_CONFERENCIA é recusado mesmo sem
+     a assinatura reconhecida — a segunda rede de proteção, para o interstitial
+     que a próxima versão do WAF disfarçar sem meta refresh. O piso não é
+     redondo: é 4x o maior interstitial já medido (1.783 × 4 = 7.132), com
+     folga larga abaixo de qualquer corpo real observado (73.589 e 194.129
+     bytes — a ordem de grandeza de uma norma publicada começa em dezenas de
+     milhares).
+Nem status != 200, nem erro de rede, nem timeout gravam nada — reportam, e a
+correção fica para quem decide a fonte (edição de content/pages.json), não para
+este gerador.
+
+FETCHER INJETÁVEL: `verificar_documentos` recebe a função de busca por
+parâmetro (contrato: url -> RespostaHTTP). O uso real vem de `busca_real`
+(urllib.request, sem dependência nova); o teste injeta uma função sintética e
+NUNCA toca a rede — mesmo padrão de tools/test_generate_bot_agents_daily_ip_lane.py,
+que importa o produtor via importlib.machinery.SourceFileLoader por não ter
+extensão .py.
+
+ESCRITA: atômica (tmp + os.replace), cópia do ledger anterior preservada em
+.agents/runtime/ com data — só quando o ledger já existia (primeira execução
+não cria backup de nada).
+
+Uso:
+    tools/generate-institucional-source-verification --seco
+    tools/generate-institucional-source-verification
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+PAGES_JSON = RAIZ / "content" / "pages.json"
+ESTOQUE_V2 = RAIZ / "data" / "editorial" / "v2_pages"
+MANIFESTO = RAIZ / "data" / "editorial" / "published_manifest.jsonl"
+LEDGER = RAIZ / "data" / "source-audit" / "institucional_source_verification.jsonl"
+BACKUP_DIR = RAIZ / ".agents" / "runtime" / "institucional-source-verification-backup"
+
+NOME_DA_FERRAMENTA = "generate-institucional-source-verification"
+
+# Espelha internal/wikijuridicabot.UserAgentComProposito(PropositoVerificacaoDeFonte)
+# byte a byte. NÃO redigir uma segunda versão desta string à mão: o pacote Go é
+# a fonte única, e um script Python não pode importá-lo — duas redações da
+# mesma identidade divergem no primeiro dia em que alguém edita uma só.
+PREFIXO_COMPATIBILIDADE = "Mozilla/5.0 (compatible; "
+NOME_AGENTE = "WikijuridicaBot"
+VERSAO_AGENTE = "1.0"
+DOCUMENTACAO_URL = "https://wikijuridica.com.br/bot/"
+PROPOSITO_VERIFICACAO_DE_FONTE = "verificacao-de-fonte"
+USER_AGENT = (
+    PREFIXO_COMPATIBILIDADE + NOME_AGENTE + "/" + VERSAO_AGENTE + "; +" + DOCUMENTACAO_URL
+    + "; " + PROPOSITO_VERIFICACAO_DE_FONTE + ")"
+)
+
+DATA_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Medido em 2026-09-05 (ver docstring): 1.783 bytes é o interstitial do WAF F5
+# do gov.br. O piso é 4x esse tamanho — folga larga sobre o único caso
+# conhecido, e ordens de grandeza abaixo de qualquer corpo real já observado.
+TAMANHO_INTERSTITIAL_MEDIDO = 1783
+PISO_BYTES_CONFERENCIA = TAMANHO_INTERSTITIAL_MEDIDO * 4  # 7.132
+
+_ASSINATURA_REFRESH = re.compile(rb'http-equiv\s*=\s*["\']?refresh', re.IGNORECASE)
+# NÃO existe _ASSINATURA_F5_WAF (f5_cspm) de propósito — ver docstring do
+# módulo: medido em 2026-09-05, o marcador aparece em conteúdo real do mesmo
+# host (l8906.htm, 194.129 bytes) tanto quanto no interstitial. Usá-lo
+# reprovaria o próprio Estatuto da OAB.
+
+
+@dataclass
+class RespostaHTTP:
+    """Contrato do fetcher, real ou sintético: nunca lança para status/erro de
+    rede — devolve o que aconteceu, para o chamador decidir e reportar."""
+    status: int | None       # None = a requisição nem chegou a ter status (timeout, DNS, etc.)
+    corpo: bytes = b""
+    erro: str | None = None  # mensagem de rede, só quando status é None
+
+
+@dataclass
+class DocumentoFaltante:
+    documento: str
+    url_original: str
+    paginas: set[str] = field(default_factory=set)
+
+
+def documento(url: str) -> str:
+    """URL sem fragmento — mesma chave que tools/check-checked-at-coerente usa
+    (`X#art6` é o mesmo GET que `X`; o fragmento fica no cliente)."""
+    url = url.strip()
+    posicao = url.find("#")
+    return url if posicao < 0 else url[:posicao]
+
+
+def carrega_pages(caminho: Path) -> list[dict]:
+    with open(caminho, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    if not isinstance(dados, list):
+        raise ValueError(f"{caminho}: esperado lista de páginas, veio {type(dados).__name__}")
+    return dados
+
+
+def rotas_do_manifesto(caminho: Path) -> set[str] | None:
+    if not caminho.is_file():
+        return None
+    rotas: set[str] = set()
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            rota = str(registro.get("path") or "").strip()
+            if rota:
+                rotas.add(rota)
+    return rotas
+
+
+def maximo_verified_at_estoque(diretorio: Path) -> dict[str, str]:
+    """{documento: verified_at máximo} lido de data/editorial/v2_pages/*.jsonl.
+    Mesma lógica do gate (o máximo, não o último shard do glob)."""
+    maximo: dict[str, str] = {}
+    for caminho in sorted(glob.glob(str(diretorio / "*.jsonl"))):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                for fonte in (registro.get("official_sources") or []) if isinstance(registro, dict) else []:
+                    if not isinstance(fonte, dict):
+                        continue
+                    url = str(fonte.get("url") or "").strip()
+                    verificada = str(fonte.get("verified_at") or "").strip()
+                    if not url or not DATA_ISO.match(verificada):
+                        continue
+                    chave = documento(url)
+                    if verificada > maximo.get(chave, ""):
+                        maximo[chave] = verificada
+    return maximo
+
+
+def carrega_ledger(caminho: Path) -> tuple[dict[str, str], list[str]]:
+    """{documento: verified_at máximo} JÁ gravado por este gerador, e as linhas
+    brutas (para reescrever o arquivo preservando o que já existia)."""
+    maximo: dict[str, str] = {}
+    linhas_brutas: list[str] = []
+    if not caminho.is_file():
+        return maximo, linhas_brutas
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            bruta = linha.rstrip("\n")
+            if not bruta.strip():
+                continue
+            linhas_brutas.append(bruta)
+            try:
+                registro = json.loads(bruta)
+            except json.JSONDecodeError:
+                continue
+            doc = str(registro.get("documento") or "").strip()
+            verificada = str(registro.get("verified_at") or "").strip()
+            if doc and DATA_ISO.match(verificada) and verificada > maximo.get(doc, ""):
+                maximo[doc] = verificada
+    return maximo, linhas_brutas
+
+
+def documentos_faltantes(
+    paginas: list[dict],
+    rotas_manifesto: set[str] | None,
+    cobertura: dict[str, str],
+) -> dict[str, DocumentoFaltante]:
+    """Documentos citados por página institucional, com checked_at preenchido,
+    e SEM lastro em `cobertura` (estoque v2 ∪ ledger deste gerador)."""
+    faltando: dict[str, DocumentoFaltante] = {}
+    for pagina in paginas:
+        if not isinstance(pagina, dict):
+            continue
+        rota = str(pagina.get("path") or "").strip()
+        if rotas_manifesto is not None and rota in rotas_manifesto:
+            continue  # rota jurídica coberta pelo gate do Go — fora do escopo deste gerador
+        for fonte in pagina.get("source_provenance") or []:
+            if not isinstance(fonte, dict):
+                continue
+            checked = str(fonte.get("checked_at") or "").strip()
+            url = str(fonte.get("source_url") or "").strip()
+            if not checked or not url:
+                continue
+            chave = documento(url)
+            if chave in cobertura:
+                continue
+            item = faltando.setdefault(chave, DocumentoFaltante(documento=chave, url_original=url))
+            item.paginas.add(rota)
+    return faltando
+
+
+def avalia_resposta(status: int | None, corpo: bytes) -> tuple[bool, str]:
+    """A régua que decide se um GET vira conferência. Ver docstring: duas
+    defesas (assinatura + piso de bytes), nenhuma delas contorna a outra."""
+    if status is None:
+        return False, "requisição não completou"
+    if status != 200:
+        return False, f"status HTTP {status} (exige exatamente 200)"
+    if _ASSINATURA_REFRESH.search(corpo):
+        return False, (
+            f"corpo reconhecido como interstitial (meta http-equiv=refresh), {len(corpo)} byte(s) — "
+            "não é o documento citado"
+        )
+    if len(corpo) < PISO_BYTES_CONFERENCIA:
+        return False, (
+            f"corpo tem {len(corpo)} byte(s), abaixo do piso de {PISO_BYTES_CONFERENCIA} "
+            f"(caso conhecido: interstitial de {TAMANHO_INTERSTITIAL_MEDIDO} bytes do WAF do Planalto)"
+        )
+    return True, "aceito: status 200, sem assinatura de interstitial, acima do piso de bytes"
+
+
+def busca_real(url: str, timeout: float = 20.0) -> RespostaHTTP:
+    """Fetcher de produção: um GET real, identidade honesta, sem cabeçalho de
+    aquecimento (X-Warming-Request é só para o nosso próprio nginx)."""
+    requisicao = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
+            corpo = resposta.read()
+            return RespostaHTTP(status=resposta.status, corpo=corpo)
+    except urllib.error.HTTPError as erro:
+        # `avalia_resposta` recusa qualquer status != 200 antes de olhar o
+        # corpo — não há por que ler o corpo do erro, e um try/except em volta
+        # dessa leitura só existiria para mascarar falha de leitura.
+        return RespostaHTTP(status=erro.code, corpo=b"")
+    except (urllib.error.URLError, TimeoutError, OSError) as erro:
+        return RespostaHTTP(status=None, corpo=b"", erro=str(erro))
+
+
+def verificar_documentos(
+    faltantes: dict[str, DocumentoFaltante],
+    fetch,
+    hoje: str,
+) -> tuple[list[dict], list[tuple[str, str, str]]]:
+    """Faz UMA requisição por documento faltante. Devolve (linhas_novas para o
+    ledger, recusas). Nunca grava conferência que não aconteceu."""
+    novas: list[dict] = []
+    recusas: list[tuple[str, str, str]] = []
+    for chave in sorted(faltantes):
+        item = faltantes[chave]
+        resposta = fetch(item.url_original)
+        if resposta.erro is not None:
+            recusas.append((chave, item.url_original, f"falha de rede: {resposta.erro}"))
+            continue
+        aceita, motivo = avalia_resposta(resposta.status, resposta.corpo)
+        if not aceita:
+            recusas.append((chave, item.url_original, motivo))
+            continue
+        novas.append({
+            "url": item.url_original,
+            "documento": chave,
+            "verified_at": hoje,
+            "http_status": resposta.status,
+            "bytes": len(resposta.corpo),
+            "sha256": hashlib.sha256(resposta.corpo).hexdigest(),
+            "user_agent": USER_AGENT,
+            "tool": NOME_DA_FERRAMENTA,
+            "paginas_citantes": sorted(item.paginas),
+        })
+    return novas, recusas
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--pages", default=str(PAGES_JSON))
+    parser.add_argument("--estoque", default=str(ESTOQUE_V2))
+    parser.add_argument("--manifesto", default=str(MANIFESTO))
+    parser.add_argument("--ledger", default=str(LEDGER))
+    parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--seco", action="store_true",
+                        help="mostra o que seria conferido; NÃO faz requisição nem grava")
+    args = parser.parse_args()
+
+    print(f"{NOME_DA_FERRAMENTA} — identidade de saída: {USER_AGENT}\n")
+
+    try:
+        paginas = carrega_pages(Path(args.pages))
+    except (OSError, ValueError, json.JSONDecodeError) as erro:
+        print(f"NÃO RODOU: {erro}", file=sys.stderr)
+        return 2
+
+    rotas_manifesto = rotas_do_manifesto(Path(args.manifesto))
+    shards_estoque = sorted(glob.glob(str(Path(args.estoque) / "*.jsonl")))
+    cobertura_estoque = maximo_verified_at_estoque(Path(args.estoque))
+    if not shards_estoque or not cobertura_estoque:
+        # Mesma guarda do gate irmão (check-checked-at-coerente): estoque
+        # vazio ou caminho errado faria TODA página institucional (e qualquer
+        # outra fora do manifesto) parecer "sem lastro", e este gerador sairia
+        # varrendo milhares de URLs de content/pages.json de uma vez —
+        # exatamente o "não varrer o site deles" que o contrato proíbe.
+        print(f"NÃO RODOU: nenhum verified_at válido lido do estoque {args.estoque} "
+              f"({len(shards_estoque)} shard(s)) — caminho errado varreria o acervo inteiro "
+              "em vez de só o gap institucional", file=sys.stderr)
+        return 2
+    cobertura_ledger, linhas_ledger_atuais = carrega_ledger(Path(args.ledger))
+    cobertura = dict(cobertura_estoque)
+    for chave, data in cobertura_ledger.items():
+        if data > cobertura.get(chave, ""):
+            cobertura[chave] = data
+
+    faltantes = documentos_faltantes(paginas, rotas_manifesto, cobertura)
+
+    print(f"páginas lidas: {len(paginas)}")
+    print(f"lastro no estoque v2: {len(cobertura_estoque)} documento(s); "
+          f"lastro já neste ledger: {len(cobertura_ledger)} documento(s)")
+    print(f"documentos SEM lastro nenhum, fora do manifesto: {len(faltantes)}")
+    for chave, item in sorted(faltantes.items()):
+        print(f"    {chave}  (citado por {', '.join(sorted(item.paginas))})")
+
+    if not faltantes:
+        print("\nnada a conferir.")
+        return 0
+
+    if args.seco:
+        print("\n--seco: nenhuma requisição feita, nada gravado.")
+        return 0
+
+    hoje = datetime.date.today().isoformat()
+    novas, recusas = verificar_documentos(faltantes, lambda u: busca_real(u, timeout=args.timeout), hoje)
+
+    print(f"\nconferidas com sucesso (viram linha no ledger): {len(novas)}")
+    for linha in novas:
+        print(f"    {linha['documento']}  {linha['http_status']} {linha['bytes']}B  "
+              f"sha256={linha['sha256'][:16]}…  verified_at={linha['verified_at']}")
+    print(f"recusadas (NÃO gravadas — não houve conferência real): {len(recusas)}")
+    for chave, url, motivo in recusas:
+        print(f"    {chave}  ·  {motivo}")
+
+    if not novas:
+        print("\nnada novo a gravar.")
+        return 0
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    caminho_ledger = Path(args.ledger)
+    carimbo = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    modo = 0o644
+    if caminho_ledger.is_file():
+        modo = caminho_ledger.stat().st_mode & 0o777
+        copia = BACKUP_DIR / f"{caminho_ledger.name}.{carimbo}.antes"
+        shutil.copy2(caminho_ledger, copia)
+        print(f"cópia do ledger anterior em {copia.relative_to(RAIZ)}")
+
+    caminho_ledger.parent.mkdir(parents=True, exist_ok=True)
+    todas_as_linhas = linhas_ledger_atuais + [json.dumps(linha, ensure_ascii=False) for linha in novas]
+    tmp = caminho_ledger.with_suffix(caminho_ledger.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        for linha in todas_as_linhas:
+            handle.write(linha + "\n")
+    os.chmod(tmp, modo)
+    os.replace(tmp, caminho_ledger)
+    print(f"\ngravado: {caminho_ledger.relative_to(RAIZ)} ({len(novas)} linha(s) nova(s), "
+          f"{len(todas_as_linhas)} no total)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

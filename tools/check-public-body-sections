@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""check-public-body-sections — READ-ONLY. Página indexável tem corpo no HTML?
+
+POR QUE EXISTE. Em 2026-08-12 uma auditoria concluiu que 45 páginas publicadas
+tinham "ZERO seção de corpo — só resumo + FAQ", e que 14 delas prometiam no meta
+description uma lei que o corpo nunca citava. Nenhuma das duas coisas era
+verdade. O extrator daquela auditoria localizava o corpo por `<section
+class="sec">`, e o render só emite essa classe quando a página ganha índice
+interno:
+
+    internal/render/render.go:943   const minTableOfContentsSections = 3
+    internal/render/render.go:1061  renderTableOfContents devolve "" abaixo disso
+    internal/render/render.go:471   `<section class="sec">` só quando há índice;
+                                    senão `<section>` puro
+
+Ou seja: TODA página de menos de três seções ficava invisível para o extrator, e
+o que sobrava para ele contar era exatamente resumo + FAQ. A conta batia — o
+"corpo" medido pela auditoria era, palavra por palavra, `summary + faq` (86=86+0,
+97=97+0, 100=54+46, 102=62+40, 108=61+47). A classe é um gancho de CSS para o
+contador do índice; usá-la como seletor semântico de corpo é o bug.
+
+O QUE ESTA FERRAMENTA GARANTE:
+  1. toda página indexável do published_manifest tem HTML em public/;
+  2. esse HTML tem pelo menos uma seção de CORPO de verdade — nem resumo, nem
+     FAQ, nem proveniência, nem "onde buscar", nem relacionados;
+  3. o número de seções servidas bate com o número de seções não vazias do
+     estoque canônico (data/editorial/v2_pages). É esta a checagem que fecha o
+     buraco real: o gate de severidade (tools/generate-v2-publication-severity,
+     regra `sem_corpo`) lê o JSONL e nunca olha o HTML — se a renderização
+     perder uma seção, nada reprova. Aqui reprova.
+
+O SELETOR CANÔNICO DE CORPO (use este, nunca `class="sec"`): dentro de <main>,
+um <section> de primeiro nível é corpo quando tem <h2> e NÃO é um dos blocos de
+serviço, identificados por id/classe estáveis (proveniencia, perguntas-frequentes,
+onde-buscar, conteudos-relacionados, faq, prov). O id do <h2> é incondicional no
+render — o gancho de CSS não é.
+
+Uso:
+    tools/check-public-body-sections
+    tools/check-public-body-sections --fixture   # prova que reprova de fato
+    tools/check-public-body-sections --limit 500
+    tools/check-public-body-sections --json evidencia.jsonl
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PUBLIC = ROOT / "public"
+MANIFEST = ROOT / "data/editorial/published_manifest.jsonl"
+STOCK = ROOT / "data/editorial/v2_pages"
+
+RE_MAIN = re.compile(r"<main\b[^>]*>(.*?)</main>", re.S)
+RE_OPEN_SECTION = re.compile(r"<section\b([^>]*)>")
+RE_ANY_SECTION = re.compile(r"<section\b[^>]*>|</section>")
+RE_H2 = re.compile(r"<h2\b([^>]*)>(.*?)</h2>", re.S)
+RE_ID = re.compile(r'id="([^"]*)"')
+RE_CLASS = re.compile(r'class="([^"]*)"')
+RE_LABELLEDBY = re.compile(r'aria-labelledby="([^"]*)"')
+RE_TAG = re.compile(r"<[^>]+>")
+
+# Blocos de SERVIÇO da página — tudo que não é o texto jurídico autoral.
+# Casados por id do <h2> / aria-labelledby / classe, que o render emite de forma
+# incondicional (ao contrário de .sec, que depende do índice existir).
+IDS_DE_SERVICO = frozenset({
+    "proveniencia", "perguntas-frequentes", "onde-buscar",
+    "conteudos-relacionados", "fontes", "referencias",
+})
+CLASSES_DE_SERVICO = frozenset({"faq", "prov", "cta", "related", "sources"})
+
+
+def secoes_de_primeiro_nivel(main_html: str) -> list[tuple[str, str]]:
+    """Devolve (atributos, conteúdo) de cada <section> de primeiro nível.
+
+    Conta aninhamento à mão: um <section> dentro de outro não pode encerrar o
+    de fora, e regex não equilibra sozinha.
+    """
+    achadas: list[tuple[str, str]] = []
+    cursor = 0
+    while True:
+        abertura = RE_OPEN_SECTION.search(main_html, cursor)
+        if not abertura:
+            return achadas
+        profundidade = 1
+        fim = abertura.end()
+        while profundidade > 0:
+            proxima = RE_ANY_SECTION.search(main_html, fim)
+            if not proxima:
+                fim = len(main_html)
+                break
+            profundidade += -1 if proxima.group(0).startswith("</") else 1
+            fim = proxima.end()
+        corte = max(abertura.end(), fim - len("</section>"))
+        achadas.append((abertura.group(1), main_html[abertura.end():corte]))
+        cursor = fim
+
+
+def eh_secao_de_corpo(atributos: str, conteudo: str) -> bool:
+    classe = RE_CLASS.search(atributos)
+    if classe and set(classe.group(1).split()) & CLASSES_DE_SERVICO:
+        return False
+    rotulo = RE_LABELLEDBY.search(atributos)
+    if rotulo and rotulo.group(1) in IDS_DE_SERVICO:
+        return False
+    h2 = RE_H2.search(conteudo)
+    if not h2:
+        return False
+    identificador = RE_ID.search(h2.group(1))
+    if identificador and identificador.group(1) in IDS_DE_SERVICO:
+        return False
+    return True
+
+
+def corpo_do_html(html: str) -> tuple[int, int, list[str]]:
+    """(nº de seções de corpo, nº de palavras do corpo, títulos das seções)."""
+    main = RE_MAIN.search(html)
+    if not main:
+        return 0, 0, []
+    corpo = [(a, c) for a, c in secoes_de_primeiro_nivel(main.group(1))
+             if eh_secao_de_corpo(a, c)]
+    texto = RE_TAG.sub(" ", "\n".join(c for _a, c in corpo))
+    palavras = [p for p in re.split(r"\s+", texto) if re.search(r"[0-9A-Za-zÀ-ÿ]", p)]
+    titulos = [re.sub(r"\s+", " ", RE_TAG.sub("", RE_H2.search(c).group(2))).strip()
+               for _a, c in corpo]
+    return len(corpo), len(palavras), titulos
+
+
+def secoes_do_estoque() -> dict[str, int]:
+    """intent_id -> nº de seções com texto no estoque canônico."""
+    quantas: dict[str, int] = {}
+    for shard in sorted(glob.glob(os.path.join(STOCK, "*.jsonl"))):
+        with open(shard, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                intent = registro.get("intent_id")
+                if not intent:
+                    continue
+                quantas[intent] = sum(
+                    1 for secao in (registro.get("sections") or [])
+                    if (secao.get("text") or "").strip())
+    return quantas
+
+
+def entradas_indexaveis(limite: int | None) -> list[dict]:
+    if not MANIFEST.is_file():
+        raise SystemExit(f"published_manifest ausente: {MANIFEST}")
+    linhas = []
+    with open(MANIFEST, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            entrada = json.loads(linha)
+            if entrada.get("index_policy") == "noindex":
+                continue
+            linhas.append(entrada)
+            if limite and len(linhas) >= limite:
+                break
+    return linhas
+
+
+def auditar(limite: int | None) -> tuple[list[dict], list[dict]]:
+    estoque = secoes_do_estoque()
+    achados: list[dict] = []
+    evidencia: list[dict] = []
+    for entrada in entradas_indexaveis(limite):
+        caminho_web = entrada.get("path") or ""
+        intent = entrada.get("unique_intent_id") or ""
+        arquivo = PUBLIC / caminho_web.strip("/") / "index.html"
+        if not arquivo.is_file():
+            achados.append({"path": caminho_web, "intent_id": intent,
+                            "falha": "html_ausente_para_pagina_indexavel",
+                            "detalhe": os.path.relpath(arquivo, ROOT)})
+            continue
+        html = arquivo.read_text(encoding="utf-8")
+        quantas, palavras, titulos = corpo_do_html(html)
+        no_estoque = estoque.get(intent)
+        registro = {"path": caminho_web, "intent_id": intent,
+                    "secoes_html": quantas, "palavras_corpo_html": palavras,
+                    "secoes_estoque": no_estoque, "titulos": titulos}
+        evidencia.append(registro)
+        if quantas == 0:
+            achados.append({**registro,
+                            "falha": "pagina_indexavel_sem_secao_de_corpo"})
+            continue
+        if no_estoque is None:
+            achados.append({**registro,
+                            "falha": "intent_publicado_sem_registro_no_estoque"})
+            continue
+        if quantas != no_estoque:
+            achados.append({**registro, "falha": "secoes_do_estoque_perdidas_na_renderizacao",
+                            "detalhe": f"estoque={no_estoque} html={quantas}"})
+    return achados, evidencia
+
+
+def prova_de_reprovacao() -> int:
+    """Prova, sem tocar no acervo, que o detector reprova uma página sem corpo.
+
+    Constrói duas fixtures a partir de uma página REAL: (a) uma cujo corpo foi
+    removido — tem de dar 0 seções; (b) uma cujo corpo usa <section> puro, sem
+    class="sec" — tem de continuar contando, que é justamente onde o extrator
+    da auditoria de 2026-08-12 falhou.
+    """
+    candidatas = sorted(PUBLIC.glob("*/*/index.html"))
+    modelo = None
+    for arquivo in candidatas:
+        html = arquivo.read_text(encoding="utf-8")
+        quantas, _p, _t = corpo_do_html(html)
+        if quantas >= 3 and '<section class="sec">' in html:
+            modelo = (arquivo, html, quantas)
+            break
+    if not modelo:
+        print("FIXTURE: nenhuma página com 3+ seções e class=sec para servir de "
+              "modelo", file=sys.stderr)
+        return 1
+    arquivo, html, quantas = modelo
+    print(f"fixture montada a partir de {os.path.relpath(arquivo, ROOT)} "
+          f"({quantas} seções de corpo)")
+
+    sem_corpo = re.sub(r'<section class="sec">.*?</section>\n?', "", html, flags=re.S)
+    n_sem, palavras_sem, _t = corpo_do_html(sem_corpo)
+
+    sem_classe = html.replace('<section class="sec">', "<section>")
+    n_sem_classe, _p, _t = corpo_do_html(sem_classe)
+
+    ingenuo = len(re.findall(r'<section class="sec">', sem_classe))
+
+    with tempfile.TemporaryDirectory(prefix="body-sections-fixture-") as tmp:
+        Path(tmp, "sem-corpo.html").write_text(sem_corpo, encoding="utf-8")
+        Path(tmp, "sem-classe.html").write_text(sem_classe, encoding="utf-8")
+
+    ok = True
+    print(f"  corpo removido        -> {n_sem} seções, {palavras_sem} palavras "
+          f"(esperado 0) ... {'REPROVA, correto' if n_sem == 0 else 'FALHOU'}")
+    ok &= n_sem == 0
+    print(f"  <section> sem classe  -> {n_sem_classe} seções "
+          f"(esperado {quantas}) ... "
+          f"{'APROVA, correto' if n_sem_classe == quantas else 'FALHOU'}")
+    ok &= n_sem_classe == quantas
+    print(f"  extrator ingênuo por class=\"sec\" na mesma página -> {ingenuo} "
+          f"seções: é este o falso positivo que derrubou 45 páginas em "
+          f"2026-08-12")
+    ok &= ingenuo == 0
+    print("FIXTURE: " + ("ok — o detector reprova página sem corpo e não se "
+                         "engana com <section> puro" if ok else "FALHOU"))
+    return 0 if ok else 1
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=True, description=__doc__)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="audita só as N primeiras páginas do manifesto")
+    parser.add_argument("--json", dest="destino", default=None,
+                        help="grava a evidência por página em JSONL")
+    parser.add_argument("--fixture", action="store_true",
+                        help="prova que o detector reprova, sem tocar no acervo")
+    argumentos = parser.parse_args(argv)
+
+    if argumentos.fixture:
+        return prova_de_reprovacao()
+
+    achados, evidencia = auditar(argumentos.limit)
+
+    if argumentos.destino:
+        destino = Path(argumentos.destino)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        with open(destino, "w", encoding="utf-8") as handle:
+            for registro in evidencia:
+                handle.write(json.dumps(registro, ensure_ascii=False) + "\n")
+        print(f"evidência por página: {destino}")
+
+    total = len(evidencia)
+    print(f"páginas indexáveis auditadas: {total}")
+    if evidencia:
+        magra = min(evidencia, key=lambda r: r["secoes_html"])
+        print(f"menor nº de seções de corpo: {magra['secoes_html']} "
+              f"({magra['path']}, {magra['palavras_corpo_html']} palavras)")
+
+    if not achados:
+        print("APROVADO: toda página indexável serve corpo, e o nº de seções "
+              "servidas bate com o estoque canônico")
+        return 0
+
+    from collections import Counter
+    print(f"REPROVADO: {len(achados)} página(s) com defeito de corpo",
+          file=sys.stderr)
+    for falha, quantas in Counter(a["falha"] for a in achados).most_common():
+        print(f"  {falha}: {quantas}", file=sys.stderr)
+    for achado in achados[:40]:
+        print(f"  {achado['path']} [{achado['falha']}] "
+              f"{achado.get('detalhe', '')}", file=sys.stderr)
+    if len(achados) > 40:
+        print(f"  ... e mais {len(achados) - 40}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

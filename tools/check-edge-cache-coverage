@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""check-edge-cache-coverage — quantas das paginas publicas a borda serviria se a origem caisse.
+
+POR QUE EXISTE: o aquecedor `warm-edge-cache` relata 100% de HIT ao terminar um
+passe, e esse numero e honesto — mas responde outra pergunta. Ele mede o que o
+PROPRIO GET dele acabou de colocar no cache. A pergunta que ninguem respondia e
+quanto do acervo continua quente HORAS depois, que e o unico momento em que o
+cache importa: com o tunel fora, uma URL em HIT segue servindo e uma em MISS
+devolve 530 ao visitante e ao Googlebot.
+
+A resposta, medida em 2026-08-19: 1 HIT em 30 URLs sorteadas, ~3,3% de cobertura
+— cerca de 9.400 das 9.710 paginas nao estavam protegidas. O aquecedor tinha
+reportado 9.968/9.968 HIT no passe da madrugada. Os dois numeros sao verdadeiros
+e medem coisas diferentes; faltava o segundo.
+
+O MECANISMO, para nao se procurar a causa errada: o TTL de borda e de sete dias
+(`s-maxage=604800`, confirmado na resposta), entao NAO e expiracao. E evicçao:
+cache de CDN nao e armazenamento, e um acervo de quase dez mil paginas de cauda
+longa, com pouco trafego por URL, e a primeira coisa que um PoP descarta quando
+precisa de espaco. Por isso a home, que tem trafego, aparece com `age` de
+dezesseis horas enquanto os artigos somem em poucas horas.
+
+VIES CONHECIDO E DECLARADO: esta sonda AQUECE o que mede — o GET que apura o
+estado tambem repovoa aquela URL. Por isso a amostra e pequena de proposito
+(padrao 40 de 9.710, cerca de 0,4%): grande o bastante para estimar, pequena o
+bastante para nao virar um aquecedor disfarcado. E por isso a serie guarda
+`amostra_pct`, para que ninguem leia a serie como se a sonda fosse inocua.
+
+ANTI-FRAUDE: toda requisicao sai com User-Agent proprio e cabecalho de
+warming. O nginx ja separa esse cabecalho do trafego de audiencia. Sonda que se
+confunde com visita contamina a metrica que decide conteudo, e essa e a falta
+mais grave deste repositorio.
+
+Serie em data/ops/edge_cache_coverage.jsonl — no repo, versionavel, nunca em /tmp.
+
+Uso:
+    tools/check-edge-cache-coverage
+    tools/check-edge-cache-coverage --amostra 100 --json
+"""
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wikiuniverso  # noqa: E402
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+HISTORICO = os.path.join(ROOT, "data/ops/edge_cache_coverage.jsonl")
+NOTIFICADOR = os.path.join(ROOT, "tools/notify-owner")
+SCHEMA = "edge_cache_coverage_v1"
+
+# Identidade propria da sonda. Nao imita crawler nenhum: o contrato deste repo
+# proibe requisicao com User-Agent de bot real contra o host publico, porque isso
+# injetaria trafego falso na telemetria que decide conteudo.
+AGENTE = "wikijuridica-edge-audit/1.0"
+MARCA_WARMING = "X-Warming-Request: true"
+
+# Abaixo disto o acervo esta majoritariamente desprotegido. Nao e numero redondo
+# escolhido por gosto: com 20% de cobertura, uma queda de tunel de cinco minutos
+# — a duracao medida do incidente de 2026-08-08 — deixaria quatro de cada cinco
+# paginas devolvendo 530 a quem pedisse, crawler incluido.
+COBERTURA_BAIXA_PCT = 20.0
+COBERTURA_CRITICA_PCT = 5.0
+
+
+def agora():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def urls_do_sitemap():
+    """Universo de URLs publicas, derivado do INDICE que o portal anuncia.
+
+    FAMILIA-A (corrigido em 2026-08-29, BUG-014 da caca): esta funcao fazia
+    glob de public/sitemaps/*.xml e somava os 62 arquivos do disco — os 34
+    anunciados MAIS os 28 em carencia, que existem de proposito para servir 200
+    a quem tem o indice anterior e NAO sao anunciados a ninguem.
+
+    O efeito medido nao foi academico: o universo inflou de 10.336 para 18.726
+    (+81,6%), e o alerta derivado disse ao dono, com severidade alta, que
+    "~18726 paginas devolveriam 530 se o tunel cair". O numero certo e a metade.
+    Alerta critico com numero errado dessensibiliza para o alerta verdadeiro,
+    que e o dano real.
+
+    A duplicacao era pura: as URLs exclusivas dos shards retirados eram ZERO.
+    """
+    urls = wikiuniverso.urls_publicas(ROOT)
+    # Descarta raiz e hubs de primeiro nivel: eles tem trafego proprio e ficam
+    # quentes por isso, o que inflaria a cobertura do ACERVO, que e o que importa.
+    return [u for u in urls if u.rstrip("/").count("/") > 3]
+
+
+def sondar(url, timeout=12):
+    """Um GET de cabecalho. Devolve (estado_de_cache, idade, pop, http)."""
+    comando = ["curl", "-sS", "-I", "--max-time", str(timeout),
+               "-A", AGENTE, "-H", MARCA_WARMING, url]
+    try:
+        resultado = subprocess.run(comando, capture_output=True, text=True,
+                                   timeout=timeout + 8)
+    except (subprocess.SubprocessError, OSError):
+        return None, None, None, None
+    cabecalhos = resultado.stdout.lower()
+    estado = re.search(r"cf-cache-status:\s*(\w+)", cabecalhos)
+    idade = re.search(r"\bage:\s*(\d+)", cabecalhos)
+    pop = re.search(r"cf-ray:\s*\S+-(\w+)", cabecalhos)
+    http = re.search(r"^http/[\d.]+\s+(\d{3})", cabecalhos, re.M)
+    return (estado.group(1).upper() if estado else None,
+            int(idade.group(1)) if idade else None,
+            pop.group(1).upper() if pop else None,
+            int(http.group(1)) if http else None)
+
+
+def intervalo_wilson(sucessos, total, z=1.96):
+    """Intervalo de confianca de Wilson.
+
+    Nao e o intervalo normal simples: com proporcao perto de zero — exatamente o
+    caso aqui — o intervalo normal produz limite inferior NEGATIVO, que nao
+    existe. Wilson se comporta bem nas pontas, e a ponta e onde este numero vive.
+    """
+    if total == 0:
+        return 0.0, 0.0
+    p = sucessos / total
+    denominador = 1 + z * z / total
+    centro = (p + z * z / (2 * total)) / denominador
+    margem = z * math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / denominador
+    return max(0.0, (centro - margem) * 100), min(100.0, (centro + margem) * 100)
+
+
+def avisar(chave, severidade, titulo, mensagem, evidencia, resolvido=False):
+    comando = [NOTIFICADOR, "--chave", chave, "--titulo", titulo,
+               "--mensagem", mensagem, "--origem", "check-edge-cache-coverage"]
+    if resolvido:
+        comando.append("--resolvido")
+    else:
+        comando += ["--severidade", severidade, "--evidencia", evidencia]
+    try:
+        subprocess.run(comando, capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def main():
+    analisador = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    analisador.add_argument("--amostra", type=int, default=40,
+                            help="URLs sorteadas (padrao 40; a sonda aquece o que mede)")
+    analisador.add_argument("--json", action="store_true")
+    analisador.add_argument("--sem-alerta", action="store_true")
+    # ★ GRAVAR E OPT-IN, e a inversao e o ponto (BUG-236).
+    #
+    # AGENTS.md:371: "Wrapper check-* deve ser read-only para artefatos
+    # rastreados." data/ops/edge_cache_coverage.jsonl E rastreado, e este check
+    # gravava nele a cada execucao.
+    #
+    # Nao e formalidade: a sonda AQUECE o que mede -- o proprio evento carrega
+    # `sonda_aquece_o_que_mede: true`. Com a gravacao acoplada ao check, duas
+    # execucoes na mesma hora deixavam duas linhas na serie, e a segunda media o
+    # rastro que a primeira acabou de aquecer. E o defeito que o
+    # check-edge-cache-coverage-honesty apanha em oito pares consecutivos
+    # (linhas 93 a 100, de 26 e 27 de agosto), e que ja produziu um 100% falso em
+    # 2026-08-19.
+    #
+    # Quem grava agora e tools/generate-edge-cache-coverage, que existe para isso.
+    analisador.add_argument("--gravar", action="store_true",
+                            help="anexa a medicao ao ledger; so o generate-* usa")
+    argumentos = analisador.parse_args()
+
+    instante = agora()
+    universo = urls_do_sitemap()
+    if not universo:
+        print("erro: nenhum sitemap legivel em public/sitemaps/", file=sys.stderr)
+        return 2
+
+    # Semente derivada da HORA, e nao do dia.
+    #
+    # A primeira versao usava o dia, com a intencao de "comparar igual com igual"
+    # entre execucoes. O efeito foi o oposto, e foi medido no mesmo dia em que o
+    # codigo nasceu: a segunda execucao sorteou exatamente as 40 URLs que a
+    # primeira tinha acabado de aquecer e reportou 100,0% de cobertura — a sonda
+    # mediu o proprio rastro e produziu um numero falso, do tipo que este
+    # repositorio proibe.
+    #
+    # Por hora, cada execucao pega um conjunto diferente e o que ela mede e o
+    # estado do acervo, nao o da execucao anterior. O custo e variancia entre
+    # pontos; a serie de doze pontos por dia absorve isso, e um numero ruidoso e
+    # honesto vale mais que um numero limpo e errado.
+    semente = int(hashlib.blake2b(instante.strftime("%Y-%m-%dT%H").encode(),
+                                  digest_size=8).hexdigest(), 16)
+    sorteio = random.Random(semente)
+    amostra = sorteio.sample(universo, min(argumentos.amostra, len(universo)))
+
+    quentes, frias, nao_cacheaveis, erros = 0, 0, 0, 0
+    idades, pops, estados = [], {}, {}
+    for url in amostra:
+        estado, idade, pop, http = sondar(url)
+        if estado is None or http is None:
+            erros += 1
+            continue
+        estados[estado] = estados.get(estado, 0) + 1
+        if pop:
+            pops[pop] = pops.get(pop, 0) + 1
+        if estado == "HIT":
+            quentes += 1
+            if idade is not None:
+                idades.append(idade)
+        elif estado in ("MISS", "EXPIRED", "REVALIDATED"):
+            frias += 1
+        else:
+            # DYNAMIC/BYPASS: a borda nao considerou a resposta cacheavel. E
+            # defeito de REGRA de cache, nao acervo frio — e some se for contado
+            # como MISS. Foi exatamente isso que passou 48h sem alarme em
+            # 2026-08-17/18, porque o aquecedor so contava resposta != 200.
+            nao_cacheaveis += 1
+
+    medidas = quentes + frias + nao_cacheaveis
+    cobertura = (100.0 * quentes / medidas) if medidas else 0.0
+    baixo, alto = intervalo_wilson(quentes, medidas)
+
+    evento = {
+        "schema_version": SCHEMA,
+        "medido_em": instante.isoformat(),
+        "universo_urls": len(universo),
+        "amostra_pedida": argumentos.amostra,
+        "amostra_medida": medidas,
+        "amostra_pct": round(100.0 * medidas / len(universo), 3) if universo else 0.0,
+        "quentes": quentes,
+        "frias": frias,
+        "nao_cacheaveis": nao_cacheaveis,
+        "erros_de_sonda": erros,
+        "cobertura_pct": round(cobertura, 2),
+        "cobertura_ic95_baixo": round(baixo, 2),
+        "cobertura_ic95_alto": round(alto, 2),
+        "paginas_protegidas_estimadas": int(len(universo) * cobertura / 100),
+        "paginas_expostas_estimadas": int(len(universo) * (100 - cobertura) / 100),
+        "idade_hit_min_s": min(idades) if idades else None,
+        "idade_hit_max_s": max(idades) if idades else None,
+        "estados": estados,
+        "pops": pops,
+        "agente": AGENTE,
+        "sonda_aquece_o_que_mede": True,
+        # Chave da amostra: permite detectar, na serie, duas medicoes que caíram
+        # sobre o mesmo conjunto — o defeito que produziu um 100% falso em
+        # 2026-08-19.
+        "chave_amostra": instante.strftime("%Y-%m-%dT%H"),
+    }
+
+    if argumentos.gravar:
+        os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+        with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+            arquivo.write(json.dumps(evento, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if not argumentos.sem_alerta:
+        if nao_cacheaveis and nao_cacheaveis >= medidas * 0.5:
+            avisar("borda-cache-regra", "critica",
+                   "Regra de cache da borda nao esta cacheando",
+                   "%d de %d URLs vieram nao-cacheaveis: o acervo inteiro fica exposto"
+                   % (nao_cacheaveis, medidas),
+                   "tools/check-edge-cache-coverage")
+        elif cobertura < COBERTURA_CRITICA_PCT:
+            avisar("borda-cobertura", "alta",
+                   "Acervo praticamente sem cache na borda",
+                   "cobertura de %.1f%% (IC95 %.1f-%.1f%%): ~%d paginas devolveriam "
+                   "530 se o tunel cair"
+                   % (cobertura, baixo, alto, evento["paginas_expostas_estimadas"]),
+                   "tools/check-edge-cache-coverage --amostra %d" % medidas)
+        elif cobertura < COBERTURA_BAIXA_PCT:
+            avisar("borda-cobertura", "media",
+                   "Cobertura de cache baixa na borda",
+                   "cobertura de %.1f%% (IC95 %.1f-%.1f%%): ~%d paginas expostas"
+                   % (cobertura, baixo, alto, evento["paginas_expostas_estimadas"]),
+                   "tools/check-edge-cache-coverage --amostra %d" % medidas)
+        else:
+            avisar("borda-cobertura", "info", "Cobertura de cache normalizada",
+                   "cobertura de %.1f%%" % cobertura, "", resolvido=True)
+
+    if argumentos.json:
+        print(json.dumps(evento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("cobertura %.1f%% (IC95 %.1f-%.1f%%) | %d quentes, %d frias, "
+              "%d nao-cacheaveis de %d medidas (%.3f%% do acervo)"
+              % (cobertura, baixo, alto, quentes, frias, nao_cacheaveis, medidas,
+                 evento["amostra_pct"]))
+        print("  universo %d URLs -> ~%d protegidas, ~%d exporiam 530 com o tunel fora"
+              % (len(universo), evento["paginas_protegidas_estimadas"],
+                 evento["paginas_expostas_estimadas"]))
+        if idades:
+            print("  idade dos HIT: %ds a %ds" % (min(idades), max(idades)))
+        print("  PoPs: %s | estados: %s" % (", ".join(sorted(pops)), estados))
+    return 0 if cobertura >= COBERTURA_BAIXA_PCT else 1
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

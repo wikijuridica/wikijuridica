@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""generate-v2-blocked-drafts-promotion-20260812 — promove as 30 páginas redigidas que nunca chegaram ao acervo.
+
+O QUE ESTAVA PRESO. `data/editorial/v2_blocked_drafts/` guarda 1.838 registros de
+páginas que foram REDIGIDAS e tiveram fonte oficial pesquisada, mas que o CAS
+recusou promover por defeito de sistema. Medição de 2026-08-12: 1.808 delas já
+existem no acervo vivo (1.798 praticamente idênticas), e 10 divergem do vivo
+sendo a versão viva a mais longa. Sobram **30** que não existem em lugar nenhum
+do acervo — texto pago e nunca aproveitado. O motivo do bloqueio não foi
+editorial: 22 pararam em "w7-write-only: aguardando driver", 7 em
+"w6-write-only" e 1 em "intent strict sem source_hints materializados".
+
+A AUDITORIA QUE PRECEDEU ESTA PROMOÇÃO (2026-08-12). As 30 foram lidas
+integralmente, uma a uma, e cada atribuição normativa do corpo foi conferida
+contra o texto oficial em `data/legal-corpus/` — 102 ocorrências de norma em 30
+páginas. Resultado registrado no arquivo de dados ao lado: todas as atribuições
+de direito brasileiro conferem literalmente (Lei 8.245/1991 arts. 5º, 9º, 17 a
+19, 22, 46, 47 e 54; Lei 4.591/1964 arts. 31-C, 31-F, 32, 43, 50 e 66; Lei
+15.040/2024 arts. 118 e 119; Lei 9.656/1998 arts. 10, 12, 17 e 35-C, com os §§ 12
+e 13 da Lei 14.454/2022; CPC arts. 442 e 610; CC arts. 227, 421 e 422; CDC arts.
+6º, 30, 47 e 51; Lei 6.015/1973 art. 167).
+
+CINCO PÁGINAS FORAM CORRIGIDAS, NENHUMA DESCARTADA:
+
+  cid-italiana-por-casamento — P1, citação mal atribuída. O texto dizia que a
+      legislação italiana revoga a cidadania por casamento quando se comprova em
+      processo penal que o vínculo era simulado. A fonte oficial do Ministero
+      dell'Interno (consultada em 2026-08-12, sha256 no arquivo de dados) mostra
+      que a revoca é o instituto do art. 10-bis da Legge 91/1992, introduzido
+      pelo DL 113/2018 convertido na Legge 132/2018, alcançando os casos
+      EXPRESSAMENTE previstos naquele artigo — o casamento simulado não é o
+      gatilho descrito ali. Reescrito para afirmar só o que a fonte sustenta.
+  imob-locacao-residencial-verbal — precisão: o art. 22, VIII, da Lei 8.245/1991
+      fala em "prêmio de seguro COMPLEMENTAR contra fogo".
+  saude-home-care-atraso-estruturacao-alta-hospitalar,
+  sfb-bariatrica-tecnica-cirurgica-imposta-pelo-plano,
+  sfb-alta-psiquiatrica-forcada-auditor — proveniência: a fonte do CDC entrava
+      com anchor_claim de preenchimento ("texto oficial vigente da norma no
+      Planalto"), que não diz o que a fonte sustenta. Trocado pelo dispositivo
+      que o corpo de cada página efetivamente invoca.
+
+O TEXTO ANTERIOR NÃO SE PERDE: o registro em `v2_blocked_drafts/` conserva o
+`page` original byte a byte; esta ferramenta só ACRESCENTA a chave `resolved`.
+
+CONTRATO DE ESCRITA (o mesmo de generate-v2-atribuicao-dispositivo-repair-20260812):
+lease de época do estoque canônico, lock exclusivo próprio, CAS por destino
+(ausência do arquivo no shard novo; sha256 do arquivo inteiro no shard vivo),
+linhas preexistentes preservadas byte a byte, forma de serialização do destino
+preservada, word_count recalculado pela fórmula do ingest, escrita atômica com
+fsync de arquivo e de diretório, idempotente. NÃO commita e NÃO publica.
+
+Uso:
+    tools/generate-v2-blocked-drafts-promotion-20260812 --dry-run
+    tools/generate-v2-blocked-drafts-promotion-20260812
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.blocked-drafts-promotion-20260812.lock"
+DADOS = Path(__file__).with_suffix(".data.json")
+PAGES = ROOT / "data/editorial/v2_pages"
+BLOQUEADAS = ROOT / "data/editorial/v2_blocked_drafts"
+PORTFOLIO = ROOT / "data/editorial/portfolio_v2"
+
+ONDA = "W7-recuperacao-bloqueados-20260812"
+PROMOVIDO_EM = "2026-08-12"
+
+# Nenhum texto público pode prometer resultado (Provimento OAB 205/2021) nem
+# deixar vazar vocabulário interno do pipeline.
+TEXTOS_PROIBIDOS = (
+    "garantimos", "asseguramos o êxito", "êxito garantido", "resultado garantido",
+    "com certeza", "sempre ganha", "vitória certa", "jurisprudência pacífica",
+    "entendimento pacificado", "indenização garantida",
+    "rascunho", "release gate", "paid_intent", "word_count", "intent_id",
+)
+
+CAMPOS_OBRIGATORIOS = (
+    "intent_id", "title", "h1", "meta_description", "opening", "sections",
+    "faq", "official_sources", "internal_link_topics", "lane", "word_count",
+)
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def word_count(record: dict) -> int:
+    """Reproduz bodyWordCount de internal/v2ingest/validate.go."""
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def slug(*parts: str) -> str:
+    tokens: list[str] = []
+    for part in parts:
+        folded = unicodedata.normalize("NFKD", part or "")
+        folded = "".join(c for c in folded if not unicodedata.combining(c))
+        tokens += [t for t in re.split(r"[^a-z0-9]+", folded.lower()) if t]
+    return "-".join(tokens)
+
+
+def rota_de(intent_id: str, practice_area: str) -> str:
+    """Replica publicPathFor de internal/v2internallinkgraph/graph.go (DEC-008)."""
+    separador = intent_id.find("-")
+    if separador <= 0:
+        return ""
+    seed = intent_id[separador + 1:]
+    if not seed or not practice_area:
+        return ""
+    return "/" + slug(practice_area) + "/" + slug(seed) + "/"
+
+
+def forma_de_serializacao(linha: str):
+    """Descobre a forma de serialização usada por uma linha viva do destino."""
+    original = json.loads(linha)
+    for separadores in ((", ", ": "), (",", ":")):
+        if json.dumps(original, ensure_ascii=False,
+                      separators=separadores) == linha:
+            return separadores
+    return None
+
+
+def carregar_dados() -> dict:
+    with DADOS.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def indexar_areas() -> dict[str, str]:
+    areas: dict[str, str] = {}
+    for caminho in sorted(PORTFOLIO.glob("*.jsonl")):
+        with caminho.open(encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if intent and registro.get("practice_area"):
+                    areas[intent] = registro["practice_area"]
+    return areas
+
+
+def universo_vivo() -> tuple[dict[str, tuple[str, int]], dict[str, str]]:
+    """Devolve (intent_id -> shard:linha) e (rota -> intent_id) do acervo vivo."""
+    areas = indexar_areas()
+    intents: dict[str, tuple[str, int]] = {}
+    rotas: dict[str, str] = {}
+    for caminho in sorted(PAGES.glob("*.jsonl")):
+        with caminho.open(encoding="utf-8") as handle:
+            for numero, linha in enumerate(handle, 1):
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                intent = registro.get("intent_id")
+                if not intent:
+                    continue
+                intents[intent] = (caminho.name, numero)
+                rota = rota_de(intent, areas.get(intent, ""))
+                if rota:
+                    rotas.setdefault(rota, intent)
+    return intents, rotas
+
+
+def coletar_alvos(vivos: dict[str, tuple[str, int]]) -> dict[str, list[dict]]:
+    """Agrupa por shard de destino os bloqueados ausentes do acervo vivo."""
+    por_destino: dict[str, list[dict]] = {}
+    for caminho in sorted(BLOQUEADAS.glob("*.jsonl")):
+        with caminho.open(encoding="utf-8") as handle:
+            for numero, linha in enumerate(handle, 1):
+                linha = linha.strip()
+                if not linha:
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if not intent or intent in vivos:
+                    continue
+                por_destino.setdefault(caminho.name, []).append({
+                    "origem": caminho.name,
+                    "linha": numero,
+                    "intent_id": intent,
+                    "page": registro["page"],
+                })
+    return por_destino
+
+
+def aplicar_correcoes(pagina: dict, correcoes: list[dict]) -> list[str]:
+    """Aplica, por CAS de trecho, as correções apuradas na auditoria."""
+    aplicadas: list[str] = []
+    for correcao in correcoes:
+        if correcao["intent_id"] != pagina["intent_id"]:
+            continue
+        campo = correcao["campo"]
+        if campo.startswith("official_sources["):
+            indice = int(campo[len("official_sources["):-1])
+            fonte = pagina["official_sources"][indice]
+            if fonte.get("anchor_claim") == correcao["claim_para"]:
+                continue
+            if fonte.get("anchor_claim") != correcao["claim_de"]:
+                raise SystemExit(
+                    f"CAS falhou em {pagina['intent_id']} {campo}: "
+                    f"anchor_claim observado {fonte.get('anchor_claim')!r}")
+            if fonte.get("name") != correcao["name_de"]:
+                raise SystemExit(
+                    f"CAS falhou em {pagina['intent_id']} {campo}: "
+                    f"name observado {fonte.get('name')!r}")
+            fonte["name"] = correcao["name_para"]
+            fonte["anchor_claim"] = correcao["claim_para"]
+            aplicadas.append(f"{campo} ({correcao['classe']})")
+            continue
+        casamento = re.fullmatch(r"sections\[(\d+)\]\.text", campo)
+        if not casamento:
+            raise SystemExit(f"campo de correção não suportado: {campo}")
+        secao = pagina["sections"][int(casamento.group(1))]
+        texto = secao.get("text") or ""
+        if correcao["para"] in texto:
+            continue
+        if texto.count(correcao["de"]) != 1:
+            raise SystemExit(
+                f"CAS de trecho falhou em {pagina['intent_id']} {campo}: "
+                f"{texto.count(correcao['de'])} ocorrência(s) do trecho antigo")
+        secao["text"] = texto.replace(correcao["de"], correcao["para"])
+        aplicadas.append(f"{campo} ({correcao['classe']})")
+    return aplicadas
+
+
+def validar(pagina: dict) -> None:
+    for campo in CAMPOS_OBRIGATORIOS:
+        if campo not in pagina or pagina[campo] in (None, "", []):
+            raise SystemExit(f"{pagina.get('intent_id')}: campo obrigatório ausente: {campo}")
+    visivel = " \n ".join([
+        pagina["title"], pagina["h1"], pagina["meta_description"], pagina["opening"],
+        *[s.get("heading", "") for s in pagina["sections"]],
+        *[s.get("text", "") for s in pagina["sections"]],
+        *[q.get("q", "") for q in pagina.get("faq", [])],
+        *[q.get("a", "") for q in pagina.get("faq", [])],
+    ]).lower()
+    for proibido in TEXTOS_PROIBIDOS:
+        if proibido in visivel:
+            raise SystemExit(f"{pagina['intent_id']}: texto proibido no corpo: {proibido!r}")
+    if not 20 <= len(pagina["title"]) <= 65:
+        raise SystemExit(f"{pagina['intent_id']}: title com {len(pagina['title'])} caracteres")
+    if not 70 <= len(pagina["meta_description"]) <= 160:
+        raise SystemExit(
+            f"{pagina['intent_id']}: meta_description com "
+            f"{len(pagina['meta_description'])} caracteres")
+
+
+def preflight(por_destino: dict[str, list[dict]], rotas_vivas: dict[str, str],
+              areas: dict[str, str], correcoes: list[dict]) -> dict[str, list[dict]]:
+    rotas_novas: dict[str, str] = {}
+    total = 0
+    for destino in sorted(por_destino):
+        caminho = PAGES / destino
+        existe = caminho.exists()
+        print(f"\n{destino} — {'shard vivo (append)' if existe else 'shard novo'}, "
+              f"{len(por_destino[destino])} página(s)")
+        for alvo in por_destino[destino]:
+            pagina = alvo["page"]
+            area = areas.get(alvo["intent_id"], "")
+            if not area:
+                raise SystemExit(f"{alvo['intent_id']}: sem practice_area no portfólio")
+            rota = rota_de(alvo["intent_id"], area)
+            if not rota:
+                raise SystemExit(f"{alvo['intent_id']}: rota não derivável")
+            if rota in rotas_vivas:
+                raise SystemExit(
+                    f"{alvo['intent_id']}: rota {rota} colide com "
+                    f"{rotas_vivas[rota]} no acervo vivo")
+            if rota in rotas_novas:
+                raise SystemExit(
+                    f"{alvo['intent_id']}: rota {rota} colide com "
+                    f"{rotas_novas[rota]} no próprio lote")
+            rotas_novas[rota] = alvo["intent_id"]
+            aplicadas = aplicar_correcoes(pagina, correcoes)
+            declarado = pagina.get("word_count")
+            pagina["word_count"] = word_count(pagina)
+            validar(pagina)
+            alvo["rota"] = rota
+            marca = "corrigida: " + "; ".join(aplicadas) if aplicadas else "como redigida"
+            aviso = "" if declarado == pagina["word_count"] else \
+                f" word_count {declarado} -> {pagina['word_count']}"
+            print(f"  {alvo['intent_id']:<52} {rota:<58} "
+                  f"{pagina['word_count']:>4} palavras  {marca}{aviso}")
+            total += 1
+    print(f"\npreflight: {total} página(s), {len(rotas_novas)} rota(s) única(s), "
+          f"zero colisão")
+    return por_destino
+
+
+def escrever_shard(destino: str, alvos: list[dict], dry_run: bool) -> int:
+    caminho = PAGES / destino
+    if caminho.exists():
+        bruto = caminho.read_bytes()
+        antes = hashlib.sha256(bruto).hexdigest()
+        linhas_vivas = bruto.decode("utf-8").splitlines()
+        separadores = None
+        for linha in linhas_vivas:
+            if linha.strip():
+                separadores = forma_de_serializacao(linha.strip())
+                break
+        print(f"  CAS: {destino} existe, sha256 {antes[:16]}, "
+              f"{len(linhas_vivas)} linha(s) preservada(s)")
+    else:
+        linhas_vivas = []
+        separadores = (", ", ": ")
+        print(f"  CAS: {destino} ausente — criação")
+    if separadores is None:
+        separadores = (", ", ": ")
+        print("  aviso: forma de serialização do destino não reconhecida; "
+              "emitindo na forma padrão", file=sys.stderr)
+
+    novas = [json.dumps(alvo["page"], ensure_ascii=False, separators=separadores)
+             for alvo in alvos]
+    payload = ("\n".join(linhas_vivas + novas) + "\n").encode("utf-8")
+    if dry_run:
+        print(f"  --dry-run: gravaria {len(novas)} linha(s) nova(s), "
+              f"total {len(linhas_vivas) + len(novas)}")
+        for indice, alvo in enumerate(alvos, len(linhas_vivas) + 1):
+            alvo["gravado_em"] = f"data/editorial/v2_pages/{destino}:{indice}"
+        return 0
+    atomic_write(caminho, payload)
+    for indice, alvo in enumerate(alvos, len(linhas_vivas) + 1):
+        alvo["gravado_em"] = f"data/editorial/v2_pages/{destino}:{indice}"
+        alvo["sha256_linha"] = hashlib.sha256(
+            novas[indice - len(linhas_vivas) - 1].encode("utf-8")).hexdigest()
+    print(f"  gravado: {len(novas)} linha(s) nova(s), total "
+          f"{len(linhas_vivas) + len(novas)}, sha256 "
+          f"{hashlib.sha256(payload).hexdigest()[:16]}")
+    return len(novas)
+
+
+def marcar_resolvidos(alvos_por_origem: dict[str, list[dict]], dry_run: bool) -> int:
+    """Acrescenta a chave `resolved`; o `page` original fica intocado."""
+    marcados = 0
+    for origem in sorted(alvos_por_origem):
+        caminho = BLOQUEADAS / origem
+        bruto = caminho.read_text(encoding="utf-8")
+        linhas = bruto.splitlines()
+        por_linha = {alvo["linha"]: alvo for alvo in alvos_por_origem[origem]}
+        saida: list[str] = []
+        alterados = 0
+        for numero, linha in enumerate(linhas, 1):
+            if numero not in por_linha or not linha.strip():
+                saida.append(linha)
+                continue
+            registro = json.loads(linha)
+            if registro.get("resolved"):
+                saida.append(linha)
+                continue
+            alvo = por_linha[numero]
+            registro["resolved"] = {
+                "status": "promoted",
+                "promoted_at": PROMOVIDO_EM,
+                "wave": ONDA,
+                "target": alvo.get("gravado_em", ""),
+                "public_route": alvo.get("rota", ""),
+                "post_provenance_sha256": alvo.get("sha256_linha", ""),
+                "note": ("pagina auditada linha a linha, citacoes conferidas contra "
+                         "data/legal-corpus/ e promovida via CAS na onda W7; "
+                         "nao reescrever nem repromover"),
+            }
+            separadores = forma_de_serializacao(linha) or (", ", ": ")
+            saida.append(json.dumps(registro, ensure_ascii=False,
+                                    separators=separadores))
+            alterados += 1
+        if not alterados:
+            print(f"  {origem}: já marcado")
+            continue
+        if dry_run:
+            print(f"  --dry-run: marcaria {alterados} registro(s) em {origem}")
+        else:
+            atomic_write(caminho, ("\n".join(saida) + "\n").encode("utf-8"))
+            print(f"  {origem}: {alterados} registro(s) marcado(s) como resolved")
+        marcados += alterados
+    return marcados
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    dados = carregar_dados()
+    correcoes = dados["correcoes"]
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                areas = indexar_areas()
+                vivos, rotas_vivas = universo_vivo()
+                por_destino = coletar_alvos(vivos)
+                if not por_destino:
+                    print("nada a promover: todos os bloqueados já estão no acervo.")
+                    return 0
+                por_destino = preflight(por_destino, rotas_vivas, areas, correcoes)
+
+                gravadas = 0
+                print()
+                for destino in sorted(por_destino):
+                    print(destino)
+                    gravadas += escrever_shard(destino, por_destino[destino],
+                                               args.dry_run)
+                por_origem: dict[str, list[dict]] = {}
+                for alvos in por_destino.values():
+                    for alvo in alvos:
+                        por_origem.setdefault(alvo["origem"], []).append(alvo)
+                print("\nfila de recuperação:")
+                marcados = marcar_resolvidos(por_origem, args.dry_run)
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print(f"\n--dry-run: {sum(len(v) for v in por_destino.values())} página(s) "
+              f"promovível(is), {marcados} marcação(ões) pendente(s). Nada escrito.")
+        return 0
+    print(f"\n{gravadas} página(s) promovida(s), {marcados} registro(s) "
+          f"marcado(s) como resolved.")
+    print("NÃO commitado e NÃO publicado: a cadeia de release é do maestro.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

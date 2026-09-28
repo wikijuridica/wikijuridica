@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+# check-ingress-security-headers — mede, numa instância nginx DESCARTÁVEL, o que a
+# proposta de ops/proposed/ realmente emite na borda.
+#
+# Read-only sobre o repositório (convenção tools/check-*): nada em ops/nginx/,
+# ops/cloudflared/ ou ops/systemd/ é tocado, nenhum sinal é mandado ao nginx de
+# produção. Toda a medição acontece num prefixo temporário próprio, com porta,
+# pid, logs e docroot próprios.
+#
+# POR QUE ISTO EXISTE
+# -------------------
+# A adoção de ops/proposed/ é a única ação desta frente que exige o dono
+# (`nginx -t && systemctl reload nginx`). Ele não deve executá-la baseado em
+# afirmação de agente: este script reproduz a medição inteira em ~10 s e falha
+# com mensagem específica se qualquer garantia tiver regredido.
+#
+# O QUE PROVA
+#   1. header duplicado: config ATUAL de produção vs PROPOSTA, contando linhas;
+#   2. baseline de segurança nos DOIS caminhos (estático de disco e proxiado);
+#   3. Cache-Control por rota — /healthz volta a ser no-store de verdade;
+#   4. página de erro do ingress em PT-BR (502) sem perder a política;
+#   5. dotfile negado sem engolir /.well-known/;
+#   6. www → apex em 301;
+#   7. gzip em application/json;
+#   8. modo de arquivo das páginas de erro (worker do nginx não roda como o dono
+#      do repositório: 0600 vira página em inglês só em produção).
+#
+# Uso: ./tools/check-ingress-security-headers [--keep]
+#      --keep mantém o prefixo temporário para inspeção manual.
+
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+NGINX_BIN="${NGINX_BIN:-/usr/sbin/nginx}"
+KEEP=0
+[[ "${1:-}" == "--keep" ]] && KEEP=1
+
+command -v "$NGINX_BIN" >/dev/null 2>&1 || {
+	echo "FALHA: $NGINX_BIN ausente"
+	exit 2
+}
+
+# A SONDA DO PROPRIO PORTAL TEM IDENTIDADE, E ELA E OBRIGATORIA (CLAUDE.md secao
+# 11). Ate 2026-09-10 todo `curl` daqui saia como `curl/8.x`: anonimo no log e,
+# pior, indistinguivel de visita humana na METRICA — o portal media o proprio
+# eco. `wikijuridica-superficie-probe/1.0` e o nome que o contrato fixa para a
+# sonda interna, e `X-Warming-Request: true` e o que
+# `internal/httpserver/access_log.go` le para gravar `warming=true` e manter a
+# requisicao FORA da contagem de trafego.
+#
+# A funcao SOMBREIA o comando: assim nenhuma chamada nova nasce muda, que e como
+# esta divida apareceu. `command curl` chama o binario real e evita recursao.
+UA_SONDA="wikijuridica-superficie-probe/1.0"
+curl() { command curl -A "$UA_SONDA" -H "X-Warming-Request: true" "$@"; }
+
+WORK="$(mktemp -d /tmp/wj-ingress-probe.XXXXXX)"
+
+# Porta LIVRE pedida ao kernel, nunca um número fixo. Em 2026-08-04 a primeira
+# execução usou 18089 fixo e caiu num servidor de OUTRA frente que já estava ali
+# (var/deploy-staging-20260804): o upstream falso não subiu, e a medição inteira
+# rodou contra um processo desconhecido — verde enganoso, o pior resultado
+# possível. Porta efêmera + verificação de bind eliminam a classe do erro.
+pick_free_port() {
+	python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()'
+}
+PORT_INGRESS="$(pick_free_port)"
+PORT_UPSTREAM="$(pick_free_port)"
+[[ -n "$PORT_INGRESS" && -n "$PORT_UPSTREAM" ]] || {
+	echo "FALHA: não consegui portas livres"
+	exit 2
+}
+
+FAILURES=0
+CHECKS=0
+declare -a REPORT
+
+cleanup() {
+	[[ -f "$WORK/nginx.pid" ]] && "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" -s stop >/dev/null 2>&1
+	[[ -n "${UPSTREAM_PID:-}" ]] && kill "$UPSTREAM_PID" >/dev/null 2>&1
+	wait "${UPSTREAM_PID:-}" 2>/dev/null
+	if [[ $KEEP -eq 1 ]]; then echo "prefixo mantido em $WORK"; else rm -rf "$WORK"; fi
+}
+trap cleanup EXIT
+
+ok() {
+	CHECKS=$((CHECKS + 1))
+	REPORT+=("  OK   $1")
+}
+fail() {
+	CHECKS=$((CHECKS + 1))
+	FAILURES=$((FAILURES + 1))
+	REPORT+=("  FALHA $1")
+}
+assert_eq() { # <esperado> <obtido> <descrição>
+	if [[ "$1" == "$2" ]]; then ok "$3 ($2)"; else fail "$3 — esperado [$1], obtido [$2]"; fi
+}
+
+# ---------------------------------------------------------------- staging tree
+# As configs do repositório apontam para o caminho FINAL (/opt/wiki/ops/nginx),
+# que ainda não existe: é isso que a adoção cria. Aqui o prefixo é reescrito para
+# a árvore temporária, e só aqui.
+mkdir -p "$WORK/ops/nginx/error-pages" "$WORK/docroot/.git" "$WORK/docroot/.well-known" "$WORK/logs" "$WORK/tmp"
+for conf in wj-security-headers.conf wj-proxy-hide-security-headers.conf wj-error-pages.conf; do
+	sed "s#/opt/wiki/ops/nginx#$WORK/ops/nginx#g" "$REPO/ops/proposed/$conf" >"$WORK/ops/nginx/$conf"
+done
+cp "$REPO/ops/proposed/error-pages/"*.html "$WORK/ops/nginx/error-pages/"
+
+# O security-headers.conf VIVO tambem, e nao so os propostos (2026-08-27).
+#
+# A config real de producao passou a fazer `include
+# /opt/wiki/ops/nginx/security-headers.conf`, e o probe reescreve esse prefixo
+# para a arvore temporaria — mas ninguem copiava o arquivo para la. Resultado:
+# `nginx -t` reprovava com "No such file or directory" e o gate contava 1 falha
+# em 44, dando a impressao de defeito de seguranca quando era o probe
+# incompleto.
+#
+# Uma auditoria de hoje leu essa falha como "gate bugado, aposentar". Ele nao
+# esta bugado: esta DESATUALIZADO em relacao a uma config que cresceu depois
+# dele. A diferenca importa — aposentar teria removido a unica prova automatica
+# de que os oito headers de seguranca continuam saindo do ingresso.
+if [ -f "$REPO/ops/nginx/security-headers.conf" ]; then
+	sed "s#/opt/wiki/ops/nginx#$WORK/ops/nginx#g" \
+		"$REPO/ops/nginx/security-headers.conf" >"$WORK/ops/nginx/security-headers.conf"
+fi
+
+stage_server_conf() { # <origem> <destino>
+	sed -e "s#/opt/wiki/ops/nginx#$WORK/ops/nginx#g" \
+		-e "s#listen 127.0.0.1:8088;#listen 127.0.0.1:$PORT_INGRESS;#" \
+		-e "s#http://127.0.0.1:8089#http://127.0.0.1:$PORT_UPSTREAM#g" \
+		-e "s#root /opt/wiki/releases/current/public;#root $WORK/docroot;#" \
+		-e "s#access_log /var/log/nginx/wikijuridica/access.log#access_log $WORK/logs/access.log#" \
+		"$1" >"$2"
+}
+
+printf '<!doctype html><html lang="pt-BR"><head><title>pagina estatica de teste</title></head><body><p>estatico</p></body></html>\n' >"$WORK/docroot/index.html"
+printf '[core]\n\trepositoryformatversion = 0\n' >"$WORK/docroot/.git/config"
+printf 'Contact: mailto:contato@wikijuridica.com.br\n' >"$WORK/docroot/.well-known/security.txt"
+
+write_root_conf() { # <conf do servidor a incluir>
+	cat >"$WORK/nginx.conf" <<EOF
+# OS MESMOS MODULOS QUE O NGINX DO WIKI CARREGA (2026-08-27).
+#
+# A config de producao usa \`more_set_headers\` (headers-more) e \`brotli_static\`,
+# e o probe subia um nginx sem esses modulos: \`nginx -t\` reprovava com "unknown
+# directive" e o gate contava 1 falha em 44 — falha do PROBE, nao do ingresso.
+#
+# Sem os load_module aqui, este gate nunca poderia validar a config real, porque
+# ela deixaria de parsear antes de qualquer verificacao de header acontecer.
+load_module /usr/lib/nginx/modules/ngx_http_headers_more_filter_module.so;
+load_module /usr/lib/nginx/modules/ngx_http_brotli_filter_module.so;
+load_module /usr/lib/nginx/modules/ngx_http_brotli_static_module.so;
+worker_processes 1;
+pid $WORK/nginx.pid;
+error_log $WORK/logs/error.log warn;
+events { worker_connections 64; }
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    client_body_temp_path $WORK/tmp/client;
+    proxy_temp_path       $WORK/tmp/proxy;
+    fastcgi_temp_path     $WORK/tmp/fastcgi;
+    uwsgi_temp_path       $WORK/tmp/uwsgi;
+    scgi_temp_path        $WORK/tmp/scgi;
+    include $1;
+}
+EOF
+}
+
+# --------------------------------------------------------------- upstream falso
+# Emite os MESMOS headers que internal/httpserver/security_headers.go — lidos de
+# ops/proposed/wj-security-headers.conf, arquivo que o teste de drift
+# (internal/httpserver/nginx_security_header_drift_test.go) mantém idêntico às
+# constantes Go. Assim a medição não pode divergir do binário real por descuido.
+#
+# Usar o upstream falso em vez do cmd/server evita disputar o índice Bleve em
+# var/on-demand-cache com o servidor de produção, que está vivo.
+cat >"$WORK/upstream.py" <<'PYEOF'
+import re, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+conf_path, port = sys.argv[1], int(sys.argv[2])
+pattern = re.compile(r'^\s*add_header\s+([A-Za-z0-9-]+)\s+(?:"([^"]*)"|([^\s;]+))', re.M)
+SECURITY = []
+for name, quoted, bare in pattern.findall(open(conf_path, encoding='utf-8').read()):
+    SECURITY.append((name, quoted or bare))
+
+# Espelho das rotas do Go: cada uma com sua política de cache própria.
+ROUTES = {
+    '/healthz': ('text/plain; charset=utf-8', 'no-store', b'ok\n', None),
+    '/readyz': ('text/plain; charset=utf-8', 'no-store', b'ready\n', None),
+    '/api/v1/health': ('application/json', 'public, max-age=60',
+                       b'{"status":"ok","version":"v1","padding":"' + b'x' * 2048 + b'"}', 'cross-origin'),
+    '/buscar/': ('text/html; charset=utf-8', 'no-store', b'<html lang="pt-BR"><body>busca</body></html>', None),
+}
+DEFAULT = ('text/html; charset=utf-8', 'public, max-age=600, s-maxage=3600',
+           b'<html lang="pt-BR"><body>dinamico</body></html>', None)
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *args): pass
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        ctype, cache, body, corp = ROUTES.get(path, DEFAULT)
+        self.send_response(200)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Cache-Control', cache)
+        for name, value in SECURITY:
+            self.send_header(name, value)
+        self.send_header('Cross-Origin-Resource-Policy', corp or 'same-origin')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    do_HEAD = do_GET
+
+ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
+PYEOF
+
+nice -n 19 python3 "$WORK/upstream.py" "$WORK/ops/nginx/wj-security-headers.conf" "$PORT_UPSTREAM" 2>"$WORK/logs/upstream.err" &
+UPSTREAM_PID=$!
+UPSTREAM_UP=0
+for _ in $(seq 1 60); do
+	if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT_UPSTREAM/healthz"; then
+		UPSTREAM_UP=1
+		break
+	fi
+	read -r -t 0.25 </dev/null 2>/dev/null || true
+done
+# Fail-fast: sem ESTE upstream (o que eu controlo e posso derrubar no teste de
+# 502) nenhuma medição abaixo significa coisa alguma.
+if [[ "$UPSTREAM_UP" -ne 1 ]]; then
+	echo "FALHA: upstream de teste não subiu em 127.0.0.1:$PORT_UPSTREAM"
+	cat "$WORK/logs/upstream.err"
+	exit 2
+fi
+
+start_nginx() { # <conf do servidor>
+	[[ -f "$WORK/nginx.pid" ]] && "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" -s stop >/dev/null 2>&1
+	write_root_conf "$1"
+	if ! "$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" -t 2>"$WORK/logs/t.log"; then
+		fail "nginx -t reprovou $1"
+		cat "$WORK/logs/t.log"
+		return 1
+	fi
+	"$NGINX_BIN" -p "$WORK" -c "$WORK/nginx.conf" || {
+		fail "nginx não subiu com $1"
+		return 1
+	}
+	for _ in $(seq 1 40); do
+		curl -s -o /dev/null "http://127.0.0.1:$PORT_INGRESS/" && return 0
+	done
+	fail "ingress não respondeu"
+	return 1
+}
+
+hdrs() { curl -s -D - -o /dev/null "$@"; }
+count_header() { grep -ci "^$1:" <<<"$2" | tr -d ' '; }
+value_header() { grep -i "^$1:" <<<"$2" | head -1 | cut -d' ' -f2- | tr -d '\r'; }
+
+# ============================================================ 1. CONFIG ATUAL
+# ATÉ 2026-08-04 17h esta seção media a duplicação que a adoção do binário Go
+# NOVO criaria se o ingress ficasse como estava: o upstream emite os 7 headers e
+# o nginx acrescentava os seus por cima (add_header é APPEND, nunca
+# substituição). Era uma asserção de CARACTERIZAÇÃO — ficava verde justamente
+# porque o defeito existia.
+#
+# O defeito foi CORRIGIDO no arquivo vivo (ops/nginx/wikijuridica.conf): caiu o
+# `add_header Cache-Control "public, max-age=3600"` de nível server e entrou
+# proxy_hide_header de X-Content-Type-Options/Referrer-Policy nas locations
+# proxiadas. Com isso as três asserções antigas viraram vermelhas — não porque
+# algo quebrou, mas porque a linha de base que elas guardavam envelheceu.
+#
+# Manter o teste com a força invertida: em vez de EXIGIR a duplicação, exige
+# agora exatamente UMA cópia de cada header, que é o estado correto. Se alguém
+# reintroduzir um add_header cego no nível server, a contagem volta a 2 e esta
+# checagem reprova — o controle continua existindo, com o sinal certo.
+stage_server_conf "$REPO/ops/nginx/wikijuridica.conf" "$WORK/atual.conf"
+if start_nginx "$WORK/atual.conf"; then
+	H="$(hdrs "http://127.0.0.1:$PORT_INGRESS/healthz")"
+	for header in Cache-Control Referrer-Policy X-Content-Type-Options; do
+		n="$(count_header "$header" "$H")"
+		assert_eq "1" "$n" "ATUAL entrega 1 cópia de $header em /healthz (duplicação corrigida)"
+	done
+	# A política de cache do /healthz tem de ser a do Go. Com o add_header cego
+	# ainda no lugar, aqui saía "no-store" E "public, max-age=3600" ao mesmo tempo.
+	assert_eq "no-store" "$(value_header Cache-Control "$H")" "ATUAL preserva o no-store do Go em /healthz"
+
+	# @fallback é a location que serve HOJE 100% do tráfego real: enquanto
+	# releases/current não existir, toda página, o robots.txt e o sitemap caem
+	# nela. /healthz sozinho não a cobre (é location própria), então a duplicação
+	# poderia continuar viva justamente onde o visitante e o Googlebot batem. Um
+	# caminho que não existe no snapshot estático força o try_files a cair no
+	# @fallback e mede a resposta que o portal de fato entrega.
+	HF="$(hdrs "http://127.0.0.1:$PORT_INGRESS/imobiliario/pagina-de-prova-do-fallback/")"
+	for header in Cache-Control Referrer-Policy X-Content-Type-Options; do
+		assert_eq "1" "$(count_header "$header" "$HF")" "ATUAL @fallback : 1 cópia de $header"
+	done
+
+	n_csp="$(count_header Content-Security-Policy "$H")"
+	assert_eq "1" "$n_csp" "ATUAL emite CSP só porque o upstream emite (ingress não tem)"
+	# A EXPECTATIVA AQUI ERA A DE 2026-08-19 E ENVELHECEU (corrigido em 27/08).
+	#
+	# Este teste afirmava que a config ATUAL *não* comprime `application/json` —
+	# era verdade quando foi escrito, e serviu para mostrar o ganho da proposta.
+	# A config viva passou a listar `application/json` em `gzip_types` desde
+	# então, e o teste virou o inverso do que deveria: exigia a AUSÊNCIA da
+	# correção e reprovava justamente por ela existir.
+	#
+	# É a mesma classe do comentário que mente, na forma mais cara: um gate que
+	# pune a melhoria. Uma auditoria de hoje leu esta linha vermelha como "gate
+	# bugado, aposentar" — aposentá-lo teria removido as outras 51 verificações,
+	# que provam que os oito headers de segurança continuam saindo do ingresso.
+	ENC_ATUAL="$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' "http://127.0.0.1:$PORT_INGRESS/api/v1/health" | grep -ic '^content-encoding: gzip' | tr -d ' ')"
+	assert_eq "1" "$ENC_ATUAL" "ATUAL comprime application/json (gzip_types lista JSON)"
+fi
+
+# ========================================================== 2. CONFIG PROPOSTA
+stage_server_conf "$REPO/ops/proposed/wikijuridica.conf" "$WORK/proposta.conf"
+if start_nginx "$WORK/proposta.conf"; then
+	BASELINE=(Content-Security-Policy Strict-Transport-Security X-Content-Type-Options
+		X-Frame-Options Referrer-Policy Permissions-Policy Cross-Origin-Opener-Policy)
+
+	# 2.1 caminho ESTÁTICO (disco, sem passar pelo Go)
+	H="$(hdrs "http://127.0.0.1:$PORT_INGRESS/")"
+	for header in "${BASELINE[@]}"; do
+		assert_eq "1" "$(count_header "$header" "$H")" "estático / : 1 cópia de $header"
+	done
+	assert_eq "1" "$(count_header Cache-Control "$H")" "estático / : 1 cópia de Cache-Control"
+	assert_eq "public, max-age=600, s-maxage=3600" "$(value_header Cache-Control "$H")" "estático / : política de cache da página"
+
+	# 2.2 caminho PROXIADO (Go emite; ingress esconde a cópia)
+	H="$(hdrs "http://127.0.0.1:$PORT_INGRESS/healthz")"
+	for header in "${BASELINE[@]}"; do
+		assert_eq "1" "$(count_header "$header" "$H")" "proxiado /healthz : 1 cópia de $header"
+	done
+	assert_eq "1" "$(count_header Cache-Control "$H")" "proxiado /healthz : 1 cópia de Cache-Control"
+	assert_eq "no-store" "$(value_header Cache-Control "$H")" "proxiado /healthz : no-store preservado"
+
+	# 2.3 API pública: cache próprio e CORP afrouxado só ali
+	H="$(hdrs "http://127.0.0.1:$PORT_INGRESS/api/v1/health")"
+	assert_eq "public, max-age=60" "$(value_header Cache-Control "$H")" "/api/v1/health : cache curto próprio"
+	assert_eq "cross-origin" "$(value_header Cross-Origin-Resource-Policy "$H")" "/api/v1/health : CORP cross-origin"
+	assert_eq "1" "$(count_header Cross-Origin-Resource-Policy "$H")" "/api/v1/health : 1 cópia de CORP"
+
+	# 2.4 gzip em JSON (application/json entrou no gzip_types)
+	ENC="$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' "http://127.0.0.1:$PORT_INGRESS/api/v1/health" | grep -ic '^content-encoding: gzip' | tr -d ' ')"
+	assert_eq "1" "$ENC" "/api/v1/health : comprimido com gzip"
+
+	# 2.5 superfícies negadas
+	assert_eq "404" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_INGRESS/metrics")" "/metrics : 404 no ingress"
+	assert_eq "403" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_INGRESS/.git/config")" "/.git/config : 403"
+	assert_eq "200" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_INGRESS/.well-known/security.txt")" "/.well-known/ : não é engolido pela negação de dotfile"
+
+	# 2.6 host duplicado: www só redireciona
+	H="$(hdrs -H 'Host: www.wikijuridica.com.br' "http://127.0.0.1:$PORT_INGRESS/imobiliario/usucapiao/")"
+	assert_eq "301" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: www.wikijuridica.com.br' "http://127.0.0.1:$PORT_INGRESS/imobiliario/usucapiao/")" "www : 301 para o apex"
+	assert_eq "https://wikijuridica.com.br/imobiliario/usucapiao/" "$(value_header Location "$H")" "www : destino preserva o caminho"
+
+	# 2.7 modo de arquivo — o worker do nginx não roda como o dono do repositório
+	for page in "$REPO/ops/proposed/error-pages/"*.html; do
+		mode="$(stat -c '%a' "$page")"
+		if [[ "${mode: -1}" =~ [4567] ]]; then
+			ok "$(basename "$page") : legível pelo worker (modo $mode)"
+		else fail "$(basename "$page") : modo $mode — worker do nginx não lê, o 502 sairia em inglês"; fi
+	done
+	dirmode="$(stat -c '%a' "$REPO/ops/proposed/error-pages")"
+	if [[ "${dirmode: -1}" =~ [15] ]]; then
+		ok "error-pages/ : atravessável pelo worker (modo $dirmode)"
+	else fail "error-pages/ : modo $dirmode — worker não atravessa o diretório"; fi
+
+	# 2.8 página de erro do ingress: derruba o upstream e mede o 502
+	kill "$UPSTREAM_PID" >/dev/null 2>&1
+	wait "$UPSTREAM_PID" 2>/dev/null
+	UPSTREAM_PID=""
+	H="$(hdrs "http://127.0.0.1:$PORT_INGRESS/healthz")"
+	BODY="$(curl -s "http://127.0.0.1:$PORT_INGRESS/healthz")"
+	assert_eq "502" "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT_INGRESS/healthz")" "upstream fora : status 502 preservado"
+	if grep -q 'lang="pt-BR"' <<<"$BODY" && ! grep -qi '<center>nginx' <<<"$BODY"; then
+		ok "502 : página própria em PT-BR (nginx padrão em inglês não aparece)"
+	else fail "502 : não é a página PT-BR do repositório"; fi
+	if grep -qi 'nginx/[0-9]' <<<"$BODY"; then fail "502 : versão do nginx vaza no corpo"; else ok "502 : sem versão do nginx no corpo"; fi
+	for header in "${BASELINE[@]}"; do
+		assert_eq "1" "$(count_header "$header" "$H")" "502 : 1 cópia de $header"
+	done
+	assert_eq "no-store" "$(value_header Cache-Control "$H")" "502 : no-store (borda não guarda indisponibilidade)"
+	assert_eq "noindex" "$(value_header X-Robots-Tag "$H")" "502 : noindex"
+
+	# 2.9 excesso de requisições (limit_req 120r/m burst 60): a última medição,
+	# porque esgota a janela de rate limit do endereço.
+	code=""
+	for _ in $(seq 1 200); do
+		code="$(curl -s -o "$WORK/flood.html" -w '%{http_code}' "http://127.0.0.1:$PORT_INGRESS/")"
+		[[ "$code" == "429" ]] && break
+	done
+	if [[ "$code" == "429" ]]; then
+		if grep -q 'lang="pt-BR"' "$WORK/flood.html"; then
+			ok "429 : página de excesso de requisições em PT-BR"
+		else fail "429 : corpo não é a página PT-BR"; fi
+	else fail "429 : rate limit não disparou em 200 requisições (veio $code)"; fi
+fi
+
+printf '\n== check-ingress-security-headers ==\n'
+printf '%s\n' "${REPORT[@]}"
+printf '\n%d verificações, %d falhas\n' "$CHECKS" "$FAILURES"
+[[ $FAILURES -eq 0 ]] || exit 1

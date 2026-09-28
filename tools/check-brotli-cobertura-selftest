@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""check-brotli-cobertura-selftest — os papéis da família brotli, provados.
+
+DUAS COISAS SÃO VERIFICADAS AQUI, e a segunda é a que custa caro se falhar.
+
+1. `tools/check-brotli-static-fresco` é READ-ONLY. Ele é o lado que MEDE:
+   cobertura contra o piso de 90%, gêmea `.br` STALE e gêmea ÓRFÃ. A prova é a
+   impressão digital do sandbox (caminho + tamanho + mtime_ns + sha256) antes e
+   depois — escrita silenciosa em arquivo existente não escapa dela.
+
+2. O TIMER HORÁRIO CONTINUA APONTANDO PARA O LADO QUE AGE.
+   `wikijuridica-brotli-cobertura.timer` roda de hora em hora porque
+   `brotli_static on` serve `$uri.br` SEM comparar frescor com o fonte: gêmea
+   velha devolve CORPO ANTIGO com 200 e ETag válido, e a Cloudflare puxa a
+   origem já comprimida e distribui esse corpo a todos. Se a separação de
+   papéis (2026-08-29, quando `check-brotli-e-recomprimir` virou
+   `tools/repair-brotli-cobertura`) fizer o `ExecStart` cair no lado read-only,
+   nada recomprime e o acervo apodrece EM SILÊNCIO — o gate fica vermelho e
+   ninguém age. Este selftest reprova essa regressão.
+
+   Ele também confere o fragment INSTALADO em /etc/systemd/system: enquanto ele
+   for symlink para `ops/systemd/`, editar o repositório basta (falta só o
+   `daemon-reload`). Se alguém o substituir por uma CÓPIA, o repositório passa a
+   mentir sobre o que a máquina executa — e isso é reprovado com o comando de
+   correção junto.
+
+Uso: ./tools/check-brotli-cobertura-selftest
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FERRAMENTAS = pathlib.Path(__file__).resolve().parent
+RAIZ_REPO = FERRAMENTAS.parent
+CHECK = FERRAMENTAS / "check-brotli-static-fresco"
+REPAIR = FERRAMENTAS / "repair-brotli-cobertura"
+UNIT = RAIZ_REPO / "ops" / "systemd" / "wikijuridica-brotli-cobertura.service"
+FRAGMENT = pathlib.Path("/etc/systemd/system/wikijuridica-brotli-cobertura.service")
+
+falhas: list[str] = []
+
+
+def confere(descricao: str, condicao: bool, detalhe: str = "") -> None:
+    if condicao:
+        print(f"  ok   {descricao}")
+        return
+    falhas.append(descricao)
+    print(f"  FAIL {descricao}" + (f"\n       {detalhe}" if detalhe else ""))
+
+
+def impressao_digital(raiz: pathlib.Path) -> str:
+    partes: list[str] = []
+    for caminho in sorted(raiz.rglob("*")):
+        relativo = caminho.relative_to(raiz).as_posix()
+        if caminho.is_dir():
+            partes.append(f"d {relativo}")
+            continue
+        estado = caminho.stat()
+        partes.append(f"f {relativo} {estado.st_size} {estado.st_mtime_ns} "
+                      f"{hashlib.sha256(caminho.read_bytes()).hexdigest()}")
+    return hashlib.sha256("\n".join(partes).encode("utf-8")).hexdigest()
+
+
+def execstart_de(texto: str) -> str:
+    achados = re.findall(r"^ExecStart=(.+)$", texto, flags=re.MULTILINE)
+    return achados[0].strip() if achados else ""
+
+
+def monta_acervo(stale: bool) -> pathlib.Path:
+    """Sandbox com um par html/.br. `stale=True` desalinha o mtime da gêmea."""
+    raiz = pathlib.Path(tempfile.mkdtemp(prefix="brotli-cobertura-selftest-"))
+    publico = raiz / "public" / "artigo"
+    publico.mkdir(parents=True)
+    fonte = publico / "index.html"
+    # Acima de 1 KB: abaixo disso o gerador não cria gêmea e o gate não cobra.
+    fonte.write_text("<!doctype html><html lang=\"pt-BR\"><body>"
+                     + ("<p>corpo do artigo de teste.</p>" * 80)
+                     + "</body></html>\n", encoding="utf-8")
+    gemea = publico / "index.html.br"
+    gemea.write_bytes(b"\x1b\x00\x00corpo comprimido de teste\n")
+    marca = fonte.stat()
+    if stale:
+        # Gêmea uma hora atrás do fonte: o corpo antigo que o nginx serviria.
+        os.utime(gemea, ns=(marca.st_atime_ns - 3_600_000_000_000,
+                            marca.st_mtime_ns - 3_600_000_000_000))
+    else:
+        os.utime(gemea, ns=(marca.st_atime_ns, marca.st_mtime_ns))
+    return raiz
+
+
+def rodar_check(raiz: pathlib.Path) -> subprocess.CompletedProcess:
+    ambiente = dict(os.environ, WIKI_ROOT=os.fspath(raiz))
+    return subprocess.run([sys.executable, os.fspath(CHECK)],
+                          cwd=raiz, env=ambiente, capture_output=True, text=True)
+
+
+def caso_check_e_read_only() -> None:
+    print("caso 1 — o lado que MEDE acusa a gêmea velha e não toca no disco")
+    raiz = monta_acervo(stale=True)
+    try:
+        antes = impressao_digital(raiz)
+        saida = rodar_check(raiz)
+        depois = impressao_digital(raiz)
+        confere("reprova (exit 1) com gêmea .br mais velha que o fonte",
+                saida.returncode == 1, f"exit={saida.returncode} out={saida.stdout[:300]}")
+        confere("diz que o nginx serviria esse corpo a quem pede br",
+                "MAIS VELHO" in saida.stdout, saida.stdout[:300])
+        confere("a impressão digital do acervo é IDÊNTICA depois de rodar",
+                antes == depois, f"{antes[:16]} != {depois[:16]}")
+        confere("não recomprimiu nada: nenhum .br novo apareceu",
+                len(list((raiz / "public").rglob("*.br"))) == 1)
+    finally:
+        shutil.rmtree(raiz, ignore_errors=True)
+
+    print("caso 2 — com a gêmea alinhada ao fonte, o mesmo gate aprova")
+    raiz = monta_acervo(stale=False)
+    try:
+        antes = impressao_digital(raiz)
+        saida = rodar_check(raiz)
+        confere("aprova (exit 0)", saida.returncode == 0,
+                f"exit={saida.returncode} out={saida.stdout[:300]}")
+        confere("e continua sem escrever", antes == impressao_digital(raiz))
+    finally:
+        shutil.rmtree(raiz, ignore_errors=True)
+
+
+def caso_papeis_separados() -> None:
+    print("caso 3 — os papéis estão separados por nome e por conteúdo")
+    confere("tools/repair-brotli-cobertura existe e é executável",
+            REPAIR.is_file() and os.access(REPAIR, os.X_OK), f"{REPAIR}")
+    confere("não sobrou nenhum tools/check-* que recomprima o acervo",
+            not (FERRAMENTAS / "check-brotli-e-recomprimir").exists(),
+            "check-brotli-e-recomprimir voltou: o nome já confessa a mistura de papéis")
+    fonte_repair = REPAIR.read_text(encoding="utf-8")
+    confere("o repair é quem invoca tools/generate-brotli-static",
+            "tools/generate-brotli-static" in fonte_repair)
+    fonte_check = CHECK.read_text(encoding="utf-8")
+    confere("o check NÃO invoca o gerador (só o indica no texto de correção)",
+            not re.search(r"^\s*[^#\n]*(subprocess|os\.system|os\.exec)",
+                          fonte_check, flags=re.MULTILINE),
+            "o lado read-only ganhou execução de processo")
+
+
+def caso_timer_aponta_para_quem_age() -> None:
+    print("caso 4 — o timer horário aponta para o lado que AGE (a armadilha)")
+    if not UNIT.is_file():
+        confere("a unit existe no repositório", False, f"{UNIT} ausente")
+        return
+    texto_unit = UNIT.read_text(encoding="utf-8")
+    alvo = execstart_de(texto_unit)
+    confere("a unit declara um ExecStart", bool(alvo), texto_unit[:200])
+    caminho = pathlib.Path(alvo.split()[0]) if alvo else pathlib.Path("/inexistente")
+    confere("o ExecStart existe no disco e é executável",
+            caminho.is_file() and os.access(caminho, os.X_OK),
+            f"ExecStart={alvo} — timer órfão: nada recomprime e o alerta de falha "
+            f"mora dentro do próprio arquivo que sumiu")
+    confere("o ExecStart NÃO é um tools/check-* (medir não recomprime)",
+            not caminho.name.startswith("check-"),
+            f"ExecStart={alvo}: um timer que só mede deixa as gêmeas apodrecerem "
+            f"servindo corpo velho em silêncio")
+    confere("o ExecStart é o repair da família brotli",
+            caminho.name == "repair-brotli-cobertura", f"ExecStart={alvo}")
+    confere("nenhum comentário da unit cita o nome antigo da ferramenta",
+            "check-brotli-e-recomprimir" not in texto_unit,
+            "comentário que aponta para arquivo inexistente é comentário que mente")
+
+    if not FRAGMENT.exists():
+        print("  --   fragment /etc/systemd/system ausente nesta máquina "
+              "(não instalado); nada a conferir")
+        return
+    if FRAGMENT.is_symlink():
+        destino = pathlib.Path(os.path.realpath(FRAGMENT))
+        confere("o fragment instalado é symlink para a unit do repositório",
+                destino == UNIT.resolve(),
+                f"{FRAGMENT} -> {destino}, esperado {UNIT.resolve()}")
+        print("  nota: symlink no lugar — editar a unit no repo basta, mas o systemd "
+              "só relê depois de:\n        sudo systemctl daemon-reload")
+    else:
+        confere("o fragment instalado (cópia) executa o mesmo alvo da unit do repo",
+                execstart_de(FRAGMENT.read_text(encoding="utf-8")) == alvo,
+                f"a máquina executa '{execstart_de(FRAGMENT.read_text(encoding='utf-8'))}' "
+                f"e o repositório declara '{alvo}'. Reinstale:\n"
+                f"        sudo cp {UNIT} {FRAGMENT} && sudo systemctl daemon-reload")
+
+
+def main() -> int:
+    for ferramenta in (CHECK, REPAIR):
+        if not ferramenta.is_file():
+            print(f"REPROVADO: {ferramenta} não existe", file=sys.stderr)
+            return 2
+    caso_check_e_read_only()
+    caso_papeis_separados()
+    caso_timer_aponta_para_quem_age()
+    print()
+    if falhas:
+        print(f"check-brotli-cobertura-selftest: REPROVADO "
+              f"({len(falhas)} verificação(ões))", file=sys.stderr)
+        for item in falhas:
+            print(f"  - {item}", file=sys.stderr)
+        return 1
+    print("check-brotli-cobertura-selftest: OK — o check não escreve e o timer "
+          "continua chamando quem recomprime")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""reload-wiki-server — fecha o buraco entre PUBLICAR e SERVIR.
+
+O DEFEITO QUE ISTO RESOLVE (medido em 2026-08-20, em producao).
+
+cmd/publish-v2-direct escreve HTML em public/, content/pages.json, o manifesto
+e o sitemap -- tudo transacional, tudo coerente. E nada recarrega o servidor Go.
+O nginx serve o HTML estatico direto do disco, entao o acervo aparece na hora e
+a publicacao PARECE completa. Nao esta: o processo Go guarda o pages.json
+ANTIGO em memoria, e ele e quem atende:
+
+  - /<rota>/index.md  -- o markdown gemeo, canal que o ClaudeBot consome
+    AGORA, a ~1 pagina/hora, e o unico canal de maquina do portal;
+  - /buscar/          -- a busca interna;
+  - as fatias paginadas de hub e a geracao sob demanda.
+
+Medido logo apos publicar 280 paginas novas: markdown de pagina ANTIGA HTTP 200,
+markdown de pagina NOVA HTTP 404. O visitante humano via a pagina; o agente de
+IA recebia "nao existe". Numa fabrica que publica todo dia, isso significa que o
+conteudo mais fresco -- justamente o que traz o robo de volta -- e o unico que
+ele nao enxerga.
+
+O QUE ESTA FERRAMENTA FAZ, nesta ordem:
+
+  1. mede a divergencia: pede o markdown de uma rota que EXISTE no manifesto do
+     disco e pergunta se o servidor a conhece;
+  2. so reinicia se houver divergencia -- reiniciar sem motivo derruba a busca a
+     toa e zera o indice quente;
+  3. VERIFICA depois, pelo mesmo predicado. Reiniciar nao e provar; a prova e a
+     rota responder;
+  4. grava evidencia em data/ops/server_reload.jsonl.
+
+Sem divergencia, sai 0 sem tocar em nada. E idempotente por construcao.
+
+Uso:
+    tools/reload-wiki-server --check      # so mede, nao reinicia (read-only)
+    tools/reload-wiki-server              # mede, reinicia se preciso, verifica
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+MANIFESTO = RAIZ / "data/editorial/published_manifest.jsonl"
+LEDGER = RAIZ / "data/ops/server_reload.jsonl"
+# ORIGEM e sobrescrivel para que o proprio detector seja TESTAVEL. Detector que
+# nunca disparou nao esta provado -- a regra vale para este tambem. Apontando
+# para uma porta sem ninguem ouvindo, as rotas tem de vir todas como
+# desconhecidas; apontando para o processo vivo e atualizado, nenhuma.
+ORIGEM = os.environ.get("WIKI_ORIGEM", "http://127.0.0.1:8089").rstrip("/")
+SERVICO = "wikijuridica-server"
+ESPERA_MAXIMA = 90
+# O ARTEFATO QUE O PROCESSO CARREGA NO BOOT. E dele que saem a gemea Markdown, a
+# busca, o MCP e o A2A -- tudo que NAO passa pelo nginx.
+PAGES_JSON = RAIZ / "content/pages.json"
+
+
+def rotas_do_manifesto(quantas: int = 6) -> list[str]:
+    """Amostra as rotas de PUBLICACAO MAIS RECENTE, por approved_at.
+
+    A primeira versao desta funcao pegava as ultimas linhas do arquivo, com o
+    comentario de que "o fim e onde as publicacoes recentes caem". Era FALSO, e
+    o proprio teste do detector mostrou: as seis rotas amostradas foram
+    /tributario/transacao-*, publicadas em 07/08. O manifesto e ordenado por
+    shard e intent, nunca por data -- e uma amostra que nunca inclui pagina nova
+    e um detector que nunca detecta o que existe para detectar.
+
+    approved_at separa de verdade. Medido em 2026-08-20: seis datas distintas no
+    manifesto (280 em 20/08, 20 em 19/08, 62 em 13/08, 6 em 12/08, 155 em 07/08),
+    e as 280 de hoje sao exatamente as que acabaram de entrar. Esse campo so
+    discrimina porque a data passou a vir do CONTEUDO e nao do relogio; enquanto
+    ela era time.Now(), o acervo inteiro tinha uma data so e esta amostra seria
+    tao cega quanto a anterior.
+    """
+    if not MANIFESTO.exists():
+        return []
+    registros: list[tuple[str, str]] = []
+    for linha in MANIFESTO.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            registro = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        caminho = registro.get("path")
+        aprovada = registro.get("approved_at") or ""
+        if isinstance(caminho, str) and caminho.count("/") == 3:
+            registros.append((aprovada, caminho))
+    if not registros:
+        return []
+    mais_recente = max(data for data, _ in registros)
+    recentes = sorted(caminho for data, caminho in registros if data == mais_recente)
+    if len(recentes) >= quantas:
+        # Espalha pela coorte em vez de pegar as primeiras alfabeticas: paginas
+        # vizinhas no alfabeto costumam vir do mesmo shard, e um shard so nao
+        # representa o lote.
+        passo = max(1, len(recentes) // quantas)
+        return recentes[::passo][:quantas]
+    faltam = quantas - len(recentes)
+    resto = sorted(caminho for data, caminho in registros if data != mais_recente)
+    return recentes + resto[:faltam]
+
+
+def titulos_do_disco() -> dict:
+    """Titulo de cada rota segundo content/pages.json -- a verdade do disco.
+
+    ★ O CAMPO E `heading`, NAO `title`. Os dois existem e sao DIFERENTES por
+    desenho: `title` respeita o teto de 65 caracteres do <title>, `heading` vai
+    ate 70 e e o que vira <h1> e a primeira linha do markdown. Comparar o
+    markdown servido com `title` acusa divergencia em pagina correta -- foi o
+    que aconteceu com /jurisprudencia/stj-tema-898/, cujo title termina em
+    "atualizacao monetaria" e cujo heading segue "...nas indenizacoes".
+
+    E a armadilha que docs/DADOS_CONFIAVEIS_E_ARMADILHAS.md cataloga: ler o
+    campo pela semantica que se supoe, e nao pela que ele tem.
+    """
+    caminho = RAIZ / "content/pages.json"
+    try:
+        dados = json.loads(caminho.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    paginas = dados.get("pages", dados) if isinstance(dados, dict) else dados
+    saida = {}
+    for pagina in paginas if isinstance(paginas, list) else []:
+        if not isinstance(pagina, dict):
+            continue
+        rota = pagina.get("path") or pagina.get("public_path") or ""
+        titulo = (pagina.get("heading") or pagina.get("title") or "").strip()
+        if rota and titulo:
+            if not rota.startswith("/"):
+                rota = "/" + rota
+            if not rota.endswith("/"):
+                rota += "/"
+            saida[rota] = titulo
+    return saida
+
+
+def markdown_responde(rota: str, timeout: float = 8.0) -> tuple[bool, int, str]:
+    """O servidor conhece esta rota no canal de maquina, e com que titulo?"""
+    # X-Warming-Request: 2026-09-16. O cabecalho FALTAVA, e a conta e' esta:
+    # `tools/check-sonda-interna-declarada` mediu 193 requisicoes desta sonda em
+    # 7 dias (~24/dia, todo dia) gravadas com `warming=false` no access log —
+    # ou seja, CONTADAS COMO VISITA. Cada recarga do servidor sondava o canal de
+    # maquina e o portal media o proprio eco.
+    #
+    # A sonda e' legitima e continua: e' assim que se prova que o processo novo
+    # serve o conteudo novo. O que estava errado era ela entrar na metrica, e a
+    # correcao e' no PONTO DE SAIDA — filtrar a linha depois seria maquiar o
+    # numero em vez de consertar a sonda. `internal/httpserver/access_log.go` le
+    # este cabecalho para gravar `warming=true`.
+    pedido = urllib.request.Request(
+        ORIGEM + rota, headers={"Accept": "text/markdown",
+                                "User-Agent": "wikijuridica-reload-check/1.0",
+                                "X-Warming-Request": "true"})
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            if resposta.status != 200:
+                return False, resposta.status, ""
+            corpo = resposta.read(4096).decode("utf-8", "replace")
+            # O markdown abre com "# <titulo>"; e o titulo que o servidor tem em
+            # MEMORIA, que e o que interessa comparar.
+            titulo = ""
+            for linha in corpo.splitlines():
+                if linha.startswith("# "):
+                    titulo = linha[2:].strip()
+                    break
+            return True, resposta.status, titulo
+    except urllib.error.HTTPError as erro:
+        return False, erro.code, ""
+    except Exception:
+        return False, 0, ""
+
+
+def divergencia() -> tuple[list[str], list[str]]:
+    """Rotas que o servidor serve corretamente, e as que nao.
+
+    ★ COMPARA CONTEUDO, NAO SO EXISTENCIA -- e a correcao de 2026-08-20.
+
+    A versao anterior perguntava apenas "esta rota responde 200?". Isso detecta
+    rota NOVA e e cego para conteudo ALTERADO: quando 419 titulos foram
+    corrigidos em rotas que ja existiam, todas responderam 200 com o texto
+    VELHO, esta funcao devolveu zero divergencias e a publicacao imprimiu "sem
+    divergencia: o processo ja serve o manifesto do disco".
+
+    O estrago nao era cosmetico. O nginx serve o HTML estatico de public/ e
+    estava certo; mas o markdown gemeo, a busca, o MCP e o A2A saem do processo
+    Go, que seguia com o pages.json antigo em memoria. Ou seja: o unico publico
+    que recebia o titulo desatualizado era exatamente o que este projeto quer
+    alcancar -- os agentes de IA.
+
+    E a mesma armadilha que docs/ARQUITETURA_FIEL.md cataloga: a sonda mede uma
+    coisa (a rota existe) e a conclusao afirma outra (o conteudo esta atual).
+    """
+    conhecidas, desconhecidas, motivos = [], [], {}
+    esperados = titulos_do_disco()
+    for rota in rotas_do_manifesto():
+        ok, _, titulo_servido = markdown_responde(rota)
+        if not ok:
+            desconhecidas.append(rota)
+            motivos[rota] = "rota desconhecida no canal de maquina"
+            continue
+        esperado = esperados.get(rota, "")
+        if esperado and titulo_servido and titulo_servido != esperado:
+            desconhecidas.append(rota)
+            motivos[rota] = (f"titulo em memoria {titulo_servido[:52]!r} "
+                             f"!= disco {esperado[:52]!r}")
+            continue
+        conhecidas.append(rota)
+    # A ROTA sai limpa e o motivo vai a parte: quem chama precisa da URL para
+    # sondar de novo depois do restart, e concatenar a explicacao nela quebrava
+    # essa sonda.
+    return conhecidas, desconhecidas, motivos
+
+
+def ativo_desde() -> float | None:
+    """Instante em que o processo vivo subiu, em epoch. None = NAO MEDIDO."""
+    try:
+        saida = subprocess.run(
+            ["systemctl", "show", "-p", "ActiveEnterTimestampMonotonic",
+             "-p", "ActiveEnterTimestamp", "--value", SERVICO],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if saida.returncode != 0:
+        return None
+    linhas = [l.strip() for l in saida.stdout.splitlines() if l.strip()]
+    for linha in linhas:
+        # "Wed 2026-09-16 06:51:45 -03"
+        try:
+            return time.mktime(time.strptime(linha[4:23], "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+    return None
+
+
+def impressao(caminho: Path) -> str:
+    h = hashlib.sha256()
+    with caminho.open("rb") as arquivo:
+        for bloco in iter(lambda: arquivo.read(1 << 20), b""):
+            h.update(bloco)
+    return h.hexdigest()
+
+
+def reconciliado_neste_processo(sha_atual: str, inicio: float) -> bool:
+    """O ledger ja registrou ESTE sha para ESTE processo?
+
+    Sem isto, um artefato reescrito com conteudo identico (mtime novo, bytes
+    iguais) forcaria restart a cada passada -- e restart sem motivo derruba o
+    indice de busca a frio, que e o que a versao anterior desta ferramenta
+    tentava evitar. Com isto, o restart acontece quando o CONTEUDO mudou.
+    """
+    if not LEDGER.exists():
+        return False
+    try:
+        linhas = LEDGER.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for linha in reversed(linhas[-400:]):
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            reg = json.loads(linha)
+        except ValueError:
+            continue
+        if reg.get("pages_json_sha256") != sha_atual:
+            continue
+        marcado = reg.get("processo_ativo_desde")
+        if isinstance(marcado, (int, float)) and abs(marcado - inicio) < 2:
+            return True
+    return False
+
+
+def processo_carregou_o_disco(caminho: Path = PAGES_JSON) -> tuple[bool | None, str]:
+    """A INVARIANTE, e ela nao amostra nada.
+
+    ★ POR QUE ELA EXISTE, com o caso de 2026-09-16
+
+    A funcao `divergencia()` acima ja compara CONTEUDO -- mas compara o TITULO,
+    porque o incidente de 2026-08-20 foi de 419 titulos trocados. Em 2026-09-16 a
+    republicacao corrigiu a DATA DE ESTREIA de 10.996 paginas e nao mexeu em
+    titulo nenhum: a amostra bateu, esta ferramenta imprimiu "sem divergencia: o
+    processo ja serve o manifesto do disco" e NAO reiniciou.
+
+    O estrago foi exatamente o mesmo de 2026-08-20, uma camada mais fundo. O
+    nginx ja servia o HTML corrigido de public/, e a GEMEA MARKDOWN continuou
+    servindo `date_published: "2026-09-16"` com `date_modified: "2026-09-05"` --
+    a cronologia impossivel que `cmd/publish-v2-direct` declara proibida, viva no
+    canal que o CLAUDE.md §12 define como o produto. Medido: o processo subira as
+    06:51 e o `content/pages.json` no disco era de 10:54.
+
+    Comparar um CAMPO e sempre perder o campo seguinte. Esta funcao nao compara
+    campo: confere que o processo vivo subiu DEPOIS do artefato que ele carrega no
+    boot. Nao ha amostra, nao ha falso negativo por escolha de campo, e o unico
+    jeito de ela falhar e o systemctl nao responder -- que devolve None e vira
+    NAO MEDIDO, nunca "esta tudo bem".
+    """
+    if not caminho.exists():
+        return None, f"nao medido: {caminho} nao existe"
+    inicio = ativo_desde()
+    if inicio is None:
+        return None, "nao medido: systemctl nao devolveu ActiveEnterTimestamp"
+    mtime = caminho.stat().st_mtime
+    if mtime <= inicio:
+        return False, ""
+    sha_atual = impressao(caminho)
+    if reconciliado_neste_processo(sha_atual, inicio):
+        return False, ""
+    return True, (
+        f"o processo subiu em {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(inicio))} "
+        f"e {caminho.relative_to(RAIZ)} e de "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))} "
+        f"(sha256 {sha_atual[:16]}): a gemea Markdown, a busca, o MCP e o A2A "
+        f"respondem pelo artefato EM MEMORIA, nao pelo do disco")
+
+
+def grava_evidencia(registro: dict) -> None:
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as saida:
+        saida.write(json.dumps(registro, ensure_ascii=False) + "\n")
+
+
+def main() -> int:
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--check", action="store_true",
+                            help="apenas mede; nunca reinicia")
+    argumentos = analisador.parse_args()
+
+    # A INVARIANTE PRIMEIRO. Ela nao amostra, entao nao depende de haver rota de
+    # duas partes no manifesto — e foi justamente pela amostra que o defeito de
+    # 2026-09-16 passou. Ver processo_carregou_o_disco().
+    desatualizado, motivo_artefato = processo_carregou_o_disco()
+    if desatualizado is None:
+        print(f"NAO MEDIDO: {motivo_artefato}", file=sys.stderr)
+        print("   esta ferramenta existe para GARANTIR que o processo serve o disco;",
+              file=sys.stderr)
+        print("   sem essa medicao nao ha garantia a dar, e verde seria mentira.",
+              file=sys.stderr)
+        grava_evidencia({"acao": "reload", "resultado": "nao_medido",
+                         "detalhe": motivo_artefato})
+        return 2
+    if desatualizado:
+        print(f"ARTEFATO MAIS NOVO QUE O PROCESSO: {motivo_artefato}")
+
+    conhecidas, desconhecidas, motivos = divergencia()
+    total = len(conhecidas) + len(desconhecidas)
+    if total == 0 and not desatualizado:
+        print("manifesto sem rota de duas partes para amostrar; nada a medir")
+        return 0
+
+    print(f"amostra da coorte mais recente ({total} rota(s))")
+    print(f"  o servidor conhece   : {len(conhecidas)}")
+    print(f"  o servidor DESCONHECE: {len(desconhecidas)}")
+    for rota in desconhecidas:
+        print(f"     {rota}  ({motivos.get(rota, 'sem motivo registrado')})")
+
+    if not desconhecidas and not desatualizado:
+        print("\nsem divergencia: o processo ja serve o manifesto do disco.")
+        return 0
+
+    if argumentos.check:
+        if desatualizado and not desconhecidas:
+            print("\nDIVERGENCIA pela INVARIANTE: a amostra de titulos bate, e ainda assim")
+            print("   o processo carregou um content/pages.json anterior ao que esta no disco.")
+            print("   Foi assim que a data de estreia de 10.996 paginas ficou errada na")
+            print("   gemea Markdown em 2026-09-16 com o HTML ja correto.")
+            print("   corrija com: ./tools/reload-wiki-server")
+            return 1
+        print("\nDIVERGENCIA: publicado no disco, invisivel no canal de maquina.")
+        print("   o markdown gemeo e a busca respondem pelo pages.json em MEMORIA.")
+        print("   corrija com: ./tools/reload-wiki-server")
+        return 1
+
+    print(f"\nreiniciando {SERVICO} (o acervo estatico segue no ar pelo nginx)...")
+    reinicio = subprocess.run(
+        ["sudo", "-n", "systemctl", "restart", SERVICO], capture_output=True)
+    if reinicio.returncode != 0:
+        detalhe = reinicio.stderr.decode(errors="replace").strip()[:200]
+        print(f"FALHA ao reiniciar: {detalhe}", file=sys.stderr)
+        grava_evidencia({"acao": "reload", "resultado": "falha_restart",
+                         "detalhe": detalhe, "desconhecidas": desconhecidas})
+        return 2
+
+    # Reiniciar nao e provar. O indice de busca aquece sobre ~10 mil paginas, e
+    # perguntar cedo demais devolve 000 (conexao recusada) -- que nao e defeito,
+    # e impaciencia. Por isso a espera e por PREDICADO, com teto.
+    # Quando SO a invariante disparou, `desconhecidas` esta vazia: a sonda de
+    # prontidao usa entao uma rota qualquer que o servidor ja conhecia.
+    sonda = desconhecidas[0] if desconhecidas else (conhecidas[0] if conhecidas else "")
+    inicio = time.monotonic()
+    while sonda and time.monotonic() - inicio < ESPERA_MAXIMA:
+        ok, _, _ = markdown_responde(sonda, timeout=4.0)
+        if ok:
+            break
+        time.sleep(2)
+
+    conhecidas2, desconhecidas2, motivos2 = divergencia()
+    segundos = round(time.monotonic() - inicio, 1)
+    registro = {
+        "acao": "reload",
+        "servico": SERVICO,
+        "amostradas": total,
+        "desconhecidas_antes": len(desconhecidas),
+        "desconhecidas_depois": len(desconhecidas2),
+        "segundos_ate_servir": segundos,
+        "resultado": "ok" if not desconhecidas2 else "ainda_divergente",
+        # O QUE FOI RECONCILIADO, para que a proxima passada nao reinicie de novo
+        # por um artefato reescrito com bytes identicos.
+        "pages_json_sha256": impressao(PAGES_JSON) if PAGES_JSON.exists() else "",
+        "processo_ativo_desde": ativo_desde(),
+        "disparou_invariante": bool(desatualizado),
+    }
+    grava_evidencia(registro)
+
+    desatualizado2, motivo2 = processo_carregou_o_disco()
+    if desatualizado2:
+        print(f"AINDA DESATUALIZADO apos {segundos}s: {motivo2}", file=sys.stderr)
+        return 2
+    if desconhecidas2:
+        print(f"AINDA DIVERGENTE apos {segundos}s: {desconhecidas2}", file=sys.stderr)
+        print("   o reinicio nao resolveu -- investigue antes de publicar de novo.",
+              file=sys.stderr)
+        return 2
+
+    print(f"OK: as {total} rota(s) da amostra respondem no canal de maquina "
+          f"({segundos}s ate servir). Evidencia em data/ops/server_reload.jsonl")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

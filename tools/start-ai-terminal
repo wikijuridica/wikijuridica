@@ -1,0 +1,879 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Todo estado local criado pelo launcher (SQLite, rollout, log e wrapper) deve
+# nascer privado. Os shells/panes recebem o mesmo umask antes de iniciar Codex.
+umask 077
+
+if [ "$(id -un)" != "rafael" ] || [ "$(id -u)" != "$(id -u rafael)" ] || [ "$HOME" != "/home/rafael" ]; then
+	printf 'start-ai-terminal: execute como rafael com HOME=/home/rafael; usuário atual=%s HOME=%s\n' "$(id -un)" "$HOME" >&2
+	exit 2
+fi
+
+if [ -n "${AI_TMUX_SESSION:-}" ]; then
+	session="$AI_TMUX_SESSION"
+	reuse_existing=1
+	session_explicit=1
+elif [ -n "${CODEX_TMUX_SESSION:-}" ]; then
+	session="$CODEX_TMUX_SESSION"
+	reuse_existing=1
+	session_explicit=1
+else
+	session="ai-$(date +%Y%m%d-%H%M%S)-$$"
+	reuse_existing=0
+	session_explicit=0
+fi
+workdir="${AI_WORKDIR:-${CODEX_WORKDIR:-$HOME}}"
+attach=1
+autostart=0
+validate_only=0
+resume_thread_id=""
+resume_requested=0
+requested_codex_max_threads=""
+requested_codex_max_threads_set=0
+
+for arg in "$@"; do
+	case "$arg" in
+	--no-attach) attach=0 ;;
+	--codex | --autostart) autostart=1 ;;
+	--shell-only) autostart=0 ;;
+	--validate-only)
+		validate_only=1
+		attach=0
+		;;
+	--resume=*)
+		resume_thread_id="${arg#--resume=}"
+		resume_requested=1
+		autostart=1
+		;;
+	--resume)
+		printf 'start-ai-terminal: use --resume=<UUID>; retomada sem thread específico é recusada para impedir backfill global.\n' >&2
+		exit 2
+		;;
+	--reuse)
+		reuse_existing=1
+		if [[ "$session" == ai-[0-9]*-$$ ]]; then
+			session="${AI_TMUX_REUSE_SESSION:-ai-dev}"
+		fi
+		;;
+	--session=*)
+		session="${arg#--session=}"
+		reuse_existing=1
+		session_explicit=1
+		;;
+	--max-agents=*)
+		requested_codex_max_threads="${arg#--max-agents=}"
+		requested_codex_max_threads_set=1
+		;;
+	*)
+		printf 'start-ai-terminal: argumento desconhecido recusado: %s\n' "$arg" >&2
+		exit 2
+		;;
+	esac
+done
+
+if [ "$resume_requested" -eq 1 ] && [ -z "$resume_thread_id" ]; then
+	printf 'start-ai-terminal: --resume exige UUID completo e não vazio.\n' >&2
+	exit 2
+fi
+if [ -n "$resume_thread_id" ] && [[ ! "$resume_thread_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+	printf 'start-ai-terminal: --resume exige UUID completo; recebido: %s\n' "$resume_thread_id" >&2
+	exit 2
+fi
+resume_thread_id="$(printf '%s' "$resume_thread_id" | tr 'A-F' 'a-f')"
+[ -z "$resume_thread_id" ] || autostart=1
+if [ -n "$resume_thread_id" ] && [ "$session_explicit" -ne 1 ]; then
+	printf 'start-ai-terminal: --resume=%s exige --session=<nome> (ou AI_TMUX_SESSION/CODEX_TMUX_SESSION) para localizar o home isolado; nenhum home foi criado.\n' \
+		"$resume_thread_id" >&2
+	exit 2
+fi
+if [ -z "$session" ]; then
+	printf 'start-ai-terminal: nome de sessão vazio é inválido.\n' >&2
+	exit 2
+fi
+if [[ ! "$session" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+	printf 'start-ai-terminal: nome de sessão não canônico: %s; use 1-64 caracteres ASCII [A-Za-z0-9_-], começando por letra ou número.\n' \
+		"$session" >&2
+	exit 2
+fi
+
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# COLORTERM informa capacidade truecolor; CLICOLOR faz colorir SO em TTY.
+# FORCE_COLOR removido de proposito: forcava cor mesmo sem TTY, poluindo com
+# escape-seq ANSI o output que os agentes (claude/codex) capturam por pipe.
+# Humano no shell interativo continua com cor via auto-deteccao de TTY.
+export COLORTERM=truecolor
+export CLICOLOR=1
+unset NO_COLOR
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$HOME/bin:$HOME/go/bin:$HOME/.cargo/bin:/usr/local/go/bin:/snap/bin:$PATH"
+
+if [ ! -d "$workdir" ]; then
+	printf "${YELLOW}Diretório de trabalho inexistente ou inválido: %s${NC}\n" "$workdir" >&2
+	exit 2
+fi
+workdir="$(realpath -e -- "$workdir")"
+
+stable_codex_bin="$HOME/.npm-global/bin/codex"
+stable_resolved_codex_bin="$(readlink -f -- "$stable_codex_bin" 2>/dev/null || true)"
+case "$stable_resolved_codex_bin" in
+"$HOME/.npm-global/lib/node_modules/@openai/codex/"*) ;;
+*)
+	printf "${YELLOW}Codex npm oficial não encontrado no pacote @openai/codex: %s${NC}\n" "$stable_codex_bin" >&2
+	exit 2
+	;;
+esac
+if [ ! -f "$stable_resolved_codex_bin" ] || [ ! -x "$stable_resolved_codex_bin" ]; then
+	printf "${YELLOW}Binário Codex npm oficial inexistente ou não executável: %s${NC}\n" "$stable_resolved_codex_bin" >&2
+	exit 2
+fi
+
+codex_bin_override="${AI_CODEX_BIN:-${CODEX_BIN:-}}"
+if [ -n "$codex_bin_override" ]; then
+	case "$codex_bin_override" in
+	/*) ;;
+	*)
+		printf "${YELLOW}AI_CODEX_BIN/CODEX_BIN deve ser caminho absoluto: %s${NC}\n" "$codex_bin_override" >&2
+		exit 2
+		;;
+	esac
+	resolved_codex_bin="$(readlink -f -- "$codex_bin_override" 2>/dev/null || true)"
+	if [ -z "$resolved_codex_bin" ] || [ ! -f "$resolved_codex_bin" ] || [ ! -x "$resolved_codex_bin" ]; then
+		printf "${YELLOW}Binario Codex alternativo inexistente ou nao executavel: %s${NC}\n" "$codex_bin_override" >&2
+		exit 2
+	fi
+	if [ "$resolved_codex_bin" != "$stable_resolved_codex_bin" ]; then
+		printf "${YELLOW}AI_CODEX_BIN/CODEX_BIN só pode apontar para o mesmo binário npm oficial: %s${NC}\n" "$stable_codex_bin" >&2
+		exit 2
+	fi
+fi
+codex_bin="$stable_resolved_codex_bin"
+
+# `agents.max_threads` é a única chave pública usada aqui. O launcher só a
+# sobrescreve quando o dono fornece um inteiro positivo por argumento ou env.
+# Sem override, nenhum `-c` é injetado: o padrão fica a cargo do Codex oficial.
+codex_max_threads=""
+codex_max_threads_source="padrão oficial do Codex"
+codex_max_threads_override_set=0
+if [ "$requested_codex_max_threads_set" -eq 1 ]; then
+	codex_max_threads="$requested_codex_max_threads"
+	codex_max_threads_source="--max-agents"
+	codex_max_threads_override_set=1
+elif [ -n "${AI_CODEX_MAX_THREADS:-}" ]; then
+	codex_max_threads="$AI_CODEX_MAX_THREADS"
+	codex_max_threads_source="AI_CODEX_MAX_THREADS"
+	codex_max_threads_override_set=1
+fi
+if [ "$codex_max_threads_override_set" -eq 1 ] && [[ ! "$codex_max_threads" =~ ^[1-9][0-9]*$ ]]; then
+	printf "${YELLOW}Override agents.max_threads via %s deve ser inteiro positivo; recebido: %s${NC}\n" \
+		"$codex_max_threads_source" "$codex_max_threads" >&2
+	exit 2
+fi
+if [ "$codex_max_threads_override_set" -eq 0 ]; then
+	unset AI_CODEX_MAX_THREADS
+fi
+
+base_codex_home="${AI_CODEX_BASE_HOME:-${CODEX_BASE_HOME:-$HOME/.codex}}"
+if [ "$base_codex_home" != "/home/rafael/.codex" ]; then
+	printf "${YELLOW}CODEX_BASE_HOME deve ser /home/rafael/.codex; recebido: %s${NC}\n" "$base_codex_home" >&2
+	exit 2
+fi
+export CODEX_BASE_HOME="$base_codex_home"
+
+if [ "${AI_TERMINAL_SHARED_CODEX_HOME:-0}" = "1" ] || [ "${AI_TERMINAL_ISOLATE_CODEX_HOME:-1}" = "0" ]; then
+	printf "${YELLOW}CODEX_HOME compartilhado foi desativado: use isolamento por sessão.${NC}\n" >&2
+	exit 2
+fi
+
+requested_codex_home="${AI_CODEX_HOME:-}"
+canonical_codex_home=""
+legacy_codex_home=""
+tmux_session_target=""
+tmux_shell_target=""
+tmux_codex_target=""
+
+home_contract_error() {
+	printf "${YELLOW}AI Terminal recusou CODEX_HOME inseguro: %s${NC}\n" "$1" >&2
+	printf "${YELLOW}Nenhum symlink, rollout ou SQLite existente foi movido/apagado. Use uma nova sessão canônica ou corrija o home fora de processo ativo.${NC}\n" >&2
+	exit 2
+}
+
+reject_symlink_components() {
+	local path="$1" component current=""
+	local components=()
+	case "$path" in
+	/*) ;;
+	*) home_contract_error "caminho não absoluto no guard de symlinks: $path" ;;
+	esac
+	IFS='/' read -r -a components <<<"${path#/}"
+	for component in "${components[@]}"; do
+		[ -n "$component" ] || continue
+		current="$current/$component"
+		if [ -L "$current" ]; then
+			home_contract_error "componente intermediário symlinkado recusado: $current (em $path)"
+		fi
+	done
+}
+
+set_canonical_codex_home() {
+	local safe_prefix session_hash expected_home resolved_parent resolved_expected
+	safe_prefix="${session:0:48}"
+	session_hash="$(printf '%s' "$session" | sha256sum | awk '{print $1}')"
+	expected_home="$CODEX_BASE_HOME/terminal-homes/${safe_prefix}--${session_hash}"
+	legacy_codex_home="$CODEX_BASE_HOME/terminal-homes/$session"
+
+	# Rejeite cada componente antes de realpath: resolver parent e filho pelo
+	# mesmo symlink faria ambos parecerem contidos mesmo depois de escapar.
+	reject_symlink_components "$CODEX_BASE_HOME/terminal-homes"
+	reject_symlink_components "$expected_home"
+	resolved_parent="$(realpath -m -- "$CODEX_BASE_HOME/terminal-homes")"
+	resolved_expected="$(realpath -m -- "$expected_home")"
+	case "$resolved_expected" in
+	"$resolved_parent"/*) ;;
+	*)
+		printf "${YELLOW}CODEX_HOME canônico escapou de terminal-homes: %s${NC}\n" "$resolved_expected" >&2
+		exit 2
+		;;
+	esac
+
+	canonical_codex_home="$expected_home"
+	export CODEX_HOME="$canonical_codex_home"
+	export CODEX_SQLITE_HOME="$canonical_codex_home"
+	tmux_session_target="=$session"
+	tmux_shell_target="${tmux_session_target}:=shell"
+	tmux_codex_target="${tmux_session_target}:=codex"
+}
+
+set_canonical_codex_home
+
+adopt_existing_session_home() {
+	local candidate="$1" source="$2" resolved_parent resolved_candidate
+	if [ -z "$candidate" ]; then
+		home_contract_error "$source não informou CODEX_HOME"
+	fi
+	case "$candidate" in
+	"$canonical_codex_home" | "$legacy_codex_home") ;;
+	*) home_contract_error "$source usa home de outra sessão: $candidate" ;;
+	esac
+	reject_symlink_components "$candidate"
+	if [ -L "$candidate" ] || [ ! -d "$candidate" ]; then
+		home_contract_error "$source aponta para home inexistente, symlinkado ou não diretório: $candidate"
+	fi
+	if [ "$(stat -c '%U' "$candidate")" != "rafael" ]; then
+		home_contract_error "$source aponta para home que não pertence a rafael: $candidate"
+	fi
+	resolved_parent="$(realpath -e -- "$CODEX_BASE_HOME/terminal-homes")"
+	resolved_candidate="$(realpath -e -- "$candidate")"
+	if [ "$(dirname -- "$resolved_candidate")" != "$resolved_parent" ]; then
+		home_contract_error "$source aponta fora dos homes diretos de terminal: $candidate"
+	fi
+	if [ -n "$requested_codex_home" ] && [ "$requested_codex_home" != "$candidate" ]; then
+		home_contract_error "AI_CODEX_HOME=$requested_codex_home diverge do home de $source: $candidate"
+	fi
+	canonical_codex_home="$candidate"
+	export CODEX_HOME="$candidate"
+	export CODEX_SQLITE_HOME="$candidate"
+}
+
+quote_for_shell() {
+	printf '%q' "$1"
+}
+
+codex_env_exports() {
+	printf 'umask 077; export CODEX_HOME=%s CODEX_SQLITE_HOME=%s CODEX_BASE_HOME=%s; ' \
+		"$(quote_for_shell "$CODEX_HOME")" "$(quote_for_shell "$CODEX_SQLITE_HOME")" "$(quote_for_shell "$CODEX_BASE_HOME")"
+	if [ "$codex_max_threads_override_set" -eq 1 ]; then
+		printf 'export AI_CODEX_MAX_THREADS=%s; ' "$(quote_for_shell "$codex_max_threads")"
+	else
+		printf 'unset AI_CODEX_MAX_THREADS; '
+	fi
+	printf 'export PATH=%s:"$PATH"; ' "$(quote_for_shell "$CODEX_HOME/bin")"
+	if [ -n "$codex_bin_override" ]; then
+		printf 'export AI_CODEX_BIN=%s CODEX_BIN=%s; ' "$(quote_for_shell "$codex_bin")" "$(quote_for_shell "$codex_bin")"
+	else
+		printf 'unset AI_CODEX_BIN CODEX_BIN; '
+	fi
+}
+
+codex_launch_command() {
+	quote_for_shell "$codex_bin"
+	if [ "$codex_max_threads_override_set" -eq 1 ]; then
+		printf ' -c %s' "$(quote_for_shell "agents.max_threads=$codex_max_threads")"
+	fi
+	if [ -n "$resume_thread_id" ]; then
+		printf ' resume %s' "$(quote_for_shell "$resume_thread_id")"
+	fi
+}
+
+validate_isolated_local_state() {
+	local local_path candidate
+	reject_symlink_components "$CODEX_HOME"
+	[ -e "$CODEX_HOME" ] || [ -L "$CODEX_HOME" ] || return 0
+	if [ -L "$CODEX_HOME" ] || [ ! -d "$CODEX_HOME" ]; then
+		home_contract_error "$CODEX_HOME deve ser diretório real"
+	fi
+	if [ "$(stat -c '%U' "$CODEX_HOME")" != "rafael" ]; then
+		home_contract_error "$CODEX_HOME não pertence a rafael"
+	fi
+
+	for local_path in sessions archived_sessions; do
+		if [ -L "$CODEX_HOME/$local_path" ]; then
+			home_contract_error "$CODEX_HOME/$local_path é symlink (backfill/estado compartilhado proibido)"
+		fi
+		if [ -e "$CODEX_HOME/$local_path" ] && [ ! -d "$CODEX_HOME/$local_path" ]; then
+			home_contract_error "$CODEX_HOME/$local_path não é diretório local"
+		fi
+	done
+
+	# O nome dos bancos é versionado pelo Codex e pode crescer (por exemplo,
+	# thread_history_1.sqlite). Inspecione todo SQLite e qualquer sidecar.
+	for candidate in "$CODEX_HOME"/*.sqlite* "$CODEX_HOME"/.*.sqlite*; do
+		[ -e "$candidate" ] || [ -L "$candidate" ] || continue
+		if [ -L "$candidate" ]; then
+			home_contract_error "$candidate é SQLite/sidecar symlinkado"
+		fi
+		if [ ! -f "$candidate" ]; then
+			home_contract_error "$candidate deveria ser arquivo SQLite/sidecar regular"
+		fi
+	done
+}
+
+validate_shared_codex_path() {
+	local name="$1"
+	local src="$CODEX_BASE_HOME/$name"
+	local dst="$CODEX_HOME/$name"
+	if [ ! -e "$src" ]; then
+		if [ -e "$dst" ] || [ -L "$dst" ]; then
+			home_contract_error "$dst existe sem origem oficial correspondente em $src"
+		fi
+		return 0
+	fi
+	if [ -L "$dst" ]; then
+		if [ "$(readlink -f -- "$dst" 2>/dev/null || true)" != "$(readlink -f -- "$src")" ]; then
+			home_contract_error "$dst aponta para origem diferente de $src"
+		fi
+		return 0
+	fi
+	if [ -e "$dst" ]; then
+		home_contract_error "$dst é cópia local/stale; configuração compartilhada não será confiada nem sobrescrita"
+	fi
+}
+
+link_shared_codex_path() {
+	local name="$1"
+	local src="$CODEX_BASE_HOME/$name"
+	local dst="$CODEX_HOME/$name"
+	[ -e "$src" ] || return 0
+	[ -e "$dst" ] || [ -L "$dst" ] || ln -s "$src" "$dst"
+}
+
+config_contract_keys() {
+	local config_path="$1"
+	python3 -I - "$config_path" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+path = pathlib.Path(sys.argv[1])
+try:
+    with path.open("rb") as source:
+        config = tomllib.load(source)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(2)
+
+if "sqlite_home" in config:
+    print("sqlite_home")
+agents = config.get("agents")
+if isinstance(agents, dict) and "max_threads" in agents:
+    print("agents.max_threads")
+PY
+}
+
+validate_persistent_config() {
+	local config_path="$1" keys key
+	[ -e "$config_path" ] || [ -L "$config_path" ] || return 0
+	if [ ! -f "$config_path" ]; then
+		home_contract_error "$config_path não é arquivo TOML regular"
+	fi
+	# TOML inválido/fora do schema é diagnosticado pelo runtime oficial no
+	# preflight. Este parser local só detecta as duas chaves de isolamento.
+	if ! keys="$(config_contract_keys "$config_path" 2>/dev/null)"; then
+		return 0
+	fi
+	while IFS= read -r key; do
+		case "$key" in
+		sqlite_home)
+			home_contract_error "$config_path define sqlite_home e pode sobrepor CODEX_SQLITE_HOME isolado"
+			;;
+		agents.max_threads)
+			if [ "$codex_max_threads_override_set" -eq 0 ]; then
+				home_contract_error "$config_path fixa agents.max_threads; remova o cap persistente ou use override explícito --max-agents=N/AI_CODEX_MAX_THREADS=N"
+			fi
+			;;
+		esac
+	done <<<"$keys"
+}
+
+validate_persistent_configs() {
+	local cursor config_path agent_config
+	if ! command -v python3 >/dev/null 2>&1; then
+		home_contract_error "python3 com tomllib é necessário para validar config TOML"
+	fi
+	for config_path in "$CODEX_BASE_HOME/config.toml" /etc/codex/config.toml /etc/codex/managed_config.toml; do
+		validate_persistent_config "$config_path"
+	done
+	for agent_config in "$CODEX_BASE_HOME"/agents/*.toml; do
+		[ -e "$agent_config" ] || continue
+		validate_persistent_config "$agent_config"
+	done
+
+	cursor="$workdir"
+	while :; do
+		config_path="$cursor/.codex/config.toml"
+		validate_persistent_config "$config_path"
+		for agent_config in "$cursor"/.codex/agents/*.toml; do
+			[ -e "$agent_config" ] || continue
+			validate_persistent_config "$agent_config"
+		done
+		[ "$cursor" != "/" ] || break
+		cursor="${cursor%/*}"
+		[ -n "$cursor" ] || cursor="/"
+	done
+}
+
+validate_local_resume() {
+	local db candidate candidate_rollout rollout_path="" resolved_rollout
+	local query_failures=0 successful_queries=0
+	local state_databases=()
+	[ -n "$resume_thread_id" ] || return 0
+	if ! command -v sqlite3 >/dev/null 2>&1; then
+		home_contract_error "sqlite3 é necessário para provar índice local antes de codex resume $resume_thread_id"
+	fi
+	for candidate in "$CODEX_HOME"/state_*.sqlite; do
+		[ -f "$candidate" ] || continue
+		state_databases+=("$candidate")
+	done
+	if [ "${#state_databases[@]}" -eq 0 ]; then
+		home_contract_error "thread $resume_thread_id não está indexado neste home; state_*.sqlite local ausente"
+	fi
+	# O nome do state DB é versionado pelo runtime. Um upgrade pode preservar o
+	# banco anterior ao criar o novo; isso não torna o home inseguro. Consulte
+	# todos em read-only e aceite somente um rollout local não ambíguo.
+	for db in "${state_databases[@]}"; do
+		if candidate_rollout="$(sqlite3 -readonly -cmd '.timeout 2000' "$db" \
+			"SELECT rollout_path FROM threads WHERE id = '$resume_thread_id' AND archived = 0 LIMIT 1;" 2>/dev/null)"; then
+			successful_queries=$((successful_queries + 1))
+		else
+			query_failures=$((query_failures + 1))
+			continue
+		fi
+		[ -n "$candidate_rollout" ] || continue
+		if [ -n "$rollout_path" ] && [ "$candidate_rollout" != "$rollout_path" ]; then
+			home_contract_error "thread $resume_thread_id tem rollouts divergentes em state_*.sqlite locais"
+		fi
+		rollout_path="$candidate_rollout"
+	done
+	if [ "$successful_queries" -eq 0 ]; then
+		home_contract_error "nenhum state_*.sqlite local pôde ser consultado em modo read-only"
+	fi
+	if [ "$query_failures" -gt 0 ] && [ -z "$rollout_path" ]; then
+		home_contract_error "thread $resume_thread_id não pôde ser provado: $query_failures state_*.sqlite local(is) falharam em modo read-only"
+	fi
+	if [ -z "$rollout_path" ]; then
+		home_contract_error "thread $resume_thread_id não está indexado neste home; import/backfill global é proibido"
+	fi
+	resolved_rollout="$(realpath -e -- "$rollout_path" 2>/dev/null || true)"
+	case "$resolved_rollout" in
+	"$CODEX_HOME"/sessions/*.jsonl) ;;
+	*)
+		home_contract_error "índice do thread $resume_thread_id aponta fora de sessions local: $rollout_path"
+		;;
+	esac
+	if [ ! -f "$resolved_rollout" ]; then
+		home_contract_error "rollout local do thread $resume_thread_id não existe"
+	fi
+	if ! python3 -I - "$resolved_rollout" "$resume_thread_id" <<'PY'; then
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+thread_id = sys.argv[2]
+try:
+    with path.open("rb") as source:
+        first_line = source.readline(1024 * 1024 + 1)
+    if not first_line or len(first_line) > 1024 * 1024:
+        raise ValueError("header ausente ou maior que 1 MiB")
+    header = json.loads(first_line.decode("utf-8"))
+    payload = header.get("payload") if isinstance(header, dict) else None
+    if header.get("type") != "session_meta" or not isinstance(payload, dict):
+        raise ValueError("primeiro evento não é session_meta")
+    if str(payload.get("id", "")).lower() != thread_id:
+        raise ValueError("id do session_meta diverge do UUID pedido")
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+PY
+		home_contract_error "rollout local do thread $resume_thread_id não tem header oficial válido"
+	fi
+}
+
+install_codex_command_wrapper() {
+	local wrapper_dir="$CODEX_HOME/bin"
+	local wrapper_path="$CODEX_HOME/bin/codex"
+	local wrapper_tmp="$CODEX_HOME/bin/.codex.tmp.$$"
+	mkdir -p "$wrapper_dir"
+	if [ -L "$wrapper_dir" ] || [ "$(stat -c '%U' "$wrapper_dir")" != "rafael" ]; then
+		printf 'start-ai-terminal: diretório do encaminhador deve pertencer a rafael: %s\n' "$wrapper_dir" >&2
+		exit 2
+	fi
+	{
+		printf '#!/usr/bin/env bash\n'
+		printf '# Encaminha exclusivamente ao pacote npm oficial.\n'
+		printf 'umask 077\n'
+		printf 'export CODEX_HOME=%q CODEX_SQLITE_HOME=%q\n' "$CODEX_HOME" "$CODEX_SQLITE_HOME"
+		if [ "$codex_max_threads_override_set" -eq 1 ]; then
+			printf 'exec %q -c %q "$@"\n' "$codex_bin" "agents.max_threads=$codex_max_threads"
+		else
+			printf 'exec %q "$@"\n' "$codex_bin"
+		fi
+	} >"$wrapper_tmp"
+	chmod 0700 "$wrapper_tmp"
+	mv -f -- "$wrapper_tmp" "$wrapper_path"
+	export PATH="$wrapper_dir:$PATH"
+}
+
+init_codex_home() {
+	validate_isolated_local_state
+	validate_persistent_configs
+	mkdir -p "$CODEX_HOME"
+	reject_symlink_components "$CODEX_HOME"
+	chmod 0700 "$CODEX_HOME"
+
+	local shared_path
+	for shared_path in auth.json config.toml installation_id version.json attachments plugins skills rules; do
+		validate_shared_codex_path "$shared_path"
+	done
+
+	local shared_file
+	for shared_file in auth.json config.toml installation_id version.json; do
+		link_shared_codex_path "$shared_file"
+	done
+
+	local shared_dir
+	for shared_dir in attachments plugins skills rules; do
+		link_shared_codex_path "$shared_dir"
+	done
+	install_codex_command_wrapper
+}
+
+print_official_doctor_diagnostics() {
+	python3 -I -c '
+import json
+import sys
+
+try:
+    report = json.load(sys.stdin)
+except (json.JSONDecodeError, OSError, UnicodeError):
+    raise SystemExit(2)
+checks = report.get("checks") if isinstance(report, dict) else None
+if not isinstance(checks, dict):
+    raise SystemExit(2)
+printed = False
+for check_id, check in checks.items():
+    status = check.get("status") if isinstance(check, dict) else None
+    if status == "ok":
+        continue
+    print(json.dumps({"id": check_id, "check": check}, ensure_ascii=False, sort_keys=True))
+    printed = True
+if not printed:
+    print(json.dumps({"overallStatus": report.get("overallStatus")}, ensure_ascii=False))
+'
+}
+
+print_official_doctor_reproduction() {
+	printf 'Reproduza sem launcher: CODEX_HOME=%q CODEX_SQLITE_HOME=%q %q --strict-config -C %q' \
+		"$CODEX_HOME" "$CODEX_SQLITE_HOME" "$codex_bin" "$workdir" >&2
+	if [ "$codex_max_threads_override_set" -eq 1 ]; then
+		printf ' -c %q' "agents.max_threads=$codex_max_threads" >&2
+	fi
+	printf ' doctor --no-color --all\n' >&2
+}
+
+run_official_doctor() {
+	local output doctor_stderr="" doctor_stderr_file="" doctor_rc=0 parsed_report="" parsed_status="" warning_checks=""
+	local config_args=()
+	if [ "$codex_max_threads_override_set" -eq 1 ]; then
+		config_args=(-c "agents.max_threads=$codex_max_threads")
+	fi
+	if ! command -v timeout >/dev/null 2>&1; then
+		home_contract_error "timeout(1) é necessário para executar o doctor oficial com orçamento"
+	fi
+	if ! doctor_stderr_file="$(mktemp "$CODEX_HOME/.doctor-stderr.XXXXXX")"; then
+		home_contract_error "não foi possível criar captura privada de stderr para o doctor"
+	fi
+	if output="$(LC_ALL=C.UTF-8 LANG=C.UTF-8 NO_COLOR=1 CODEX_HOME="$CODEX_HOME" CODEX_SQLITE_HOME="$CODEX_SQLITE_HOME" \
+		timeout --signal=TERM --kill-after=2s 20s "$codex_bin" --strict-config -C "$workdir" \
+		"${config_args[@]}" doctor --json </dev/null 2>"$doctor_stderr_file")"; then
+		doctor_rc=0
+	else
+		doctor_rc=$?
+	fi
+	doctor_stderr="$(tail -n 20 -- "$doctor_stderr_file" 2>/dev/null || true)"
+	rm -f -- "$doctor_stderr_file"
+	if [ "$doctor_rc" -eq 124 ] || [ "$doctor_rc" -eq 137 ]; then
+		printf "${YELLOW}Doctor oficial excedeu 20s; nenhum processo Codex será iniciado até o diagnóstico funcionar.${NC}\n" >&2
+		printf '%s\n' "$output" | tail -n 20 >&2
+		[ -z "$doctor_stderr" ] || printf '%s\n' "$doctor_stderr" >&2
+		print_official_doctor_reproduction
+		exit 2
+	fi
+	if [ "$doctor_rc" -ne 0 ]; then
+		printf "${YELLOW}Doctor oficial recusou a instalação/configuração de %s no home %s (rc=%s).${NC}\n" \
+			"$workdir" "$CODEX_HOME" "$doctor_rc" >&2
+		if ! printf '%s' "$output" | print_official_doctor_diagnostics >&2; then
+			printf '%s\n' "$output" | tail -n 20 >&2
+		fi
+		[ -z "$doctor_stderr" ] || printf '%s\n' "$doctor_stderr" >&2
+		print_official_doctor_reproduction
+		exit 2
+	fi
+	if ! parsed_report="$(printf '%s' "$output" | python3 -I -c '
+import json
+import sys
+
+try:
+    report = json.load(sys.stdin)
+except (json.JSONDecodeError, OSError, UnicodeError):
+    raise SystemExit(2)
+status = report.get("overallStatus") if isinstance(report, dict) else None
+checks = report.get("checks") if isinstance(report, dict) else None
+if status not in {"ok", "warning"} or not isinstance(checks, dict):
+    raise SystemExit(2)
+warnings = []
+for check_id, check in checks.items():
+    check_status = check.get("status") if isinstance(check, dict) else None
+    if check_status == "warning":
+        warnings.append(str(check_id))
+    elif check_status != "ok":
+        raise SystemExit(2)
+print(status + "\t" + ",".join(sorted(warnings)))
+')"; then
+		printf "${YELLOW}Doctor oficial não emitiu o relatório JSON esperado; nenhum processo Codex será iniciado.${NC}\n" >&2
+		if ! printf '%s' "$output" | print_official_doctor_diagnostics >&2; then
+			printf '%s\n' "$output" | tail -n 20 >&2
+		fi
+		[ -z "$doctor_stderr" ] || printf '%s\n' "$doctor_stderr" >&2
+		print_official_doctor_reproduction
+		exit 2
+	fi
+	IFS=$'\t' read -r parsed_status warning_checks <<<"$parsed_report"
+	if [ "$parsed_status" = "warning" ]; then
+		printf "${YELLOW}Doctor oficial concluiu com avisos não fatais (%s); nenhum check falhou.${NC}\n" \
+			"${warning_checks:-sem id exposto}" >&2
+		printf '%s' "$output" | print_official_doctor_diagnostics >&2 || true
+	fi
+}
+
+preflight_codex_home() {
+	# `codex doctor --json` é a superfície oficial estável para instalação,
+	# configuração, auth, runtime e inventário de threads. A validade decorre do
+	# diagnóstico executado no home isolado real, não de um piso local de versão.
+	run_official_doctor
+}
+
+if [ "$validate_only" -eq 0 ] && ! command -v tmux >/dev/null 2>&1; then
+	printf "${YELLOW}tmux é obrigatório para preservar isolamento e configuração do Codex.${NC}\n" >&2
+	exit 2
+fi
+
+if [ "$autostart" -eq 1 ] && ! command -v "$codex_bin" >/dev/null 2>&1; then
+	printf "${YELLOW}codex nao encontrado no PATH; abrindo shell colorido.${NC}\n"
+	autostart=0
+fi
+
+window_exists() {
+	tmux list-windows -t "$tmux_session_target" -F '#{window_name}' | grep -Fxq "$1"
+}
+
+pane_command() {
+	local target
+	case "$1" in
+	shell) target="$tmux_shell_target" ;;
+	codex) target="$tmux_codex_target" ;;
+	*) return 2 ;;
+	esac
+	tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || true
+}
+
+set_tmux_environment() {
+	tmux set-environment -t "$tmux_session_target" COLORTERM truecolor
+	tmux set-environment -t "$tmux_session_target" CLICOLOR 1
+	tmux set-environment -t "$tmux_session_target" CODEX_HOME "$CODEX_HOME"
+	tmux set-environment -t "$tmux_session_target" CODEX_SQLITE_HOME "$CODEX_SQLITE_HOME"
+	tmux set-environment -t "$tmux_session_target" CODEX_BASE_HOME "$CODEX_BASE_HOME"
+	tmux set-environment -t "$tmux_session_target" AI_CODEX_BASE_HOME "$CODEX_BASE_HOME"
+	if [ "$codex_max_threads_override_set" -eq 1 ]; then
+		tmux set-environment -t "$tmux_session_target" AI_CODEX_MAX_THREADS "$codex_max_threads"
+	else
+		tmux set-environment -t "$tmux_session_target" -u AI_CODEX_MAX_THREADS 2>/dev/null || true
+	fi
+	tmux set-environment -t "$tmux_session_target" PATH "$CODEX_HOME/bin:$PATH"
+	if [ -n "$codex_bin_override" ]; then
+		tmux set-environment -t "$tmux_session_target" AI_CODEX_BIN "$codex_bin"
+		tmux set-environment -t "$tmux_session_target" CODEX_BIN "$codex_bin"
+	else
+		tmux set-environment -t "$tmux_session_target" -u AI_CODEX_BIN 2>/dev/null || true
+		tmux set-environment -t "$tmux_session_target" -u CODEX_BIN 2>/dev/null || true
+	fi
+	tmux set-environment -t "$tmux_session_target" -u NO_COLOR 2>/dev/null || true
+}
+
+export_shell_if_idle() {
+	local command_name
+	command_name="$(pane_command shell)"
+	case "$command_name" in
+	bash | zsh | fish | sh | '')
+		tmux send-keys -t "$tmux_shell_target" "$(codex_env_exports)unset NO_COLOR; export COLORTERM=truecolor CLICOLOR=1; clear" C-m
+		;;
+	esac
+}
+
+set_shell_title_if_idle() {
+	local command_name
+	command_name="$(pane_command shell)"
+	case "$command_name" in
+	bash | zsh | fish | sh | '')
+		tmux select-pane -t "$tmux_shell_target" -T "AI Terminal"
+		;;
+	esac
+}
+
+prepare_shell_window() {
+	if ! window_exists shell; then
+		tmux new-window -d -t "$tmux_session_target" -n shell -c "$workdir" \
+			-e "CODEX_HOME=$CODEX_HOME" -e "CODEX_SQLITE_HOME=$CODEX_SQLITE_HOME" -e "CODEX_BASE_HOME=$CODEX_BASE_HOME" \
+			-e "AI_CODEX_BASE_HOME=$CODEX_BASE_HOME"
+		tmux select-pane -t "$tmux_shell_target" -T "AI Terminal"
+		tmux send-keys -t "$tmux_shell_target" "$(codex_env_exports)unset NO_COLOR; export COLORTERM=truecolor CLICOLOR=1; clear" C-m
+	else
+		set_shell_title_if_idle
+		export_shell_if_idle
+	fi
+}
+
+prepare_codex_window() {
+	if ! window_exists codex; then
+		tmux new-window -d -t "$tmux_session_target" -n codex -c "$workdir" \
+			-e "CODEX_HOME=$CODEX_HOME" -e "CODEX_SQLITE_HOME=$CODEX_SQLITE_HOME" -e "CODEX_BASE_HOME=$CODEX_BASE_HOME" \
+			-e "AI_CODEX_BASE_HOME=$CODEX_BASE_HOME"
+		tmux send-keys -t "$tmux_codex_target" "$(codex_env_exports)unset NO_COLOR; export COLORTERM=truecolor CLICOLOR=1; clear; $(codex_launch_command)" C-m
+	else
+		printf "${YELLOW}Janela Codex já viva: o cap de threads carregado não muda; retome o mesmo thread em novo processo para aplicar um override.${NC}\n" >&2
+	fi
+}
+
+if [ "$reuse_existing" -eq 0 ]; then
+	base_session="$session"
+	counter=1
+	while tmux has-session -t "$tmux_session_target" 2>/dev/null; do
+		session="${base_session}-${counter}"
+		if [ "${#session}" -gt 64 ]; then
+			printf "${YELLOW}Não foi possível derivar nome tmux canônico sem exceder 64 caracteres: %s${NC}\n" "$session" >&2
+			exit 2
+		fi
+		set_canonical_codex_home
+		counter=$((counter + 1))
+	done
+fi
+
+if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$tmux_session_target" 2>/dev/null; then
+	existing_tmux_codex_home="$(tmux show-environment -t "$tmux_session_target" CODEX_HOME 2>/dev/null | sed -n 's/^CODEX_HOME=//p' || true)"
+	adopt_existing_session_home "$existing_tmux_codex_home" "sessão tmux $session"
+	existing_tmux_sqlite_home="$(tmux show-environment -t "$tmux_session_target" CODEX_SQLITE_HOME 2>/dev/null | sed -n 's/^CODEX_SQLITE_HOME=//p' || true)"
+	if [ -n "$existing_tmux_sqlite_home" ] && [ "$existing_tmux_sqlite_home" != "$CODEX_HOME" ]; then
+		home_contract_error "sessão tmux $session usa CODEX_SQLITE_HOME divergente $existing_tmux_sqlite_home"
+	fi
+else
+	if [ -n "$requested_codex_home" ]; then
+		case "$requested_codex_home" in
+		"$canonical_codex_home") ;;
+		"$legacy_codex_home") adopt_existing_session_home "$legacy_codex_home" "AI_CODEX_HOME explícito" ;;
+		*)
+			home_contract_error "AI_CODEX_HOME divergente recusado: sessão $session aceita $canonical_codex_home ou o legado exato existente $legacy_codex_home; recebido $requested_codex_home"
+			;;
+		esac
+	elif [ "$legacy_codex_home" != "$canonical_codex_home" ] && [ -d "$legacy_codex_home" ] && [ ! -e "$canonical_codex_home" ] && [ "$session_explicit" -eq 1 ]; then
+		# Compatibilidade sem migração: uma sessão criada pelo launcher anterior
+		# já possui isolamento próprio em terminal-homes/<sessão>. Reutilize esse
+		# diretório exato; nunca copie/linke sessions ou SQLite para o nome novo.
+		adopt_existing_session_home "$legacy_codex_home" "home legado exato da sessão $session"
+	elif [ "$resume_requested" -eq 1 ] && [ -d "$legacy_codex_home" ] && [ -d "$canonical_codex_home" ]; then
+		home_contract_error "resume ambíguo: existem homes canônico e legado para $session; escolha um com AI_CODEX_HOME"
+	fi
+fi
+
+printf "${BLUE}Iniciando AI Terminal %s: %s${NC}\n" "$([ "$reuse_existing" -eq 1 ] && printf 'reutilizavel' || printf 'novo')" "$session"
+if [ "$codex_max_threads_override_set" -eq 1 ]; then
+	printf "${BLUE}Cap de threads de agentes abertas para novos processos: %s (%s; agents.max_threads).${NC}\n" \
+		"$codex_max_threads" "$codex_max_threads_source"
+else
+	printf "${BLUE}Cap de threads de agentes abertas para novos processos: padrão oficial do Codex (sem override).${NC}\n"
+fi
+
+init_codex_home
+preflight_codex_home
+validate_isolated_local_state
+validate_local_resume
+
+if [ "$validate_only" -eq 1 ]; then
+	printf "${GREEN}Home canônico validado sem iniciar ou alterar sessão tmux: %s${NC}\n" "$CODEX_HOME"
+	exit 0
+fi
+
+if ! tmux has-session -t "$tmux_session_target" 2>/dev/null; then
+	if [ "$autostart" -eq 1 ]; then
+		tmux new-session -d -s "$session" -n codex -c "$workdir" \
+			-e "CODEX_HOME=$CODEX_HOME" -e "CODEX_SQLITE_HOME=$CODEX_SQLITE_HOME" -e "CODEX_BASE_HOME=$CODEX_BASE_HOME" \
+			-e "AI_CODEX_BASE_HOME=$CODEX_BASE_HOME"
+	else
+		tmux new-session -d -s "$session" -n shell -c "$workdir" \
+			-e "CODEX_HOME=$CODEX_HOME" -e "CODEX_SQLITE_HOME=$CODEX_SQLITE_HOME" -e "CODEX_BASE_HOME=$CODEX_BASE_HOME" \
+			-e "AI_CODEX_BASE_HOME=$CODEX_BASE_HOME"
+	fi
+	set_tmux_environment
+	if [ "$autostart" -eq 1 ]; then
+		tmux send-keys -t "$tmux_codex_target" "$(codex_env_exports)unset NO_COLOR; export COLORTERM=truecolor CLICOLOR=1; clear; $(codex_launch_command)" C-m
+		printf "${GREEN}Sessao tmux criada e Codex iniciado por pedido explicito.${NC}\n"
+	else
+		tmux select-pane -t "$tmux_shell_target" -T "AI Terminal"
+		tmux send-keys -t "$tmux_shell_target" "$(codex_env_exports)unset NO_COLOR; export COLORTERM=truecolor CLICOLOR=1; clear" C-m
+		printf "${GREEN}Sessao tmux criada em modo shell.${NC}\n"
+	fi
+else
+	set_tmux_environment
+	if [ "$autostart" -eq 1 ]; then
+		prepare_codex_window
+	else
+		prepare_shell_window
+	fi
+	printf "${GREEN}Sessao tmux existente encontrada.${NC}\n"
+fi
+
+# O launcher nunca executa GC automaticamente. Históricos e homes isolados são
+# entradas de retomada; eventual limpeza deve ser uma operação explícita,
+# auditada e fora do caminho de inicialização.
+
+if [ "$attach" -eq 0 ]; then
+	exit 0
+fi
+
+printf "${BLUE}Conectando. Prefix tmux: Ctrl+A.${NC}\n"
+if [ "$autostart" -eq 1 ]; then
+	exec tmux attach-session -t "$tmux_codex_target"
+fi
+
+exec tmux attach-session -t "$tmux_shell_target"

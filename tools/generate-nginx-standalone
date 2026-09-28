@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Deriva o nginx dedicado do wiki A PARTIR do vhost VIVO — nunca de copia manual.
+
+POR QUE ESTE GERADOR EXISTE (2026-08-13)
+----------------------------------------
+`ops/nginx/standalone/` foi escrito a mao em 2026-08-06 e ficou 39 diretivas
+atras do vhost vivo — medido por `tools/check-nginx-standalone-parity`. Entre as
+ausencias: `absolute_redirect off` (sem ele todo 301 vaza a porta interna),
+`gzip_types` com `text/xml` (sem ele o sitemap de 684 KB volta a sair cru),
+`error_page 403 = @fallback`, o rate limit de 3000 r/m (contra 600, que faria o
+proprio aquecimento levar 429), os oito cabecalhos de seguranca e todos os maps
+da negociacao de conteudo.
+
+Copia manual apodrece assim: o vhost vivo recebe correcao, a copia nao, e a
+divergencia so aparece no dia do cutover — quando o custo de descobrir e maior.
+Aqui o dedicado NASCE do vivo a cada execucao, entao a paridade e por construcao
+e nao por disciplina.
+
+O QUE O DEDICADO PRECISA TER A MAIS
+-----------------------------------
+Uma instancia propria carrega o que o vhost hospedado herdava do host: contexto
+`main` e `events`, `load_module` explicito (a instancia sobe com `-c` proprio e
+NAO le /etc/nginx/modules-enabled/), mime.types, e os diretorios temporarios
+dentro de /opt/wiki/var/nginx — porque a unit roda como usuario comum.
+
+O QUE ELE NAO PODE HERDAR
+-------------------------
+`open_file_cache max=900000` do host: e a razao declarada do `restart` que
+derrubava a origem 8 a 9 segundos por deploy. Superado em 2026-08-29 (BUG-080):
+esta frase dizia "o vhost ja define o seu proprio, pequeno e com `valid 5s`" —
+falso, o vhost define APENAS o `valid`, sem cache nenhum para valida-lo. O
+template abaixo declara `open_file_cache off;` por DIRETIVA, no bloco `http {}`,
+com o comentario completo do porque (ver a diretiva no corpo do gerador).
+
+Uso:
+    tools/generate-nginx-standalone                 # porta do ops/ingress.env
+    tools/generate-nginx-standalone --porta 8090    # porta de ensaio, para o smoke do cutover
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+VHOST_VIVO = RAIZ / "ops" / "nginx" / "wikijuridica.conf"
+DESTINO = RAIZ / "ops" / "nginx" / "standalone" / "nginx.conf"
+INGRESS_ENV = RAIZ / "ops" / "ingress.env"
+
+# Modulos que o vhost usa e que a instancia dedicada precisa carregar
+# explicitamente. headers-more sustenta os oito cabecalhos de seguranca, o Vary e
+# o Link; brotli serve o artefato pre-comprimido.
+MODULOS = [
+    "/usr/lib/nginx/modules/ngx_http_headers_more_filter_module.so",
+    "/usr/lib/nginx/modules/ngx_http_brotli_filter_module.so",
+    "/usr/lib/nginx/modules/ngx_http_brotli_static_module.so",
+]
+
+
+def porta_padrao() -> int:
+    if INGRESS_ENV.is_file():
+        achado = re.search(r"^WIKI_ORIGIN_PORT=(\d+)$", INGRESS_ENV.read_text(encoding="utf-8"), re.M)
+        if achado:
+            return int(achado.group(1))
+    return 8088
+
+
+def linhas_decisivas(texto: str) -> set:
+    """Conjunto de linhas que DECIDEM RESPOSTA, para a guarda de perda.
+
+    O critério é DELIBERADAMENTE mais largo que o de
+    `tools/check-nginx-standalone-parity`. Aquele compara só linhas cujo
+    primeiro token está numa lista de diretivas conhecidas — e por isso CORPO DE
+    `map` é invisível para ele, nos dois sentidos. Foi exatamente ali que o drift
+    passou: as áreas `diarios`, `jurisprudencia` e `noticias` vivem dentro do
+    corpo de dois maps, e nenhum gate as viu sumir.
+
+    Aqui entra toda linha que não seja vazia nem comentário, normalizada em
+    espaço em branco. Falso positivo é barato (a saída lista o que sumiria e há
+    `--forcar`); falso negativo apagaria produção em silêncio.
+
+    A porta é normalizada porque `--porta` existe para o smoke do cutover: subir
+    numa porta de ensaio não pode ser lido como perda da linha `listen`.
+    A linha do carimbo é ignorada pelo mesmo motivo — ela muda a cada execução.
+    """
+    fora = set()
+    for linha in texto.split("\n"):
+        crua = linha.strip()
+        if not crua or crua.startswith("#"):
+            continue
+        crua = re.sub(r"listen\s+127\.0\.0\.1:\d+", "listen 127.0.0.1:PORTA", crua)
+        fora.add(" ".join(crua.split()))
+    return fora
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--porta", type=int, default=porta_padrao())
+    ap.add_argument("--saida", default=str(DESTINO))
+    ap.add_argument("--forcar", action="store_true",
+                    help="grava mesmo que a saida perca linhas que decidem resposta "
+                         "(ver a GUARDA DE PERDA abaixo — use so depois de conferir o diff)")
+    args = ap.parse_args()
+
+    if not VHOST_VIVO.is_file():
+        print(f"FALHA: {VHOST_VIVO} nao existe — nao ha de onde derivar.")
+        return 1
+    vivo = VHOST_VIVO.read_text(encoding="utf-8")
+
+    # O vhost vivo escuta na porta do ingress. Para o SMOKE do cutover a
+    # instancia nova precisa subir numa porta propria, sem disputar com a que
+    # esta servindo — dai a substituicao ser parametrizada e nao fixa.
+    corpo = re.sub(r"listen\s+127\.0\.0\.1:\d+", f"listen 127.0.0.1:{args.porta}", vivo)
+
+    modulos = "\n".join(f"load_module {m};" for m in MODULOS)
+    carimbo = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conteudo = f"""# GERADO por tools/generate-nginx-standalone em {carimbo}. NAO EDITE A MAO.
+#
+# Este arquivo e DERIVADO de ops/nginx/wikijuridica.conf — o vhost vivo, que e a
+# fonte unica de verdade sobre como o wiki responde. Editar aqui cria a mesma
+# divergencia que este gerador veio corrigir: a versao escrita a mao em
+# 2026-08-06 ficou 39 diretivas atras do vivo, e migrar a partir dela regrediria
+# o sitemap (gzip), os 301 (porta vazando no Location), o rate limit dos bots e
+# os oito cabecalhos de seguranca de uma vez so.
+#
+# Para mudar o comportamento: edite o vhost vivo e rode este gerador de novo.
+# tools/check-nginx-standalone-parity reprova se os dois divergirem.
+
+# A instancia sobe com `-c` proprio e NAO le /etc/nginx/modules-enabled/. Sem
+# estes load_module, o `nginx -t` do ExecStartPre reprova em more_set_headers —
+# e os oito cabecalhos de seguranca, o Vary e o Link dependem dele.
+{modulos}
+
+# O master NAO e privilegiado (a unit usa User=rafael) — mas `user` e obrigatoria
+# mesmo assim. Ver o comentario da diretiva `user rafael rafael;`, logo abaixo de
+# events {{}}: e o que impede que um `sudo nginx -t` acidental deixe os diretorios
+# de var/nginx/ com dono `nobody` e derrube o canal de maquina (medido, 2026-09-02).
+worker_processes auto;
+worker_rlimit_nofile 65535;
+
+# 30s para o worker antigo drenar no reload. O host usava o mesmo valor, e ele
+# so era inutil porque o TimeoutStopSec=5s do systemd matava antes — defeito que
+# nao existe aqui, porque esta instancia usa reload e nao restart.
+worker_shutdown_timeout 30s;
+
+pid /opt/wiki/var/nginx/nginx.pid;
+error_log /var/log/nginx/wikijuridica/error.log warn;
+
+events {{
+    worker_connections 8192;
+    multi_accept on;
+    use epoll;
+}}
+
+# `user rafael rafael;` — E POR QUE ELA E OBRIGATORIA MESMO COM O MASTER SEM ROOT.
+#
+# A unit roda o nginx como rafael, entao esta diretiva nao muda o dono dos
+# workers (o nginx ate avisa: "the user directive makes sense only if the master
+# process runs with super-user privileges"). O que ela muda e o que acontece
+# quando ALGUEM roda `sudo nginx -t` com este conf — o deploy fazia isso antes de
+# cada reload e o operador tambem: rodando como root, o `-t` cria os diretorios
+# de client_body_temp_path/proxy_temp_path/proxy_cache_path e os RE-ATRIBUI ao
+# usuario da diretiva `user`, cujo padrao e nobody. Medido em 2026-09-02: apos o
+# `-t` sob sudo do deploy (11:19:24), var/nginx/cache voltou a nobody:0700, os
+# workers (rafael) tomaram EACCES em cada objeto, e todo o canal de maquina
+# (gemea Markdown, cards, lote) respondeu 500 por 12 minutos — e o 404 saiu
+# truncado (0 B) e virou 520 na borda. var/nginx/proxy ja era nobody desde
+# 01/09 pelo mesmo caminho. Com a diretiva, o `-t` sob root atribui a rafael.
+user rafael rafael;
+
+http {{
+    # AS VARIÁVEIS NÃO CABIAM MAIS NO HASH PADRÃO, e o nginx avisava em vez de
+    # falhar — que é a pior forma de defeito, porque `-t` continua dizendo
+    # "successful". As zonas de tier agregado acrescentaram `$wj_operador_do_ip`
+    # e duas chaves compostas por tier; com 1024 (o default) o nginx reclama
+    # "could not build optimal variables_hash" e passa a resolver variável por
+    # varredura em vez de hash. Não é erro de config: é custo por requisição,
+    # em todas elas.
+    variables_hash_max_size 2048;
+    # REVALIDACAO CONDICIONAL: `before`, nao o default `exact`.
+    #
+    # O DEFEITO, medido em 2026-08-26. Sem esta diretiva o nginx usa
+    # `if_modified_since exact`, que devolve 304 SO quando a data do
+    # If-Modified-Since e EXATAMENTE igual ao Last-Modified. Como todo bot
+    # revalida com a data da propria ultima visita -- sempre POSTERIOR --, todo
+    # bot rebaixava a pagina inteira, toda vez. Medido no log: 78 respostas 304
+    # em 41.768, ou 0,19%.
+    #
+    # Custo real: nao e banda do servidor, e ORCAMENTO DE RASTREIO e TOKEN DE
+    # AGENTE. Com o Googlebot em ~30 requisicoes/dia, cada corpo de 22 KB
+    # devolvido sem necessidade e uma pagina nova que ele deixa de buscar. Para
+    # um agente de IA e o mesmo em tokens: o `meta-externalagent` baixou o
+    # acervo DUAS vezes inteiro (15.697 requisicoes, UMA resposta 304) porque
+    # nada lhe disse que nada tinha mudado.
+    #
+    # POR QUE E SEGURO AGORA, e nao era quando o plano foi escrito. A RFC 9110
+    # §13.1.3 justifica o comportamento `exact` citando literalmente
+    # "Last-Modified dates that appear to go 'back in time'" -- e este acervo
+    # TEM mtime que retrocede, por desenho de `gravaDatado`. Ligar `before` sem
+    # entender isso devolveria 304 para pagina que mudou.
+    #
+    # A medicao que destravou: o `revised_on` de 9.585 rotas e 2026-08-06 e o
+    # `html_sha256` mudou em 9.467 de 9.467. Ou seja, os BYTES mudaram por
+    # RENDERIZACAO (rodape, links, template), e o CONTEUDO AUTORAL nao. O
+    # Last-Modified de 06/08 esta correto para o que o leitor le, e devolver 304
+    # a quem pede com data posterior e a resposta certa.
+    #
+    # Residual conhecido e aceito: um cliente que revalide depois de uma mudanca
+    # de RENDERIZACAO recebe 304 e fica com a navegacao anterior. Mitigado
+    # porque renderizacao muda em deploy, e o deploy purga a borda.
+    if_modified_since before;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Diretorios temporarios dentro do repo: o usuario da unit nao escreve em
+    # /var/lib/nginx.
+    client_body_temp_path /opt/wiki/var/nginx/body;
+    proxy_temp_path /opt/wiki/var/nginx/proxy;
+
+    # ★ CACHE DE ORIGEM PARA O CANAL DE MAQUINA (2026-09-02).
+    #
+    # Ate hoje nao havia proxy_cache: com o processo Go parado (17 h em
+    # 01-02/09/2026, 448 restarts futeis do vigia), toda rota dinamica — gemea
+    # Markdown, /api/v1, /.well-known, openapi — devolvia 503 a todo bot, e a
+    # borda, que guardava 5xx como no-cache, servia o 503 STALE e ainda derrubava
+    # o HTML da mesma chave. A zona abaixo guarda a ULTIMA resposta boa de cada
+    # rota dinamica e, quando o upstream cai ou reinicia, `proxy_cache_use_stale`
+    # (nas locations @markdown e @fallback) entrega o objeto velho em vez do erro.
+    # Latencia e frescor sao os do Cache-Control que o Go ja manda; `no-store`
+    # (busca, contato) nunca entra. Dimensionado pelo medido: index.md mediana
+    # 10,6 KB, p90 39 KB, maximo 127 KB -> ~10 mil objetos cabem em < 400 MB.
+    # O deploy limpa este diretorio no passo 4/7 junto com o cache do Go.
+    proxy_cache_path /opt/wiki/var/nginx/cache levels=1:2 keys_zone=wj_dyn:64m
+                     max_size=2g inactive=30d use_temp_path=off;
+
+    # ZONA PROPRIA DA REDE SOCIAL, e ela e separada da wj_dyn de proposito.
+    #
+    # Compartilhar a zona do acervo faria uma pagina social autenticada e uma
+    # pagina do acervo disputarem as mesmas chaves e o mesmo max_size: um pico
+    # de trafego social despejaria o acervo do cache, e o acervo e o ativo que
+    # sustenta o projeto. Separadas, um lado nao despeja o outro.
+    #
+    # Menor de proposito (16m de chaves, 512m de disco): a rede social nasce com
+    # poucas rotas publicas, e o cache dela serve visitante anonimo e bot -- nao
+    # sessao, que nunca entra aqui (proxy_no_cache abaixo).
+    proxy_cache_path /opt/wiki/var/nginx/cache-social levels=1:2 keys_zone=wj_social:16m
+                     max_size=512m inactive=7d use_temp_path=off;
+
+    # ★ BUFFERS DIMENSIONADOS, e o defeito que a ausencia deles causou.
+    #
+    # Ate 2026-09-01 nao havia `proxy_buffers` nem `proxy_buffer_size` em lugar
+    # nenhum deste arquivo, entao valia o default do nginx: 4k + 8x4k, ~36 KB.
+    # Resposta maior que isso precisa DERRAMAR EM DISCO quando o cliente e lento --
+    # e o caminho pela borda/tunel e lento por natureza. O derrame ia para o
+    # proxy_temp_path acima, que era `nobody:rafael` 0700 enquanto o nginx roda
+    # como `rafael`: o open() falhava com [crit] Permission denied, o nginx
+    # abortava a leitura do upstream, e o que ja havia sido enviado virava a
+    # resposta -- com status 200 ja no fio.
+    #
+    # MEDIDO: GET /api/v1/lote entregava 172.407 bytes e 14 registros na borda
+    # contra 604.090 bytes e 51 registros na origem. O consumidor nao tinha como
+    # saber que recebeu 14 de 51. Um cliente externo real bateu nisso as 10:38.
+    #
+    # A CAUSA foi corrigida no dono dos cinco diretorios. Estes buffers sao a
+    # segunda camada: com 512 KB em memoria, as respostas grandes deste portal
+    # (o maior lote medido tem 604 KB) param de precisar de disco no caminho
+    # normal, e o derrame volta a ser excecao em vez de rotina. Nao substituem a
+    # permissao correta -- resposta acima de 512 KB ainda derrama, e ai o
+    # diretorio precisa estar gravavel.
+    #
+    # Guarda contra truncamento silencioso: tools/check-corpo-integro-na-borda,
+    # que compara borda e origem em bytes descomprimidos e em contagem de
+    # registros, porque status e latencia ficam perfeitos quando isto quebra.
+    proxy_buffer_size 32k;
+    proxy_buffers 16 32k;
+    proxy_busy_buffers_size 64k;
+    fastcgi_temp_path /opt/wiki/var/nginx/fastcgi;
+    scgi_temp_path /opt/wiki/var/nginx/scgi;
+    uwsgi_temp_path /opt/wiki/var/nginx/uwsgi;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 15;
+    keepalive_requests 10000;
+    reset_timedout_connection on;
+    client_body_timeout 30s;
+    client_header_timeout 30s;
+    send_timeout 30s;
+    server_tokens off;
+    types_hash_max_size 4096;
+
+    # Brotli para o acervo estatico. `brotli_static on` serve o .br pre-comprimido
+    # do disco quando ele existe: custo de CPU por requisicao de bot cai a zero, e
+    # o ETag sobrevive (a compressao on-the-fly do gzip o descarta).
+    brotli on;
+    brotli_static on;
+    brotli_comp_level 5;
+    brotli_min_length 256;
+    # `application/linkset+json` entrou em 2026-08-19, em paridade com o
+    # `gzip_types` do vhost vivo (ops/nginx/wikijuridica.conf). MEDIDO na
+    # origem (127.0.0.1:8088) e na borda (Cloudflare) no mesmo dia: a entrada
+    # e HOJE INOCUA — o catalogo do RFC 9727 (internal/httpserver/descritores.go
+    # `linksetContentType`) sai como `application/linkset+json; profile="..."`,
+    # e o nginx so descasca o parametro `charset=` de um Content-Type
+    # proxiado (ngx_http_upstream_copy_content_type), nunca `profile=`. O
+    # `content_type_len` comparado contra esta lista inclui o parametro
+    # inteiro, que nunca bate com a entrada literal — nem aqui nem em
+    # `gzip_types`. Confirmado por harness isolado (nginx 1.22.1, mesmo
+    # binario): Content-Type raso `application/linkset+json` comprime,
+    # `application/linkset+json; profile="x"` nao, com a MESMA lista.
+    # Corrigir de verdade exige o emissor Go parar de anexar o parametro, ou
+    # a lista passar a conter o Content-Type completo com o parametro (o que
+    # esbarra em `types_hash_bucket_size` fixo em 64 no nginx.org, hardcoded
+    # no merge de tipos — nao ha diretiva que aumente esse hash especifico).
+    # A entrada fica pela paridade com o gzip_types e por correcao automatica
+    # no dia em que o emissor mudar — nao e o fix funcional completo.
+    brotli_types text/plain text/css text/xml text/markdown application/xml application/json application/atom+xml image/svg+xml application/linkset+json;
+
+    # CACHE DE ARQUIVO ABERTO: DESLIGADO, e agora dito por DIRETIVA e nao so por
+    # comentario (BUG-080, 2026-08-29).
+    #
+    # O `open_file_cache max=900000 inactive=900s` de /etc/nginx/nginx.conf
+    # (linha 1944, herdado do hardening do projeto vizinho) era a razao declarada
+    # do `systemctl restart nginx` a cada deploy, que derrubava a origem 8 a 9
+    # segundos por publicacao. Nesta instancia ele nao existe — e nao por
+    # heranca ausente que alguem precise lembrar: a unit sobe com `-c` proprio e
+    # NAO le /etc/nginx/nginx.conf, entao nada daquele arquivo chega aqui.
+    #
+    # ATE 2026-08-29 ESSA AUSENCIA SO EXISTIA EM PROSA, e a prosa mentia: dizia
+    # "O vhost define o seu, com `valid 5s`" quando o vhost define APENAS o
+    # `valid`, sem cache nenhum para valida-lo. Medido na config totalmente
+    # expandida, includes ja resolvidos:
+    #
+    #   nginx -T -c ops/nginx/standalone/nginx.conf -p var/nginx/ \\
+    #     | grep -cE '^[[:space:]]*open_file_cache[[:space:]]'   ->  0
+    #
+    # `off` e o mesmo estado efetivo que a medicao ja mostrava — zero mudanca de
+    # comportamento — com a diferenca de que agora esta declarado, e
+    # internal/contract/public/nginx_config_honesty_test.go reprova qualquer
+    # `open_file_cache_valid|_min_uses|_errors` que volte a aparecer sem a
+    # postura ao lado.
+    open_file_cache off;
+
+{corpo}
+}}
+"""
+
+    destino = pathlib.Path(args.saida)
+
+    # ═══ GUARDA DE PERDA — 2026-08-26 ═══════════════════════════════════════
+    #
+    # ESTE GERADOR ESTAVA A UM COMANDO DE REGREDIR A PRODUÇÃO, e `--saida` tem
+    # como DEFAULT o arquivo que a unit carrega.
+    #
+    # Medido em 2026-08-26: o `ops/nginx/standalone/nginx.conf` que roda está À
+    # FRENTE do vhost, não atrás — 76 diretivas contra 67. Três commits de
+    # 2026-08-20 (59bc7add, 3bd86cb7, 4a3217eb) editaram SÓ o standalone,
+    # coerentes com os testes de contrato Go (internal/contract/public/
+    # nginx_agent_surface_test.go:21-25 e nginx_bot_policy_drift_test.go:33),
+    # que declaram o standalone canônico — e violando o "NAO EDITE A MAO" que
+    # este próprio gerador escreve no cabeçalho. É uma colisão de fonte-de-verdade,
+    # não descuido de uma pessoa.
+    #
+    # Rodar `tools/generate-nginx-standalone` sem argumento naquele estado
+    # produziria, medido por diff contra um temporário:
+    #
+    #   • as áreas diarios, jurisprudencia e noticias somem dos DOIS maps de
+    #     roteamento (32 -> 29) — o Cache-Tag por área some com elas, e a purga
+    #     seletiva da borda deixa de alcançar 278 páginas publicadas;
+    #   • os 3 hubs perdem negociação Markdown e `Link: rel=alternate`;
+    #   • /feed.xml e /rss.xml regridem de application/atom+xml para text/xml;
+    #   • @fallback perde `gzip_vary off` e `-s '200 304'` — e essa vale para
+    #     TODAS as rotas servidas pelo Go, não só para as 3 áreas.
+    #
+    # E o pior: `nginx -t` APROVA o gerado (medido, exit 0) e o
+    # `check-nginx-standalone-parity` ficaria VERDE depois, certificando o
+    # estrago — porque ele compara um sentido só, e corpo de `map` é invisível
+    # para o parser dele nos dois sentidos.
+    #
+    # A guarda não decide qual arquivo é canônico: ela só recusa APAGAR
+    # conteúdo. Sobrescrever com MAIS é sempre permitido; sobrescrever com
+    # MENOS exige --forcar e a decisão explícita de quem roda.
+    if destino.exists() and not args.forcar:
+        atual = destino.read_text(encoding="utf-8")
+        perdidas = linhas_decisivas(atual) - linhas_decisivas(conteudo)
+        if perdidas:
+            print(f"RECUSADO: gerar sobre {destino} APAGARIA {len(perdidas)} linha(s) "
+                  "que decidem resposta e existem hoje no arquivo em produção.")
+            print("  O standalone está À FRENTE do vhost — ele foi editado à mão, e os")
+            print("  testes de contrato Go o tratam como canônico. Portar para o vhost")
+            print("  ANTES de gerar é o caminho; gerar agora regride o que está no ar.")
+            print("  As linhas que sumiriam (até 12):")
+            for l in sorted(perdidas)[:12]:
+                print(f"      {l[:118]}")
+            if len(perdidas) > 12:
+                print(f"      ... e mais {len(perdidas) - 12}")
+            print("  Se a perda for INTENCIONAL e você a conferiu linha a linha: --forcar")
+            return 2
+
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text(conteudo, encoding="utf-8")
+    print(f"gerado: {destino}")
+    print(f"  derivado de: {VHOST_VIVO}")
+    print(f"  porta      : 127.0.0.1:{args.porta}")
+    print(f"  bytes      : {destino.stat().st_size}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

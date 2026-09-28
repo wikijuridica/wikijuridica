@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# ai-gc — cleanup do ambiente de agentes, com principio ARQUIVAR ANTES DE APAGAR.
+#
+# POR QUE EXISTE (o GC antigo nao cobria o que mais cresce)
+#   `ai-terminal-gc` so remove CODEX_HOME *vazios* (<=1MB). Home com historico so
+#   sai com --include-history, e a unit systemd nunca passa essa flag — por isso
+#   ~/.codex/terminal-homes chegou a 4.1 GB em 22 homes de sessoes ja mortas.
+#   Medido em 2026-07-28: 96% desse volume e sessions/*.jsonl e sqlite de log, que
+#   comprimem ~3.2x. Este GC comprime em vez de destruir: o historico continua
+#   recuperavel (tar -I zstd -xf) e o disco volta.
+#
+# O QUE NAO E LIXO (medido, nao mexer)
+#   ~/.claude/projects (transcripts) e ~/.claude/file-history JA se auto-limpam:
+#   nao ha nenhum arquivo com mais de 30 dias. Sao a memoria das sessoes (/resume,
+#   Agents view, recuperacao de trabalho) — apagar seria destruir o que o dono ja
+#   pagou para produzir. Este GC NAO os toca; so relata o tamanho.
+#
+# SEGURANCA (nada e tocado se qualquer camada falhar)
+#   - Nunca toca home de sessao tmux VIVA nem de processo codex/claude VIVO.
+#   - Nunca toca nada com menos de --days dias (default 3).
+#   - Arquiva PRIMEIRO, confere o arquivo gerado, e so entao remove o original.
+#   - Dry-run por padrao: sem --apply nada e alterado.
+#
+# USO
+#   ai-gc                      # dry-run: mostra o que faria e quanto liberaria
+#   ai-gc --apply              # executa
+#   ai-gc --apply --days 7     # so o que tem 7+ dias
+#   ai-gc --purge-archives 90  # remove arquivos .tar.zst com mais de 90 dias
+set -uo pipefail
+
+APPLY=0
+DAYS=3
+PURGE_ARCHIVES=0
+BASE_HOME="${CODEX_BASE_HOME:-$HOME/.codex}"
+HOMES_DIR="$BASE_HOME/terminal-homes"
+ARCHIVE_DIR="$BASE_HOME/terminal-homes-archive"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --days) shift; DAYS="${1:-3}" ;;
+    --days=*) DAYS="${1#--days=}" ;;
+    --purge-archives) shift; PURGE_ARCHIVES="${1:-90}" ;;
+    --purge-archives=*) PURGE_ARCHIVES="${1#--purge-archives=}" ;;
+    -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "arg desconhecido: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ "$DAYS" =~ ^[0-9]+$ ]] || { echo "--days precisa ser inteiro" >&2; exit 2; }
+
+now=$(date +%s)
+min_age=$(( DAYS * 86400 ))
+freed_kb=0; acted=0; kept=0
+
+mode="DRY-RUN (nada sera alterado — use --apply)"
+[ "$APPLY" -eq 1 ] && mode="APLICANDO"
+printf 'ai-gc  [%s]  retencao=%sd\n\n' "$mode" "$DAYS"
+
+# ---------------------------------------------------------------- compressor --
+# Threads limitadas de proposito. Com -T0 o zstd toma os 8 cores e disputa CPU com
+# a frota de agentes (medido 2026-07-28: load 31 em 8 cores durante o GC). Limpeza
+# e trabalho de fundo: nunca pode atrasar o trabalho que produz. nice/ionice ja
+# cedem prioridade; -T2 evita ate a disputa por escalonamento.
+ZSTD_THREADS="${AI_GC_ZSTD_THREADS:-2}"
+if command -v zstd >/dev/null 2>&1; then
+  EXT="tar.zst"; TARFLAG=(-I "zstd -T${ZSTD_THREADS} -12")
+else
+  EXT="tar.gz"; TARFLAG=(-z)
+fi
+
+# ------------------------------------------------- 1) CODEX_HOME orfaos -------
+live_sessions=""
+command -v tmux >/dev/null 2>&1 && live_sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+
+live_homes=""
+for pid in $(pgrep -f 'codex|claude' 2>/dev/null || true); do
+  [ -r "/proc/$pid/environ" ] || continue
+  ch="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | sed -n 's/^CODEX_HOME=//p' | head -1)"
+  [ -n "$ch" ] && live_homes="$live_homes
+$ch"
+done
+
+echo "── CODEX_HOME orfaos (compressao ~3.2x, historico preservado) ──"
+if [ -d "$HOMES_DIR" ]; then
+  for home in "$HOMES_DIR"/*/; do
+    [ -d "$home" ] || continue
+    home="${home%/}"
+    name="$(basename "$home")"
+    # A sessao tmux pode ter nome curto e o home nome longo (<sessao>--<sha>).
+    sess="${name%%--*}"
+
+    if printf '%s\n' "$live_sessions" | grep -Fxq "$sess" 2>/dev/null; then
+      printf '  MANTEM  [tmux vivo]        %s\n' "${name:0:46}"; kept=$((kept+1)); continue
+    fi
+    if printf '%s\n' "$live_homes" | grep -Fxq "$home" 2>/dev/null; then
+      printf '  MANTEM  [processo vivo]    %s\n' "${name:0:46}"; kept=$((kept+1)); continue
+    fi
+    mtime=$(stat -c %Y "$home" 2>/dev/null || echo "$now")
+    age=$(( now - mtime ))
+    if [ "$age" -lt "$min_age" ]; then
+      printf '  MANTEM  [recente %2sd]      %s\n' "$(( age/86400 ))" "${name:0:46}"; kept=$((kept+1)); continue
+    fi
+
+    size_kb=$(du -sk "$home" 2>/dev/null | cut -f1); size_kb="${size_kb:-0}"
+    archive="$ARCHIVE_DIR/${name}.${EXT}"
+    if [ "$APPLY" -eq 1 ]; then
+      mkdir -p "$ARCHIVE_DIR"
+      if tar -C "$HOMES_DIR" "${TARFLAG[@]}" -cf "$archive.partial" "$name" 2>/dev/null &&
+         mv -f "$archive.partial" "$archive" &&
+         [ -s "$archive" ]; then
+        # So remove o original DEPOIS de o arquivo existir e ter conteudo.
+        rm -rf -- "$home"
+        arc_kb=$(du -sk "$archive" 2>/dev/null | cut -f1)
+        printf '  ARQUIVA %6sMB -> %5sMB  %s\n' "$(( size_kb/1024 ))" "$(( arc_kb/1024 ))" "${name:0:40}"
+        freed_kb=$(( freed_kb + size_kb - arc_kb )); acted=$((acted+1))
+      else
+        rm -f -- "$archive.partial" 2>/dev/null
+        printf '  FALHOU  [compressao]       %s (original intacto)\n' "${name:0:46}"
+      fi
+    else
+      printf '  ARQUIVA %6sMB (~%4sMB apos)  %s\n' "$(( size_kb/1024 ))" "$(( size_kb/1024/3 ))" "${name:0:36}"
+      freed_kb=$(( freed_kb + size_kb - size_kb/3 )); acted=$((acted+1))
+    fi
+  done
+else
+  echo "  (nenhum)"
+fi
+
+# --------------------------------------------- 2) archives muito antigos ------
+if [ "$PURGE_ARCHIVES" -gt 0 ] && [ -d "$ARCHIVE_DIR" ]; then
+  echo
+  echo "── archives com mais de ${PURGE_ARCHIVES}d ──"
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    kb=$(du -sk "$a" 2>/dev/null | cut -f1)
+    if [ "$APPLY" -eq 1 ]; then rm -f -- "$a"; fi
+    printf '  REMOVE  %5sMB  %s\n' "$(( kb/1024 ))" "$(basename "$a")"
+    freed_kb=$(( freed_kb + kb )); acted=$((acted+1))
+  done < <(find "$ARCHIVE_DIR" -maxdepth 1 -type f -name "*.${EXT}" -mtime "+${PURGE_ARCHIVES}" 2>/dev/null)
+fi
+
+# ------------------------------------------------- 3) temporarios proprios ----
+echo
+echo "── temporarios de execucao ──"
+tmp_run="/tmp/ai-pane-$(id -u)/run"
+if [ -d "$tmp_run" ]; then
+  n=$(find "$tmp_run" -type f -mmin +1440 2>/dev/null | wc -l)
+  if [ "$n" -gt 0 ]; then
+    [ "$APPLY" -eq 1 ] && find "$tmp_run" -type f -mmin +1440 -delete 2>/dev/null
+    printf '  LIMPA   %s arquivos de run com +24h em %s\n' "$n" "$tmp_run"; acted=$((acted+1))
+  else
+    printf '  ok      %s sem sobras\n' "$tmp_run"
+  fi
+fi
+
+# PID files de agente cujo processo ja morreu (o hook grava o PID do proprio hook,
+# que morre em seguida — sem esta limpeza o diretorio acumula lixo indefinidamente).
+lockdir="/tmp/claude-agents-running"
+if [ -d "$lockdir" ]; then
+  dead=0
+  for f in "$lockdir"/agent-*.pid; do
+    [ -f "$f" ] || continue
+    pid="$(cat "$f" 2>/dev/null)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      [ "$APPLY" -eq 1 ] && rm -f "$f"
+      dead=$((dead+1))
+    fi
+  done
+  [ "$dead" -gt 0 ] && { printf '  LIMPA   %s pid-file(s) de processo morto em %s\n' "$dead" "$lockdir"; acted=$((acted+1)); } \
+                    || printf '  ok      %s sem pid morto\n' "$lockdir"
+fi
+
+# ------------------------------------------------------- 4) relatorio ---------
+echo
+echo "── nao tocado (auto-limpa em 30d; e a memoria das sessoes) ──"
+printf '  %-28s %s\n' "~/.claude/projects"     "$(du -sh ~/.claude/projects 2>/dev/null | cut -f1) — transcripts (/resume, Agents view)"
+printf '  %-28s %s\n' "~/.claude/file-history" "$(du -sh ~/.claude/file-history 2>/dev/null | cut -f1) — undo de edicoes"
+
+printf '\nresumo: %s acao(oes), %s mantido(s), ~%s MB liberados%s\n' \
+  "$acted" "$kept" "$(( freed_kb/1024 ))" \
+  "$([ "$APPLY" -eq 1 ] && echo '' || echo ' (estimado — dry-run)')"
+[ "$APPLY" -eq 1 ] || printf 'nada foi alterado. para executar: ai-gc --apply\n'
+printf 'restaurar um home arquivado: tar -I zstd -xf %s/<nome>.%s -C %s\n' "$ARCHIVE_DIR" "$EXT" "$HOMES_DIR"

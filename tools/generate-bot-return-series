@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""generate-bot-return-series — a métrica que faltava: RETORNO, não cobertura.
+
+★ O DEFEITO QUE ESTA FERRAMENTA CORRIGE (ordem do dono, 2026-08-26)
+
+    "Os bots terem varrido a plataforma não quer dizer que funciona.
+     Eles têm que sempre voltar."
+
+Toda a telemetria de bot deste repositório media COBERTURA ACUMULADA — um número
+que só cresce e que, por construção, NUNCA acusa abandono. Foi assim que
+ninguém viu o GPTBot cair para 1 requisição/dia em 08/08 e o `meta-externalagent`
+sumir em 23/08 depois de varrer 96,8% do acervo duas vezes. Sob a régua da
+cobertura, os dois estavam ótimos.
+
+Pior: cobertura parada é compatível com DOIS problemas OPOSTOS — "não achou" e
+"achou e recusou" — que pedem correções opostas. `tools/check-crawl-coverage-stall`
+só sabe dizer que a cobertura parou. Esta série separa os dois casos.
+
+★ O QUE ELA PRODUZ
+
+    data/ops/bot_return_daily.jsonl   uma linha por (date, agent_key)
+    data/ops/bot_return_state.json    o estado de retorno de cada agente HOJE
+
+O arquivo diário é DERIVADO e REESCRITO POR INTEIRO a cada execução — não é
+append-only. É decisão de desenho, não preguiça: `crawl_coverage_daily.jsonl` é
+append-only, cumulativo, e por isso tem 1.225 linhas para 220 fatos, com
+`googlebot/2026-08-12` aparecendo 21 vezes com seis valores diferentes de
+`paths_requested_that_day`. Série derivada que se reescreve não herda essa
+armadilha, e é reproduzível: mesmo insumo, mesmo arquivo, byte a byte.
+
+★ AS TRÊS FONTES TÊM CONVENÇÕES DIFERENTES, E MISTURÁ-LAS É A ARMADILHA
+
+    data/ops/edge_bot_agents_daily.jsonl
+        Lido por tools/edgetelemetry.serie_saneada — dedup por (date, agent_key)
+        mantendo a ÚLTIMA linha, descartando a fisicamente impossível.
+        Requisições por dia, com identidade verificada pela Cloudflare.
+
+    data/ops/crawl_coverage_daily.jsonl
+        Lido por tools/crawlcoverage.serie_saneada — dedup por (date, crawler),
+        v2 (identidade autenticada) vencendo v1 (string de User-Agent).
+        `paths_requested_that_day` e `new_sitemap_urls_that_day` são DO DIA;
+        `cumulative_sitemap_coverage` é ACUMULADO e não se soma entre datas.
+
+    data/ops/ai_citation_signal_daily.jsonl
+        Linhas são INCREMENTOS SOMÁVEIS (`summable: true`): quem consome SOMA
+        por (date, layer, key). Regravar o total do dia subcontaria, porque a
+        janela do log encolhe com o logrotate.
+
+Três convenções, três leitores. Aplicar a de uma na outra é a armadilha A1 com
+outra roupa — foi exatamente assim que `paths_requested_that_day: 103` virou um
+número 2,6× inflado.
+
+★ O QUE ESTA SÉRIE NÃO MEDE, E POR QUE ESTÁ ESCRITO NO SCHEMA
+
+  - Não mede CITAÇÃO. O campo `citacao_clique_de_volta` é a camada (c) de
+    `tools/measure-ai-citation` — leitor humano que chegou de assistente — e ele
+    carrega `is_citation_count: false` na origem. É limite inferior de interesse,
+    nunca contagem de citação.
+  - Não mede requisição servida em HIT na borda para o crawler sem tocar a
+    origem: ORIGEM ≤ BORDA sempre. As requisições daqui vêm da BORDA justamente
+    por isso.
+  - Agente fora de `crawl_coverage_daily` (hoje: só 10 crawlers são medidos por
+    URL) tem retorno em requisições, mas não tem novas × revisitadas. O campo
+    fica ausente em vez de zero — zero afirmaria "não descobriu nada".
+
+Uso:
+    tools/generate-bot-return-series            # grava as duas séries
+    tools/generate-bot-return-series --dry-run  # imprime, não escreve
+    tools/generate-bot-return-series --json
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import statistics
+import sys
+import tempfile
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(RAIZ, "tools"))
+
+import botagents  # noqa: E402
+import crawlcoverage  # noqa: E402
+import edgetelemetry  # noqa: E402
+
+SERIE_DIARIA = os.path.join(RAIZ, "data/ops/bot_return_daily.jsonl")
+ESTADO = os.path.join(RAIZ, "data/ops/bot_return_state.json")
+SERIE_CITACAO = os.path.join(RAIZ, "data/ops/ai_citation_signal_daily.jsonl")
+SCHEMA_DIARIO = "bot_return_daily_v1"
+# v2 (2026-09-05): `queda_vs_referencia_pct` ENTROU ao lado de
+# `queda_desde_o_pico_pct`, que continua no estado e mudou de numerador (o
+# parcial de hoje saiu). O campo antigo nao foi removido — a queda que ele mede
+# e verdadeira — mas quem decide alarme e o novo. A versao muda porque um
+# consumidor do v1 leria a mesma chave com outro valor, e mudanca silenciosa de
+# semantica em campo de mesmo nome e o pior tipo de mudanca de schema.
+SCHEMA_ESTADO = "bot_return_state_v2"
+
+# Um bot é VALIOSO quando a função dele é buscar, atender usuário ou treinar
+# modelo — as três que produzem citação ou indexação. A classificação sai de
+# tools/botagents.FUNCAO, fonte única de identidade de bot deste repositório;
+# lista escrita à mão aqui divergiria dela no primeiro agente novo.
+FUNCOES_VALIOSAS = ("search", "user", "training")
+
+# PISO do intervalo tolerado antes de chamar de abandono. Existe porque um
+# agente cujo intervalo mediano é 1 dia não pode disparar alarme por faltar um
+# único dia — ruído de amostragem da borda (o dataset é amostrado) produziria
+# alarme diário e o canal de alerta morreria afogado, que é o defeito O39 já
+# medido neste repositório.
+PISO_DIAS_ABANDONO = 3
+
+# MÚLTIPLO do ritmo do próprio agente. "Parou de vir no ritmo dele" é o critério
+# honesto: um bot que visita a cada 7 dias não está abandonando o portal no
+# oitavo. Três vezes o intervalo mediano é folga suficiente para não confundir
+# variação com sumiço.
+MULTIPLO_DO_RITMO = 3
+
+# JANELA RECENTE da comparacao de volume, em dias COM VISITA e JA COMPLETOS.
+# Tres e o menor tamanho em que a mediana ainda e mediana (ela ignora o maior e
+# o menor); dois viraria media de dois e um dia ruim mandaria no veredito.
+DIAS_RECENTES = 3
+
+# Piso de dias COM VISITA para que exista tendencia. Abaixo dele nao ha janela
+# anterior que sustente comparacao: com 6 sobram 3 de cada lado, o minimo para
+# que os dois lados sejam medianas de verdade. Ver o comentario (2) adiante,
+# que registra o falso positivo real (applebot, 2 visitas) que fixou este piso.
+DIAS_MINIMOS_PARA_TENDENCIA = 2 * DIAS_RECENTES
+
+# Fracao da referencia abaixo da qual o volume conta como ESFRIAMENTO.
+FRACAO_DE_ESFRIAMENTO = 0.25
+
+
+def dia_de_hoje() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def diferenca_em_dias(a: str, b: str) -> int:
+    return (datetime.date.fromisoformat(a) - datetime.date.fromisoformat(b)).days
+
+
+def carregar_citacao() -> dict:
+    """Soma os incrementos da série de citação por (date, key), só da camada
+    `clique_de_volta` — a única que indica leitor humano vindo de assistente.
+
+    SOMA, e não "última linha", porque o produtor declara `summable: true` no
+    próprio registro: a janela do log encolhe com o logrotate, e regravar o
+    total do dia faria uma execução posterior reportar MENOS requisições para a
+    mesma data. A série mentiria para baixo, na direção que faz concluir "os
+    bots pararam de vir" — a conclusão mais cara possível para este projeto.
+    """
+    somado: dict[tuple, int] = {}
+    if not os.path.isfile(SERIE_CITACAO):
+        return somado
+    with open(SERIE_CITACAO, encoding="utf-8") as handle:
+        for bruto in handle:
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registro = json.loads(bruto)
+            except json.JSONDecodeError:
+                continue
+            if registro.get("layer") != "clique_de_volta":
+                continue
+            if not registro.get("summable"):
+                continue
+            chave = (registro.get("date"), registro.get("key"))
+            somado[chave] = somado.get(chave, 0) + int(registro.get("requests") or 0)
+    return somado
+
+
+def montar(hoje: str | None = None,
+           borda: dict | None = None,
+           borda_descartadas: list | None = None,
+           cobertura: dict | None = None,
+           cobertura_descartadas: list | None = None,
+           citacao: dict | None = None) -> tuple[list[dict], dict]:
+    """Monta a serie diaria e o estado de retorno.
+
+    OS PARAMETROS SAO PARA O TESTE, e nao para o caminho de producao: omitidos,
+    a funcao le exatamente as mesmas fontes de sempre. `hoje` e o que torna a
+    prova reproduzivel — a regua exclui deliberadamente o dia corrente, e um
+    teste que deixasse `dia_de_hoje()` decidir mudaria de veredito a meia-noite
+    UTC, virando vermelho sozinho sem ninguem ter mexido em codigo.
+    """
+    if borda is None:
+        borda, borda_descartadas = edgetelemetry.serie_saneada(RAIZ)
+    if cobertura is None:
+        cobertura, cobertura_descartadas = crawlcoverage.serie_saneada(RAIZ)
+    if citacao is None:
+        citacao = carregar_citacao()
+    borda_descartadas = list(borda_descartadas or [])
+    cobertura_descartadas = list(cobertura_descartadas or [])
+
+    # A chave do ledger de borda é `agent_key`; a de cobertura é `crawler`. As
+    # duas saem de tools/botagents, então casam por igualdade — mas o casamento
+    # é DECLARADO aqui, e o que não casa fica visível em `sem_cobertura_por_url`.
+    dias: dict[str, dict] = {}
+    for (data, agente), registro in borda.items():
+        if not data or not agente:
+            continue
+        dias.setdefault(agente, {})[data] = registro
+
+    linhas: list[dict] = []
+    estado_por_agente: dict[str, dict] = {}
+    hoje = hoje or dia_de_hoje()
+
+    for agente in sorted(dias):
+        funcao = botagents.funcao_de(agente) or "desconhecida"
+        valioso = funcao in FUNCOES_VALIOSAS
+        datas = sorted(dias[agente])
+        # DIA DE VISITA = dia com pelo menos UMA requisição de identidade
+        # verificada. Linha com zero verificado e só UA não verificado NÃO conta
+        # como visita: é exatamente o caso em que a "série" era, na maior parte,
+        # sonda do próprio repositório com o User-Agent do crawler.
+        dias_com_visita = []
+        anterior_com_visita = None
+        for data in datas:
+            registro = dias[agente][data]
+            verificadas = int(registro.get("requests_estimated") or 0)
+            nao_verificadas = int(registro.get("requests_estimated_unverified_ua") or 0)
+            veio = verificadas > 0
+            intervalo = None
+            if veio and anterior_com_visita is not None:
+                intervalo = diferenca_em_dias(data, anterior_com_visita)
+
+            linha = {
+                "schema_version": SCHEMA_DIARIO,
+                "date": data,
+                "agent_key": agente,
+                "funcao": funcao,
+                "valioso": valioso,
+                "requisicoes": verificadas,
+                "requisicoes_ua_nao_verificado": nao_verificadas,
+                "identidade": registro.get("authenticity"),
+                "veio_hoje": veio,
+                "dias_desde_visita_anterior": intervalo,
+                "fonte_requisicoes": "data/ops/edge_bot_agents_daily.jsonl via "
+                                     "tools/edgetelemetry.serie_saneada (ultima linha por (date, agent_key))",
+                "is_citation_count": False,
+                "citacao_clique_de_volta": citacao.get((data, agente), 0),
+                "fonte_citacao": "data/ops/ai_citation_signal_daily.jsonl, camada clique_de_volta, "
+                                 "SOMANDO os incrementos (summable: true). Limite inferior de "
+                                 "interesse de citacao, nunca contagem de citacao.",
+            }
+
+            registro_cobertura = cobertura.get((data, agente))
+            if registro_cobertura is not None:
+                pedidos = registro_cobertura.get("paths_requested_that_day")
+                novas = registro_cobertura.get("new_sitemap_urls_that_day")
+                linha["paths_distintos_no_dia"] = pedidos
+                linha["urls_novas_no_dia"] = novas
+                if isinstance(pedidos, int) and isinstance(novas, int):
+                    linha["paths_ja_conhecidos_no_dia"] = max(0, pedidos - novas)
+                linha["nota_revisita"] = (
+                    "paths_ja_conhecidos_no_dia = paths_distintos_no_dia - urls_novas_no_dia. "
+                    "urls_novas_no_dia e escopo SITEMAP (exato, do produtor); "
+                    "paths_distintos_no_dia inclui rota fora do sitemap (robots, descritores), "
+                    "entao a subtracao e APROXIMACAO por excesso do que foi revisitado."
+                )
+                linha["cobertura_acumulada"] = registro_cobertura.get("cumulative_sitemap_coverage")
+                linha["cobertura_acumulada_pct"] = registro_cobertura.get("cumulative_coverage_pct")
+                linha["cobertura_e_piso"] = registro_cobertura.get("coverage_is_floor")
+                linha["fonte_cobertura"] = ("data/ops/crawl_coverage_daily.jsonl via "
+                                            "tools/crawlcoverage.serie_saneada (v2 vence v1; "
+                                            "dedup por (date, crawler)). cumulative_* NAO se soma "
+                                            "entre datas.")
+            else:
+                linha["sem_cobertura_por_url"] = (
+                    "este agente nao e medido por URL em crawl_coverage_daily; "
+                    "novas x revisitadas fica AUSENTE em vez de zero, porque zero "
+                    "afirmaria que ele nao descobriu nada"
+                )
+
+            linhas.append(linha)
+            if veio:
+                dias_com_visita.append(data)
+                anterior_com_visita = data
+
+        intervalos = [diferenca_em_dias(dias_com_visita[k], dias_com_visita[k - 1])
+                      for k in range(1, len(dias_com_visita))]
+        ultima = dias_com_visita[-1] if dias_com_visita else None
+        dias_sem_vir = diferenca_em_dias(hoje, ultima) if ultima else None
+        mediana = statistics.median(intervalos) if intervalos else None
+        requisicoes_por_dia = [int(dias[agente][d].get("requests_estimated") or 0) for d in datas]
+
+        nao_verificadas_total = sum(
+            int(dias[agente][d].get("requests_estimated_unverified_ua") or 0) for d in datas)
+
+        # ★ AS DUAS CORREÇÕES QUE A PRIMEIRA VERSÃO DESTE DETECTOR EXIGIU, e as
+        # duas foram apanhadas rodando contra a amostra REAL antes de o arquivo
+        # existir no disco. Detector novo nasce com teste de falso positivo.
+        #
+        # (1) O DIA DE HOJE ESTÁ INCOMPLETO. A série da borda é escrita ao longo
+        #     do dia; contar o parcial de hoje na tendência faz TODO agente
+        #     parecer que está esfriando, todo dia, até a noite. Na primeira
+        #     execução o `yandexbot` entrou como "esfriando" tendo visitado
+        #     naquele instante. O dia corrente sai da comparação de tendência —
+        #     e só dela: ele continua valendo para "veio hoje".
+        #
+        # (2) VOLUME ESPARSO NÃO SUSTENTA TENDÊNCIA. A regra antiga olhava
+        #     `dias_observados >= 6`, e o `applebot` — que tem 9 linhas na série
+        #     e apenas DUAS visitas de verdade (2 requisições em 05/08 e 38 em
+        #     25/08) — foi classificado como "esfriando" no dia seguinte ao
+        #     MELHOR dia dele. A exigência passa a ser 6 dias COM VISITA, e a
+        #     comparação usa MEDIANA dos 3 últimos (robusta a um pico isolado)
+        #     contra a mediana dos anteriores.
+        dias_de_tendencia = [d for d in dias_com_visita if d != hoje]
+        requisicoes_com_visita = [int(dias[agente][d].get("requests_estimated") or 0)
+                                  for d in dias_de_tendencia]
+        # A JANELA RECENTE EXISTE MESMO SEM TENDENCIA. Ela e o numerador das
+        # DUAS leituras (contra o pico e contra a referencia); so o denominador
+        # da segunda exige os DIAS_MINIMOS_PARA_TENDENCIA dias com visita.
+        requisicoes_recentes = requisicoes_com_visita[-DIAS_RECENTES:]
+        esfriou = False
+        volume_recente = None
+        volume_anterior = None
+        if len(dias_de_tendencia) >= DIAS_MINIMOS_PARA_TENDENCIA:
+            volume_recente = statistics.median(requisicoes_recentes)
+            volume_anterior = statistics.median(requisicoes_com_visita[:-DIAS_RECENTES])
+            esfriou = (volume_anterior > 0
+                       and volume_recente < volume_anterior * FRACAO_DE_ESFRIAMENTO)
+
+        pico = max(requisicoes_por_dia) if requisicoes_por_dia else 0
+        dia_do_pico = None
+        if pico > 0:
+            dia_do_pico = max(datas, key=lambda d: int(dias[agente][d].get("requests_estimated") or 0))
+
+        # ★ A QUEDA SE MEDE CONTRA MEDIANA DE JANELA, NUNCA CONTRA O PICO
+        #   (corrigido em 2026-09-05, sobre a serie real de 33 dias)
+        #
+        # A versao anterior gravava `queda_desde_o_pico_pct`, definida como
+        # `1 - mediana(3 ultimas datas) / MAXIMO da janela`. O maximo e a
+        # estatistica que UM unico dia desloca inteira, e o resultado medido no
+        # estado de 2026-09-05 foi uma regua que acusava 9 dos 15 bots valiosos
+        # com queda >= 90%:
+        #
+        #   googlebot            -99,2%  — veio HOJE, 43 e 36 requisicoes nos
+        #                                  dois ultimos dias completos, contra
+        #                                  mediana propria de 54/dia.
+        #   gptbot              -100,0%  — mediana propria de 1 requisicao/dia,
+        #                                  fez 7, 6 e 9: SETE VEZES o ritmo dele.
+        #   cloudflare-ai-search -91,0%  — o "pico" (1.647 em 04/09) esta DENTRO
+        #                                  da janela comparada: caiu de si mesmo.
+        #   amazonbot            -97,8%  — 379/dia contra referencia de 338.
+        #
+        # Regua que acusa quase todo mundo nao separa ninguem, e foi ela que pos
+        # googlebot e gptbot na mesma lista do claudebot, que parou de verdade.
+        #
+        # A referencia passa a ser a MEDIANA dos dias com visita ANTERIORES a
+        # janela recente. Mediana, e nao maximo, porque acrescentar um unico dia
+        # arbitrariamente grande a uma serie de N dias move a mediana no maximo
+        # meio posto — a propriedade que "robusto a outlier" nomeia, e que o
+        # maximo nao tem por construcao. Janela PRE-CORTE, e nao a mediana da
+        # serie toda, porque a mediana global inclui os dias ja caidos e por
+        # isso subestima a queda em curso.
+        #
+        # E e a MESMA referencia que `esfriou` ja usava: tendo uma referencia
+        # so, "queda" e "esfriando" nao podem discordar entre si — antes
+        # discordavam, e o applebot saia como `esfriando` com queda de 99,7%
+        # calculada contra outro numero.
+        #
+        # O DIA CORRENTE fica fora dos DOIS lados pelo motivo (1) acima. Ele
+        # aparecia como ultimo elemento de `requisicoes_por_dia_ultimos_3` em
+        # TODA linha do estado (7, 9, 4, 48 em 05/09, medidos as 06h UTC) e
+        # puxava a queda para cima todo dia, ate a noite.
+        #
+        # O sinal e PRESERVADO: negativo significa CRESCIMENTO, e apagar isso
+        # com um `max(0, ...)` esconderia justamente o caso que motivou a
+        # correcao (gptbot a 7x o proprio ritmo apareceria como "0% de queda",
+        # indistinguivel de estavel).
+        queda_vs_referencia = None
+        if volume_anterior:
+            queda_vs_referencia = round(100.0 * (1 - (volume_recente / volume_anterior)), 1)
+
+        # ★ A QUEDA DESDE O PICO CONTINUA MEDIDA E PUBLICADA — como CONTEXTO.
+        #
+        # Ela responde uma pergunta legitima e diferente: "quanto este bot ja
+        # trouxe, no melhor dia dele, comparado com o que traz agora?". Para o
+        # googlebot a resposta e verdadeira e importante: 4.297 requisicoes em
+        # 10/08 contra 43/dia agora e uma queda real de 99,0%, e apagar esse
+        # numero seria esconder do dono a varredura inicial que nao se repetiu.
+        #
+        # O QUE ELA NAO PODE SER e a regua do ALARME, e a razao esta na mesma
+        # medicao: sobre a serie de 2026-09-05 ela poe 9 dos 15 bots valiosos
+        # acima de 90% — inclusive o cloudflare-ai-search, cujo pico (1.647 em
+        # 04/09) esta DENTRO da janela comparada, e o amazonbot e o gptbot, que
+        # estao ACIMA da propria referencia. Comparar contra o maximo responde
+        # "ja foi maior um dia", nunca "esta caindo agora"; quem decide alarme
+        # e `queda_vs_referencia_pct`.
+        #
+        # UMA CORRECAO NELA MESMA: o numerador passa a ser a janela recente
+        # COMPLETA. Antes era `mediana(requisicoes_por_dia[-3:])`, as 3 ultimas
+        # DATAS observadas — que sempre incluem o parcial de hoje. Medido as
+        # 06h UTC de 05/09, o ultimo elemento era o coto do dia em toda linha do
+        # estado (googlebot 7, gptbot 9, applebot 4, amazonbot 48). Este mesmo
+        # arquivo ja tirava o dia corrente da tendencia desde 26/08, pelo motivo
+        # (1) acima; o campo do pico ficou de fora daquela correcao e por isso
+        # inflava a queda todo dia, ate a noite.
+        queda_desde_o_pico = None
+        if pico > 0 and requisicoes_recentes:
+            queda_desde_o_pico = round(
+                100.0 * (1 - (statistics.median(requisicoes_recentes) / pico)), 1)
+
+        if not dias_com_visita:
+            # DUAS AUSÊNCIAS DIFERENTES, e confundi-las custa a correção errada.
+            #
+            # `nunca_veio` é ausência de tráfego: problema de DESCOBERTA — o bot
+            # não achou o portal, e a correção é canal de descoberta.
+            #
+            # `so_ua_nao_verificado` é o oposto: existe tráfego com a string de
+            # User-Agent daquele bot, e a Cloudflare NUNCA autenticou nenhuma
+            # requisição. Medido em 2026-08-26 no `perplexitybot`: 17 dias na
+            # série, ZERO verificadas em todos, e até 490 não verificadas num
+            # único dia. Isso é identidade forjada ou operador sem método de
+            # verificação — problema de POLÍTICA DE BOT, não de descoberta, e
+            # tratar como "nunca veio" mandaria consertar o canal errado.
+            veredito = "so_ua_nao_verificado" if nao_verificadas_total > 0 else "nunca_veio"
+        else:
+            limite = max(PISO_DIAS_ABANDONO,
+                         int(round((mediana or 1) * MULTIPLO_DO_RITMO)))
+            # QUEM VEIO HOJE NAO ESTA ABANDONADO — hoje ele esta aqui. Isso
+            # ja decorre de `limite >= PISO_DIAS_ABANDONO` (3), e mesmo assim
+            # `dias_sem_vir > 0` fica escrito: ausencia e a condicao SEMANTICA
+            # do veredito, e o limite so decide a partir de quantos dias ela
+            # pesa. Deixar a conclusao depender do valor de uma constante que
+            # alguem pode baixar e como o gate ficaria absurdo em silencio.
+            ausente = (dias_sem_vir is not None and dias_sem_vir > 0
+                       and dias_sem_vir > limite)
+            if ausente:
+                # UMA VISITA SÓ NÃO É RETORNO PERDIDO — é retorno que nunca
+                # existiu, e a diferença decide a correção. `claude-searchbot`
+                # veio uma única vez, em 07/08, com UMA requisição, e sumiu:
+                # chamar isso de "abandonou" põe no mesmo balde o crawler
+                # estabelecido que parou (meta-externalagent, 9 dias de visita e
+                # picos de 10 mil) e o que nunca chegou a vir. Só o primeiro é
+                # regressão.
+                #
+                # A categoria também tem lastro na linha de base medida no log
+                # de acesso da origem: 493 de 652 clientes distintos não-warm
+                # (75,6%) apareceram UM ÚNICO DIA em 21 dias. Vir uma vez e
+                # sumir é o padrão dominante deste portal, não a exceção.
+                veredito = "veio_uma_vez_e_sumiu" if len(dias_com_visita) == 1 else "abandonou"
+            elif esfriou:
+                veredito = "esfriando"
+            else:
+                veredito = "ativo"
+
+        estado_por_agente[agente] = {
+            "funcao": funcao,
+            "valioso": valioso,
+            "veredito": veredito,
+            "primeira_visita": dias_com_visita[0] if dias_com_visita else None,
+            "ultima_visita": ultima,
+            "dias_desde_ultima_visita": dias_sem_vir,
+            "dias_com_visita": len(dias_com_visita),
+            "dias_observados": len(datas),
+            "intervalo_mediano_entre_visitas_dias": mediana,
+            "limite_de_abandono_dias": max(PISO_DIAS_ABANDONO,
+                                           int(round((mediana or 1) * MULTIPLO_DO_RITMO)))
+            if dias_com_visita else None,
+            "requisicoes_no_ultimo_dia_com_visita": int(
+                dias[agente][ultima].get("requests_estimated") or 0) if ultima else 0,
+            "requisicoes_por_dia_mediana": statistics.median(requisicoes_por_dia) if requisicoes_por_dia else 0,
+            "requisicoes_por_dia_ultimos_3": requisicoes_por_dia[-3:],
+            "requisicoes_ua_nao_verificado_total": nao_verificadas_total,
+            # DUAS LEITURAS DA MESMA SERIE, e cada uma responde outra pergunta.
+            # Nenhuma das duas saiu do estado: apagar a do pico esconderia do
+            # dono que a varredura inicial nao se repetiu, e usar so a do pico
+            # como alarme poe 9 dos 15 bots valiosos na mesma lista.
+            #
+            #   requisicoes_pico / _em      o maior dia da vida do bot, e quando.
+            #   queda_desde_o_pico_pct      CONTEXTO: "ja foi maior um dia".
+            #   queda_vs_referencia_pct     ALARME:   "esta caindo AGORA".
+            "requisicoes_pico": pico,
+            "requisicoes_pico_em": dia_do_pico,
+            "queda_desde_o_pico_pct": queda_desde_o_pico,
+            # A QUEDA QUE VALE, medida contra a mediana da janela anterior.
+            # NEGATIVO significa crescimento. `None` significa que nao ha
+            # janela anterior que a sustente (menos de
+            # DIAS_MINIMOS_PARA_TENDENCIA dias com visita, ou referencia zero) —
+            # e ausencia de base, nunca "queda de 0%".
+            "queda_vs_referencia_pct": queda_vs_referencia,
+            "referencia_de_volume": volume_anterior,
+            "volume_mediano_recente": volume_recente,
+            "volume_mediano_anterior": volume_anterior,
+            "requisicoes_nos_dias_recentes_completos": requisicoes_recentes,
+            "dias_usados_na_tendencia": len(dias_de_tendencia),
+            "citacao_clique_de_volta_total": sum(
+                citacao.get((d, agente), 0) for d in datas),
+        }
+
+    citacao_por_assistente: dict[str, int] = {}
+    for (data, chave), total in citacao.items():
+        if not chave:
+            continue
+        citacao_por_assistente[chave] = citacao_por_assistente.get(chave, 0) + total
+
+    janela = sorted({linha["date"] for linha in linhas})
+    estado = {
+        "schema_version": SCHEMA_ESTADO,
+        "gerado_em": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "janela": {"de": janela[0] if janela else None, "ate": janela[-1] if janela else None,
+                   "dias": len(janela)},
+        "criterio_de_visita": "dia com >=1 requisicao de identidade VERIFICADA na borda "
+                              "(requests_estimated). UA nao verificado nao conta como visita: "
+                              "e onde a sonda do proprio repositorio se disfarca de crawler.",
+        "criterio_de_abandono": f"dias_desde_ultima_visita > max({PISO_DIAS_ABANDONO}, "
+                                f"{MULTIPLO_DO_RITMO} x intervalo_mediano_do_proprio_agente)",
+        "criterio_de_esfriamento": f"mediana das requisicoes nos {DIAS_RECENTES} ultimos dias COM "
+                                   f"VISITA < {FRACAO_DE_ESFRIAMENTO:.0%} da mediana dos dias com "
+                                   f"visita anteriores, exigindo >={DIAS_MINIMOS_PARA_TENDENCIA} "
+                                   "dias com visita. O DIA CORRENTE fica FORA da tendencia porque "
+                                   "a serie da borda ainda esta sendo escrita: contar o parcial de "
+                                   "hoje faria todo agente parecer que esta esfriando ate a noite.",
+        "criterio_de_queda": f"queda_vs_referencia_pct = 100 x (1 - mediana dos {DIAS_RECENTES} "
+                             f"ultimos dias com visita COMPLETOS / mediana dos dias com visita "
+                             f"anteriores a eles). A referencia e MEDIANA DE JANELA, nunca o pico: "
+                             f"o maximo e deslocado por um unico dia, e ate 2026-09-05 essa regua "
+                             f"acusava 9 dos 15 bots valiosos com queda >=90%, incluindo o "
+                             f"googlebot que veio no mesmo dia e o gptbot a 7x o proprio ritmo. "
+                             f"Valor NEGATIVO e crescimento. `null` e ausencia de base "
+                             f"(<{DIAS_MINIMOS_PARA_TENDENCIA} dias com visita ou referencia zero), "
+                             f"nunca 'queda de 0%'.",
+        "criterio_de_queda_desde_o_pico": "queda_desde_o_pico_pct = 100 x (1 - mediana dos dias "
+                                          "recentes COMPLETOS / maior dia da serie). E CONTEXTO, "
+                                          "nao alarme: responde 'ja foi maior um dia', nunca 'esta "
+                                          "caindo agora'. Continua no estado porque a queda que ela "
+                                          "mede e verdadeira (o googlebot fez 4.297 requisicoes em "
+                                          "10/08 e faz 43/dia agora). O que mudou em 2026-09-05: o "
+                                          "numerador deixou de incluir o PARCIAL DE HOJE, que "
+                                          "inflava a queda de todo agente todo dia ate a noite, e "
+                                          "o alarme passou a ser decidido por "
+                                          "queda_vs_referencia_pct — sob a regua do pico, 9 dos 15 "
+                                          "bots valiosos passavam de 90%, inclusive dois que "
+                                          "estavam ACIMA da propria referencia e um cujo pico esta "
+                                          "DENTRO da janela comparada.",
+        # ★ A CITAÇÃO NÃO PODE SER SOMADA PELA LISTA DE BOTS, e a primeira
+        # versão desta ferramenta cometeu exatamente esse erro: ela somava
+        # `citacao[(data, agente)]` percorrendo os agentes do ledger de BORDA, e
+        # a chave da camada de clique de volta é o ASSISTENTE (copilot, chatgpt,
+        # perplexity), não um agent_key de bot. Resultado: o total dava ZERO
+        # enquanto a série tinha 2 cliques de volta do Copilot gravados. Um zero
+        # falso em métrica de citação é a pior direção possível de erro — faz
+        # concluir "ninguém nos cita" quando alguém citou.
+        "citacao_clique_de_volta": citacao_por_assistente,
+        "citacao_clique_de_volta_total": sum(citacao.values()),
+        "citacao_is_citation_count": False,
+        "citacao_nota": "camada (c) de tools/measure-ai-citation: leitor humano que chegou de "
+                        "assistente, por Referer de produto de IA ou por utm_source. E LIMITE "
+                        "INFERIOR de interesse de citacao, nunca contagem de citacao — citacao sem "
+                        "clique (~68% das buscas sao zero-clique) e resposta por memoria do modelo "
+                        "nao deixam rastro nenhum na origem. Trafego proprio ja sai excluido na "
+                        "origem: aquecimento marcado pelo nginx, sonda com bot_sim, IP nao publico "
+                        "e User-Agent de ferramenta interna.",
+        "por_que_nao_e_cobertura": "cobertura acumulada so cresce e por isso nunca acusa abandono; "
+                                   "cobertura PARADA e compativel com 'nao achou' E com 'achou e "
+                                   "recusou', que sao problemas opostos com correcoes opostas.",
+        "linhas_descartadas": {
+            "edge_bot_agents_daily": len(borda_descartadas),
+            "crawl_coverage_daily": len(cobertura_descartadas),
+        },
+        "agentes": estado_por_agente,
+    }
+    linhas.sort(key=lambda linha: (linha["date"], linha["agent_key"]))
+    return linhas, estado
+
+
+def gravar_atomico(caminho: str, conteudo: str) -> None:
+    os.makedirs(os.path.dirname(caminho), exist_ok=True)
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False,
+                                         dir=os.path.dirname(caminho))
+    try:
+        handle.write(conteudo)
+        handle.flush()
+        os.fsync(handle.fileno())
+    finally:
+        handle.close()
+    os.replace(handle.name, caminho)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true", help="não escreve nada")
+    parser.add_argument("--json", action="store_true", help="imprime o estado em JSON")
+    args = parser.parse_args()
+
+    linhas, estado = montar()
+    if not args.dry_run:
+        gravar_atomico(SERIE_DIARIA,
+                       "".join(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n"
+                               for linha in linhas))
+        gravar_atomico(ESTADO, json.dumps(estado, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+
+    if args.json:
+        print(json.dumps(estado, ensure_ascii=False, indent=1))
+        return 0
+
+    print(f"série de retorno: {len(linhas)} linhas, janela {estado['janela']['de']} → "
+          f"{estado['janela']['ate']} ({estado['janela']['dias']} dias)")
+    print(f"{'AGENTE':<28} {'FUNÇÃO':<10} {'VEREDITO':<20} {'ÚLT.':<11} {'SEM VIR':>7} "
+          f"{'MEDIANA':>8} {'REQ/DIA':>8} {'UA N/V':>8} {'CITAÇÃO':>8}")
+    print("-" * 116)
+    for agente, dados in sorted(estado["agentes"].items(),
+                                key=lambda item: (not item[1]["valioso"], item[1]["veredito"], item[0])):
+        print(f"{agente:<28} {dados['funcao']:<10} {dados['veredito']:<20} "
+              f"{str(dados['ultima_visita'] or '-'):<11} "
+              f"{str(dados['dias_desde_ultima_visita'] if dados['dias_desde_ultima_visita'] is not None else '-'):>7} "
+              f"{str(dados['intervalo_mediano_entre_visitas_dias'] or '-'):>8} "
+              f"{str(dados['requisicoes_por_dia_mediana']):>8} "
+              f"{str(dados['requisicoes_ua_nao_verificado_total']):>8} "
+              f"{str(dados['citacao_clique_de_volta_total']):>8}")
+    if not args.dry_run:
+        print(f"\ngravado: {os.path.relpath(SERIE_DIARIA, RAIZ)} e {os.path.relpath(ESTADO, RAIZ)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

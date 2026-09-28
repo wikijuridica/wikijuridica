@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""check-sitemap-fidelity — o sitemap diz a verdade sobre as URLs do portal?
+
+POR QUE EXISTE: o sitemap e o unico canal que o Google de fato usa para
+enumerar um acervo grande de dominio novo. Se ele mente — declara shard que nao
+existe, esquece paginas publicadas, ou anuncia URL que nao esta no acervo — a
+descoberta falha em silencio e nenhum check acusa.
+
+Em 2026-08-06, medido: o indice SERVIDO declarava 1 shard com 9.406 URLs; o
+indice em DISCO declarava 2 shards (5.000 + 4.400) com 9.400 URLs, e o segundo
+shard respondia 404. Os dois vinham de geradores diferentes — o runtime
+(internal/httpserver/httpserver.go:261, PlanOptions zero-value = 40.000/shard,
+sobre todas as paginas indexaveis) e a publicacao
+(cmd/publish-v2-direct/main.go:174, 5.000/shard, so sobre o manifesto). O de
+disco nao continha a HOME.
+
+O QUE ELE COMPARA (tres conjuntos que tem de ser identicos):
+  servido   URLs no sitemap que o visitante/robo busca por HTTP
+  disco     URLs nos arquivos public/sitemap.xml + public/sitemaps/*.xml
+  esperado  paginas indexaveis de content/pages.json
+            (status=published e index_policy=index — internal/editorial/editorial.go:39)
+            MAIS o manifesto paralelo das derivadas (home, institucional, hub de
+            area, fatia de paginacao — internal/publishedmanifest/derived_artifacts.go),
+            obtido de ./cmd/inspect-derived-artifacts. Ate 2026-08-13 este check so
+            conhecia pages.json e acusava, ao mesmo tempo, "no sitemap mas nao
+            indexavel" e "HTML orfao em public/" para as 209 URLs (29 hubs + 180
+            fatias) que sao indexaveis por direito mas nunca tiveram linha em
+            pages.json nem no published_manifest — falso-positivo sistematico,
+            confirmado contra o estado vivo por
+            internal/publishedmanifest/derived_artifacts_live_test.go
+            (manifesto 9.690 + derivadas 216 = locs 9.906, exato).
+
+E confere ainda:
+  - todo shard declarado no indice existe e responde 200
+  - toda pagina do published_manifest esta no sitemap (nada publicado fica orfao)
+  - nenhuma pagina servivel indexavel fica de fora
+  - orfas: HTML em public/ sem linha no manifesto e sem ser institucional
+  - loc absoluto, HTTPS, no dominio de content/site.json
+
+Read-only.
+
+Uso:
+    tools/check-sitemap-fidelity
+    tools/check-sitemap-fidelity --host https://wikijuridica.com.br
+    tools/check-sitemap-fidelity --listar 40
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+PUBLIC = os.path.join(ROOT, "public")
+PAGES = os.path.join(ROOT, "content/pages.json")
+SITE = os.path.join(ROOT, "content/site.json")
+MANIFEST = os.path.join(ROOT, "data/editorial/published_manifest.jsonl")
+GO_MODERN = os.path.join(ROOT, "tools/go-modern")
+
+DEFAULT_HOST = "http://127.0.0.1:8088"
+DEFAULT_SNI = "wikijuridica.com.br"
+USER_AGENT = "wikijuridica-check-sitemap-fidelity/1.0 (+interno; nao-indexar)"
+
+LOC = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>")
+
+# internal/content/content.go:21 — LegalPageTypes. Pagina fora desta lista e
+# institucional (home, sobre, termos...): pode estar no sitemap sem linha no
+# manifesto, e publishedmanifest.go:178 a isenta explicitamente.
+TIPOS_JURIDICOS = {
+    "wiki", "legislacao", "dispositivo-legal", "jurisprudencia", "precedente",
+    "noticia-juridica", "artigo", "pergunta", "hub-tematico",
+}
+
+
+def buscar(host, sni, caminho, timeout=20.0):
+    url = host.rstrip("/") + caminho
+    pedido = urllib.request.Request(url, headers={
+        "Host": sni,
+        "User-Agent": USER_AGENT,
+        "X-Warming-Request": "true",
+        "Accept-Encoding": "identity",
+    })
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return resposta.read().decode("utf-8", "replace"), resposta.status
+    except urllib.error.HTTPError as erro:
+        return "", erro.code
+    except Exception:
+        return "", 0
+
+
+def locs(texto):
+    return [m.strip() for m in LOC.findall(texto)]
+
+
+def caminho_de(url, base):
+    return url[len(base):] if url.startswith(base) else url
+
+
+def coletar_servido(host, sni, base):
+    """Le o indice servido, segue cada shard, devolve (urls, shards, problemas)."""
+    problemas = []
+    indice, status = buscar(host, sni, "/sitemap.xml")
+    if status != 200:
+        return set(), [], ["/sitemap.xml nao respondeu 200 (status=%s)" % status]
+    shards = locs(indice)
+    if not shards:
+        problemas.append("/sitemap.xml servido nao declara nenhum shard")
+    urls = set()
+    for shard in shards:
+        rota = caminho_de(shard, base)
+        corpo, status = buscar(host, sni, rota)
+        if status != 200:
+            problemas.append("shard declarado no indice SERVIDO nao responde 200: %s (status=%s)"
+                             % (rota, status))
+            continue
+        urls.update(locs(corpo))
+    return urls, shards, problemas
+
+
+def coletar_disco(base):
+    """Le o indice e os shards em public/, devolve (urls, shards, problemas)."""
+    problemas = []
+    arquivo = os.path.join(PUBLIC, "sitemap.xml")
+    if not os.path.exists(arquivo):
+        return set(), [], ["public/sitemap.xml ausente"]
+    with open(arquivo, encoding="utf-8") as handle:
+        shards = locs(handle.read())
+    urls = set()
+    for shard in shards:
+        rota = caminho_de(shard, base).lstrip("/")
+        caminho = os.path.join(PUBLIC, rota)
+        if not os.path.exists(caminho):
+            problemas.append("shard declarado no indice em DISCO nao existe: %s" % rota)
+            continue
+        with open(caminho, encoding="utf-8") as handle:
+            urls.update(locs(handle.read()))
+    return urls, shards, problemas
+
+
+def coletar_derivadas(root):
+    """Le o manifesto paralelo das derivadas via cmd/inspect-derived-artifacts.
+
+    Fonte unica: internal/publishedmanifest.DerivedArtifacts, a MESMA funcao
+    que Validate(root) chama no boot do servidor
+    (internal/httpserver/httpserver.go:480). Reimplementar a
+    classificacao de hub/paginacao aqui em Python seria abrir uma segunda
+    verdade que poderia divergir da que o boot de fato usa — por isso o
+    subprocesso, e nao uma segunda logica.
+
+    Devolve (anunciaveis, todas, areas_com_hub, problemas). "todas" e o
+    conjunto de canonical_url de todo registro derivado reconhecido (home,
+    institucional, hub de area, fatia de paginacao quando o Go a emitir);
+    "areas_com_hub" e o segmento de area de cada registro classe "area-hub"
+    (usado por fatias_de_paginacao_conhecidas, abaixo, para reconhecer fatia
+    de paginacao por OUTRA via — ver o comentario la). Falha do subprocesso
+    ou JSON invalido volta em "problemas" como reprovacao explicita, nunca
+    como conjunto vazio silencioso: um manifesto derivado que nao pode ser
+    lido nao prova nada, e fingir que ele deu zero URLs derivadas
+    reintroduziria o falso-positivo que esta funcao existe para fechar.
+    """
+    comando = [GO_MODERN, "run", "./cmd/inspect-derived-artifacts", "--root", root]
+    try:
+        resultado = subprocess.run(
+            comando, cwd=root, capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as erro:
+        return set(), set(), set(), ["cmd/inspect-derived-artifacts nao executou: %s" % erro]
+    try:
+        relatorio = json.loads(resultado.stdout)
+    except json.JSONDecodeError as erro:
+        return set(), set(), set(), [
+            "cmd/inspect-derived-artifacts nao devolveu JSON valido (exit=%s): %s\nstderr: %s"
+            % (resultado.returncode, erro, resultado.stderr.strip())
+        ]
+    if not relatorio.get("passed", False):
+        return set(), set(), set(), [
+            "manifesto derivado (cmd/inspect-derived-artifacts) reprovou: %s"
+            % "; ".join(relatorio.get("issues") or ["sem detalhe"])
+        ]
+    # AS FATIAS DE PAGINACAO NAO SAO ESPERADAS NO SITEMAP desde 2026-09-01: sao
+    # servidas e linkadas -- 186 URLs de lista fatiada competindo pelo
+    # orcamento de um crawler que faz 13,9 paginas/dia. Quem decide e
+    # areahubroutes.SemFatiasDePaginacao nos tres escritores de sitemap; aqui
+    # so se espelha a classe que ele exclui.
+    #
+    # ATE 2026-09-03 O COMENTARIO ACIMA DIZIA "continuam hasheadas no
+    # manifesto derivado" -- e MEDIDO isso e falso desde o commit que tirou as
+    # fatias do mapa (02b79b52): DerivedArtifacts monta o conjunto a
+    # verificar (derivedArtifactRecords, internal/publishedmanifest/
+    # derived_artifacts.go:152) a partir de sitemapHashByCanonical, ou seja, DO
+    # QUE O SITEMAP ANUNCIA -- "DIRECAO UNICA, DE PROPOSITO" (mesmo arquivo,
+    # linhas 60-67). Como as fatias saíram do sitemap, elas nunca mais chegam
+    # a esse conjunto, e a classe "area-hub-pagination" (definida e usada em
+    # areaHubClass) ficou inalcancavel na pratica: rodando
+    # cmd/inspect-derived-artifacts contra o acervo vivo em 2026-09-03,
+    # `records` tem 39 entradas (32 area-hub + 6 institucional + 1 home) e
+    # ZERO area-hub-pagination -- as 186 fatias nao aparecem. Corrigir a
+    # direcao do candidato e mudanca em internal/publishedmanifest/
+    # derived_artifacts.go, fora do escopo deste script; aqui a lacuna se
+    # fecha por OUTRA fonte (fatias_de_paginacao_conhecidas).
+    todas = {registro["canonical_url"] for registro in relatorio.get("records", [])}
+    anunciaveis = {registro["canonical_url"] for registro in relatorio.get("records", [])
+                   if registro.get("class") != "area-hub-pagination"}
+    areas_com_hub = {registro["path"].strip("/") for registro in relatorio.get("records", [])
+                      if registro.get("class") == "area-hub"}
+    return anunciaveis, todas, areas_com_hub, []
+
+
+_RE_ROTA_PAGINACAO = re.compile(r"^([^/]+)/pagina/(\d+)/$")
+
+
+def fatias_de_paginacao_conhecidas(public_dir, base, areas_com_hub):
+    """Reconhece "/{area}/pagina/N/" como classe derivada CONHECIDA (fora do
+    sitemap por desenho, 02b79b52) SEM reimplementar a matematica de
+    paginacao de internal/areahubroutes -- exatamente o que o docstring de
+    coletar_derivadas, acima, ja recusava fazer, e por um motivo que continua
+    valendo: duas fontes de verdade podem divergir.
+
+    Em vez disso, reconhece pela ASSINATURA ESTRUTURAL do proprio artefato —
+    o mesmo principio de internal/sitemapgrace, cuja marca vive DENTRO do
+    arquivo, nao num ledger a parte. Uma fatia de paginacao legitima, gerada
+    por internal/render/area_hub.go, carrega TRES sinais ao mesmo tempo:
+    canonical AUTORREFERENTE (href == a propria URL), robots index,follow, e
+    o marcador <nav class="pagination"> que so esse renderizador emite. Exigir
+    os tres ao mesmo tempo -- e nao so o formato do caminho -- e o que evita
+    que um residuo de colisao de rota (o "orfao de verdade" que este script
+    existe para achar) escape por coincidir com "/{area}/pagina/N/".
+
+    A area, alem disso, tem de estar em `areas_com_hub` -- o conjunto que
+    cmd/inspect-derived-artifacts JA VERIFICOU como hub real (classe
+    area-hub, com lastro de hash). Sem essa amarra, um nome de pasta como
+    "/aviso-legal/pagina/2/" (institucional, um segmento, mesma forma que uma
+    area) contaria como area por engano.
+    """
+    conhecidas = set()
+    if not areas_com_hub:
+        return conhecidas
+    for raiz, _, arquivos in os.walk(public_dir):
+        if "index.html" not in arquivos:
+            continue
+        relativo = os.path.relpath(raiz, public_dir).replace(os.sep, "/")
+        achado = _RE_ROTA_PAGINACAO.match(relativo + "/")
+        if not achado:
+            continue
+        area, numero = achado.group(1), achado.group(2)
+        if area not in areas_com_hub:
+            continue
+        url = "%s/%s/pagina/%s/" % (base, area, numero)
+        with open(os.path.join(raiz, "index.html"), encoding="utf-8") as handle:
+            corpo = handle.read()
+        canonical_ok = ('<link rel="canonical" href="%s">' % url) in corpo
+        robots_ok = re.search(r'<meta name="robots" content="index,follow', corpo) is not None
+        nav_ok = '<nav class="pagination"' in corpo
+        if canonical_ok and robots_ok and nav_ok:
+            conhecidas.add(url)
+    return conhecidas
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--sni", default=DEFAULT_SNI)
+    parser.add_argument("--listar", type=int, default=15)
+    args = parser.parse_args()
+
+    with open(SITE, encoding="utf-8") as handle:
+        base = json.load(handle)["base_url"].rstrip("/")
+    with open(PAGES, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+
+    indexaveis, juridicas_indexaveis, conhecidas = set(), set(), set()
+    for pagina in paginas:
+        conhecidas.add(base + pagina["path"])
+        if pagina.get("status") == "published" and pagina.get("index_policy") == "index":
+            indexaveis.add(base + pagina["path"])
+            if pagina.get("page_type") in TIPOS_JURIDICOS:
+                juridicas_indexaveis.add(base + pagina["path"])
+
+    manifesto = set()
+    if os.path.exists(MANIFEST):
+        with open(MANIFEST, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if linha:
+                    manifesto.add(base + json.loads(linha)["path"])
+
+    # DOIS CONJUNTOS, e a diferenca e a correcao de 2026-09-01: as fatias
+    # /pagina/N/ sao CONHECIDAS (servidas, hasheadas, linkadas -- nao sao orfas)
+    # mas nao sao ANUNCIAVEIS (o sitemap deixou de lista-las). Um conjunto so
+    # faria o gate acusar 186 orfas ou exigir 186 locs, conforme o lado.
+    derivadas, derivadas_todas, areas_com_hub, problemas_derivadas = coletar_derivadas(ROOT)
+    # Home, hub de area e fatia de paginacao sao indexaveis por direito, mesmo
+    # sem linha em content/pages.json — fecha o falso-positivo duplo descrito
+    # no docstring do modulo (acusava "nao indexavel" e "orfao" ao mesmo tempo).
+    indexaveis |= derivadas
+    conhecidas |= derivadas_todas
+
+    # A CLASSE "area-hub-pagination" ESTA INALCANCAVEL EM
+    # cmd/inspect-derived-artifacts desde 02b79b52 (ver o comentario extenso
+    # em coletar_derivadas): o candidato que ele classifica vem do que o
+    # SITEMAP anuncia, e as 186 fatias saíram do sitemap por desenho. Sem
+    # esta segunda fonte elas cairiam em "HTML orfao em public/", que e
+    # exatamente o falso positivo medido em 2026-09-03. Reconhecidas por
+    # assinatura estrutural (nao por reimplementar a matematica de
+    # paginacao) sobre area JA VERIFICADA como hub real.
+    fatias_paginacao = fatias_de_paginacao_conhecidas(PUBLIC, base, areas_com_hub)
+    conhecidas |= fatias_paginacao
+
+    servido, shards_servidos, problemas = coletar_servido(args.host, args.sni, base)
+    disco, shards_disco, problemas_disco = coletar_disco(base)
+    problemas.extend(problemas_disco)
+    problemas.extend(problemas_derivadas)
+
+    print("=== FIDELIDADE DO SITEMAP ===")
+    print("dominio               : %s" % base)
+    print("manifesto derivado    : %d URLs conhecidas, %d anunciaveis no sitemap" % (len(derivadas_todas), len(derivadas)))
+    print("fatias de paginacao   : %d conhecidas por assinatura estrutural (fora do sitemap por desenho, 02b79b52)"
+          % len(fatias_paginacao))
+    print("indice SERVIDO        : %d shard(s), %d URLs" % (len(shards_servidos), len(servido)))
+    print("indice em DISCO       : %d shard(s), %d URLs" % (len(shards_disco), len(disco)))
+    print("paginas indexaveis    : %d (das quais %d juridicas)"
+          % (len(indexaveis), len(juridicas_indexaveis)))
+    print("published_manifest    : %d" % len(manifesto))
+    print()
+
+    def relatar(titulo, conjunto):
+        if not conjunto:
+            return
+        problemas.append("%s: %d" % (titulo, len(conjunto)))
+        print("--- %s (%d) ---" % (titulo, len(conjunto)))
+        for url in sorted(conjunto)[:args.listar]:
+            print("  %s" % caminho_de(url, base))
+        if len(conjunto) > args.listar:
+            print("  ... e mais %d" % (len(conjunto) - args.listar))
+        print()
+
+    relatar("no sitemap SERVIDO mas nao no de DISCO", servido - disco)
+    relatar("no sitemap em DISCO mas nao no SERVIDO", disco - servido)
+    relatar("indexaveis FORA do sitemap servido", indexaveis - servido)
+    relatar("no sitemap servido mas NAO indexaveis", servido - indexaveis)
+    relatar("publicadas no manifesto FORA do sitemap servido", manifesto - servido)
+
+    # Orfas: HTML servido em public/ que nao corresponde a NENHUMA pagina de
+    # content/pages.json.
+    #
+    # O criterio e "desconhecida", nao "nao indexavel". Pagina deliberadamente
+    # noindex — /contato/advogado/ (page_type=contato), /buscar/, /fontes/... —
+    # e conhecida, tem dono e proposito; acusa-la seria falso positivo, e foi
+    # exatamente o que a primeira versao deste detector fez. Orfa de verdade e o
+    # residuo de colisao de rota (/educacao/desapropriacao/, /sucessoes/licitacao/):
+    # sem registro, sem proveniencia, invisivel a qualquer fila de correcao,
+    # servivel por URL direta. Viola a coerencia de artefato do CLAUDE.md.
+    orfas = set()
+    for raiz, _, arquivos in os.walk(PUBLIC):
+        if "index.html" not in arquivos:
+            continue
+        relativo = os.path.relpath(raiz, PUBLIC)
+        rota = "/" if relativo == "." else "/" + relativo.strip("/") + "/"
+        url = base + rota
+        if url not in conhecidas and url not in manifesto:
+            orfas.add(url)
+    relatar("HTML orfao em public/ (nenhuma pagina correspondente em content/pages.json)", orfas)
+
+    if problemas:
+        print("REPROVADO:")
+        for problema in problemas:
+            print("  - %s" % problema)
+        return 1
+
+    print("OK: sitemap servido, sitemap em disco e paginas indexaveis descrevem o MESMO conjunto.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

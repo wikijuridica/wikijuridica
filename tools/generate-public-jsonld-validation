@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""generate-public-jsonld-validation -- valida o JSON-LD das paginas REAIS.
+
+Por que existe (medido em 2026-08-26). O repositorio JA tinha validador de
+JSON-LD (`internal/structureddataevidence`, com jsonschema/v6 fixado) e ele
+nunca foi apontado para o site: a unica evidencia commitada,
+`data/ops/structured_data_evidence.jsonl`, e de 2026-07-01 e cobre 360
+registros da camada de ENSAIO `data/editorial/public_final_page_rehearsal.jsonl`
+-- contra 10.298 HTMLs publicados em `public/`. Validar o ensaio nao diz nada
+sobre o que o Googlebot e os agentes de IA leem.
+
+Este gerador le o artefato PUBLICO, o mesmo byte que sai pelo nginx, e mede:
+
+  1. bloco `application/ld+json` que NAO faz parse -- defeito invisivel: o
+     navegador ignora calado e todo consumidor perde a pagina inteira;
+  2. no sem `@type` ou sem `@context` schema.org;
+  3. propriedade obrigatoria ausente nos tipos que o Google ainda documenta;
+  4. COERENCIA com o HTML: `headline` que nao bate com o `<title>` e `url`/`@id`
+     que nao bate com o `<link rel=canonical>`. E o defeito que nenhum
+     validador de schema pega, porque o JSON-LD esta bem formado -- so descreve
+     outra pagina.
+
+TRES FALSOS POSITIVOS FORAM MEDIDOS E CORRIGIDOS ANTES DA PRIMEIRA EVIDENCIA
+(2026-08-26), porque detector novo sem teste de falso positivo sobre amostra
+real e pior que detector nenhum:
+
+  a) comparar `headline` com o `<h1>` acusava 9.812 paginas. Errado: `headline`
+     e o TITULO do artigo, e numa amostra de 1.201 paginas ele e exatamente o
+     `<title>` em 1.166 -- o `<h1>` deste portal e um gancho editorial
+     deliberadamente diferente do titulo. A comparacao certa e com o `<title>`;
+  b) exigir `@type` em todo no acusava 5.936. Errado: `{"@id": "..."}` sozinho
+     e o idioma normal de JSON-LD para REFERENCIAR entidade definida noutro
+     lugar (`#organization`, `urn:lex:...`), e nesse caso `@type` nao deve
+     mesmo existir;
+  c) exigir `name` em `WebPage` acusava 10.070. Errado: nao e exigencia de
+     ninguem -- `WebPage` nao e tipo de rich result e o Google nao pede `name`;
+  d) desescapar entidades HTML com tabela escrita a mao acusava 5 paginas de
+     `headline` divergente do `<title>`. Errado: a tabela nao conhecia `&#34;`,
+     a forma NUMERICA de `"`. As cinco strings eram identicas. Agora usa
+     `html.unescape` da biblioteca padrao.
+
+Escreve `data/ops/public_jsonld_validation.jsonl`. Read-only sobre `public/`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html as html_entities
+import json
+import os
+import re
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EVIDENCIA = "data/ops/public_jsonld_validation.jsonl"
+
+BLOCO_JSONLD = re.compile(
+    r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', re.S | re.I
+)
+TITULO = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+CANONICAL = re.compile(
+    r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"|<link[^>]+href="([^"]+)"[^>]+rel="canonical"',
+    re.I,
+)
+TAG = re.compile(r"<[^>]+>")
+
+# Propriedades exigidas por tipo. A fonte e a documentacao oficial do Google
+# para dados estruturados; so entram tipos que ele ainda documenta como uteis
+# para entendimento de pagina.
+OBRIGATORIAS = {
+    "Article": ("headline",),
+    "NewsArticle": ("headline",),
+    "BreadcrumbList": ("itemListElement",),
+    "ListItem": ("position", "name"),
+    "Organization": ("name",),
+    "Person": ("name",),
+    "FAQPage": ("mainEntity",),
+    "Question": ("name", "acceptedAnswer"),
+    "Answer": ("text",),
+    "HowTo": ("name", "step"),
+    "HowToStep": ("name",),
+}
+
+
+def texto_limpo(html: str) -> str:
+    return " ".join(TAG.sub(" ", html).split()).strip()
+
+
+def desescapa(valor: str) -> str:
+    # `html.unescape` da biblioteca padrao, e nao uma tabela escrita a mao: a
+    # tabela manual foi o QUARTO falso positivo desta ferramenta -- ela nao
+    # conhecia `&#34;` (a forma numerica de `"`), e por isso acusou 5 paginas de
+    # `headline` divergente do `<title>` quando as duas strings eram iguais.
+    return " ".join(html_entities.unescape(valor).split()).strip()
+
+
+def percorre(no, visita):
+    if isinstance(no, dict):
+        visita(no)
+        for valor in no.values():
+            percorre(valor, visita)
+    elif isinstance(no, list):
+        for valor in no:
+            percorre(valor, visita)
+
+
+def valida_pagina(caminho: str, html: str) -> tuple[list[dict], Counter, int]:
+    defeitos: list[dict] = []
+    tipos = Counter()
+    blocos = BLOCO_JSONLD.findall(html)
+    if not blocos:
+        return ([{"defeito": "sem_bloco_jsonld", "pagina": caminho}], tipos, 0)
+
+    titulo_match = TITULO.search(html)
+    titulo_html = desescapa(texto_limpo(titulo_match.group(1))) if titulo_match else ""
+    can_match = CANONICAL.search(html)
+    canonical = ""
+    if can_match:
+        canonical = desescapa(can_match.group(1) or can_match.group(2) or "")
+
+    for indice, bruto in enumerate(blocos):
+        try:
+            documento = json.loads(bruto)
+        except Exception as erro:  # noqa: BLE001 -- a mensagem exata do parser e o achado
+            defeitos.append(
+                {
+                    "defeito": "jsonld_nao_faz_parse",
+                    "pagina": caminho,
+                    "bloco": indice,
+                    "erro": str(erro)[:200],
+                }
+            )
+            continue
+
+        contexto = documento.get("@context") if isinstance(documento, dict) else None
+        if not (isinstance(contexto, str) and "schema.org" in contexto):
+            defeitos.append(
+                {
+                    "defeito": "contexto_nao_e_schema_org",
+                    "pagina": caminho,
+                    "bloco": indice,
+                    "contexto": str(contexto)[:80],
+                }
+            )
+
+        def visita(no: dict) -> None:
+            tipo = no.get("@type")
+            if not isinstance(tipo, str):
+                # No que so tem `@id` e REFERENCIA a entidade definida noutro
+                # lugar do grafo -- nao leva `@type`, e exigi-lo seria inventar
+                # defeito. So acusa no com conteudo proprio e sem tipo.
+                proprias = set(no.keys()) - {"@context", "@id"}
+                if tipo is None and proprias:
+                    defeitos.append(
+                        {"defeito": "no_sem_tipo", "pagina": caminho, "bloco": indice,
+                         "chaves": sorted(no.keys())[:6]}
+                    )
+                return
+            tipos[tipo] += 1
+            for propriedade in OBRIGATORIAS.get(tipo, ()):  # noqa: B023
+                if propriedade not in no or no[propriedade] in ("", None, [], {}):
+                    defeitos.append(
+                        {
+                            "defeito": "propriedade_obrigatoria_ausente",
+                            "pagina": caminho,
+                            "tipo": tipo,
+                            "propriedade": propriedade,
+                        }
+                    )
+            # Coerencia com o HTML servido.
+            if tipo in ("Article", "NewsArticle") and titulo_html:
+                headline = desescapa(str(no.get("headline", "")))
+                if headline and headline != titulo_html:
+                    defeitos.append(
+                        {
+                            "defeito": "headline_diverge_do_title",
+                            "pagina": caminho,
+                            "headline": headline[:160],
+                            "title": titulo_html[:160],
+                        }
+                    )
+            if tipo in ("WebPage", "Article", "NewsArticle", "CollectionPage") and canonical:
+                declarado = no.get("url") or no.get("@id")
+                if isinstance(declarado, str) and declarado and declarado != canonical:
+                    defeitos.append(
+                        {
+                            "defeito": "url_do_jsonld_diverge_do_canonical",
+                            "pagina": caminho,
+                            "tipo": tipo,
+                            "jsonld_url": declarado,
+                            "canonical": canonical,
+                        }
+                    )
+
+        percorre(documento, visita)
+
+    return (defeitos, tipos, len(blocos))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--public-dir", default="public")
+    parser.add_argument("--evidence", default=EVIDENCIA)
+    parser.add_argument(
+        "--max-defect-samples",
+        type=int,
+        default=40,
+        help="quantas amostras de defeito gravar na evidencia (o total sempre e integral)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="mede e imprime, sem escrever a evidencia",
+    )
+    argumentos = parser.parse_args()
+
+    os.chdir(RAIZ)
+    base = argumentos.public_dir
+    if not os.path.isdir(base):
+        print(f"generate-public-jsonld-validation: {base} nao existe", file=sys.stderr)
+        return 1
+
+    paginas = 0
+    paginas_com_jsonld = 0
+    blocos_total = 0
+    tipos = Counter()
+    defeitos_contagem = Counter()
+    amostras: list[dict] = []
+    hasher = hashlib.sha256()
+
+    for pasta, _, arquivos in os.walk(base):
+        for nome in sorted(arquivos):
+            if not nome.endswith(".html"):
+                continue
+            caminho = os.path.join(pasta, nome)
+            paginas += 1
+            try:
+                with open(caminho, encoding="utf-8") as handle:
+                    html = handle.read()
+            except OSError as erro:
+                defeitos_contagem["html_ilegivel"] += 1
+                if len(amostras) < argumentos.max_defect_samples:
+                    amostras.append({"defeito": "html_ilegivel", "pagina": caminho, "erro": str(erro)})
+                continue
+            hasher.update(caminho.encode("utf-8"))
+            hasher.update(hashlib.sha256(html.encode("utf-8")).digest())
+            defeitos, tipos_pagina, blocos = valida_pagina(caminho, html)
+            blocos_total += blocos
+            if blocos:
+                paginas_com_jsonld += 1
+            tipos.update(tipos_pagina)
+            for defeito in defeitos:
+                defeitos_contagem[defeito["defeito"]] += 1
+                if len(amostras) < argumentos.max_defect_samples:
+                    amostras.append(defeito)
+
+    agora = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    registro = {
+        "evidence_id": "public-jsonld-validation-" + agora,
+        "record_status": "public_jsonld_validation_blocked_no_publication",
+        "producer": "tools/generate-public-jsonld-validation",
+        "public_dir": base,
+        "html_pages_scanned": paginas,
+        "pages_with_jsonld": paginas_com_jsonld,
+        "jsonld_blocks": blocos_total,
+        "corpus_sha256": hasher.hexdigest(),
+        "node_types": dict(sorted(tipos.items(), key=lambda item: -item[1])),
+        "defects": dict(sorted(defeitos_contagem.items(), key=lambda item: -item[1])),
+        "defects_total": sum(defeitos_contagem.values()),
+        "defect_samples": amostras,
+        "executed_live": True,
+        "publication_allowed": False,
+        "render_allowed": False,
+        "sitemap_allowed": False,
+        "approval": False,
+        "public_path": "",
+        "index_policy": "noindex",
+        "checked_at": agora,
+    }
+
+    print(
+        "generate-public-jsonld-validation: paginas={} com_jsonld={} blocos={} tipos={} defeitos={}".format(
+            paginas, paginas_com_jsonld, blocos_total, len(tipos), registro["defects_total"]
+        )
+    )
+    for nome, quantidade in registro["defects"].items():
+        print(f"  defeito {nome}: {quantidade}")
+
+    if argumentos.dry_run:
+        return 0
+
+    os.makedirs(os.path.dirname(argumentos.evidence), exist_ok=True)
+    with open(argumentos.evidence, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

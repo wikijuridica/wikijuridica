@@ -1,0 +1,432 @@
+#!/usr/bin/env node
+'use strict'
+// check-writing-mass-dispatch — prova a LOGICA DE DESPACHO de
+// scripts/workflows/writing-mass.js SEM chamar agente LLM de verdade.
+//
+// POR QUE EXISTE (ordem do dono 2026-07-29): duas ondas morreram em 21ms por
+// erro de sandbox (process.env; parsedArgs orfao no derivado) — cada
+// lancamento morto e token queimado. Este check carrega o transcript com
+// DUBLES de agent/parallel/pipeline/phase/log e reproduz o sandbox do harness
+// (process/require/TextEncoder INDEFINIDOS; Date.now()/new Date()/
+// Math.random() LANCAM). Toda mudanca no transcript passa AQUI antes de
+// queimar redator.
+//
+// O QUE ELE PROVA (assercoes duras):
+//   (a) TODOS os lotes validos sao despachados exatamente 1 vez (nenhum perdido);
+//   (b) NAO ha barreira por janela: um lote lento nao impede os demais de comecar;
+//   (c) o circuit breaker dispara com N falhas duras CONSECUTIVAS e NAO dispara
+//       com falhas intercaladas por progresso/claim;
+//   (d) o breaker para de LANCAR mas NAO aborta quem ja esta em voo;
+//   (e) lote stale/duplicado e DROPADO sem derrubar os validos; fila 100% stale
+//       lanca erro (sucesso vazio silencioso e proibido);
+//   (f) rejeicao do harness em UM agent() NAO envenena a barreira unica
+//       (vira falha dura contada pelo breaker; claims dos demais preservadas);
+//   (g) contabilidade do retorno: unattempted = lotes nunca lancados (breaker),
+//       failed = falhas duras entre os LANCADOS — telemetria que o operador le.
+//
+// SEMANTICA DO DUBLE DE parallel(): convencao do repo (todos os transcripts que
+// rodaram) e parallel(xs.map((x) => () => agent(...))) — THUNKS, invocados
+// lazy num pool com teto min(16, nucleos-2) (= 6 nesta maquina de 8). Barreira:
+// espera todos; rejeicao de um thunk rejeita a barreira (fail-fast) sem matar
+// os em voo. O modo --eager documenta a degradacao se o harness invocar tudo
+// no mesmo tick (breaker perde a capacidade de pular lancamentos).
+//
+// USO:
+//   tools/check-writing-mass-dispatch                 # cenarios sinteticos no base
+//   tools/check-writing-mass-dispatch --file scripts/workflows/writing-mass-todo.js
+//       # preflight da fila REAL derivada: valida schema dos lotes embutidos,
+//       # constroi TODOS os prompts, despacha com dubles; exit 3 se houver drop
+//       # (fila stale — regenerar com ops/relaunch-writing.sh antes de lancar).
+// Exit: 0 verde; 1 assercao falhou; 2 erro de uso; 3 fila real com drops.
+
+const fs = require('node:fs')
+const path = require('node:path')
+
+// Raiz derivada da propria localizacao do script (tools/<este arquivo>), nunca
+// hardcoded: com '/opt/wiki' fixo o check so rodava nesta maquina e quebrava em
+// qualquer clone/worktree (defeito apontado em
+// docs/goal/cowork/COWORK_SESSION_CHARTER_20260729.md:29).
+const ROOT = path.resolve(__dirname, '..')
+const BASE = path.join(ROOT, 'scripts/workflows/writing-mass.js')
+const HARNESS_CAP = 6 // min(16, 8 nucleos - 2)
+
+// ---------- carga do transcript com sandbox fiel ----------
+
+const ANCHOR = "const parsedArgs = typeof args === 'string' ? JSON.parse(args) : args\n" +
+  "if (!Array.isArray(parsedArgs)) throw new Error('args deve ser o array de lotes')\n" +
+  'const batches = parsedArgs'
+
+function loadTranscript(source, hooks) {
+  // O harness real avalia o transcript como corpo com export/meta + top-level
+  // await/return; aqui embrulhamos num arrow async. Sombras de process/require/
+  // TextEncoder/Date/Math reproduzem o sandbox (indefinidos ou armadilhados).
+  const body = source.replace(/^export const meta/m, 'const meta')
+  if (body === source) throw new Error('transcript sem "export const meta" — formato inesperado')
+  const factory = new Function(
+    'agent', 'parallel', 'pipeline', 'phase', 'log', 'workflow', 'budget', 'args',
+    'process', 'require', 'TextEncoder', 'Date', 'Math',
+    '"use strict"; return (async () => {\n' + body + '\n})()',
+  )
+  const trapDate = function Date() { throw new Error('sandbox: new Date() proibido no transcript') }
+  trapDate.now = () => { throw new Error('sandbox: Date.now() proibido no transcript') }
+  const trapMath = Object.create(null)
+  for (const key of Object.getOwnPropertyNames(Math)) trapMath[key] = Math[key]
+  trapMath.random = () => { throw new Error('sandbox: Math.random() proibido no transcript') }
+  return factory(
+    hooks.agent, hooks.parallel, hooks.pipeline, hooks.phase, hooks.log,
+    hooks.workflow, hooks.budget, hooks.args,
+    undefined, undefined, undefined, trapDate, trapMath,
+  )
+}
+
+// ---------- dubles ----------
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }
+
+function pooledParallel(cap, eager, env) {
+  return function parallel(thunks) {
+    if (!Array.isArray(thunks)) return Promise.reject(new Error('parallel: esperado array'))
+    for (const t of thunks) {
+      if (typeof t !== 'function') {
+        return Promise.reject(new Error('parallel: item nao-thunk — convencao do harness e () => agent(...); passar promise ja iniciada quebra o pool'))
+      }
+    }
+    env.parallelCalls.push(thunks.length)
+    const results = new Array(thunks.length)
+    if (thunks.length === 0) return Promise.resolve(results)
+    if (eager) {
+      // degradacao diagnostica: tudo invocado no mesmo tick
+      return Promise.all(thunks.map((t, i) => Promise.resolve().then(t).then((v) => { results[i] = v }))).then(() => results)
+    }
+    return new Promise((resolve, reject) => {
+      let next = 0, inFlight = 0, done = 0, rejected = false
+      const total = thunks.length
+      const pump = () => {
+        while (!rejected && inFlight < cap && next < total) {
+          const i = next++
+          inFlight++
+          Promise.resolve().then(thunks[i]).then((value) => {
+            results[i] = value
+            inFlight--; done++
+            if (done === total) resolve(results)
+            else pump()
+          }, (error) => {
+            inFlight--; done++
+            if (!rejected) { rejected = true; reject(error) }
+            // em voo continuam por conta propria; nenhum novo e lancado
+          })
+        }
+      }
+      pump()
+    })
+  }
+}
+
+const HEX_OK = 'f'.repeat(64)
+const HEX_PROGRESS = 'e'.repeat(64)
+
+function synthIntentIds(n) {
+  return Array.from({ length: n }, (_, i) => `syn-intent-${i}`)
+}
+
+function makeClaim(batch) {
+  const claim = {
+    slug: batch.slug,
+    file: `data/editorial/v2_pages/${batch.slug}.jsonl`,
+    written: batch.n, expected: batch.n,
+    intent_ids: batch.take > 0 ? synthIntentIds(batch.n) : batch.intent_ids,
+    target_sha256: batch.target_sha256,
+    audited_sha256: HEX_OK, audit_ok: true,
+    word_count_min: 700, word_count_max: 1300, notes: 'duble-sintetico',
+  }
+  if (batch.writing_recovery) {
+    claim.raw_recovery_preimage_evidence = {
+      path: `data/editorial/v2_raw_recovery_preimages/${batch.target_sha256}.raw`,
+      sha256: batch.target_sha256,
+    }
+  }
+  return claim
+}
+
+function makeProgress(batch) {
+  const claim = makeClaim(batch)
+  claim.audit_ok = false
+  claim.audited_sha256 = HEX_PROGRESS
+  return claim
+}
+
+function makeEnv({ batches, behaviors, cap = HARNESS_CAP, eager = false }) {
+  const env = {
+    events: [], calls: [], logs: [], parallelCalls: [],
+    batchBySlug: new Map(batches.filter((b) => b && typeof b.slug === 'string').map((b) => [b.slug, b])),
+    behaviors: behaviors || new Map(),
+    promptErrors: [],
+  }
+  env.hooks = {
+    args: undefined,
+    agent: async (prompt, opts) => {
+      const label = opts && opts.label ? String(opts.label) : '(sem label)'
+      const slug = label.replace(/^write:/, '')
+      if (typeof prompt !== 'string' || prompt.length < 500 || !prompt.includes(slug)) {
+        env.promptErrors.push(`${label}: prompt invalido (${typeof prompt}, ${String(prompt).length} chars)`)
+      }
+      env.events.push(`start:${slug}`)
+      env.calls.push({ slug, promptBytes: Buffer.byteLength(String(prompt)), agentType: opts && opts.agentType, model: opts && opts.model, hasSchema: Boolean(opts && opts.schema) })
+      const behavior = env.behaviors.get(slug) || { kind: 'claim', delay: 3 }
+      await sleep(behavior.delay)
+      env.events.push(`end:${slug}`)
+      if (behavior.kind === 'reject') throw new Error(`harness-sim: agent ${slug} rejeitado (falha de API)`)
+      if (behavior.kind === 'null') return null
+      if (behavior.kind === 'garbage') return { slug: 'slug-trocado', lixo: true }
+      const batch = env.batchBySlug.get(slug)
+      if (!batch) throw new Error(`duble: lote desconhecido ${slug}`)
+      return behavior.kind === 'progress' ? makeProgress(batch) : makeClaim(batch)
+    },
+    pipeline: () => { throw new Error('duble: pipeline() nao deveria ser chamado por writing-mass') },
+    workflow: () => { throw new Error('duble: workflow() nao deveria ser chamado por writing-mass') },
+    budget: undefined,
+    phase: (name) => { env.events.push(`phase:${name}`) },
+    log: (line) => { env.logs.push(String(line)) },
+  }
+  env.hooks.parallel = pooledParallel(cap, eager, env)
+  return env
+}
+
+// ---------- lotes sinteticos que PASSAM batchIsUnsafe do transcript ----------
+
+function synthBatch(i) {
+  return {
+    slug: `synt-lote-${String(i).padStart(2, '0')}`,
+    area: 'consumidor',
+    writer: 'redator-juridico',
+    file: 'data/editorial/portfolio_v2/consumidor.jsonl',
+    families: [`fam-${i}`],
+    skip: 0, take: 3, n: 3,
+    target_sha256: i.toString(16).padStart(64, '0'),
+    portfolio_sha256: '1'.repeat(64),
+    source_hint_catalog_sha256: '2'.repeat(64),
+    semantic_contract_sha256: '3'.repeat(64),
+    sources: [], source_overrides: {}, strict_source_intents: [],
+    preserved_record_sha256: {},
+  }
+}
+
+// ---------- infra de assercao ----------
+
+let failures = 0
+function assertThat(cond, label, detail) {
+  if (cond) {
+    console.log(`  ok   ${label}`)
+  } else {
+    failures++
+    console.log(`  FAIL ${label}${detail ? ` — ${detail}` : ''}`)
+  }
+}
+
+function eventIndex(env, ev) { return env.events.indexOf(ev) }
+
+// ---------- cenarios ----------
+
+async function scenarioS1(source) {
+  console.log('S1: completude do despacho + ausencia de barreira por janela (40 lotes, cap 6, lote 02 lento)')
+  const batches = Array.from({ length: 40 }, (_, i) => synthBatch(i))
+  const slowSlug = batches[2].slug
+  const behaviors = new Map([[slowSlug, { kind: 'claim', delay: 220 }]])
+  const env = makeEnv({ batches, behaviors })
+  env.hooks.args = batches
+  const result = await loadTranscript(source, env.hooks)
+  assertThat(env.calls.length === 40, '(a) 40/40 lotes chegaram ao agent()', `calls=${env.calls.length}`)
+  assertThat(new Set(env.calls.map((c) => c.slug)).size === 40, '(a) nenhum lote despachado 2x')
+  assertThat(result.claimed_batches === 40 && result.claims.length === 40, 'claims 40/40 no retorno', JSON.stringify({ claimed: result.claimed_batches }))
+  assertThat(result.halted === false && result.dropped_batches === 0, 'sem halt e sem drop')
+  const slowEnd = eventIndex(env, `end:${slowSlug}`)
+  const lastStart = Math.max(...batches.filter((b) => b.slug !== slowSlug).map((b) => eventIndex(env, `start:${b.slug}`)))
+  assertThat(slowEnd > lastStart, '(b) TODOS os outros 39 lotes COMECARAM antes de o lento terminar (sem janela)', `end_lento@${slowEnd} ultimo_start@${lastStart}`)
+  assertThat(env.parallelCalls.length === 1 && env.parallelCalls[0] === 40, 'despacho unico: 1 chamada parallel() com 40 thunks', JSON.stringify(env.parallelCalls))
+  assertThat(env.promptErrors.length === 0, 'prompts bem formados nos 40', env.promptErrors[0])
+  assertThat(result.attempted_batches === 40 && result.failed_claims === 0 && result.unattempted_batches === 0, '(g) contabilidade: attempted=40 failed=0 unattempted=0', JSON.stringify({ a: result.attempted_batches, f: result.failed_claims, u: result.unattempted_batches }))
+}
+
+async function scenarioS2(source) {
+  console.log('S2: breaker dispara com 6 falhas duras consecutivas; em voo terminam; nao lancados = unattempted (12 lotes, cap 4)')
+  const batches = Array.from({ length: 12 }, (_, i) => synthBatch(i))
+  const behaviors = new Map()
+  // lotes 0..5: falha dura rapida escalonada -> streak 6 fecha o breaker
+  for (let i = 0; i < 6; i++) behaviors.set(batches[i].slug, { kind: 'null', delay: 5 + i * 8 })
+  // lotes 6..8: claims LENTAS — estarao em voo quando o breaker fechar
+  for (let i = 6; i < 9; i++) behaviors.set(batches[i].slug, { kind: 'claim', delay: 150 })
+  // lotes 9..11: nunca devem ser lancados
+  for (let i = 9; i < 12; i++) behaviors.set(batches[i].slug, { kind: 'claim', delay: 3 })
+  const env = makeEnv({ batches, behaviors, cap: 4 })
+  env.hooks.args = batches
+  const result = await loadTranscript(source, env.hooks)
+  const launched = env.calls.length
+  assertThat(result.halted === true, '(c) halted=true com 6 falhas duras consecutivas')
+  assertThat(env.logs.some((l) => l.includes('CIRCUIT BREAKER')), '(c) log do breaker emitido')
+  assertThat(launched === 9, '(d) lancados exatamente 9 (0..8); 9..11 nunca chegaram ao agent()', `launched=${launched}`)
+  for (let i = 9; i < 12; i++) {
+    assertThat(eventIndex(env, `start:${batches[i].slug}`) === -1, `(d) ${batches[i].slug} NAO lancado pelo breaker`)
+  }
+  const claims = result.claims.map((c) => c.slug).sort()
+  assertThat(claims.length === 3 && claims.join(',') === [batches[6].slug, batches[7].slug, batches[8].slug].sort().join(','), '(d) os 3 em voo TERMINARAM e entregaram claim (nao abortados)', claims.join(','))
+  const breakerLogIdx = env.logs.findIndex((l) => l.includes('CIRCUIT BREAKER'))
+  assertThat(breakerLogIdx !== -1 && result.claims.length === 3, '(d) claims coletadas mesmo com halt anterior ao fim delas')
+  assertThat(result.attempted_batches === 9 && result.failed_claims === 6 && result.unattempted_batches === 3,
+    '(g) contabilidade: attempted=9 (lancados), failed=6 (falhas duras), unattempted=3 (pulados pelo breaker)',
+    JSON.stringify({ a: result.attempted_batches, f: result.failed_claims, u: result.unattempted_batches }))
+}
+
+async function scenarioS3(source) {
+  console.log('S3: falhas intercaladas por progresso NAO disparam o breaker (14 lotes, cap 1 = serial deterministico)')
+  const batches = Array.from({ length: 14 }, (_, i) => synthBatch(i))
+  const kinds = ['null', 'null', 'null', 'null', 'null', 'progress', 'null', 'null', 'null', 'null', 'null', 'claim', 'null', 'claim']
+  const behaviors = new Map(batches.map((b, i) => [b.slug, { kind: kinds[i], delay: 2 }]))
+  const env = makeEnv({ batches, behaviors, cap: 1 })
+  env.hooks.args = batches
+  const result = await loadTranscript(source, env.hooks)
+  assertThat(result.halted === false, '(c) streak max 5 < 6: halted=false')
+  assertThat(env.calls.length === 14, '(c) todos os 14 lancados', `launched=${env.calls.length}`)
+  assertThat(result.claims.length === 2, 'claims=2 (progress honesto nao vira claim)', `claims=${result.claims.length}`)
+  assertThat(env.logs.filter((l) => l.startsWith('REPROVADO')).length === 12, '12 REPROVADO logados (11 null + 1 progress)', String(env.logs.filter((l) => l.startsWith('REPROVADO')).length))
+}
+
+async function scenarioS4(source) {
+  console.log('S4 (diagnostico): se o harness invocar TODOS os thunks no mesmo tick (eager), o breaker perde a capacidade de pular')
+  const batches = Array.from({ length: 12 }, (_, i) => synthBatch(i))
+  const behaviors = new Map()
+  for (let i = 0; i < 6; i++) behaviors.set(batches[i].slug, { kind: 'null', delay: 2 })
+  const env = makeEnv({ batches, behaviors, eager: true })
+  env.hooks.args = batches
+  const result = await loadTranscript(source, env.hooks)
+  assertThat(env.calls.length === 12, 'eager: 12/12 lancados — breaker NAO pulou nenhum (dependencia da semantica pooled do harness)', `launched=${env.calls.length}`)
+  assertThat(result.halted === true, 'eager: halted ainda vira true (mas tarde demais para poupar lancamentos)')
+}
+
+async function scenarioS5(source) {
+  console.log('S5: lote stale e slug duplicado sao DROPADOS sem derrubar os validos')
+  const good = Array.from({ length: 6 }, (_, i) => synthBatch(i))
+  const stale = { slug: 'stale-lote-01', area: 'consumidor' } // schema quebrado
+  const dupA = synthBatch(90); const dupB = synthBatch(91)
+  dupB.slug = dupA.slug // disputariam o mesmo alvo
+  const batches = [...good.slice(0, 3), stale, dupA, ...good.slice(3), dupB]
+  const env = makeEnv({ batches })
+  env.hooks.args = batches
+  const result = await loadTranscript(source, env.hooks)
+  assertThat(result.dropped_batches === 3, '(e) 3 drops (1 stale + 2 dup)', JSON.stringify(result.dropped))
+  assertThat(env.calls.length === 6, '(e) os 6 validos despachados', `calls=${env.calls.length}`)
+  assertThat(result.claimed_batches === 6, '(e) 6 claims')
+  const motivos = result.dropped.map((d) => d.motivo)
+  assertThat(motivos.some((m) => m.includes('stale')) && motivos.some((m) => m.includes('duplicado')), '(e) motivos corretos nos drops')
+}
+
+async function scenarioS6(source) {
+  console.log('S6: rejeicao do harness em 1 agent() NAO pode envenenar a barreira unica (8 lotes, cap 3, lote 01 rejeita)')
+  const batches = Array.from({ length: 8 }, (_, i) => synthBatch(i))
+  const behaviors = new Map([[batches[1].slug, { kind: 'reject', delay: 10 }]])
+  for (const b of batches) if (b.slug !== batches[1].slug) behaviors.set(b.slug, { kind: 'claim', delay: 40 })
+  const env = makeEnv({ batches, behaviors, cap: 3 })
+  env.hooks.args = batches
+  let result = null
+  let died = null
+  try {
+    result = await loadTranscript(source, env.hooks)
+  } catch (error) {
+    died = error
+  }
+  assertThat(died === null, '(f) transcript sobreviveu a rejeicao (sem try/catch a barreira inteira morre e TODAS as claims se perdem)', died ? String(died) : '')
+  if (result) {
+    assertThat(result.claims.length === 7, '(f) 7 claims preservadas', `claims=${result.claims.length}`)
+    assertThat(result.failed_claims === 1 && result.halted === false, '(f) rejeicao contada como 1 falha dura; breaker nao disparou', JSON.stringify({ f: result.failed_claims, h: result.halted }))
+    assertThat(env.logs.some((l) => l.includes(batches[1].slug)), '(f) falha logada com o slug do lote')
+  }
+}
+
+async function scenarioS7(source) {
+  console.log('S7: fila vazia retorna sem lancar nada; fila 100% stale LANCA erro')
+  const envEmpty = makeEnv({ batches: [] })
+  envEmpty.hooks.args = []
+  const resultEmpty = await loadTranscript(source, envEmpty.hooks)
+  assertThat(resultEmpty.claimed_batches === 0 && envEmpty.calls.length === 0, 'fila vazia: 0 claims, 0 agent()')
+  const broken = [{ slug: 'quebrado-um' }, { slug: 'quebrado-dois' }]
+  const envStale = makeEnv({ batches: broken })
+  envStale.hooks.args = broken
+  let threw = null
+  try { await loadTranscript(source, envStale.hooks) } catch (error) { threw = error }
+  assertThat(threw !== null && String(threw).includes('fila 100% stale'), 'fila 100% stale: throw explicito (sem sucesso vazio silencioso)', String(threw))
+}
+
+async function scenarioS8(source) {
+  console.log('S8: derivado com args de operador {concurrency:2} respeita o limite deliberado (fatia com barreira por fatia)')
+  const batches = Array.from({ length: 8 }, (_, i) => synthBatch(i))
+  if (!source.includes(ANCHOR)) throw new Error('ancora do parsedArgs ausente no base — relaunch-writing.sh quebraria (assert :1046)')
+  const derivedShape = source
+    .replace(ANCHOR, 'const batches = ' + JSON.stringify(batches) + '\n')
+    .replace("name: 'writing-mass'", "name: 'writing-mass-todo'")
+  const env = makeEnv({ batches })
+  env.hooks.args = { concurrency: 2, breakerStreak: 4 }
+  const result = await loadTranscript(derivedShape, env.hooks)
+  assertThat(env.calls.length === 8 && result.claimed_batches === 8, 'derivado: 8/8 despachados com override')
+  assertThat(env.parallelCalls.length === 4 && env.parallelCalls.every((n) => n === 2), 'override concurrency=2: 4 fatias de 2 (limite deliberado do operador)', JSON.stringify(env.parallelCalls))
+  // barreira por fatia e intencional no modo override: start da fatia k+1 apos os ends da fatia k
+  const startOf = (i) => eventIndex(env, `start:${batches[i].slug}`)
+  const endOf = (i) => eventIndex(env, `end:${batches[i].slug}`)
+  assertThat(startOf(2) > endOf(0) && startOf(2) > endOf(1), 'fatia 2 so comeca apos fatia 1 terminar (cota deliberada)')
+}
+
+// ---------- modo --file: preflight da fila real derivada ----------
+
+async function preflightDerived(filePath) {
+  const source = fs.readFileSync(filePath, 'utf8')
+  const match = source.match(/^const batches = (\[.*\])$/m)
+  if (!match) { console.error(`uso: ${filePath} nao tem "const batches = [...]" inline (nao e derivado)`); process.exit(2) }
+  const batches = JSON.parse(match[1])
+  console.log(`preflight ${path.basename(filePath)}: ${batches.length} lotes embutidos, ${batches.reduce((s, b) => s + (b.n || 0), 0)} paginas`)
+  const env = makeEnv({ batches })
+  env.hooks.args = undefined
+  const started = Number(process.hrtime.bigint() / 1000000n)
+  const result = await loadTranscript(source, env.hooks)
+  const elapsed = Number(process.hrtime.bigint() / 1000000n) - started
+  const promptBytes = env.calls.map((c) => c.promptBytes)
+  const maxPrompt = Math.max(...promptBytes)
+  console.log(`  despachados=${env.calls.length} claims=${result.claimed_batches} dropados=${result.dropped_batches} halted=${result.halted} em ${elapsed}ms`)
+  console.log(`  prompts: max=${maxPrompt}B media=${Math.round(promptBytes.reduce((a, b) => a + b, 0) / promptBytes.length)}B; agentTypes=${JSON.stringify([...new Set(env.calls.map((c) => c.agentType))])}; models=${JSON.stringify([...new Set(env.calls.map((c) => c.model))])}`)
+  assertThat(env.promptErrors.length === 0, 'todos os prompts bem formados', env.promptErrors[0])
+  assertThat(env.calls.length === batches.length - result.dropped_batches, 'todos os lotes nao-dropados despachados')
+  assertThat(result.claimed_batches === env.calls.length, 'claims sinteticas aceitas pelo contrato de identidade de TODOS os lotes despachados (wellFormedBatchClaim)')
+  if (failures > 0) process.exit(1)
+  if (result.dropped_batches > 0) {
+    console.log(`  ATENCAO: ${result.dropped_batches} lote(s) dropado(s) — fila stale; regenere com ops/relaunch-writing.sh antes de lancar:`)
+    for (const d of result.dropped) console.log(`    - ${d.slug}: ${d.motivo}`)
+    process.exit(3)
+  }
+  console.log('  fila real: verde para lancamento (nenhum drop, nenhum erro de sandbox, nenhum prompt malformado)')
+}
+
+// ---------- main ----------
+
+async function main() {
+  const argv = process.argv.slice(2)
+  if (argv[0] === '--help' || argv[0] === '-h') {
+    console.log('uso: tools/check-writing-mass-dispatch [--file scripts/workflows/writing-mass-todo.js]')
+    process.exit(0)
+  }
+  if (argv[0] === '--file') {
+    if (!argv[1]) { console.error('faltou o caminho apos --file'); process.exit(2) }
+    await preflightDerived(path.resolve(ROOT, argv[1]))
+    return
+  }
+  const source = fs.readFileSync(BASE, 'utf8')
+  console.log(`base: ${BASE} (${source.length} bytes)`)
+  await scenarioS1(source)
+  await scenarioS2(source)
+  await scenarioS3(source)
+  await scenarioS4(source)
+  await scenarioS5(source)
+  await scenarioS6(source)
+  await scenarioS7(source)
+  await scenarioS8(source)
+  console.log(failures === 0 ? 'VERDE: logica de despacho provada sem queimar nenhum redator' : `VERMELHO: ${failures} assercao(oes) falharam`)
+  process.exit(failures === 0 ? 0 : 1)
+}
+
+main().catch((error) => { console.error(`erro do harness: ${error && error.stack || error}`); process.exit(1) })

@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""generate-risco-superacao — mede, por pagina, o risco de a orientacao dela ter sido
+superada por decisao coletada DEPOIS da revisao editorial (mandato AI-first §8, P3).
+
+O QUE MEDE (e so isso): para cada pagina publicada que cita dispositivos legais
+(grafo: pagina -cita-> dispositivo), quantos acordaos coletados citam o MESMO
+dispositivo ou a norma dele, e quantos desses foram julgados DEPOIS de reviewed_at
+da pagina. O risco e uma funcao explicita desses numeros:
+
+    risco = min(1, peso / 5) * recencia
+    peso  = soma dos posteriores: 1,0 se o acordao cita o MESMO dispositivo
+            (artigo), 0,2 se cita so a norma inteira (laco fraco)
+    recencia = 1.0 se o mais recente tem ate 365 dias; 0.5 ate 730; 0.25 depois
+
+"Posterior" e relativo a ANCORA da pagina: o checked_at mais antigo da
+proveniencia de fonte (a conferencia), senao approved_at, senao reviewed_at --
+reviewed_at sozinho e carimbo de execucao (9.715 paginas em 2026-08-26). Sem
+acordao posterior, risco = 0 e a explicacao diz isso, com a contagem de
+acordaos do corpus ainda sem dispositivo extraido (nao medidos): o numero e
+honesto, nao e "seguro". Corpus em 2026-09-08: 9.199 acordaos do STJ de 2018 a
+2024, 3.801 ainda sem aresta (fila de extracao local). Acordao que cita a Sumula 7 do STJ (reexame de fatos) conta,
+mas entra na explicacao, porque raramente muda tese.
+
+SAIDA: data/ai/risco_superacao.jsonl, uma linha por pagina com dispositivo,
+schema risco_superacao_v1, ordenada por path; escrita atomica; deterministica
+(mesma entrada = mesmos bytes fora de gerado_em). O servidor le este arquivo no
+boot e contexto_juridico o devolve com medido=true. Nunca escreve em public/.
+"""
+import argparse, collections, datetime, json, os, sqlite3, sys, time
+
+SCHEMA = "risco_superacao_v1"
+PESO_LACO = {"dispositivo": 1.0, "norma": 0.2}
+
+
+def ancora_da_pagina(r):
+    """Data em que o estado juridico da pagina foi conferido. NAO e reviewed_at:
+    medido em 2026-09-08, 9.715 de 10.141 paginas trazem reviewed_at=2026-08-26
+    porque um gerador carimbou o dia da execucao em todas (commit 546f4aef) -- e
+    uma pagina escrita em 2026-07 por modelo que nunca leu um acordao de 2024
+    ficaria com esse acordao como "anterior". A ancora e o checked_at mais
+    antigo de source_provenance (a conferencia da fonte), senao approved_at,
+    senao reviewed_at. Devolve (data, origem)."""
+    datas = sorted((sp.get("checked_at") or "")[:10] for sp in (r.get("source_provenance") or []) if sp.get("checked_at"))
+    if datas:
+        return datas[0], "source_provenance.checked_at"
+    if r.get("approved_at"):
+        return r["approved_at"][:10], "approved_at"
+    return (r.get("reviewed_at") or "")[:10], "reviewed_at"
+
+
+def carrega_revisoes(root):
+    rev = {}
+    with open(os.path.join(root, "data", "editorial", "published_manifest.jsonl"), encoding="utf-8") as f:
+        for l in f:
+            if not l.strip():
+                continue
+            r = json.loads(l)
+            rev[r["path"]] = ancora_da_pagina(r)
+    return rev
+
+
+def calcula(db, revisoes, hoje):
+    """Devolve a lista de registros; puro sobre o SQLite e o dicionario de revisoes."""
+    cur = db.cursor()
+    # pagina -> dispositivos (chave, norma_base)
+    disp_por_pagina = collections.defaultdict(list)
+    for path, chave_disp, atributos in cur.execute(
+        "select p.chave, d.chave, d.atributos from arestas a join nos p on p.id=a.origem join nos d on d.id=a.destino "
+        "where a.tipo='cita' and p.tipo='pagina' and d.tipo in ('dispositivo','norma')"):
+        base = chave_disp
+        try:
+            base = json.loads(atributos).get("norma_base") or chave_disp
+        except (TypeError, ValueError):
+            pass
+        disp_por_pagina[path].append((chave_disp, base))
+    # acordao -> alvos citados (dispositivo ou norma), com data e rotulo
+    acordaos = {}
+    for chave, rotulo, atributos in cur.execute("select chave, rotulo, atributos from nos where tipo='acordao'"):
+        try:
+            a = json.loads(atributos)
+        except (TypeError, ValueError):
+            a = {}
+        acordaos[chave] = {"rotulo": rotulo, "data": (a.get("data_julgamento") or "")[:10], "fonte_url": a.get("fonte_url", "")}
+    cita_alvo = collections.defaultdict(set)   # alvo (dispositivo|norma chave) -> acordaos
+    for chave_ac, alvo in cur.execute(
+        "select ac.chave, d.chave from arestas a join nos ac on ac.id=a.origem join nos d on d.id=a.destino "
+        "where a.tipo='cita' and ac.tipo='acordao' and d.tipo in ('dispositivo','norma')"):
+        cita_alvo[alvo].add(chave_ac)
+    cita_sumula7 = set(r[0] for r in cur.execute(
+        "select ac.chave from arestas a join nos ac on ac.id=a.origem join nos s on s.id=a.destino "
+        "where a.tipo='cita' and ac.tipo='acordao' and s.chave='sumula:STJ:7'"))
+    sem_aresta = cur.execute(
+        "select count(*) from nos n where n.tipo='acordao' and not exists (select 1 from arestas a join nos d on d.id=a.destino "
+        "where a.origem=n.id and a.tipo='cita' and d.tipo in ('dispositivo','norma','sumula'))").fetchone()[0]
+    saida = []
+    for path in sorted(disp_por_pagina):
+        revisao, origem_ancora = revisoes.get(path, ("", ""))
+        if not revisao:
+            continue
+        candidatos = {}   # acordao -> {"via": set(dispositivos da pagina), "laco": "dispositivo" | "norma"}
+        for chave_disp, base in disp_por_pagina[path]:
+            for ac in cita_alvo.get(chave_disp, set()):
+                c = candidatos.setdefault(ac, {"via": set(), "laco": "dispositivo"})
+                c["via"].add(chave_disp); c["laco"] = "dispositivo"
+            for ac in cita_alvo.get(base, set()):
+                c = candidatos.setdefault(ac, {"via": set(), "laco": "norma"})
+                c["via"].add(chave_disp)
+        if not candidatos:
+            continue
+        # Laco por norma inteira ("cita o CDC") pesa 0,2: e um laco fraco, e sem
+        # o peso 5 acordaos citando "o CDC" levariam 1.173 paginas a 1,0 identicas
+        # (refutacao de 2026-09-08). Laco por dispositivo (mesmo artigo) pesa 1.
+        posteriores = {ac: c for ac, c in candidatos.items() if acordaos[ac]["data"] and acordaos[ac]["data"] > revisao}
+        peso = round(sum(PESO_LACO[c["laco"]] for c in posteriores.values()), 2)
+        mais_recente = max((acordaos[ac]["data"] for ac in candidatos if acordaos[ac]["data"]), default="")
+        recencia = 0.0
+        if posteriores and mais_recente:
+            dias = (hoje - datetime.date.fromisoformat(mais_recente)).days
+            recencia = 1.0 if dias <= 365 else 0.5 if dias <= 730 else 0.25
+        risco = round(min(1.0, peso / 5.0) * recencia, 3)
+        so_sumula7 = bool(posteriores) and all(ac in cita_sumula7 for ac in posteriores)
+        por_disp = sum(1 for c in posteriores.values() if c["laco"] == "dispositivo")
+        if not posteriores:
+            explicacao = ("nenhum acórdão coletado foi julgado depois da conferência da página (%s, %s); %d acórdão(s) anteriores citam os mesmos dispositivos ou normas"
+                          % (revisao, origem_ancora, len(candidatos)))
+        else:
+            explicacao = ("%d acórdão(s) julgados depois da conferência da página (%s, %s) citam o mesmo dispositivo (%d) ou só a mesma norma inteira (%d, peso 0,2); "
+                          "peso %.1f; o mais recente é de %s" % (len(posteriores), revisao, origem_ancora, por_disp, len(posteriores) - por_disp, peso, mais_recente))
+            if so_sumula7:
+                explicacao += "; todos invocam a Súmula 7 do STJ (reexame de fatos), que raramente altera tese"
+        explicacao += "; %d acórdão(s) do corpus ainda sem dispositivo extraído não entram (não medidos)" % sem_aresta
+        top = sorted(candidatos, key=lambda ac: (acordaos[ac]["data"], ac), reverse=True)[:3]
+        saida.append({
+            "schema_version": SCHEMA, "path": path, "reviewed_at": revisao, "ancora_origem": origem_ancora,
+            "dispositivos": sorted({d for d, _ in disp_por_pagina[path]}),
+            "acordaos_total": len(candidatos), "acordaos_apos_revisao": len(posteriores), "peso_apos_revisao": peso,
+            "mais_recente": mais_recente, "acordaos_sem_extracao": sem_aresta,
+            "risco": risco, "medido": True, "explicacao": explicacao,
+            "fontes": [{"chave": ac, "rotulo": acordaos[ac]["rotulo"], "data_julgamento": acordaos[ac]["data"], "fonte_url": acordaos[ac]["fonte_url"],
+                        "laco": candidatos[ac]["laco"], "via": sorted(candidatos[ac]["via"])} for ac in top],
+        })
+    return saida
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--db", default="data/ai/grafo.sqlite")
+    ap.add_argument("--saida", default="data/ai/risco_superacao.jsonl")
+    ap.add_argument("--hoje", default="", help="AAAA-MM-DD (teste); vazio = hoje")
+    ap.add_argument("--medicao", default="data/ops/risco_superacao_daily.jsonl", help="serie diaria (append); vazio = nao gravar")
+    ap.add_argument("--timings", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    root = os.path.abspath(args.root)
+    t0 = time.time()
+    hoje = datetime.date.fromisoformat(args.hoje) if args.hoje else datetime.date.today()
+    db = sqlite3.connect("file:%s?mode=ro" % os.path.join(root, args.db), uri=True)
+    registros = calcula(db, carrega_revisoes(root), hoje)
+    gerado_em = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    linhas = [json.dumps(dict(r, gerado_em=gerado_em), ensure_ascii=False, sort_keys=True) for r in registros]
+    com_risco = sum(1 for r in registros if r["risco"] > 0)
+    print("risco-superacao: %d páginas com dispositivo citado por acórdão, %d com risco > 0, %.2fs" % (len(registros), com_risco, time.time() - t0))
+    if args.dry_run:
+        return 0
+    destino = os.path.join(root, args.saida)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    tmp = destino + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(linhas) + ("\n" if linhas else ""))
+    os.replace(tmp, destino)
+    if args.medicao:
+        medicao = {"schema_version": "risco_superacao_daily_v1", "gerado_em": gerado_em, "paginas_com_par": len(registros),
+                   "paginas_com_risco": com_risco, "risco_maximo": max((r["risco"] for r in registros), default=0.0),
+                   "acordao_mais_recente": max((r["mais_recente"] for r in registros), default=""),
+                   "acordaos_distintos": len({f["chave"] for r in registros for f in r["fontes"]}), "segundos": round(time.time() - t0, 2)}
+        os.makedirs(os.path.dirname(os.path.join(root, args.medicao)) or ".", exist_ok=True)
+        with open(os.path.join(root, args.medicao), "a", encoding="utf-8") as f:
+            f.write(json.dumps(medicao, ensure_ascii=False, sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

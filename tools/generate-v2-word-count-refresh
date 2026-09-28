@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# generate-v2-word-count-refresh — recomputa word_count dos shards FINALIZADOS
+# (nunca *.partial.jsonl) ou dos caminhos finalizados passados como argumentos.
+# Usa a formula CANONICA do gate
+# de ingestao (bodyWordCount em internal/v2ingest/validate.go: opening +
+# headings + textos das secoes + FAQ), via tools/audit_v2_pages.py.
+#
+# Motivo: os agentes redatores declararam word_count com formula divergente
+# (sem headings/FAQ); o gate rejeita declared_word_count_incoherent quando a
+# diferenca passa de 10%. Recomputar o campo e correcao mecanica honesta —
+# word_count E a contagem real por definicao do gate. Nao altera texto.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+python3 - "$@" <<'PY'
+import glob, json, os, stat, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, 'tools')
+from audit_v2_pages import body_word_count, is_finalized_v2_path
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+def refresh():
+    pages_dir = os.path.join('data', 'editorial', 'v2_pages')
+    requested = sys.argv[1:]
+    candidates = requested or sorted(glob.glob(os.path.join(pages_dir, '*.jsonl')))
+    paths = []
+    seen = set()
+    for path in candidates:
+        normalized = os.path.normpath(path)
+        if (os.path.isabs(path) or path != normalized or
+                os.path.dirname(path) != pages_dir):
+            raise SystemExit(
+                'generate-v2-word-count-refresh: somente shard finalizado canonico '
+                f'direto em {pages_dir} pode ser alterado: {path}')
+        if not is_finalized_v2_path(path):
+            if requested:
+                raise SystemExit(
+                    'generate-v2-word-count-refresh: staging writer-owned nao pode '
+                    f'ser alterado: {path}')
+            continue
+        if path in seen:
+            raise SystemExit(
+                f'generate-v2-word-count-refresh: caminho duplicado: {path}')
+        seen.add(path)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            raise SystemExit(
+                f'generate-v2-word-count-refresh: arquivo ausente: {path}')
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
+                info.st_nlink != 1):
+            raise SystemExit(
+                'generate-v2-word-count-refresh: shard deve ser arquivo regular '
+                f'exclusivo, sem symlink ou hardlink: {path}')
+        paths.append((path, info))
+
+    changed_pages = 0
+    changed_files = 0
+    for path, initial_info in paths:
+        with open(path, 'rb') as source:
+            before = source.read()
+        # LINHA NAO CORRIGIDA SAI BYTE A BYTE COMO ENTROU (2026-08-29).
+        #
+        # Ate aqui toda linha do arquivo era re-serializada por json.dumps, e o
+        # estoque tem DOIS estilos de separador convivendo: 2.546 linhas
+        # compactas ({"a":"b"}) e 7.698 espacadas ({"a": "b"}), com 153 shards
+        # mistos. Reemitir tudo normalizava o estilo e sujava o diff: a passada
+        # de hoje mexeu em 950 word_count e mudou 1.510 linhas — 560 delas com
+        # JSON IDENTICO, so reformatado. Alem do ruido de revisao, isso reescreve
+        # linha que outra sessao pode ter editado e ainda nao commitado, quando
+        # este gerador nao tem nada a dizer sobre ela.
+        out = []
+        touched = False
+        for line in before.decode('utf-8').splitlines():
+            if not line.strip():
+                continue
+            page = json.loads(line)
+            if not page.get('skipped'):
+                real = body_word_count(page)
+                if page.get('word_count') != real:
+                    page['word_count'] = real
+                    touched = True
+                    changed_pages += 1
+                    out.append(json.dumps(page, ensure_ascii=False))
+                    continue
+            out.append(line)
+        if touched:
+            current_info = os.lstat(path)
+            if ((current_info.st_dev, current_info.st_ino, current_info.st_mode,
+                 current_info.st_nlink) !=
+                    (initial_info.st_dev, initial_info.st_ino,
+                     initial_info.st_mode, initial_info.st_nlink) or
+                    Path(path).read_bytes() != before):
+                raise SystemExit(
+                    f'generate-v2-word-count-refresh: CAS mismatch: {path}')
+            directory = os.path.dirname(path)
+            fd, tmp = tempfile.mkstemp(
+                prefix=os.path.basename(path) + '.', dir=directory)
+            try:
+                os.fchmod(fd, stat.S_IMODE(initial_info.st_mode))
+                with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                    fh.write('\n'.join(out) + '\n')
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                if Path(path).read_bytes() != before:
+                    raise SystemExit(
+                        f'generate-v2-word-count-refresh: CAS mismatch antes do rename: {path}')
+                os.replace(tmp, path)
+                directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            changed_files += 1
+    print(f'word_count recomputado: {changed_pages} paginas em {changed_files} arquivos')
+
+
+canonical_root = Path.cwd()
+try:
+    with canonical_stock_write_lease(canonical_root):
+        refresh()
+except StockEpochBusy as error:
+    print(f'generate-v2-word-count-refresh: canonical stock busy: {error}', file=sys.stderr)
+    raise SystemExit(75)
+PY

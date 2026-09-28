@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""check-tunnel-replica-fleet — a frota de tuneis esta de pe, com quantas conexoes.
+
+READ-ONLY: consulta o endpoint `/ready` que cada instancia do cloudflared publica
+em 127.0.0.1 e soma as conexoes vivas. Nao reinicia nada, nao escreve config.
+
+POR QUE A CONTA E POR CONEXAO E NAO POR PROCESSO. `systemctl is-active` diz que a
+unit esta rodando, e isso NAO significa que ela esta servindo: o cloudflared fica
+`active` enquanto tenta reconectar, com zero conexao pronta. Uma frota inteira
+pode aparecer verde no systemd e a borda estar devolvendo 530. O `/ready` de cada
+instancia devolve `readyConnections`, que e o numero que corresponde a realidade.
+
+O TETO E DA CLOUDFLARE, nao nosso: a doc de disponibilidade de tunel define 25
+replicas / 100 conexoes por tunel, com 4 conexoes por instancia. Ate 2026-09-03
+este projeto operava NO TETO — 1 principal + 24 replicas —, e a frota foi
+reduzida para 1 principal (metrics 20243) + 4 replicas (20251..20254), 20
+conexoes.
+
+POR QUE A FROTA ENCOLHEU, e o numero que a sustentava era falso. As 25 replicas
+foram dimensionadas em 2026-08-12 sobre uma medicao de `measure-tunnel-gaps`
+("10 janelas / 121 s em 48 h"). Em 2026-09-03 essa ferramenta foi confrontada
+com o estado OBSERVADO (`data/ops/tunnel_health.jsonl`, amostra a cada 30 s) e
+se descobriu que ela inventava janela: um `Unregistered` cuja conexao foi
+registrada ANTES do recorte esvazia o conjunto vivo sem que nada tenha caido.
+A janela de 2.165 s que ela declarou em 01/09 tem 66 amostras de saude dizendo
+`ha_connections=4` DENTRO dela, e 24 sondas externas respondendo 200. Com o
+confronto ligado: ZERO janela confirmada em 48 h.
+
+Medido no mesmo dia, com a frota no teto: 18 das 24 replicas tinham menos de
+1.000 requisicoes desde o boot (as outras 6 concentravam ~25 mil cada, que sao
+as rajadas do aquecedor), 664 MB de RSS, 99 conexoes e um thrash de reconexao de
+2h44 no boot (546 "unknown error registering the connection"). Depois da
+reducao: 5 processos, 127 MB, 20 conexoes, borda em 60 ms.
+
+O que derruba o portal nao e o processo do tunel — e o host e o uplink, e contra
+isso replica no MESMO host nao faz nada.
+
+REPROVA quando o total de conexoes vivas cai abaixo do minimo. O default de 8 nao
+e simbolico: com 8 conexoes vivas em pelo menos 2 instancias distintas, a queda
+simultanea que produziria um 530 exige que dois processos independentes falhem no
+mesmo instante — que e exatamente o modo de falha que a frota veio eliminar.
+
+Uso:
+    tools/check-tunnel-replica-fleet
+    tools/check-tunnel-replica-fleet --minimo 40
+    tools/check-tunnel-replica-fleet --json
+"""
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+PORTA_PRINCIPAL = 20243
+# 2026-09-03: a frota caiu de 25 instâncias (100 conexões) para 5 (20). Ver o
+# bloco "O TETO E DA CLOUDFLARE" acima, corrigido com a medição que derrubou a
+# premissa. As portas 20255..20274 continuam RESERVADAS ao template: religar uma
+# réplica é `systemctl enable --now cloudflared-wikijuridica-replica@2025N`, e
+# este intervalo é o que o gate vigia.
+PORTAS_REPLICA = range(20251, 20255)
+
+# IDENTIDADE DA SONDA (CLAUDE.md secao 11). Ate 2026-09-10 estas leituras saiam
+# como `Python-urllib/3.x`. O destino e servico NOSSO na maquina, nao o portal:
+# vai o User-Agent da sonda interna que o contrato nomeia, e nao vai o
+# `X-Warming-Request` — aquele cabecalho existe para tirar a requisicao da
+# metrica de audiencia do portal, e aqui nao ha metrica de audiencia.
+UA_SONDA = "wikijuridica-superficie-probe/1.0"
+CABECALHOS_SONDA = {"User-Agent": UA_SONDA}
+MINIMO_PADRAO = 8
+MINIMO_INSTANCIAS = 2
+
+
+def consulta(porta, timeout=3):
+    """Devolve (conexoes_prontas, connector_id, erro)."""
+    try:
+        pedido = urllib.request.Request("http://127.0.0.1:%d/ready" % porta,
+                                       headers=CABECALHOS_SONDA)
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+        return int(dados.get("readyConnections", 0)), dados.get("connectorId", ""), ""
+    except urllib.error.HTTPError as erro:
+        # 503 e a resposta legitima de instancia viva e ainda sem conexao.
+        try:
+            dados = json.loads(erro.read().decode("utf-8"))
+            return int(dados.get("readyConnections", 0)), dados.get("connectorId", ""), "HTTP %d" % erro.code
+        except Exception:
+            return 0, "", "HTTP %d" % erro.code
+    except Exception as erro:
+        return 0, "", type(erro).__name__
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--minimo", type=int, default=MINIMO_PADRAO,
+                        help="conexoes vivas minimas para aprovar (padrao %d)" % MINIMO_PADRAO)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    instancias = []
+    for porta in [PORTA_PRINCIPAL] + list(PORTAS_REPLICA):
+        conexoes, conector, erro = consulta(porta)
+        instancias.append({
+            "porta": porta,
+            "papel": "principal" if porta == PORTA_PRINCIPAL else "replica",
+            "conexoes_prontas": conexoes,
+            "connector_id": conector,
+            "erro": erro,
+        })
+
+    servindo = [i for i in instancias if i["conexoes_prontas"] > 0]
+    total = sum(i["conexoes_prontas"] for i in instancias)
+    # Connector distinto por instancia e a prova de que sao processos separados —
+    # se dois compartilhassem o id, seriam a mesma falha contada duas vezes.
+    conectores = {i["connector_id"] for i in servindo if i["connector_id"]}
+
+    aprovado = total >= args.minimo and len(servindo) >= MINIMO_INSTANCIAS
+    resultado = {
+        "schema_version": "tunnel_replica_fleet_v1",
+        "conexoes_vivas": total,
+        "teto_cloudflare": 100,
+        "instancias_servindo": len(servindo),
+        "instancias_configuradas": len(instancias),
+        "connectors_distintos": len(conectores),
+        "minimo_exigido": args.minimo,
+        "aprovado": aprovado,
+        "instancias": instancias,
+    }
+
+    if args.json:
+        print(json.dumps(resultado, sort_keys=True, ensure_ascii=False, indent=1))
+        return 0 if aprovado else 1
+
+    print("check-tunnel-replica-fleet")
+    print("  conexoes vivas          : %d (teto da Cloudflare: 100)" % total)
+    print("  instancias servindo     : %d de %d" % (len(servindo), len(instancias)))
+    print("  connectors distintos    : %d" % len(conectores))
+    mudas = [i for i in instancias if i["conexoes_prontas"] == 0]
+    if mudas:
+        print("  SEM conexao pronta      : %s"
+              % " ".join("%d(%s)" % (i["porta"], i["erro"] or "0 conn") for i in mudas[:12]))
+    if aprovado:
+        print("\n  APROVADO: com %d conexoes em %d processos independentes, um 530 por" % (total, len(servindo)))
+        print("  tunel desconectado exigiria que todos caissem no mesmo instante.")
+        return 0
+    print("\n  REPROVADO: %d conexoes vivas em %d instancias (minimo %d em %d)."
+          % (total, len(servindo), args.minimo, MINIMO_INSTANCIAS))
+    print("  Enquanto o total for zero, a borda devolve 530 a todo visitante,")
+    print("  inclusive ao crawler. Ver ops/systemd/cloudflared-wikijuridica-replica@.service")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

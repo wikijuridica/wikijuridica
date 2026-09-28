@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""check-serie-404-bots — crawler valioso batendo em 404 e defeito de engenharia.
+
+POR QUE EXISTE (2026-09-01, BUG-127): o 404 era a unica superficie servida sem
+medicao, e agora tem serie (tools/generate-serie-404-bots grava
+data/ops/serie_404_bots.jsonl, por dia UTC fechado e por agente VERIFICADO pela
+Cloudflare, a partir de data/ops/edge_bot_status_daily.jsonl). Serie sem leitor
+e serie orfa — a doenca dos 311 check-* que ninguem executava —, e este e o
+leitor. Ele nasce com a prova dos dois lados (tools/test_serie_404_bots.py):
+REPROVA no caso ruim e PASSA no caso bom, e dado ausente nunca vira aprovacao.
+
+O QUE A FONTE ALCANCA, para nao afirmar mais do que ela mede: a linha "borda"
+vem da Cloudflare e enxerga o acervo INTEIRO (o nginx serve public/ do disco e
+a borda cacheia por sete dias, entao a origem nao ve a maior parte do rastreio).
+Ela NAO traz rota, entao as ~10,5 mil rotas `.br` que respondem 404 por acerto
+desde 2026-08-29 (10.471 em 2026-09-01, `find public -name '*.br' | wc -l`; BUG-088) NAO estao excluidas do denominador — cada linha diz
+`br_excluded: false`, e este gate nao finge o contrario. As linhas "origem_go"
+da mesma serie (ledger do processo Go, UA declarado, so rota dinamica e
+@fallback) NAO decidem nada aqui: servem para o operador ver QUAIS caminhos
+deram 404 quando o gate reprovar.
+
+A REGUA, e de onde vem cada numero:
+
+  1. Por (dia, bot valioso): requests_404 / requests_total > 5% com
+     requests_total >= 50 REPROVA. O piso de 50 e guarda contra amostra
+     pequena (adsbot-google: 1 de 2 = 50%), nao contra reprovar: dia abaixo do
+     piso e IMPRESSO com a fracao dele, e a segunda regra o alcanca.
+     Medido em 11 dias fechados (2026-08-21 a 08-31): o unico dia acima da
+     regua e bingbot em 2026-08-21, 31 de 324 = 9,6%; googlebot ficou em 1,1%
+     (1 de 89) e 1,3% (1 de 76); oai-searchbot em 0,6%; applebot em 0 de 9.996.
+     5% cabe entre o pior dia normal (1,3%) e o dia de defeito (9,6%).
+  2. Por bot valioso, SOMA da janela: 404 / total > 5% com total >= 50 tambem
+     reprova. Existe porque um bot de 30 requisicoes/dia com 3 404 por dia
+     nunca alcanca o piso diario e ainda assim esta a 10% — e um Googlebot a
+     13,9 paginas/dia e exatamente esse bot.
+  3. Bot valioso AUSENTE da janela, serie parada (ultima linha "dia" mais velha
+     que --atraso-max), campo nao numerico: INCONCLUSIVO, exit 1. Crawler que
+     nao aparece nao foi aprovado — foi nao medido, e o gate diz isso.
+  4. Serie ausente ou sem nenhuma linha legivel: NAO RODOU, exit 2. Isto NAO e
+     aprovacao: e o produtor que nao rodou, e o runner registra como vermelho.
+
+Bots valiosos: googlebot, bingbot, applebot, oai-searchbot — os quatro que
+indexam ou citam este portal; os demais entram na tabela e nunca decidem o
+exit code. facebookexternalhit a 46,9% de 404 em 2026-08-27 e social e
+scanner fantasiado (ver check-crawler-error-budget), nao perda de indexacao.
+
+Fonte oficial que faz de 404 a crawler perda de superficie, e nao estatistica
+(developers.google.com/search/docs/crawling-indexing/http-network-errors, "How
+HTTP Status Codes Affect Google's Crawlers", lida em 2026-09-01): no 404 "the
+indexing pipeline removes the URL from the index if it was previously indexed.
+Newly encountered 404 pages aren't processed. The crawling frequency gradually
+decreases" — da URL. A mesma pagina diz que 4xx (fora 429) NAO altera a taxa de
+rastreio do HOST; o dano do 404 e por URL: cada uma anunciada e nao servida e
+uma pagina que sai (ou nunca entra) no indice.
+
+READ-ONLY. Exit 0 = os quatro bots medidos e dentro da regua; exit 1 = FAIL
+ou INCONCLUSIVO; exit 2 = NAO RODOU (serie ausente).
+
+Uso:
+    tools/check-serie-404-bots
+    tools/check-serie-404-bots --janela-dias 7 --teto-fracao 0.05 --piso-requisicoes 50
+    tools/check-serie-404-bots --json
+    tools/check-serie-404-bots --serie /caminho/serie-sintetica.jsonl --hoje 2026-09-01
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SERIE = os.path.join(ROOT, "data", "ops", "serie_404_bots.jsonl")
+NOME = "check-serie-404-bots"
+
+# 5%: entre o pior dia normal medido (googlebot 1,3%) e o dia de defeito
+# (bingbot 9,6%). NAO afrouxe para o gate passar: o vermelho e a informacao.
+TETO_FRACAO_PADRAO = 0.05
+# 50 requisicoes: abaixo disso uma unica resposta ja e 2% — a fracao e ruido.
+PISO_REQUISICOES_PADRAO = 50
+JANELA_DIAS_PADRAO = 7
+# O produtor da borda grava o dia fechado ~02:42 UTC do dia seguinte e este
+# gate roda ~04:42 UTC (timers em ops/systemd): atraso normal e 1 dia. Dois
+# dias sem linha nova e o timer parado — e serie parada da veredito velho.
+ATRASO_MAX_DIAS_PADRAO = 2
+BOTS_VALIOSOS = ("googlebot", "bingbot", "applebot", "oai-searchbot")
+
+
+def _data(texto) -> _dt.date | None:
+    try:
+        return _dt.date.fromisoformat(texto)
+    except (TypeError, ValueError):
+        return None
+
+
+def _inteiro(valor) -> int | None:
+    """Campo numerico real, ou None. `None`, booleano e string nao contam:
+    campo ausente NAO e zero, e zero aprovaria (0 de N = 0%)."""
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return None
+    if valor < 0:
+        return None
+    return int(valor)
+
+
+def ler_serie(caminho: str) -> tuple[dict, dict, int, int]:
+    """Devolve (borda, dias, linhas_lidas, linhas_ilegiveis).
+
+    borda: agent_key -> {date -> registro "borda"}; dias: date -> registro
+    "dia". A ultima linha de cada chave vence (o produtor substitui por data e
+    e idempotente, mas ler "a ultima" e o que impede o replay de um run de
+    virar duas medicoes). "origem_go" e o resto nao entram: nao decidem.
+    """
+    borda: dict[str, dict[str, dict]] = {}
+    dias: dict[str, dict] = {}
+    lidas = 0
+    ilegiveis = 0
+    if not os.path.isfile(caminho):
+        return borda, dias, lidas, ilegiveis
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            # Linha quebrada e contada e impressa, nunca engolida: o gerador
+            # conta `invalidas`, e um gate que descarta em silencio leria uma
+            # serie meio corrompida como serie inteira.
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                ilegiveis += 1
+                continue
+            if not isinstance(registro, dict):
+                ilegiveis += 1
+                continue
+            data = registro.get("date")
+            if _data(data) is None:
+                ilegiveis += 1
+                continue
+            lidas += 1
+            tipo = registro.get("record_type")
+            if tipo == "dia":
+                dias[data] = registro
+            elif tipo == "borda" and registro.get("agent_key"):
+                borda.setdefault(registro["agent_key"], {})[data] = registro
+    return borda, dias, lidas, ilegiveis
+
+
+def avalia_dia(registro: dict, teto: float, piso: int) -> dict:
+    """Um dia de um bot: numeros, fracao e o motivo se reprovar. Campo nao
+    numerico vira `medido: False` — nunca zero."""
+    total = _inteiro(registro.get("requests_total"))
+    n404 = _inteiro(registro.get("requests_404"))
+    n200 = _inteiro(registro.get("requests_200"))
+    saida = {"date": registro.get("date"), "requests_total": total, "requests_404": n404,
+             "requests_200": n200, "medido": total is not None and n404 is not None,
+             "acima_do_piso": False, "fracao": None, "reprova": False}
+    if not saida["medido"] or total == 0:
+        return saida
+    saida["fracao"] = n404 / total
+    saida["acima_do_piso"] = total >= piso
+    saida["reprova"] = saida["acima_do_piso"] and saida["fracao"] > teto
+    return saida
+
+
+def avalia_bot(bot: str, por_data: dict[str, dict], janela: list[str], args) -> dict:
+    resultado = {"bot": bot, "valioso": bot in BOTS_VALIOSOS, "status": "inconclusivo",
+                 "problemas": [], "dias": [], "janela_total": 0, "janela_404": 0,
+                 "janela_fracao": None}
+    datas = [d for d in janela if d in por_data]
+    if not datas:
+        resultado["motivo"] = "ausente da serie na janela %s..%s" % (janela[0], janela[-1])
+        return resultado
+
+    nao_medidos = []
+    for data in datas:
+        dia = avalia_dia(por_data[data], args.teto_fracao, args.piso_requisicoes)
+        resultado["dias"].append(dia)
+        if not dia["medido"]:
+            nao_medidos.append(data)
+            continue
+        resultado["janela_total"] += dia["requests_total"]
+        resultado["janela_404"] += dia["requests_404"]
+        if dia["reprova"]:
+            resultado["problemas"].append(
+                "%s_404_acima_do_teto@%s:%d de %d requisicoes = %.1f%% (teto %.0f%%, piso %d)"
+                % (bot, data, dia["requests_404"], dia["requests_total"], 100 * dia["fracao"],
+                   100 * args.teto_fracao, args.piso_requisicoes))
+    if nao_medidos:
+        resultado["motivo"] = ("campo requests_total/requests_404 ausente ou nao numerico em: "
+                               + ", ".join(nao_medidos))
+        return resultado
+
+    if not resultado["janela_total"]:
+        # Presente na serie com ZERO requisicoes em toda a janela nao e "0 de
+        # 0 = ok": e um crawler que nao veio, e crawler ausente nunca e
+        # aprovacao (contrato 6). O produtor real nunca emite 0 (o minimo
+        # medido na fonte e 1), entao hoje isto so acontece com serie torta —
+        # e serie torta tem de sair como inconclusivo, nao como verde.
+        resultado["motivo"] = ("presente na serie com 0 requisicoes na janela %s..%s"
+                               % (janela[0], janela[-1]))
+        return resultado
+
+    resultado["janela_fracao"] = resultado["janela_404"] / resultado["janela_total"]
+    if (resultado["janela_total"] >= args.piso_requisicoes
+            and resultado["janela_fracao"] > args.teto_fracao
+            and not resultado["problemas"]):
+        # So entra quando nenhum dia sozinho reprovou: e a regra do 404
+        # espalhado fino, nao uma segunda contagem do mesmo dia.
+        resultado["problemas"].append(
+            "%s_404_acima_do_teto_na_janela:%d de %d requisicoes em %d dia(s) = %.1f%% "
+            "(teto %.0f%%; nenhum dia sozinho passou do piso de %d com esse excesso)"
+            % (bot, resultado["janela_404"], resultado["janela_total"], len(datas),
+               100 * resultado["janela_fracao"], 100 * args.teto_fracao,
+               args.piso_requisicoes))
+    resultado["status"] = "fail" if resultado["problemas"] else "ok"
+    return resultado
+
+
+def _pct(fracao) -> str:
+    return "-" if fracao is None else "%.1f%%" % (100 * fracao)
+
+
+def _linha_tabela(r: dict, args) -> str:
+    marca = "*" if r["valioso"] else " "
+    status = {"ok": "OK", "fail": "FALHA", "inconclusivo": "INCONCLUSIVO"}[r["status"]]
+    if r["dias"]:
+        pior = max((d for d in r["dias"] if d["medido"] and d["fracao"] is not None),
+                   key=lambda d: (d["fracao"], d["requests_total"]), default=None)
+        pior_txt = ("pior dia %s: %d de %d = %s%s"
+                    % (pior["date"], pior["requests_404"], pior["requests_total"],
+                       _pct(pior["fracao"]),
+                       "" if pior["acima_do_piso"] else " (abaixo do piso de %d)" % args.piso_requisicoes)
+                    ) if pior else "sem dia medido"
+        detalhe = "janela %d de %d = %s | %s" % (r["janela_404"], r["janela_total"],
+                                                  _pct(r["janela_fracao"]), pior_txt)
+    else:
+        detalhe = r.get("motivo", "sem medicao")
+    return "  %-12s %s%-22s %s" % (status, marca, r["bot"], detalhe)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--teto-fracao", type=float, default=TETO_FRACAO_PADRAO,
+                        help="fracao de 404 acima disto reprova (padrao: %(default)s). NAO afrouxe.")
+    parser.add_argument("--piso-requisicoes", type=int, default=PISO_REQUISICOES_PADRAO,
+                        help="dia com menos requisicoes que isto nao reprova sozinho (padrao: %(default)s)")
+    parser.add_argument("--janela-dias", type=int, default=JANELA_DIAS_PADRAO,
+                        help="dias fechados avaliados, contados da ultima linha (padrao: %(default)s)")
+    parser.add_argument("--atraso-max", type=int, default=ATRASO_MAX_DIAS_PADRAO,
+                        help="ultima linha mais velha que isto, em dias, = serie parada (padrao: %(default)s)")
+    parser.add_argument("--json", action="store_true")
+    # --serie e --hoje existem para o TESTE (tools/test_serie_404_bots.py).
+    parser.add_argument("--serie", default=SERIE,
+                        help="caminho da serie (default: data/ops/serie_404_bots.jsonl)")
+    parser.add_argument("--hoje", default=None,
+                        help="data de referencia ISO para o atraso (default: hoje em UTC)")
+    args = parser.parse_args()
+
+    hoje = _data(args.hoje) if args.hoje else _dt.datetime.now(_dt.timezone.utc).date()
+    if hoje is None:
+        print("%s: NAO RODOU (exit 2, isto NAO e aprovacao): --hoje invalido: %r" % (NOME, args.hoje),
+              file=sys.stderr)
+        return 2
+    if args.janela_dias < 1 or args.piso_requisicoes < 1 or not (0 < args.teto_fracao < 1):
+        print("%s: NAO RODOU (exit 2, isto NAO e aprovacao): parametros fora do dominio" % NOME,
+              file=sys.stderr)
+        return 2
+
+    borda, dias, lidas, ilegiveis = ler_serie(args.serie)
+    if not lidas or not dias:
+        print("%s: NAO RODOU (exit 2, isto NAO e aprovacao)" % NOME, file=sys.stderr)
+        print("  serie ausente, vazia ou sem linha \"dia\": %s (%d linha(s) legivel(is)) — rode"
+              " tools/generate-serie-404-bots" % (args.serie, lidas), file=sys.stderr)
+        return 2
+
+    # Frescor pela linha "dia", nao pela linha do bot: dia medido sem o bot e
+    # "bot ausente" (INCONCLUSIVO do bot), nao "serie parada".
+    datas_medidas = sorted(dias)
+    ultima = _data(datas_medidas[-1])
+    atraso = (hoje - ultima).days
+    janela = [d for d in datas_medidas if (ultima - _data(d)).days < args.janela_dias]
+
+    print("serie-404-bots (borda = acervo inteiro, agente verificado, `.br` NAO excluido do"
+          " denominador; janela %s..%s, teto %s, piso %d req/dia, ultima linha ha %d dia(s))"
+          % (janela[0], janela[-1], _pct(args.teto_fracao), args.piso_requisicoes, atraso))
+    if ilegiveis:
+        print("  ATENCAO: %d linha(s) ilegivel(is) na serie foram ignoradas — o veredito abaixo"
+              " cobre so o que foi lido" % ilegiveis)
+    truncadas = sorted(d for d in janela if dias[d].get("query_truncated") is True)
+    if truncadas:
+        print("  ATENCAO: a API cortou a consulta em %s — nesses dias total e 404 sao PISO,"
+              " nao total" % ", ".join(truncadas))
+
+    if atraso > args.atraso_max or atraso < 0:
+        motivo = ("serie parada: ultima linha \"dia\" de %s, ha %d dia(s) (maximo %d); o produtor"
+                  " e tools/generate-serie-404-bots sobre edge_bot_status_daily"
+                  % (datas_medidas[-1], atraso, args.atraso_max)) if atraso >= 0 else \
+                 "ultima linha de %s e posterior a hoje (%s)" % (datas_medidas[-1], hoje)
+        print("\n%s: INCONCLUSIVO" % NOME, file=sys.stderr)
+        print("  - %s" % motivo, file=sys.stderr)
+        print("\n  Serie parada da veredito velho, nao veredito. Isto NAO e aprovacao.", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"problemas": [], "inconclusivos": [{"bot": "*", "motivo": motivo}],
+                              "bots": []}, ensure_ascii=False, sort_keys=True))
+        return 1
+
+    ordem = list(BOTS_VALIOSOS) + sorted(b for b in borda if b not in BOTS_VALIOSOS)
+    relatorio = [avalia_bot(bot, borda.get(bot, {}), janela, args) for bot in ordem]
+    for r in relatorio:
+        print(_linha_tabela(r, args))
+    print("  (* bot valioso: so googlebot, bingbot, applebot e oai-searchbot decidem o exit code)")
+
+    problemas = [p for r in relatorio if r["valioso"] for p in r["problemas"]]
+    inconclusivos = [(r["bot"], r.get("motivo", "")) for r in relatorio
+                     if r["valioso"] and r["status"] == "inconclusivo"]
+    # Dia abaixo do piso com fracao acima do teto e AVISO: nao reprova sozinho,
+    # mas o operador precisa ve-lo — e a regra da janela ja o soma.
+    avisos = ["%s@%s: %d de %d = %s (abaixo do piso de %d)"
+              % (r["bot"], d["date"], d["requests_404"], d["requests_total"], _pct(d["fracao"]),
+                 args.piso_requisicoes)
+              for r in relatorio if r["valioso"] for d in r["dias"]
+              if d["medido"] and d["fracao"] is not None and not d["acima_do_piso"]
+              and d["fracao"] > args.teto_fracao]
+
+    if args.json:
+        print(json.dumps({"problemas": problemas, "avisos": avisos,
+                          "inconclusivos": [{"bot": b, "motivo": m} for b, m in inconclusivos],
+                          "bots": relatorio}, ensure_ascii=False, sort_keys=True))
+    sys.stdout.flush()
+
+    if problemas:
+        print("\n%s: FAIL" % NOME, file=sys.stderr)
+        for problema in problemas:
+            print("  - %s" % problema, file=sys.stderr)
+        for bot, motivo in inconclusivos:
+            print("  - %s INCONCLUSIVO: %s" % (bot, motivo), file=sys.stderr)
+        for aviso in avisos:
+            print("  - aviso: %s" % aviso, file=sys.stderr)
+        print("\n  Crawler valioso recebendo 404 acima da regua e superficie perdida: URL que o", file=sys.stderr)
+        print("  portal anunciou (sitemap, link interno, llms.txt, gemea .md) e nao serve. QUAIS", file=sys.stderr)
+        print("  caminhos: as linhas origem_go da mesma serie (top_404_paths) para a rota que chega", file=sys.stderr)
+        print("  ao Go, e o log do nginx para o acervo estatico. A correcao e no elo que anuncia", file=sys.stderr)
+        print("  ou no que serve — nunca no teto deste gate.", file=sys.stderr)
+        return 1
+
+    if inconclusivos:
+        print("\n%s: INCONCLUSIVO" % NOME, file=sys.stderr)
+        for bot, motivo in inconclusivos:
+            print("  - %s: %s" % (bot, motivo), file=sys.stderr)
+        for aviso in avisos:
+            print("  - aviso: %s" % aviso, file=sys.stderr)
+        print("\n  Bot valioso sem medicao NAO e aprovacao: ausente da janela e ou o crawler que", file=sys.stderr)
+        print("  parou de vir (assunto de check-bot-abandonment) ou o produtor que nao o gravou.", file=sys.stderr)
+        return 1
+
+    print("\n%s: pass" % NOME)
+    print("  googlebot, bingbot, applebot e oai-searchbot medidos e com 404 dentro da regua na janela")
+    for aviso in avisos:
+        print("  - aviso: %s" % aviso)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

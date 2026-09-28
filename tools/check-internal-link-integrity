@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""check-internal-link-integrity — nenhum link interno aponta para o vazio.
+
+POR QUE EXISTE: em 2026-08-07 a varredura dos 85.888 links internos das 9.631
+páginas contra os arquivos realmente materializados em `public/` encontrou
+48.175 ocorrências apontando para destinos que NÃO existiam em disco:
+
+    28.913  os 29 hubs de área (/familia/, /glossario/, ...)
+    19.262  /favicon.ico e /favicon.svg
+
+Todos respondiam 200, e só porque o `@fallback` do nginx entregava ao processo
+Go em :8089. Com esse processo fora, 48 mil ocorrências de link em 9.631
+páginas viravam 404 ao mesmo tempo, e os 8.202 artigos alcançáveis por link
+apenas através dos hubs ficavam sem caminho nenhum. Hoje hubs e favicons são
+materializados por `cmd/publish-v2-direct`, e a varredura dá 10.371/10.371.
+
+O QUE MUDOU EM 2026-09-05, E POR QUÊ
+====================================
+"Não está em `public/`" NUNCA foi sinônimo de "não existe". O portal tem rotas
+que existem e nunca terão arquivo em disco, por construção:
+
+    /redesocial/ ................ servida por `cmd/social` em 127.0.0.1:8091
+    /familia/x/index.md ......... gêmea Markdown, `cmd/server` em :8089
+    /api/v1/*, /mcp, /a2a/v1 .... canal de máquina, :8089
+    /buscar/, /contato/advogado/  rota dinâmica, :8089
+
+Enquanto nenhuma dessas rotas era destino de link no HTML do acervo (medido
+hoje: zero), a cegueira era inofensiva. Ela deixa de ser no instante em que uma
+âncora para `/redesocial/` entra nas 10.141 páginas: o modo estático puro
+acusaria 10.141 ocorrências "SEM LASTRO", todas falsas.
+
+E o modo `--com-fallback` que existia para salvar exatamente esse caso sondava
+`127.0.0.1:8089` — o Go do portal. Para `/redesocial/` o :8089 responde **404**,
+porque a rota vive na 8091. O socorro erraria justamente na rota que precisava
+dele. Medido em 2026-09-05:
+
+    /redesocial/   :8088 -> 200   :8089 -> 404   :8091 -> 200
+    /familia/      :8088 -> 200   :8089 -> 200   :8091 -> 404
+
+Por isso a sonda é na 8088, o **nginx**: é a única superfície que enxerga as
+duas origens (`ops/nginx/standalone/nginx.conf` — `location ^~ /redesocial/`
+faz proxy para :8091, o resto cai em `location /` estático ou em `@fallback`
+para :8089). Sondar uma origem só sempre erra para metade das rotas dinâmicas.
+
+AS CLASSES, E O VEREDITO DE CADA UMA
+====================================
+    (a) tem arquivo em `public/`  -> lastro em disco. Não sonda.
+    (b) sem arquivo, sonda 2xx    -> lastro provado por sonda (rota dinâmica).
+                                     Passa, com a ressalva impressa: é o que
+                                     quebra se o processo cair.
+    (c) sem arquivo, sonda 3xx/4xx-> SEM LASTRO. Reprova (exit 1), como sempre.
+
+    (d) sem arquivo e a sonda não conseguiu medir (5xx, 429, conexão recusada,
+        timeout) -> NÃO PROVADO. Exit 2, que não é veredito sobre o acervo:
+        é "não pude medir". Um 502 em `/redesocial/` significa `cmd/social`
+        parado, não link morto; declarar link morto por processo parado seria
+        falso vermelho, e contar como lastro o que não se mediu seria falso
+        verde. O gate diz a verdade: não sabe.
+
+A sonda só corre quando existe destino fora de `public/`. Com o acervo íntegro
+(o caso de hoje) o gate não faz requisição nenhuma e passa mesmo com o nginx
+morto — é o que impede que a saúde do serviço contamine a medição do acervo.
+
+`--estrito` mantém a pergunta original de 2026-08-07 — *o que quebra se o
+processo cair?* — como veredito: não sonda, e qualquer destino fora de
+`public/` reprova. É o modo para auditar a dívida de rota dinâmica, não para o
+uso diário.
+
+A sonda sai com User-Agent próprio (`wikijuridica-superficie-probe/1.0`) e
+`X-Warming-Request: true`, sempre: forjar UA de bot real é fraude, e sem o
+header de aquecimento a sonda entra na métrica e o portal mede o próprio eco.
+
+Read-only: não escreve nada.
+
+Uso:
+    tools/check-internal-link-integrity
+    tools/check-internal-link-integrity --estrito
+    tools/check-internal-link-integrity --json
+    tools/check-internal-link-integrity --public DIR --origem http://127.0.0.1:PORTA
+"""
+import argparse
+import http.client
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+PUBLIC_PADRAO = os.path.join(ROOT, "public")
+
+# A 8088 é o nginx, e é de propósito: ver o cabeçalho deste arquivo. A 8089
+# (Go do portal) e a 8091 (cmd/social) são origens PARCIAIS — cada uma devolve
+# 404 para as rotas da outra.
+ORIGEM_PADRAO = "http://127.0.0.1:8088"
+
+# Sem `Host`: o `urllib` manda `Host: 127.0.0.1:8088` e o nginx cai no PRIMEIRO
+# bloco `server` da porta, que é o do apex (o segundo redireciona o `www`).
+# É o mesmo caminho de `tools/check-paridade-go-nginx`. Se a ordem dos blocos
+# mudar, o controle passa a receber 301 e o gate sai 2 dizendo que a origem
+# está inalcançável — falha visível, nunca silenciosa.
+
+# Nunca um UA de bot real (contrato, seção 11). O header de aquecimento tira a
+# sonda da métrica de audiência.
+UA_SONDA = "wikijuridica-superficie-probe/1.0"
+CABECALHOS_SONDA = {"User-Agent": UA_SONDA, "X-Warming-Request": "true"}
+
+# Alvo da sonda de controle. `/` é `public/index.html`, servido do disco pelo
+# `location /`: responder 200 prova que a ORIGEM está alcançável, sem depender
+# de o Go ou o cmd/social estarem de pé.
+ROTA_DE_CONTROLE = "/"
+
+TIMEOUT_SONDA = 5
+
+# href="/..." — só link interno absoluto de path. Âncora pura (#x), esquema
+# externo e mailto não são destino de navegação interna.
+HREF = re.compile(r'href="(/[^"]*)"')
+
+
+def destinos_materializados(public_dir):
+    """Conjunto de paths que EXISTEM como arquivo em public/."""
+    materializados = set()
+    for pasta, _, arquivos in os.walk(public_dir):
+        relativo = os.path.relpath(pasta, public_dir)
+        base = "/" if relativo == "." else "/" + relativo.replace(os.sep, "/") + "/"
+        for arquivo in arquivos:
+            if arquivo == "index.html":
+                materializados.add(base)
+            else:
+                materializados.add(base.rstrip("/") + "/" + arquivo if base != "/" else "/" + arquivo)
+    return materializados
+
+
+def links_por_destino(public_dir):
+    """Mapeia destino interno -> (ocorrências, páginas de origem)."""
+    ocorrencias = {}
+    origens = {}
+    paginas = 0
+    for pasta, _, arquivos in os.walk(public_dir):
+        if "index.html" not in arquivos:
+            continue
+        paginas += 1
+        relativo = os.path.relpath(pasta, public_dir)
+        origem = "/" if relativo == "." else "/" + relativo.replace(os.sep, "/") + "/"
+        caminho = os.path.join(pasta, "index.html")
+        with open(caminho, encoding="utf-8", errors="replace") as handle:
+            html = handle.read()
+        for bruto in HREF.findall(html):
+            # Fragmento e query não mudam o artefato que precisa existir.
+            destino = bruto.split("#", 1)[0].split("?", 1)[0]
+            if not destino:
+                continue
+            ocorrencias[destino] = ocorrencias.get(destino, 0) + 1
+            alvo = origens.setdefault(destino, [])
+            if len(alvo) < 3:
+                alvo.append(origem)
+    return ocorrencias, origens, paginas
+
+
+class _SemRedirecionar(urllib.request.HTTPRedirectHandler):
+    """Impede o urllib de seguir 3xx.
+
+    Seguir o redirecionamento esconderia o status real: um link para
+    `/x` que responde 301 para `/x/` chegaria aqui como 200, e o link
+    continuaria custando um salto a cada rastreio. O gate reporta o que a
+    origem respondeu, não o que ela responderia no fim da cadeia.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def abridor():
+    return urllib.request.build_opener(_SemRedirecionar)
+
+
+def caminho_no_fio(destino):
+    """Percent-encoding do que vai na linha de requisição.
+
+    O `urllib` monta o pedido em ASCII: um destino acentuado colhido do HTML
+    (`/glossário/x/`) estoura `UnicodeEncodeError` DENTRO do `open`, exceção que
+    não é `OSError` nem `URLError` e derrubaria o gate inteiro em vez de medir
+    aquele destino. O acervo de hoje é todo ASCII, e nada garante que continue.
+
+    `%` entra no `safe` de propósito: href já escrito como `%C3%A1` não pode ser
+    codificado de novo (viraria `%25C3%25A1`, outra URL).
+    """
+    return urllib.parse.quote(destino, safe="/%:@&=+$,;~!*'()")
+
+
+def sonda(base, destino, timeout=TIMEOUT_SONDA, opener=None):
+    """HEAD no destino. Devolve o status HTTP, ou None se não deu para medir.
+
+    None é reservado para falha de TRANSPORTE (conexão recusada, timeout, DNS,
+    resposta ilegível). Erro de transporte não é resposta da aplicação e não
+    pode virar veredito sobre o link.
+
+    `http.client.HTTPException` entra na captura porque NÃO herda de `OSError`:
+    é o que o `urllib` levanta quando a origem devolve uma linha de status
+    ilegível (`BadStatusLine`, `LineTooLong`). Sem ela, uma origem cuspindo lixo
+    derrubaria o gate inteiro em vez de marcar aquele destino como não provado.
+    """
+    opener = opener or abridor()
+    pedido = urllib.request.Request(base + caminho_no_fio(destino), method="HEAD",
+                                    headers=dict(CABECALHOS_SONDA))
+    try:
+        with opener.open(pedido, timeout=timeout) as resposta:
+            return resposta.status
+    except urllib.error.HTTPError as erro:
+        # 3xx, 4xx e 5xx chegam por aqui: são resposta da aplicação, com status.
+        return erro.code
+    except (urllib.error.URLError, http.client.HTTPException, OSError):
+        return None
+
+
+def veredito_do_status(status):
+    """Traduz o status observado em uma das três classes.
+
+    2xx  -> "provado"      : a rota existe e é servida.
+    3xx  -> "sem_lastro"   : o destino não é o artefato final; o link aponta
+                             para um salto, e para o crawler isso é custo puro.
+    4xx  -> "sem_lastro"   : é o 404 real, que este gate existe para reprovar.
+             exceto 429    : rate limit não diz nada sobre a rota existir.
+    5xx  -> "nao_provado"  : origem degradada ou processo de trás parado
+                             (ex.: 502 em /redesocial/ = cmd/social fora).
+    None -> "nao_provado"  : não houve resposta.
+    """
+    if status is None:
+        return "nao_provado"
+    if 200 <= status < 300:
+        return "provado"
+    if status == 429 or status >= 500:
+        return "nao_provado"
+    return "sem_lastro"
+
+
+def rotulo_do_status(status):
+    return "sem resposta" if status is None else str(status)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--estrito", action="store_true",
+                        help="não sonda: todo destino fora de public/ reprova (a pergunta de 2026-08-07)")
+    parser.add_argument("--public", default=PUBLIC_PADRAO,
+                        help="diretório do acervo servido (padrão: public/ do repo)")
+    parser.add_argument("--origem", default=ORIGEM_PADRAO,
+                        help="origem HTTP a sondar (padrão: o nginx em %s)" % ORIGEM_PADRAO)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    public_dir = args.public
+    origem = args.origem.rstrip("/")
+
+    if not os.path.isdir(public_dir):
+        print("check-internal-link-integrity: %s não existe" % public_dir, file=sys.stderr)
+        return 2
+
+    materializados = destinos_materializados(public_dir)
+    ocorrencias, origens, paginas = links_por_destino(public_dir)
+
+    sem_arquivo = {d: n for d, n in ocorrencias.items() if d not in materializados}
+    dinamicos = {}
+    quebrados = {}
+    nao_provados = {}
+    status_observado = {}
+    origem_alcancavel = None
+
+    if sem_arquivo and not args.estrito:
+        # Sonda de controle ANTES de julgar destino nenhum: sem ela, um nginx
+        # parado transformaria toda rota dinâmica em "sem lastro" — falso
+        # vermelho pelo qual o acervo não tem culpa.
+        opener = abridor()
+        controle = sonda(origem, ROTA_DE_CONTROLE, opener=opener)
+        origem_alcancavel = veredito_do_status(controle) == "provado"
+        if origem_alcancavel:
+            for destino, quantidade in sem_arquivo.items():
+                status = sonda(origem, destino, opener=opener)
+                status_observado[destino] = status
+                classe = veredito_do_status(status)
+                if classe == "provado":
+                    dinamicos[destino] = quantidade
+                elif classe == "sem_lastro":
+                    quebrados[destino] = quantidade
+                else:
+                    nao_provados[destino] = quantidade
+        else:
+            nao_provados = dict(sem_arquivo)
+    else:
+        quebrados = dict(sem_arquivo)
+
+    total_ocorrencias = sum(ocorrencias.values())
+    print("paginas varridas      : %d" % paginas)
+    print("destinos distintos    : %d  (%d ocorrencias)" % (len(ocorrencias), total_ocorrencias))
+    print("materializados        : %d" % (len(ocorrencias) - len(sem_arquivo)))
+    if args.estrito:
+        print("modo                  : estrito (sem sonda; so arquivo em public/ vale)")
+    elif not sem_arquivo:
+        print("sonda                 : nao foi preciso (todo destino tem arquivo)")
+    elif origem_alcancavel:
+        print("sonda                 : %s  (UA %s, X-Warming-Request)" % (origem, UA_SONDA))
+    else:
+        print("sonda                 : %s INALCANCAVEL (controle %s falhou)" % (origem, ROTA_DE_CONTROLE))
+
+    if dinamicos:
+        soma = sum(dinamicos.values())
+        print("\nDINAMICOS PROVADOS POR SONDA: %d destino(s), %d ocorrencia(s) (%.1f%% dos links)"
+              % (len(dinamicos), soma, 100.0 * soma / max(total_ocorrencias, 1)))
+        print("  nao ha arquivo em public/, e a origem respondeu 2xx: rota servida.")
+        print("  respondem enquanto o processo por tras delas estiver de pe.")
+        for destino, quantidade in sorted(dinamicos.items(), key=lambda kv: -kv[1])[:15]:
+            print("    %7dx  %s   [%s]" % (quantidade, destino, rotulo_do_status(status_observado.get(destino))))
+        if len(dinamicos) > 15:
+            print("    ... e mais %d destino(s)" % (len(dinamicos) - 15))
+
+    if nao_provados:
+        soma = sum(nao_provados.values())
+        print("\nNAO PROVADOS: %d destino(s), %d ocorrencia(s)" % (len(nao_provados), soma))
+        if origem_alcancavel is False:
+            print("  a origem %s nao respondeu ao controle %s: nada pode ser provado nem negado."
+                  % (origem, ROTA_DE_CONTROLE))
+        else:
+            print("  a origem respondeu 5xx/429: degradacao da origem nao e veredito sobre o link.")
+        for destino, quantidade in sorted(nao_provados.items(), key=lambda kv: -kv[1])[:15]:
+            print("    %7dx  %s   [%s]" % (quantidade, destino, rotulo_do_status(status_observado.get(destino))))
+        if len(nao_provados) > 15:
+            print("    ... e mais %d destino(s)" % (len(nao_provados) - 15))
+
+    if quebrados:
+        soma = sum(quebrados.values())
+        print("\nSEM LASTRO: %d destino(s), %d ocorrencia(s)" % (len(quebrados), soma))
+        for destino, quantidade in sorted(quebrados.items(), key=lambda kv: -kv[1])[:20]:
+            rotulo = "" if args.estrito else "   [%s]" % rotulo_do_status(status_observado.get(destino))
+            print("    %7dx  %s%s   (ex.: %s)"
+                  % (quantidade, destino, rotulo, ", ".join(origens.get(destino, [])[:2])))
+        if len(quebrados) > 20:
+            print("    ... e mais %d destino(s)" % (len(quebrados) - 20))
+
+    if args.json:
+        print(json.dumps({
+            "pages_scanned": paginas,
+            "distinct_targets": len(ocorrencias),
+            "total_occurrences": total_ocorrencias,
+            "probe_origin": None if args.estrito else origem,
+            "probe_origin_reachable": origem_alcancavel,
+            "dynamic_proven": dinamicos,
+            "unproven": nao_provados,
+            "unbacked": quebrados,
+            "observed_status": {d: status_observado[d] for d in status_observado},
+        }, ensure_ascii=False, indent=2, sort_keys=True))
+
+    if quebrados:
+        if args.estrito:
+            print("\nREPROVADO: link interno sem artefato em public/ (modo estrito).")
+        else:
+            print("\nREPROVADO: link interno sem artefato em public/ e sem rota servida na origem.")
+        return 1
+    if nao_provados:
+        print("\nINDETERMINADO: %d ocorrencia(s) apontam para destino que este gate NAO conseguiu"
+              " provar nem negar. Suba a origem e repita." % sum(nao_provados.values()))
+        return 2
+    if dinamicos:
+        print("\nOK com ressalva: nenhum link quebrado, mas %d ocorrencia(s) dependem de rota dinamica."
+              % sum(dinamicos.values()))
+        return 0
+    print("\nOK: todo link interno tem artefato em disco.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

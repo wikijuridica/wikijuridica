@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""check-brotli-static-fresco — `.br` velho não é lentidão, é conteúdo errado.
+
+READ-ONLY. Sai != 0 quando existe em `public/` um `.br` mais velho que o fonte
+(STALE) ou sem fonte nenhum (ÓRFÃO).
+
+POR QUE ESTE GATE EXISTE, e por que ele não é sobre desempenho.
+
+`ops/nginx/standalone/nginx.conf` declara `brotli_static on`. Essa diretiva manda
+o nginx servir `$uri.br` quando o arquivo existe — e ela NÃO COMPARA FRESCOR com
+o fonte. Não há checagem de mtime, não há aviso, não há erro. Se o `.br` for de
+ontem e o `.html` de hoje, quem pede `Accept-Encoding: br` recebe o de ontem, com
+status 200 e um ETag perfeitamente válido do arquivo errado.
+
+E quem pede br é exatamente quem não pode receber errado: medido no access log
+em 2026-08-26, a Cloudflare puxa a origem já comprimida — os fetches dela batem
+BYTE A BYTE com o `stat -c %s` dos `.br` correspondentes. Logo o corpo velho não
+para num cliente isolado: entra no cache de borda e é distribuído a todos.
+
+A JANELA QUE ABRIU ISTO, medida no dia em que os `.br` nasceram: só
+`tools/deploy-publico` chamava o gerador. A onda diária reescreve `index.html`,
+`feed.xml`, `rss.xml`, `sitemap.xml` e os shards toda madrugada e não tocava nas
+gêmeas comprimidas — de modo que a primeira onda bem-sucedida depois da
+pré-compressão teria congelado o corpo daquele dia para todo cliente atrás da
+borda, enquanto o IndexNow anunciava as mesmas URLs como recém-atualizadas. Dois
+arquivos já estavam nesse estado quando o gate foi escrito (`/llms.txt.br` e
+`/noticias/llms.txt.br`), e o `llms.txt` é o mapa que os agentes de IA leem.
+
+ÓRFÃO É PIOR, e é o caso que quase ninguém enxerga: com `brotli_static on` o
+nginx procura `$uri.br` por conta própria. Um `.br` cujo fonte foi removido
+RESSUSCITA a página pelo caminho comprimido — ela volta a responder 200 depois de
+ter sido retirada do ar. Isso fura a coerência de artefato que o `CLAUDE.md`
+declara inegociável (`public/` ⊆ sitemap ⊆ `published_manifest`), e fura por um
+caminho que nenhuma auditoria de `public/*.html` enxerga.
+
+CORREÇÃO quando reprovar: `tools/generate-brotli-static`, que poda antes de
+comprimir. Não editar `.br` à mão, e não apagar em massa sem olhar: órfão pode
+ser sintoma de remoção legítima OU de arquivo sumido por engano.
+"""
+
+import argparse
+import os
+import sys
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+PUBLIC = os.path.join(RAIZ, "public")
+
+
+# Abaixo deste piso, a pré-compressão não completou. Não é erro de CORREÇÃO —
+# ausência de `.br` é estado seguro, e o nginx comprime em q5 na hora —, mas é
+# cegueira deixar passar sem dizer.
+#
+# Medido em 2026-08-26, na publicação que originou esta guarda: a poda apagou
+# 10.299 gêmeas obsoletas e a recompressão foi cortada por timeout no meio. O
+# gate ficou VERDE com 5.280 páginas sem gêmea, porque ele media o frescor do que
+# existia e não a cobertura do que deveria existir. Verde sobre metade do acervo.
+PISO_COBERTURA = 0.90
+
+
+def cobertura():
+    """Quantos HTML compressíveis têm gêmea, e quantos não têm."""
+    com = sem = 0
+    for raiz, _dirs, arquivos in os.walk(PUBLIC):
+        for nome in arquivos:
+            if not nome.endswith((".html", ".xml", ".txt", ".json", ".md")):
+                continue
+            caminho = os.path.join(raiz, nome)
+            try:
+                # O mesmo piso do gerador: abaixo de 1 KB o brotli não compensa,
+                # e cobrar gêmea ali seria cobrar o que o gerador não cria.
+                if os.path.getsize(caminho) < 1024:
+                    continue
+            except OSError:
+                continue
+            if os.path.exists(caminho + ".br"):
+                com += 1
+            else:
+                sem += 1
+    return com, sem
+
+
+def varre():
+    stale, orfaos, ok = [], [], 0
+    for raiz, _dirs, arquivos in os.walk(PUBLIC):
+        for nome in arquivos:
+            if not nome.endswith(".br"):
+                continue
+            br = os.path.join(raiz, nome)
+            fonte = br[:-3]
+            try:
+                if not os.path.exists(fonte):
+                    orfaos.append(br)
+                    continue
+                # `!=`, e nao `<`: o mtime do fonte tambem RETROCEDE neste
+                # acervo, por desenho de `gravaDatado` (bytes identicos ->
+                # Chtimes para a data editorial). Com `<`, o .br que ficasse mais
+                # NOVO que o fonte passava batido -- e era exatamente esse o
+                # estado ate 2026-08-28, quando `generate-brotli-static` somava
+                # 1 segundo ao .br e os 10.410 pares divergiam. O gerador passou
+                # a espelhar o mtime; este gate precisa enxergar a divergencia
+                # nas duas direcoes, senao volta a ser cego ao caso que motivou
+                # a correcao.
+                if os.path.getmtime(br) != os.path.getmtime(fonte):
+                    stale.append((br, os.path.getmtime(fonte) - os.path.getmtime(br)))
+                else:
+                    ok += 1
+            except OSError as e:
+                orfaos.append(f"{br} ({e})")
+    return sorted(stale, key=lambda p: -p[1]), sorted(orfaos), ok
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mostrar", type=int, default=10, help="quantos exemplos listar")
+    args = ap.parse_args()
+
+    if not os.path.isdir(PUBLIC):
+        print(f"check-brotli-static-fresco: FAIL\n  - {PUBLIC} nao existe")
+        return 1
+
+    stale, orfaos, ok = varre()
+    com, sem = cobertura()
+    total = com + sem
+    pct = (com / total) if total else 1.0
+    print(f"public/: {ok + len(stale) + len(orfaos)} arquivo(s) .br | "
+          f"frescos: {ok} | stale: {len(stale)} | orfaos: {len(orfaos)}")
+    print(f"cobertura: {com} de {total} compressiveis tem gemea ({pct:.1%}) | "
+          f"sem gemea: {sem}")
+
+    incompleta = pct < PISO_COBERTURA
+    if incompleta:
+        print("check-brotli-static-fresco: FAIL")
+        print(f"  - cobertura {pct:.1%}, abaixo do piso de {PISO_COBERTURA:.0%}: a "
+              f"pre-compressao nao completou.")
+        print("    Nao ha corpo VELHO sendo servido — ausencia de .br e estado seguro, e o")
+        print("    nginx comprime em q5 na hora. O que ha e trabalho pela metade, e o gate")
+        print("    existe para que isso nao passe calado: ate 2026-08-26 ele media so o")
+        print("    frescor do que existia, e ficou verde com 5.280 paginas sem gemea.")
+        print("  Complete com: ./tools/generate-brotli-static")
+        if not stale and not orfaos:
+            return 1
+
+    if not stale and not orfaos and not incompleta:
+        print("check-brotli-static-fresco: OK (todo .br espelha o mtime do proprio fonte)")
+        return 0
+
+    print("check-brotli-static-fresco: FAIL")
+    if stale:
+        print(f"  - {len(stale)} .br MAIS VELHO(S) que o fonte. O nginx serve esse corpo a")
+        print("    quem pede Accept-Encoding: br, inclusive a Cloudflare, que o distribui:")
+        for caminho, atraso in stale[:args.mostrar]:
+            print(f"      {os.path.relpath(caminho, RAIZ)}  (atras por {atraso / 3600:.1f} h)")
+        if len(stale) > args.mostrar:
+            print(f"      ... e mais {len(stale) - args.mostrar}")
+    if orfaos:
+        print(f"  - {len(orfaos)} .br SEM FONTE. Com brotli_static, esses RESSUSCITAM pagina")
+        print("    retirada do ar — resposta 200 fora do sitemap e fora do manifesto:")
+        for caminho in orfaos[:args.mostrar]:
+            print(f"      {os.path.relpath(str(caminho), RAIZ)}")
+        if len(orfaos) > args.mostrar:
+            print(f"      ... e mais {len(orfaos) - args.mostrar}")
+    print("  Resolva com: ./tools/generate-brotli-static  (poda antes de comprimir)")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

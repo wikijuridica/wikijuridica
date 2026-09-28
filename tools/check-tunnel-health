@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""check-tunnel-health — o tunel do wikijuridica esta conectado a borda?
+
+POR QUE EXISTE: em 2026-08-11 mediu-se que as 4 conexoes HA do cloudflared caem
+JUNTAS com `dial tcp [2606:4700:a0::10]:7844: connect: network is unreachable`
+— 75 ocorrencias em 08-08, cinco minutos fora do ar. Enquanto o tunel esta
+desconectado a Cloudflare devolve 530 (erro 1033) para TODO visitante, crawler
+inclusive: crawlers do Google levaram 39 erros 5xx em 08-08, 18 em 08-10 e 27
+em 08-11. O `check-portal-health` nao pega isso — ele mede a ORIGEM
+(127.0.0.1:8088), que continua respondendo 200 com o tunel caido.
+
+A causa-raiz foi corrigida em ops/cloudflared/config.yml (`edge-ip-version: 4`).
+Este vigia existe para o caso de a falha voltar por outro caminho, e para
+PROVAR com serie propria que ela nao voltou — o criterio (a) do goal de
+recuperacao de crawl exige 72h sem `network is unreachable`.
+
+POR QUE NAO REAPROVEITAR `tunnel-health-minimal` DO VIZINHO: aquela unit e do
+/opt/divorcio, aponta para o tunel DELE, e falhou 1.878 vezes num unico dia sem
+proteger nada. Regra do dono (2026-08-11): nao misturar servicos dos dois
+projetos — o wiki ganha o seu.
+
+O QUE VERIFICA, em ordem de gravidade:
+  1. CONEXOES PRONTAS  — /ready do cloudflared. Menos de 2 significa que o tunel
+                         perdeu redundancia; zero significa 530 para todo mundo.
+  2. ROTA IPv6 CAINDO  — `network is unreachable` no journal da janela. E o
+                         sintoma exato da falha de 08-08/08-10, e ele aparece
+                         ANTES de as conexoes zerarem.
+  3. ERROS DE PROXY    — cloudflared_tunnel_request_errors crescendo entre
+                         execucoes. Mede a DERIVADA: um contador alto e antigo
+                         nao e incidente em curso, e um contador que cresce e.
+
+ANTI-FRAUDE: este vigia NAO faz requisicao ao site publico. Ele le o endpoint de
+metricas local (127.0.0.1:20243), que nao passa pela borda e nao entra em
+nenhuma contagem de audiencia. Vigia que se conta como visita e fraude de
+metrica.
+
+Estado entre execucoes em data/ops/tunnel_health_state.json e historico em
+data/ops/tunnel_health.jsonl — no repo, versionavel, nunca em /tmp.
+
+--repair reinicia o cloudflared quando as conexoes estao abaixo do minimo em
+DUAS execucoes seguidas. Uma unica leitura baixa e reconexao normal em curso
+(o cloudflared reconecta sozinho em segundos); reiniciar nela e derrubar quem
+ja estava se levantando.
+
+Uso:
+    tools/check-tunnel-health                # so verifica; exit != 0 se degradado
+    tools/check-tunnel-health --repair       # reinicia apos 2 ciclos ruins
+    tools/check-tunnel-health --json
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ESTADO = os.path.join(ROOT, "data/ops/tunnel_health_state.json")
+HISTORICO = os.path.join(ROOT, "data/ops/tunnel_health.jsonl")
+NOTIFICADOR = os.path.join(ROOT, "tools/notify-owner")
+
+SERVICO = "cloudflared-wikijuridica"
+METRICAS = "http://127.0.0.1:20243"
+
+# IDENTIDADE DA SONDA (CLAUDE.md secao 11). Ate 2026-09-10 estas leituras saiam
+# como `Python-urllib/3.x`. O destino e servico NOSSO na maquina, nao o portal:
+# vai o User-Agent da sonda interna que o contrato nomeia, e nao vai o
+# `X-Warming-Request` — aquele cabecalho existe para tirar a requisicao da
+# metrica de audiencia do portal, e aqui nao ha metrica de audiencia.
+UA_SONDA = "wikijuridica-superficie-probe/1.0"
+CABECALHOS_SONDA = {"User-Agent": UA_SONDA}
+
+# A FROTA INTEIRA, e nao so a instancia principal.
+#
+# Ate 2026-08-13 este check sondava apenas 127.0.0.1:20243 — a unit principal.
+# A frota tem 25 processos (1 principal + 24 replicas em 20251..20274), entao a
+# cobertura real era de 4%: vinte e quatro replicas podiam estar mortas com o
+# check verde. E foi para ganhar redundancia que as replicas subiram, em 08-12,
+# depois de o tunel cair por rota IPv6 ausente — vigiar so a principal anula o
+# proprio motivo de elas existirem.
+#
+# Mesma classe de armadilha do `check-portal-health`, que sonda so 127.0.0.1 e
+# por isso ja produziu um veredito causal falso: a sonda alcanca menos do que a
+# conclusao supoe.
+PORTA_METRICAS_PRINCIPAL = 20243
+# Abaixo desta fracao de replicas vivas a redundancia deixou de existir de fato.
+# 0.5 = metade da frota; com 24 replicas, 12 mortas ja e degradacao real.
+MIN_FRACAO_FROTA_VIVA = 0.5
+
+# Abaixo disto o tunel perdeu redundancia. Com 4 conexoes HA, 2 ainda atendem;
+# 1 e um passo de zero, e zero e 530 para todo visitante.
+MIN_CONEXOES = 2
+
+# Duas leituras ruins seguidas antes de reiniciar. O cloudflared reconecta
+# sozinho em segundos apos perda transitoria de rede — reiniciar na primeira
+# leitura baixa interrompe a recuperacao que ja estava acontecendo.
+CICLOS_RUINS_PARA_REPARO = 2
+
+# Janela do journal consultada. Casa com um timer de 30s com folga.
+JANELA_JOURNAL = "-3min"
+
+
+# Teto de unidades reiniciadas por execucao. Nao e um numero magico: com a frota
+# inteira caida, a causa esta fora do cloudflared (uplink, borda, DNS) e reiniciar
+# 25 processos de uma vez so acrescenta uma tempestade de reconexao ao problema.
+LIMITE_UNIDADES_POR_REPARO = 6
+
+# Abaixo disto a unidade ainda esta convergindo. As replicas sobem com
+# Restart=always e RestartSec curto; reiniciar quem levantou ha segundos
+# interrompe a recuperacao em curso.
+SEGUNDOS_MINIMOS_DE_VIDA = 90
+
+
+def avisar_dono(chave, severidade, titulo, mensagem, evidencia, resolvido=False):
+    """Entrega o veredito pelo canal unico do repo (tools/notify-owner).
+
+    Falha de notificacao nao pode derrubar o vigia: se o canal nao responde, o
+    registro JSONL ja aconteceu e e ele que sustenta a serie.
+    """
+    comando = [NOTIFICADOR, "--chave", chave, "--titulo", titulo,
+               "--mensagem", mensagem, "--origem", "check-tunnel-health"]
+    if resolvido:
+        comando.append("--resolvido")
+    else:
+        comando += ["--severidade", severidade, "--evidencia", evidencia]
+    try:
+        subprocess.run(comando, capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def agora():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def unidade_de(nome_sondado):
+    """Nome systemd a partir do rotulo usado na sondagem da frota."""
+    return SERVICO if nome_sondado == "principal" else nome_sondado
+
+
+def subiu_ha_pouco(unidade):
+    """A unidade entrou em atividade ha menos de SEGUNDOS_MINIMOS_DE_VIDA?
+
+    Le `ActiveEnterTimestampMonotonic` da propria unidade — e nao o uptime do
+    host, que nao enxerga uma replica em crash-loop horas depois do boot.
+    """
+    try:
+        saida = subprocess.run(
+            ["systemctl", "show", "-p", "ActiveEnterTimestampMonotonic", "--value", unidade],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        entrou_us = int(saida)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return False
+    if entrou_us <= 0:
+        return False
+    try:
+        with open("/proc/uptime", encoding="utf-8") as arquivo:
+            agora_us = float(arquivo.read().split()[0]) * 1_000_000
+    except (OSError, ValueError, IndexError):
+        return False
+    return (agora_us - entrou_us) < SEGUNDOS_MINIMOS_DE_VIDA * 1_000_000
+
+
+def ler_json(url, timeout=5):
+    try:
+        pedido = urllib.request.Request(url, headers=CABECALHOS_SONDA)
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return json.loads(resposta.read().decode("utf-8")), None
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as erro:
+        return None, str(erro)[:160]
+
+
+def ler_metricas(timeout=5):
+    """Devolve o texto cru do /metrics do cloudflared (formato Prometheus)."""
+    try:
+        pedido = urllib.request.Request(METRICAS + "/metrics",
+                                       headers=CABECALHOS_SONDA)
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return resposta.read().decode("utf-8", "replace"), None
+    except (urllib.error.URLError, OSError, TimeoutError) as erro:
+        return None, str(erro)[:160]
+
+
+def metrica(texto, nome):
+    """Le uma metrica escalar do corpo Prometheus. None se ausente."""
+    if not texto:
+        return None
+    for linha in texto.splitlines():
+        if linha.startswith(nome + " "):
+            try:
+                return float(linha.split(" ", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def rota_v6_caindo():
+    """Conta ocorrencias de `network is unreachable` na janela recente.
+
+    E o sintoma exato da falha de 08-08/08-10 e aparece ANTES de as conexoes
+    zerarem, entao serve como aviso antecedente, nao so como autopsia.
+
+    O GLOB NAO E DETALHE. Ate 2026-08-19 esta funcao consultava `-u SERVICO`, sem
+    `*`, e portanto lia so a unit principal — enquanto o proprio docstring deste
+    arquivo declara este sinal como o principal aviso antecedente. Medido em 14
+    dias: 122 ocorrencias vistas contra 1.261 existentes na frota inteira,
+    cobertura de 9,67%. O vigia estava cego em 90% do sinal que ele mesmo elegeu
+    como mais importante.
+    """
+    try:
+        saida = subprocess.run(
+            ["journalctl", "-u", SERVICO + "*", "--since", JANELA_JOURNAL, "--no-pager"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return saida.count("network is unreachable")
+
+
+def link_caido():
+    """O host tem caminho de saida? Devolve (caiu, detalhe).
+
+    POR QUE ISTO ENTROU: em 2026-08-17, das 02:43 as 02:44, o enlace WiFi morreu
+    (`link timed out`, `ssid-not-found`) e o nginx ficou um minuto inteiro sem
+    uma unica requisicao. Este vigia gravou, nas CINCO leituras que cobriram o
+    apagao, `ready=4 frota=25/25 degradado=False problemas=[]`. Verde em 100% da
+    queda — porque tudo que ele lia era loopback, e no loopback o processo
+    continua achando que tem conexao enquanto a borda ja nao o alcanca.
+
+    A rota default e o sinal que muda PRIMEIRO e custa quase nada ler.
+    """
+    try:
+        saida = subprocess.run(
+            ["ip", "-j", "route", "show", "default"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (subprocess.SubprocessError, OSError) as erro:
+        return None, str(erro)[:120]
+    try:
+        rotas = json.loads(saida) if saida.strip() else []
+    except ValueError:
+        return None, "resposta ilegivel de ip route"
+    if not rotas:
+        return True, "sem rota default"
+    dispositivo = rotas[0].get("dev")
+    try:
+        with open("/sys/class/net/%s/operstate" % dispositivo, encoding="utf-8") as arq:
+            estado = arq.read().strip()
+    except OSError:
+        return False, "rota por %s" % dispositivo
+    if estado not in ("up", "unknown"):
+        return True, "interface %s em estado '%s'" % (dispositivo, estado)
+    return False, "rota por %s (%s)" % (dispositivo, estado)
+
+
+def descobrir_frota():
+    """Portas de metricas de TODA a frota: principal + replicas ativas.
+
+    A porta de cada replica e o proprio nome da instancia systemd
+    (`cloudflared-wikijuridica-replica@20251` -> 20251), porque o template passa
+    `--metrics 127.0.0.1:%i`. Ler do systemd em vez de fixar um intervalo faz a
+    frota poder crescer ou encolher sem que este check minta.
+    """
+    portas = [("principal", PORTA_METRICAS_PRINCIPAL)]
+    try:
+        saida = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--state=running", "--no-legend", "--plain"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return portas
+    for linha in saida.splitlines():
+        achado = re.search(r"(cloudflared-wikijuridica-replica@(\d+))\.service", linha)
+        if achado:
+            portas.append((achado.group(1), int(achado.group(2))))
+    return portas
+
+
+def sondar_frota():
+    """Conexoes HA por instancia. Devolve (vivas, mortas, conexoes_totais, detalhe)."""
+    vivas, mortas, total, detalhe = 0, [], 0, []
+    for nome, porta in descobrir_frota():
+        pronto, erro = ler_json("http://127.0.0.1:%d/ready" % porta, timeout=3)
+        if pronto is None:
+            mortas.append((nome, porta, erro))
+            detalhe.append({"instancia": nome, "porta": porta, "viva": False, "erro": erro})
+            continue
+        conexoes = int(pronto.get("readyConnections", 0))
+        vivas += 1
+        total += conexoes
+        detalhe.append({"instancia": nome, "porta": porta, "viva": True, "conexoes": conexoes})
+    return vivas, mortas, total, detalhe
+
+
+def carregar_estado():
+    try:
+        with open(ESTADO, encoding="utf-8") as arquivo:
+            return json.load(arquivo)
+    except (OSError, ValueError):
+        return {}
+
+
+def gravar_estado(dados):
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    with open(ESTADO, "w", encoding="utf-8") as arquivo:
+        json.dump(dados, arquivo, ensure_ascii=False)
+        arquivo.write("\n")
+
+
+def anexar_historico(registro):
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repair", action="store_true", help="reinicia o tunel apos 2 ciclos degradados")
+    parser.add_argument("--json", action="store_true", help="saida em JSON")
+    args = parser.parse_args()
+
+    instante = agora()
+    anterior = carregar_estado()
+    problemas = []
+
+    pronto, erro_ready = ler_json(METRICAS + "/ready")
+    conexoes = int(pronto.get("readyConnections", 0)) if pronto else 0
+    if pronto is None:
+        problemas.append("ready_inacessivel:%s" % erro_ready)
+    elif conexoes < MIN_CONEXOES:
+        problemas.append("conexoes_insuficientes:%d<%d" % (conexoes, MIN_CONEXOES))
+
+    # A frota inteira, nao so a principal. Uma principal saudavel com metade das
+    # replicas mortas e exatamente o estado que este check aprovava antes.
+    frota_vivas, frota_mortas, frota_conexoes, frota_detalhe = sondar_frota()
+    frota_total = frota_vivas + len(frota_mortas)
+    # ---- TERCEIRO ESTADO: NAO MEDI (exit 2), e nao "OK" (exit 0).
+    #
+    # `descobrir_frota()` vazia => frota_total == 0 => a guarda de frota logo
+    # abaixo comeca com `if frota_total and ...` e e PULADA INTEIRA, sem registrar
+    # problema nenhum. Ate 2026-09-16 o resultado disso era exit 0: a ferramenta
+    # dizia que a frota estava boa tendo sondado ZERO instancias.
+    #
+    # Nao e hipotese de laboratorio: a descoberta da frota depende de enumerar as
+    # units do cloudflared. Se essa enumeracao falhar (systemctl indisponivel,
+    # nome de unit trocado, permissao), o vigia fica cego exatamente na metade que
+    # existe para nao repetir o incidente das replicas mortas com a principal viva.
+    #
+    # Ausencia de sinal nao e evidencia de saude — e a unit mascara o exit 1,
+    # entao 2 e o unico codigo que ainda chega ao dono.
+    if frota_total == 0:
+        print("NAO MEDIDO: a descoberta da frota do cloudflared devolveu ZERO instancias.",
+              file=sys.stderr)
+        print("  Nenhuma replica foi sondada, entao nao ha veredito de frota a dar — e um",
+              file=sys.stderr)
+        print("  exit 0 aqui afirmaria saude sobre algo que este processo nao olhou.",
+              file=sys.stderr)
+        # Sai ANTES do reparo, do alerta e da gravacao de estado. Reiniciar unit
+        # com base numa frota que nao se conseguiu enumerar seria agir no escuro,
+        # e este vigia ja piorou uma vez o estado que tentava consertar
+        # (2026-08-15, quatro reinicios em 3m20s).
+        return 2
+    if frota_total and frota_vivas < max(1, int(frota_total * MIN_FRACAO_FROTA_VIVA)):
+        problemas.append("frota_degradada:%d_vivas_de_%d" % (frota_vivas, frota_total))
+    if frota_mortas:
+        problemas.append("instancias_mortas:%s" % ",".join(
+            "%s(:%d)" % (nome, porta) for nome, porta, _ in frota_mortas[:6]
+        ))
+
+    texto_metricas, erro_metricas = ler_metricas()
+    if texto_metricas is None:
+        problemas.append("metricas_inacessiveis:%s" % erro_metricas)
+    ha = metrica(texto_metricas, "cloudflared_tunnel_ha_connections")
+    erros_totais = metrica(texto_metricas, "cloudflared_tunnel_request_errors")
+    requisicoes = metrica(texto_metricas, "cloudflared_tunnel_total_requests")
+
+    # Derivada, nao estado: um contador alto e antigo nao e incidente em curso.
+    erros_antes = anterior.get("request_errors")
+    delta_erros = None
+    if erros_totais is not None and isinstance(erros_antes, (int, float)):
+        delta_erros = erros_totais - erros_antes
+        # O contador zera quando o processo reinicia; negativo nao e melhora.
+        if delta_erros < 0:
+            delta_erros = None
+        elif delta_erros > 0:
+            problemas.append("erros_de_proxy:+%d" % int(delta_erros))
+
+    # SINAL ANTECEDENTE — entra no registro e no alarme, NAO no gatilho de reparo.
+    #
+    # Com o glob corrigido este contador passa a ver ~10x mais eventos. Se
+    # continuasse valendo como gatilho, o vigia entraria em tempestade de
+    # restart: ja em 2026-08-14 houve quatro reinicios com `rota_ipv6_caindo`
+    # como UNICO problema, e um deles reiniciou um tunel saudavel por eco de
+    # journal da janela de tres minutos. Eco de log nao e incidente em curso;
+    # conexao ausente e. Reiniciar por sintoma antecedente derruba justamente
+    # quem ainda estava de pe.
+    v6 = rota_v6_caindo()
+    if v6:
+        problemas.append("rota_ipv6_caindo:%d" % v6)
+
+    caiu, detalhe_link = link_caido()
+    if caiu:
+        problemas.append("uplink_fora:%s" % detalhe_link)
+
+    degradado = bool(problemas)
+    # Cura so o que se conserta reiniciando o tunel. Uplink fora nao se conserta
+    # reiniciando o cloudflared — quem trata disso e o check-network-health, que
+    # mexe no radio; aqui o uplink fora serve para EXPLICAR a queda e para nao
+    # reiniciar 25 processos por uma causa que esta fora deles.
+    nao_curam_por_restart = ("rota_ipv6_caindo", "uplink_fora")
+    curaveis = [p for p in problemas if not p.startswith(nao_curam_por_restart)]
+    # Conta os ciclos CURAVEIS, e nao os degradados. Contar por `degradado`
+    # deixava um sintoma nao-curavel persistente — eco de `rota_ipv6_caindo` no
+    # journal, por exemplo — inflar o contador, e entao o primeiro ciclo com um
+    # problema de fato curavel disparava restart na hora, em vez de esperar as
+    # duas leituras que a politica exige.
+    ruins_seguidos = (int(anterior.get("ciclos_ruins", 0)) + 1) if curaveis else 0
+
+    reparo = None
+    if args.repair and curaveis and ruins_seguidos >= CICLOS_RUINS_PARA_REPARO:
+        # REINICIAR O QUE ESTA MORTO, E NAO O QUE E CONHECIDO.
+        #
+        # Ate 2026-08-19 o reparo reiniciava sempre a unit principal. Como nao ha
+        # `PartOf` nem `BindsTo` entre as units, isso NAO toca replica nenhuma: em
+        # 2026-08-15 houve quatro reinicios em 3m20s, e dois deles nomeavam apenas
+        # replicas mortas enquanto derrubavam a principal, que estava viva. O
+        # vigia piorava o estado que tentava consertar.
+        alvos = [unidade_de(nome) for nome, _, _ in frota_mortas] or [SERVICO]
+        resultados = []
+        for alvo in alvos[:LIMITE_UNIDADES_POR_REPARO]:
+            # Unidade recem-subida esta convergindo (as replicas tem
+            # Restart=always com RestartSec curto). Reiniciar quem acabou de
+            # levantar e interromper a propria recuperacao — e o teste por uptime
+            # do HOST nao pega isso, porque o crash-loop de uma replica acontece
+            # muito depois do boot.
+            if subiu_ha_pouco(alvo):
+                resultados.append("%s:pulado_recem_subida" % alvo)
+                continue
+            try:
+                execucao = subprocess.run(
+                    ["sudo", "-n", "systemctl", "restart", alvo],
+                    capture_output=True, text=True, timeout=60,
+                )
+                resultados.append("%s:%s" % (alvo, "ok" if execucao.returncode == 0
+                                             else (execucao.stderr or "").strip()[:60]))
+            except (subprocess.SubprocessError, OSError) as erro:
+                resultados.append("%s:erro_%s" % (alvo, str(erro)[:60]))
+        reparo = "; ".join(resultados)
+        # Zerar o contador so quando ALGO foi de fato reiniciado. Zerar apos um
+        # ciclo em que tudo foi pulado faz o vigia esquecer que o problema segue
+        # aberto, e o ciclo recomeca do zero para sempre.
+        if any(r.endswith(":ok") for r in resultados):
+            ruins_seguidos = 0
+
+    # O ESTADO DA FROTA ENTRA NA SERIE, e nao so quando ela degrada.
+    #
+    # sondar_frota() ja calculava vivas/mortas/conexoes/detalhe a cada 30 s, e o
+    # registro guardava apenas uma STRING em `problemas` quando o limiar era
+    # rompido. Ou seja: enquanto estava tudo bem, o dado era jogado fora — e
+    # "tudo bem" e exatamente o periodo cuja serie se precisa ter para provar
+    # que o tunel esteve inteiro. Sem esses campos, responder "a frota ficou de
+    # pe nas ultimas 72 h?" exigia reconstruir o journal, que so retem 7 dias.
+    #
+    # O custo e zero: a sondagem ja acontece. O que muda e nao descartar o
+    # resultado. `frota_conexoes` e a metrica que importa para o crawler — foi o
+    # conjunto vivo chegar a ZERO em 2026-08-11 que fez a Cloudflare devolver
+    # 530 ao Googlebot e derrubar o rastreio em 89%.
+    registro = {
+        "schema_version": "tunnel_health_v1",
+        "checked_at": instante.isoformat(),
+        "ready_connections": conexoes,
+        "ha_connections": int(ha) if ha is not None else None,
+        "request_errors_total": int(erros_totais) if erros_totais is not None else None,
+        "request_errors_delta": int(delta_erros) if delta_erros is not None else None,
+        "total_requests": int(requisicoes) if requisicoes is not None else None,
+        "ipv6_unreachable_na_janela": v6,
+        "frota_vivas": frota_vivas,
+        "frota_total": frota_total,
+        "frota_conexoes": frota_conexoes,
+        "degradado": degradado,
+        "problemas": problemas,
+        "ciclos_ruins": ruins_seguidos,
+        "reparo": reparo,
+    }
+    anexar_historico(registro)
+
+    # AVISAR O DONO — o elo que faltava.
+    #
+    # Este vigia detectava e reparava desde 08-11, mas nunca avisou ninguem: o
+    # veredito morria no journal, e `SuccessExitStatus=0 1` na unit garante que
+    # nem o systemd o marca como falha. Contados na propria serie, foram 23 ciclos
+    # degradados entre 12 e 19/08 sem um unico aviso. Detectar sem avisar so
+    # protege contra o que a cura automatica alcanca — e a cura nao alcanca
+    # uplink fora nem borda inalcancavel.
+    if degradado:
+        # A chave separa por CLASSE, para que um sintoma cronico e barulhento nao
+        # ocupe o canal do sintoma grave e raro (a mordaca por chave unica ja
+        # mordeu uma vez neste repo, em 2026-08-19, no check-network-health).
+        if any(p.startswith("uplink_fora") for p in problemas):
+            chave, severidade = "tunel-uplink", "critica"
+        elif conexoes < MIN_CONEXOES or frota_vivas == 0:
+            chave, severidade = "tunel-conexoes", "critica"
+        elif any(p.startswith(("frota_degradada", "instancias_mortas")) for p in problemas):
+            chave, severidade = "tunel-frota", "alta"
+        else:
+            chave, severidade = "tunel-sinais", "media"
+        acao = (" Reparo: %s." % reparo) if reparo else ""
+        avisar_dono(
+            chave, severidade, "Tunel Cloudflare degradado",
+            "; ".join(problemas)[:400] + acao,
+            "tools/check-tunnel-health -> conexoes=%d frota=%d/%d %s"
+            % (conexoes, frota_vivas, frota_total, detalhe_link))
+    elif anterior.get("degradado"):
+        # RESOLVER A CHAVE QUE FOI ALERTADA, e nao uma chave fixa.
+        #
+        # Ate 2026-08-26 esta linha resolvia SEMPRE `tunel-conexoes`, enquanto o
+        # ramo de alerta acima escolhe entre QUATRO chaves. Consequencia medida
+        # no ledger: `tunel-uplink` (critica) aberta ha 8h e `tunel-frota` (alta)
+        # ha 29h, com o tunel medido SAUDAVEL no mesmo instante -- 25 replicas,
+        # 101 conexoes, rota default presente e este proprio check dizendo OK.
+        # A recuperacao marcava outra chave como resolvida e a chave real ficava
+        # aberta para sempre. Era esse o motivo de o canal de alerta parecer
+        # morto: nao e que ninguem resolva, e que a resolucao ia para o lugar
+        # errado.
+        #
+        # A chave alertada passa a ser gravada no estado. Chave antiga sem esse
+        # campo cai em `tunel-conexoes`, que era o comportamento anterior --
+        # nenhuma regressao para quem ja estava no meio de um ciclo.
+        chave_aberta = anterior.get("chave_alertada") or "tunel-conexoes"
+        avisar_dono(chave_aberta, "info", "Tunel Cloudflare normalizado",
+                    "frota %d/%d com %d conexoes de borda"
+                    % (frota_vivas, frota_total, frota_conexoes), "", resolvido=True)
+
+    gravar_estado({
+        "checked_at": instante.isoformat(),
+        "request_errors": erros_totais,
+        "ciclos_ruins": ruins_seguidos,
+        "degradado": degradado,
+        # Preserva a chave enquanto o problema dura; limpa quando normaliza.
+        "chave_alertada": (chave if degradado else None),
+    })
+
+    if args.json:
+        print(json.dumps(registro, ensure_ascii=False, sort_keys=True))
+    else:
+        print("[%s] %s | conexoes=%d ha=%s erros=+%s ipv6_unreachable=%s%s" % (
+            instante.strftime("%Y-%m-%d %H:%M:%SZ"),
+            "DEGRADADO" if degradado else "OK",
+            conexoes,
+            "?" if ha is None else int(ha),
+            "?" if delta_erros is None else int(delta_erros),
+            "?" if v6 is None else v6,
+            (" | %s" % ", ".join(problemas)) if problemas else "",
+        ))
+        if reparo:
+            print("  reparo: %s" % reparo)
+
+    return 1 if degradado else 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

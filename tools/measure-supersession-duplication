@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""measure-supersession-duplication — as páginas "consolidadas por duplicata" são mesmo duplicatas?
+
+POR QUE EXISTE: os arquivos de `data/editorial/v2_superseded/` declaram 78
+intents consolidados por `near_duplicate_long_tail_query`, cada um com
+`publication_allowed: false` e `index_policy: noindex`. Com base neles, o gate
+`v2-supersession-integrity` congela o registro ativo: qualquer edição vira
+`active_source_changed_without_provenance` e ABORTA O COMMIT.
+
+Isso trava correção legítima. Em 2026-08-06 impediu a inserção do separador de
+milhar numa citação legal ("art. 1542" -> "art. 1.542") — um defeito que um
+auditor humano deste mesmo acervo classificou como REPROVADA:5.
+
+Antes de aceitar o bloqueio, a pergunta que ninguém tinha feito: as páginas são
+mesmo duplicatas? A consolidação diz `near_duplicate_long_tail_query` — ou seja,
+o critério foi a semelhança da CONSULTA DE BUSCA, não a do texto. Duas páginas
+podem responder a consultas parecidas e entregar conteúdos completamente
+diferentes.
+
+ERRO QUE ESTA FERRAMENTA JÁ COMETEU, e que fica registrado porque custou caro:
+a primeira versão mediu apenas Jaccard do VOCABULÁRIO DO CORPO, achou máximo de
+0,27 contra limiar de 0,70, e concluiu "consolidação REFUTADA". A leitura das
+páginas desmentiu a conclusão: `gloss-codicilo` e `suc-codicilo` são o mesmo
+conceito, ambos citando o art. 1.881 e o limite de valor;
+`proc-inss-prova-de-vida-digital` e `prev-prova-de-vida-como-fazer` são o mesmo
+passo a passo de 2026. Redação diferente, MESMA INTENÇÃO DE BUSCA.
+
+Vocabulário do corpo mede plágio. Não mede canibalização — que é duas páginas do
+mesmo site disputando a mesma consulta, ainda que escritas com palavras
+distintas. Era exatamente isso que o registro dizia ter detectado
+(`near_duplicate_long_tail_query`), e a métrica errada quase derrubou um gate
+correto.
+
+O QUE ELE MEDE AGORA, os dois eixos, porque respondem a perguntas diferentes:
+  corpo    Jaccard do vocabulário do corpo — plágio/duplicação literal.
+           Limiar do projeto: 0,70 (CLAUDE.md, anti-template).
+  intenção Jaccard entre title + h1 + slug, que é onde a consulta-alvo se
+           expressa. É o eixo da canibalização, e o que o registro de
+           supersessão de fato afirma.
+
+Uma página pode ter corpo distinto (não é plágio) e intenção idêntica (é
+canibalização). As duas coisas precisam ser vistas separadas para que a decisão
+não se apoie no número errado.
+
+Read-only sobre o acervo; grava a evidência em data/ops/.
+
+Uso:
+    tools/measure-supersession-duplication
+    tools/measure-supersession-duplication --json
+"""
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SUPERSEDED = os.path.join(ROOT, "data/editorial/v2_superseded/*.jsonl")
+SHARDS = os.path.join(ROOT, "data/editorial/v2_pages")
+PAGES = os.path.join(ROOT, "content/pages.json")
+MANIFEST = os.path.join(ROOT, "data/editorial/published_manifest.jsonl")
+EVIDENCIA = os.path.join(ROOT, "data/ops/supersession_duplication_measurement.json")
+
+# Limiar de duplicação do projeto (CLAUDE.md, anti-template).
+LIMIAR_DUPLICATA = 0.70
+# Canibalizacao: title/h1/slug muito parecidos significam disputa pela mesma
+# consulta, ainda que o corpo seja escrito com outras palavras. O limiar e mais
+# baixo que o de plagio porque o sinal e mais curto (poucas palavras) e porque o
+# dano nao exige texto igual — basta o buscador nao saber qual pagina ranquear.
+LIMIAR_CANIBALIZACAO = 0.35
+
+
+def _palavras(texto):
+    # Palavras com mais de três letras: descarta artigo, preposição e conectivo,
+    # que inflariam a semelhança entre quaisquer dois textos em português.
+    return {p for p in re.split(r"[^0-9a-záàâãéêíóôõúüç]+", texto.lower()) if len(p) > 3}
+
+
+def vocabulario(pagina):
+    """Vocabulário do CORPO — responde 'é plágio?'."""
+    partes = [pagina.get("summary") or "", pagina.get("heading") or ""]
+    for secao in pagina.get("body_sections") or []:
+        partes += [secao.get("title") or "", secao.get("body") or ""]
+    for item in pagina.get("faq") or []:
+        partes += [item.get("question") or "", item.get("answer") or ""]
+    return _palavras(" ".join(partes))
+
+
+def intencao(pagina):
+    """Title + h1 + slug — responde 'disputam a mesma consulta?'.
+
+    É onde a consulta-alvo se expressa. Duas páginas podem ter corpo distinto e
+    ainda assim brigar pela mesma busca, que é o defeito de canibalização.
+    """
+    caminho = (pagina.get("path") or "").strip("/").replace("-", " ").replace("/", " ")
+    partes = [pagina.get("title") or "", pagina.get("heading") or "", caminho]
+    return _palavras(" ".join(partes))
+
+
+def _canonico_por_conteudo(registros, paginas, intent):
+    """Acha o canônico quando o ponteiro (shard, linha) não resolve mais.
+
+    Procura, dentro do shard canônico declarado, a página de maior semelhança de
+    intenção com a suprimida. Exige um mínimo para não inventar par: se nada no
+    shard se parece, o registro fica sem canônico e é reportado como tal — o
+    silêncio aqui seria pior que a lacuna.
+    """
+    alvo = intencao(paginas.get(intent, {}))
+    if not alvo:
+        return set()
+    melhor, melhor_score = None, 0.0
+    for registro in registros:
+        shard = registro.get("canonical_shard")
+        if not shard:
+            continue
+        caminho = os.path.join(SHARDS, shard)
+        try:
+            with open(caminho, encoding="utf-8") as handle:
+                linhas = handle.read().splitlines()
+        except OSError:
+            continue
+        for linha in linhas:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                candidato = json.loads(linha).get("intent_id")
+            except json.JSONDecodeError:
+                continue
+            if not candidato or candidato == intent:
+                continue
+            outra = intencao(paginas.get(candidato, {}))
+            if not outra:
+                continue
+            score = len(alvo & outra) / len(alvo | outra)
+            if score > melhor_score:
+                melhor, melhor_score = candidato, score
+    # Piso deliberado: abaixo disto não há relação afirmável, e apontar um par
+    # fraco seria fabricar o dado que a ferramenta existe para medir.
+    if melhor and melhor_score >= 0.20:
+        return {melhor}
+    return set()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    supersedidos = collections.defaultdict(list)
+    for caminho in sorted(glob.glob(SUPERSEDED)):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                if registro.get("intent_id"):
+                    registro["_arquivo"] = os.path.basename(caminho)
+                    supersedidos[registro["intent_id"]].append(registro)
+
+    with open(PAGES, encoding="utf-8") as handle:
+        paginas = {p["unique_intent_id"]: p for p in json.load(handle) if p.get("unique_intent_id")}
+    publicados = set()
+    with open(MANIFEST, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if linha:
+                registro = json.loads(linha)
+                publicados.add(registro.get("unique_intent_id") or registro.get("intent_id"))
+
+    pares = []
+    sem_canonico = []
+    resolvidos_por_conteudo = []
+    for intent, registros in sorted(supersedidos.items()):
+        candidatos = set()
+        for registro in registros:
+            shard, linha_n = registro.get("canonical_shard"), registro.get("canonical_line")
+            if not shard or not linha_n:
+                continue
+            caminho = os.path.join(SHARDS, shard)
+            try:
+                with open(caminho, encoding="utf-8") as handle:
+                    linhas = handle.read().splitlines()
+            except OSError:
+                continue
+            if linha_n > len(linhas):
+                continue
+            try:
+                canonico = json.loads(linhas[linha_n - 1]).get("intent_id")
+            except json.JSONDecodeError:
+                continue
+            if canonico and canonico != intent:
+                candidatos.add(canonico)
+        if not candidatos:
+            # REGISTRO QUE APONTA PARA SI MESMO — 19 dos 78, medido.
+            #
+            # A primeira versão desta ferramenta chamou isso de "ponteiro
+            # envelhecido", e era falso: TODOS os 78 têm shard e linha válidos.
+            # O que acontece nesses 19 é pior — a linha canônica contém o PRÓPRIO
+            # intent. O registro afirma "esta página foi consolidada na página
+            # X" sendo que X é ela mesma.
+            #
+            # São páginas marcadas como duplicata de si próprias: ficam com
+            # publication_allowed=false e congeladas pelo gate, sem canônica para
+            # onde apontar. Não são canibalização (não há par), são registro
+            # inválido.
+            candidatos = _canonico_por_conteudo(registros, paginas, intent)
+            if candidatos:
+                resolvidos_por_conteudo.append(intent)
+        if not candidatos:
+            sem_canonico.append(intent)
+            continue
+        pagina_a = paginas.get(intent, {})
+        vocab_a, intent_a = vocabulario(pagina_a), intencao(pagina_a)
+        if not vocab_a:
+            continue
+        for canonico in sorted(candidatos):
+            pagina_b = paginas.get(canonico, {})
+            vocab_b, intent_b = vocabulario(pagina_b), intencao(pagina_b)
+            if not vocab_b:
+                continue
+            j_corpo = len(vocab_a & vocab_b) / len(vocab_a | vocab_b)
+            j_intencao = (len(intent_a & intent_b) / len(intent_a | intent_b)) if (intent_a and intent_b) else 0.0
+            pares.append({
+                "suprimido": intent,
+                "canonico": canonico,
+                "jaccard_corpo": round(j_corpo, 4),
+                "jaccard_intencao": round(j_intencao, 4),
+                "suprimido_no_ar": intent in publicados,
+                "canonico_no_ar": canonico in publicados,
+            })
+
+    pares.sort(key=lambda p: p["jaccard_intencao"])
+    duplicatas = [p for p in pares if p["jaccard_corpo"] >= LIMIAR_DUPLICATA]
+    canibais = [p for p in pares if p["jaccard_intencao"] >= LIMIAR_CANIBALIZACAO
+                and p["suprimido_no_ar"] and p["canonico_no_ar"]]
+    valores = [p["jaccard_corpo"] for p in pares]
+    valores_intencao = sorted(p["jaccard_intencao"] for p in pares)
+
+    print("=== CONSOLIDAÇÃO POR DUPLICATA: É DUPLICATA MESMO? ===")
+    print("intents em arquivo de supersessão : %d" % len(supersedidos))
+    print("registro que aponta para SI MESMO : %d (marcado como duplicata de si próprio)" % len(sem_canonico))
+    print("pares medidos                     : %d" % len(pares))
+    if valores:
+        vc=sorted(valores)
+        print("jaccard do CORPO   min/med/max : %.2f / %.2f / %.2f  (limiar plágio %.2f)"
+              % (vc[0], vc[len(vc)//2], vc[-1], LIMIAR_DUPLICATA))
+        print("jaccard da INTENÇÃO min/med/max: %.2f / %.2f / %.2f  (limiar canibalização %.2f)"
+              % (valores_intencao[0], valores_intencao[len(valores_intencao)//2],
+                 valores_intencao[-1], LIMIAR_CANIBALIZACAO))
+    print("pares que são PLÁGIO              : %d" % len(duplicatas))
+    print("pares que CANIBALIZAM e estão ambos no ar : %d" % len(canibais))
+    print("suprimidos que estão no ar        : %d" % sum(1 for p in pares if p["suprimido_no_ar"]))
+
+    if pares:
+        print("\n--- maior intenção compartilhada (canibalização mais provável) ---")
+        for par in pares[-8:]:
+            marca = "  <-- AMBOS NO AR" if (par["suprimido_no_ar"] and par["canonico_no_ar"]) else ""
+            print("  intenção %.2f corpo %.2f  %-40s -> %s%s"
+                  % (par["jaccard_intencao"], par["jaccard_corpo"],
+                     par["suprimido"], par["canonico"], marca))
+
+    if canibais:
+        veredito = "CONFIRMADA_COMO_CANIBALIZACAO"
+        print("\nVEREDITO: a consolidação tem fundamento, e o defeito NÃO foi resolvido.")
+        print("%d par(es) disputam a mesma consulta E estão os DOIS no ar." % len(canibais))
+        print("Não é plágio (corpo distinto), é canibalização: o buscador não sabe")
+        print("qual das duas ranquear, e as duas perdem força.")
+    elif duplicatas:
+        veredito = "CONFIRMADA_COMO_PLAGIO"
+        print("\nVEREDITO: há duplicação literal de corpo em %d par(es)." % len(duplicatas))
+    else:
+        veredito = "REFUTADA"
+        print("\nVEREDITO: nenhum par atinge plágio nem canibalização pela medição.")
+
+    registro = {
+        "schema_version": "supersession_duplication_measurement_v1",
+        "measured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "threshold": LIMIAR_DUPLICATA,
+        "intents_in_supersession": len(supersedidos),
+        "self_referencing_records": sorted(sem_canonico),
+        "resolved_by_content": sorted(resolvidos_por_conteudo),
+        "pairs_measured": len(pares),
+        "body_threshold": LIMIAR_DUPLICATA,
+        "intent_threshold": LIMIAR_CANIBALIZACAO,
+        "pairs_plagiarism": len(duplicatas),
+        "pairs_cannibalizing_both_live": len(canibais),
+        "cannibalizing_pairs": canibais,
+        "verdict": veredito,
+        "pairs": pares,
+    }
+    os.makedirs(os.path.dirname(EVIDENCIA), exist_ok=True)
+    with open(EVIDENCIA, "w", encoding="utf-8") as handle:
+        json.dump(registro, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    print("\nevidência: %s" % os.path.relpath(EVIDENCIA, ROOT))
+
+    if args.json:
+        print(json.dumps(registro, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

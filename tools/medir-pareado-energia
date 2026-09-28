@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""medir-pareado-energia — compara dois regimes de PL1 sobre o MESMO conjunto
+de amostras de embedding, a partir de data/ops/ia_local_daily.jsonl.
+
+POR QUE ELE EXISTE, e o erro que ele impede. Em 2026-09-09 eu quase reportei
+"+30% com o turbo" comparando as 100 ULTIMAS amostras anteriores (45,58 tok/s)
+contra a janela nova (59,44). Medindo as janelas INTEIRAS o numero e outro:
+55,35 -> 57,89 -> 59,35, isto e ~7%, dentro da banda diaria de +-20% que o
+proprio plano nomeia. A fatia escolhida depois de ver o resultado e o vicio que
+o R3 do contrato do dado real proibe, e ele nao se corrige com disciplina: se
+corrige com uma ferramenta que aplica a mesma regua aos dois lados.
+
+A REGRA ESTA ESCRITA ANTES DO NUMERO (plano, etapa 0.5.1): diferenca de
+prompt_tok_s abaixo de LIMIAR_ADOCAO por cento entre 15 W e 17 W significa que
+os 2 W acima do ponto do OEM viram calor, e o PL1 volta a 15 W. O criterio nao
+se escolhe depois de olhar a saida.
+
+O QUE ELE NAO FAZ: nao troca o PL1 e nao escreve na unit. Ele mede e diz. Quem
+aplica e o operador, pelo Environment= de ops/systemd/wikijuridica-energia.service,
+para a mudanca sobreviver ao reboot.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import datetime
+import statistics
+import sys
+
+LIMIAR_ADOCAO_PCT = 5.0
+# LOAD1 MAXIMO DA AMOSTRA. Sem este filtro a ferramenta compara carga, nao watt
+# — e foi o que ela fez na primeira execucao real, em 2026-09-09: 486 amostras a
+# 17 W colhidas durante dois deploys e builds contra 243 a 15 W com a maquina so
+# com o cerebro. O 17 W "perdeu" por 11,7%, que e o efeito da carga concorrente,
+# nao do teto de potencia. O regime so entra na comparacao quando a maquina
+# estava fazendo o MESMO tipo de trabalho.
+LOAD1_MAXIMO = 8.0
+SERIE_IA = "data/ops/ia_local_daily.jsonl"
+SERIE_ENERGIA = "data/ops/energia_cpu.jsonl"
+
+
+def le_jsonl(caminho):
+    with open(caminho, "r", encoding="utf-8") as fh:
+        for linha in fh:
+            linha = linha.strip()
+            if linha:
+                yield json.loads(linha)
+
+
+def instante(ts):
+    """Converte para datetime AWARE em UTC.
+
+    POR QUE ISTO E UMA FUNCAO E NAO UMA COMPARACAO DE STRING: as duas series
+    gravam fusos diferentes — data/ops/ia_local_daily.jsonl usa "...Z" e
+    data/ops/energia_cpu.jsonl usa "...-03:00". Lexicograficamente
+    "14:33:39-03:00" < "16:17:26Z", entao a leitura de energia das 14:33 LOCAL
+    (17:33Z) virava "vigente" para amostras do cerebro a partir das 14:33Z, que
+    sao TRES HORAS ANTES. Medido em 2026-09-09, na primeira execucao real: 243
+    amostras colhidas sob 17 W, durante dois deploys, foram rotuladas como 15 W,
+    e a ferramenta imprimiu "-13,2%" — comparando fuso horario, nao watt.
+    """
+    if not ts:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        return None
+    return d.astimezone(datetime.timezone.utc)
+
+
+def regime_por_instante(energia):
+    """Devolve [(ts, pl1_mmio_uw, no_turbo, load1)] ordenado: o regime vigente em
+    cada amostra do cerebro e o da ULTIMA leitura de energia anterior a ela. Sem
+    isso a comparacao atribuiria ao PL1 amostras colhidas sob outro PL1."""
+    pontos = []
+    for r in energia:
+        quando = instante(r.get("ts", ""))
+        if quando is None:
+            continue
+        pontos.append((quando, r.get("pl1_mmio_uw"), r.get("no_turbo"), r.get("load1")))
+    pontos.sort(key=lambda p: p[0])
+    return pontos
+
+
+def regime_de(ts, pontos):
+    """Regime vigente e carga ENQUADRANDO a leitura: a amostra de energia
+    anterior e a seguinte. Com amostragem de 5 minutos, olhar so a anterior
+    deixa passar leitura colhida no meio de um pico que ja comecou."""
+    quando = instante(ts)
+    if quando is None:
+        return None
+    vigente = None
+    seguinte_load = None
+    for p_ts, pl1, turbo, load1 in pontos:
+        if p_ts <= quando:
+            vigente = (pl1, turbo, load1)
+        else:
+            seguinte_load = load1
+            break
+    if vigente is None:
+        return None
+    pl1, turbo, load1 = vigente
+    cargas = [c for c in (load1, seguinte_load) if c is not None]
+    return (pl1, turbo, max(cargas) if cargas else None)
+
+
+def duracao_por_regime(pontos, fim=None):
+    """Minutos que cada (pl1, turbo) ficou vigente, pela propria serie.
+
+    O REGIME VIGENTE NAO TEM SUCESSOR NA SERIE, e ignorar isso cega a guarda de
+    densidade exatamente no caso que a motivou: em 2026-09-09 o regime de 15 W
+    tinha UMA amostra de energia e 244 do cerebro atribuidas a ele. Somando so
+    intervalos entre pontos consecutivos, o ultimo regime ficava com 0 minuto,
+    a guarda pulava por `minutos <= 0` e o numero falso saia assim mesmo. Por
+    isso o ultimo regime vai ate `fim` — o instante da amostra mais recente do
+    cerebro, ou agora."""
+    total = {}
+    for atual, proximo in zip(pontos, pontos[1:]):
+        chave = (atual[1], atual[2])
+        total[chave] = total.get(chave, 0.0) + (proximo[0] - atual[0]).total_seconds() / 60.0
+    if pontos:
+        ultimo = pontos[-1]
+        limite = fim or datetime.datetime.now(datetime.timezone.utc)
+        if limite > ultimo[0]:
+            chave = (ultimo[1], ultimo[2])
+            total[chave] = total.get(chave, 0.0) + (limite - ultimo[0]).total_seconds() / 60.0
+    return total
+
+
+def main_com_argv(argv=None):
+    """Corpo de main() com argv explicito, para o teste exercitar o caminho de
+    abort da guarda de densidade sem depender das series de producao."""
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--raiz", default=".")
+    ap.add_argument("--tipo", default="embed_pagina", help="tipo de tarefa do cerebro a comparar")
+    ap.add_argument("--minimo-amostras", type=int, default=30,
+                    help="minimo por regime; abaixo disso o veredito e 'sem dado', nunca um numero")
+    args = ap.parse_args(argv)
+
+    caminho_ia = os.path.join(args.raiz, SERIE_IA)
+    caminho_energia = os.path.join(args.raiz, SERIE_ENERGIA)
+    for caminho in (caminho_ia, caminho_energia):
+        if not os.path.isfile(caminho):
+            print(f"medir-pareado-energia: falta {caminho}", file=sys.stderr)
+            return 2
+
+    pontos = regime_por_instante(le_jsonl(caminho_energia))
+    if not pontos:
+        print("medir-pareado-energia: serie de energia vazia — ligue wikijuridica-energia-medicao.timer", file=sys.stderr)
+        return 2
+
+    por_regime = {}
+    sem_regime = 0
+    sob_carga = 0
+    ultima_leitura = None
+    for r in le_jsonl(caminho_ia):
+        if r.get("tipo") != args.tipo or not r.get("prompt_tok_s"):
+            continue
+        quando = instante(r.get("ts", ""))
+        if quando is not None and (ultima_leitura is None or quando > ultima_leitura):
+            ultima_leitura = quando
+        vigente = regime_de(r.get("ts", ""), pontos)
+        if vigente is None or vigente[0] is None:
+            sem_regime += 1
+            continue
+        pl1, turbo, load1 = vigente
+        if load1 is not None and float(load1) > LOAD1_MAXIMO:
+            sob_carga += 1
+            continue
+        por_regime.setdefault((pl1, turbo), []).append(float(r["prompt_tok_s"]))
+
+    if sob_carga:
+        print(f"amostras descartadas por load1 > {LOAD1_MAXIMO:.0f} (deploy/build concorrente): {sob_carga}")
+    if sem_regime:
+        # Dito, nunca escondido: amostra anterior ao inicio da serie de energia
+        # nao tem regime conhecido, e supor um seria inventar.
+        print(f"amostras sem regime conhecido (anteriores a serie de energia): {sem_regime}")
+
+    if not por_regime:
+        print("medir-pareado-energia: nenhuma amostra com regime conhecido", file=sys.stderr)
+        return 2
+
+    # GUARDA DE DENSIDADE. Um lote de embedding leva 28-36 s medidos, entao mais
+    # de 3 amostras por minuto num regime e fisicamente impossivel e denuncia
+    # rotulagem errada — foi exatamente o sintoma do bug de fuso: 244 amostras
+    # atribuidas a um regime aplicado havia 5 minutos. A ferramenta ABORTA
+    # nomeando o defeito, em vez de imprimir um numero que mente.
+    duracao = duracao_por_regime(pontos, fim=ultima_leitura)
+    for chave, valores in por_regime.items():
+        minutos = duracao.get(chave[:2], 0.0)
+        if minutos <= 0:
+            continue
+        densidade = len(valores) / minutos
+        if densidade > 3.0:
+            pl1 = (chave[0] or 0) / 1e6
+            print(f"medir-pareado-energia: ABORTA — {len(valores)} amostras em {minutos:.0f} min "
+                  f"no regime PL1={pl1:.0f}W ({densidade:.1f}/min). Um lote leva 28-36 s: "
+                  f"isto e rotulagem errada, nao medicao.", file=sys.stderr)
+            return 2
+
+    print(f"{args.tipo}: prompt_tok_s por regime (PL1 MMIO, no_turbo)")
+    resumo = {}
+    for (pl1, turbo), valores in sorted(por_regime.items(), key=lambda kv: (kv[0][0] or 0)):
+        rotulo = f"PL1={pl1/1e6:.0f}W turbo={'on' if turbo == 0 else 'off'}"
+        media = statistics.mean(valores)
+        resumo[rotulo] = (len(valores), media)
+        print(f"  {rotulo:24s} n={len(valores):5d} media={media:6.2f} mediana={statistics.median(valores):6.2f} "
+              f"min={min(valores):6.2f} max={max(valores):6.2f}")
+
+    comparaveis = {k: v for k, v in resumo.items() if v[0] >= args.minimo_amostras}
+    if len(comparaveis) < 2:
+        print(f"\nVEREDITO: sem dado — menos de dois regimes com {args.minimo_amostras}+ amostras.")
+        print("Rode o cerebro sob cada PL1 com a maquina ociosa; medir sob deploy mede a carga, nao o watt.")
+        return 1
+
+    # A COMPARACAO E POR WATT, NAO POR MEDIA. A primeira versao ordenava por
+    # media e chamava o vencedor de "regime maior" — e na primeira execucao real
+    # o vencedor foi o de MENOR PL1, entao o rotulo mentia. Quem decide qual e o
+    # maior e o numero de watts.
+    por_watt = sorted(comparaveis.items(), key=lambda kv: kv[0])
+    (menor, (n_menor, media_menor)) = por_watt[0]
+    (maior, (n_maior, media_maior)) = por_watt[-1]
+    ganho = (media_maior - media_menor) / media_menor * 100.0
+    print(f"\n{maior} contra {menor}: {ganho:+.1f}% (n={n_maior} e {n_menor})")
+    if ganho < LIMIAR_ADOCAO_PCT:
+        print(f"VEREDITO: abaixo de {LIMIAR_ADOCAO_PCT:.0f}% — o watt a mais nao vira trabalho.")
+        print(f"Aplique {menor} pelo Environment= de ops/systemd/wikijuridica-energia.service.")
+        return 1
+    print(f"VEREDITO: {ganho:+.1f}% >= {LIMIAR_ADOCAO_PCT:.0f}% — {maior} se paga; mantenha-o e siga medindo pela serie.")
+    return 0
+
+
+def main():
+    return main_com_argv(None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

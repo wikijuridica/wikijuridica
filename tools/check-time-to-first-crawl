@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""check-time-to-first-crawl — o KPI que reage em DIAS nao pode ficar orfao.
+
+POR QUE EXISTE (2026-09-01, BUG-076): a serie
+`data/ops/time_to_first_crawl_daily.jsonl` — tempo entre publicar uma URL e o
+crawler pedi-la pela primeira vez — e escrita todo dia desde 2026-08-28 pelo
+segundo ExecStart de `wikijuridica-crawl-coverage.service` (carimbos 04:11 a
+04:14 UTC no proprio ledger) e NENHUM gate a le: `grep -l time_to_first_crawl
+tools/check-*` devolve vazio, e `check-bot-telemetry-liveness` nem lista o
+arquivo. Enquanto isso o Googlebot fez 13,9 paginas/dia em 15 dias, a cobertura
+acumulada travou em 70,5% e 3.057 paginas nunca foram pedidas — com todos os
+vigias verdes.
+
+A DIFERENCA PARA check-crawl-coverage-stall: aquele le a cobertura ACUMULADA,
+que reage em semanas (7.152 → 7.170 URLs do Googlebot em quatro dias sao 0,18
+ponto percentual). Esta serie tem dois numeros que reagem em DIAS, e sao eles
+que dizem se a correcao de hoje surtiu efeito amanha:
+
+  - `mediana_dias`: quantos dias o crawler leva para pedir uma pagina nova.
+    Medido em 2026-09-01: googlebot 4, bingbot 19.
+  - `nunca_pedidas`: quantas rotas publicadas ele NUNCA pediu. Medido:
+    googlebot 2.937, bingbot 6.272. Se a correcao funciona, este numero CAI.
+
+O QUE ESTE CHECK COBRA, para googlebot e bingbot (os crawlers principais; os
+demais entram na tabela e nunca reprovam sozinhos):
+  1. `mediana_dias` da ultima linha NAO passa do teto declarado (default 7:
+     o triplo da mediana de 4 medida no Googlebot — acima disso a pagina nova
+     esta levando mais de uma semana so para ser PEDIDA, sem falar em indexar).
+  2. `nunca_pedidas` CAIU entre a primeira e a ultima linha da janela de N dias
+     (default 7). A queda e LIQUIDA do acervo: a onda diaria publica paginas
+     novas e cada uma nasce "nunca pedida", entao o numero bruto sobe num dia
+     em que o crawler ate avancou. Queda liquida = queda bruta + rotas
+     publicadas a mais; e o mesmo que "com_primeira_visita cresceu".
+  3. Coorte minima de rotas (default 50) com primeira visita, senao a mediana
+     e ruido e o crawler sai INCONCLUSIVO.
+  4. Crawler AUSENTE da serie, campo ausente, serie parada (ultima linha mais
+     velha que o atraso maximo) ou serie curta demais para tendencia sao
+     INCONCLUSIVO — e INCONCLUSIVO em crawler principal NAO e pass: sai com
+     exit 1 e veredito proprio. Gate que nao consegue medir e fica verde e o
+     defeito que deixou os quatro vigias deste repositorio cegos na queda.
+
+READ-ONLY. Exit 0 = os dois crawlers principais medidos e dentro da regua;
+exit 1 = algum reprovou (FAIL) ou nao pode ser medido (INCONCLUSIVO).
+
+Uso:
+    tools/check-time-to-first-crawl
+    tools/check-time-to-first-crawl --teto-mediana 7 --janela-dias 7 --coorte-minima 50
+    tools/check-time-to-first-crawl --json
+    tools/check-time-to-first-crawl --serie /caminho/ledger-sintetico.jsonl --hoje 2026-09-01
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SERIE = os.path.join(ROOT, "data", "ops", "time_to_first_crawl_daily.jsonl")
+
+# Triplo da mediana de 4 dias medida no Googlebot em 2026-09-01. NAO afrouxe
+# para o gate passar: o bingbot esta em 19 e vai reprovar ate a correcao do
+# canal dele chegar la — e esse vermelho e a informacao, nao o ruido.
+TETO_MEDIANA_PADRAO = 7
+JANELA_DIAS_PADRAO = 7
+# Abaixo de 50 rotas com primeira visita a mediana e sorteio: o perplexitybot
+# tem 0 e o chatgpt-user tinha 270 em 08-28 com mediana 16 saltando para 19
+# em quatro dias so por causa de 66 rotas novas.
+COORTE_MINIMA_PADRAO = 50
+
+# PRAZO EM QUE UMA RECUPERACAO TEM DE ACABAR para dispensar o teto de mediana.
+# Um trimestre: e o horizonte em que uma decisao de SEO se avalia, e o mesmo
+# prazo em que a cobertura acumulada de um crawler se estabiliza. Acima disso a
+# "drenagem" nao muda o resultado dentro de nenhum ciclo util, e a mediana volta
+# a ser o sinal que importa. Medido em 2026-09-05: bingbot drenaria em 18 dias,
+# perplexitybot em 10, oai-searchbot em 18 — e o chatgpt-user em 254, que por
+# isso continua reprovando.
+PRAZO_DE_DRENAGEM_DIAS = 90
+# O produtor grava uma linha por dia as ~04:14 UTC. Duas datas sem linha nova
+# ja e o timer parado — e serie parada da veredito velho, nao veredito.
+ATRASO_MAX_DIAS_PADRAO = 2
+# Duas datas distintas e o minimo para dizer se um numero caiu. A janela de N
+# dias e TETO do intervalo comparado (uma queda de tres semanas atras nao pode
+# esconder a estagnacao desta semana), nao piso: a serie nasceu em 2026-08-28
+# e exigir sete datas deixaria o gate cego justamente na semana em que as
+# correcoes de hoje precisam aparecer nele.
+DATAS_MINIMAS = 2
+CRAWLERS_PRINCIPAIS = ("googlebot", "bingbot")
+
+
+def ler_serie(caminho: str) -> dict[str, dict[str, dict]]:
+    """bot -> {date -> registro}. A ultima linha de cada (bot, date) vence: o
+    produtor e idempotente por essa chave, mas o ledger de cobertura ja
+    acumulou 21 linhas para uma chave so, e o detector que lia "as ultimas N
+    linhas" passou a ler o replay de um run. Deduplicar aqui custa nada e
+    impede o mesmo defeito por esta porta."""
+    por_bot: dict[str, dict[str, dict]] = {}
+    if not os.path.isfile(caminho):
+        return por_bot
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            bot = registro.get("bot")
+            data = registro.get("date")
+            if not bot or not data:
+                continue
+            por_bot.setdefault(bot, {})[data] = registro
+    return por_bot
+
+
+def _data(texto: str) -> _dt.date | None:
+    try:
+        return _dt.date.fromisoformat(texto)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numero(valor) -> float | None:
+    """Campo numerico real, ou None. `None` e string nao contam: campo ausente
+    ou torto NAO e zero, e zero aprovaria ("nunca_pedidas = 0" seria acervo
+    100% pedido)."""
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return None
+    return valor
+
+
+def _fmt(valor, casas: int = 0) -> str:
+    if valor is None:
+        return "-"
+    if isinstance(valor, float) and not valor.is_integer():
+        return f"{valor:.{max(casas, 1)}f}"
+    return f"{int(valor)}"
+
+
+def avalia_bot(bot: str, por_data: dict[str, dict], hoje: _dt.date, args) -> dict:
+    """Um dicionario por bot com status (ok | fail | inconclusivo), os numeros
+    e os problemas nomeados. Nunca lanca: campo ausente vira INCONCLUSIVO."""
+    resultado: dict = {"bot": bot, "principal": bot in CRAWLERS_PRINCIPAIS,
+                       "status": "inconclusivo", "problemas": []}
+    datas = sorted(d for d in por_data if _data(d) is not None)
+    if not datas:
+        resultado["motivo"] = "nenhuma linha com date valido"
+        return resultado
+
+    ultima_data = _data(datas[-1])
+    ultimo = por_data[datas[-1]]
+    resultado["ultima_data"] = datas[-1]
+    resultado["mediana_dias"] = _numero(ultimo.get("mediana_dias"))
+    resultado["p90_dias"] = _numero(ultimo.get("p90_dias"))
+    resultado["nunca_pedidas"] = _numero(ultimo.get("nunca_pedidas"))
+    resultado["com_primeira_visita"] = _numero(ultimo.get("com_primeira_visita"))
+    resultado["rotas_publicadas"] = _numero(ultimo.get("rotas_publicadas"))
+    resultado["anterior_ao_registro"] = _numero(ultimo.get("anterior_ao_registro")) or 0
+
+    atraso = (hoje - ultima_data).days
+    resultado["atraso_dias"] = atraso
+    if atraso > args.atraso_max:
+        resultado["motivo"] = ("serie parada: ultima linha de %s, ha %d dia(s); o produtor "
+                               "grava todo dia ~04:14 UTC" % (datas[-1], atraso))
+        return resultado
+    if atraso < 0:
+        resultado["motivo"] = "ultima linha de %s e posterior a hoje (%s)" % (datas[-1], hoje)
+        return resultado
+
+    # Janela: as datas a no maximo N dias da ultima medicao.
+    janela = [d for d in datas if (ultima_data - _data(d)).days < args.janela_dias]
+    resultado["janela"] = [janela[0], janela[-1]] if janela else []
+    if len(janela) < DATAS_MINIMAS:
+        resultado["motivo"] = ("serie curta: %d data(s) nos ultimos %d dias, minimo %d para "
+                               "medir tendencia" % (len(janela), args.janela_dias, DATAS_MINIMAS))
+        return resultado
+    primeiro = por_data[janela[0]]
+
+    # CAMPO AUSENTE NAO E APROVACAO. Cada campo que a regua usa tem de existir
+    # como numero nas duas pontas; faltou um, o crawler nao foi medido.
+    faltando = []
+    for nome in ("nunca_pedidas", "rotas_publicadas"):
+        if _numero(primeiro.get(nome)) is None:
+            faltando.append("%s@%s" % (nome, janela[0]))
+        if _numero(ultimo.get(nome)) is None:
+            faltando.append("%s@%s" % (nome, janela[-1]))
+    if resultado["com_primeira_visita"] is None:
+        faltando.append("com_primeira_visita@%s" % janela[-1])
+    if faltando:
+        resultado["motivo"] = "campo ausente ou nao numerico: " + ", ".join(faltando)
+        return resultado
+
+    coorte = resultado["com_primeira_visita"]
+    if coorte < args.coorte_minima:
+        resultado["motivo"] = ("coorte de %d rota(s) com primeira visita, abaixo do minimo de %d: "
+                               "mediana nao e mensuravel" % (coorte, args.coorte_minima))
+        return resultado
+    if resultado["mediana_dias"] is None:
+        # Coorte suficiente e mediana nula e linha torta do produtor, nao
+        # "sem dado": o medidor so devolve None quando a coorte e vazia.
+        resultado["motivo"] = "mediana_dias ausente com coorte de %d rotas" % coorte
+        return resultado
+
+    # Tendencia: queda LIQUIDA de nunca_pedidas na janela.
+    nunca_ini = _numero(primeiro.get("nunca_pedidas"))
+    nunca_fim = resultado["nunca_pedidas"]
+    pub_ini = _numero(primeiro.get("rotas_publicadas"))
+    pub_fim = resultado["rotas_publicadas"]
+    span = (ultima_data - _data(janela[0])).days
+    queda_bruta = nunca_ini - nunca_fim
+    acervo_delta = pub_fim - pub_ini
+    queda_liquida = queda_bruta + acervo_delta
+    resultado.update({
+        "nunca_pedidas_inicio": nunca_ini,
+        "queda_bruta": queda_bruta,
+        "acervo_delta": acervo_delta,
+        "queda_liquida": queda_liquida,
+        "span_dias": span,
+        "queda_por_dia": round(queda_liquida / span, 2) if span else None,
+    })
+
+    # ★ A MEDIANA ALTA DE QUEM ESTA DRENANDO O BACKLOG E EFEITO, NAO DEFEITO
+    # (2026-09-05).
+    #
+    # A mediana mede "quantos dias entre publicar e a primeira requisicao" sobre
+    # as rotas que ganharam a primeira visita NA JANELA. Enquanto um bot so pede
+    # pagina nova, isso e o tempo de descoberta e o teto faz sentido. Mas quando
+    # um bot que ignorava milhares de rotas COMECA a varre-las, as rotas que ele
+    # pede foram publicadas ha semanas — e a mediana sobe exatamente porque o
+    # backlog esta sendo drenado. O numero piora quando a situacao melhora.
+    #
+    # Medido em 2026-09-05, e e o caso que expos isto: o bingbot reprovava com
+    # mediana 21 enquanto suas nunca-pedidas caiam de 6.908 para 5.192 em seis
+    # dias (-286/dia). O oai-searchbot (-344/dia) e o perplexitybot (-643/dia)
+    # apareciam iguais. Ao mesmo tempo, claudebot (7.690) e googleother (6.893)
+    # tinham mediana 1 e 2 — otimas — e backlog PARADO em +0. O gate reprovava
+    # quem estava recuperando e elogiava quem estava parado.
+    #
+    # A regua correta compoe os dois eixos em vez de soma-los: a mediana so
+    # acusa quando a drenagem NAO explica o atraso. E "drenar" tem piso medido,
+    # nao boa vontade — no ritmo da janela, o backlog atual tem de acabar em ate
+    # PRAZO_DE_DRENAGEM_DIAS. Um bot que devolve uma rota por dia sobre sete mil
+    # nao esta recuperando, e continua reprovando pela mediana.
+    #
+    # O eixo duro nao mudou: backlog que nao cai reprova sempre, e sozinho.
+    problemas = []
+    drenagem_dias = None
+    if resultado.get("queda_por_dia") and resultado["queda_por_dia"] > 0:
+        drenagem_dias = resultado["nunca_pedidas"] / resultado["queda_por_dia"]
+    resultado["drenagem_dias"] = round(drenagem_dias, 1) if drenagem_dias else None
+    drenando = drenagem_dias is not None and drenagem_dias <= PRAZO_DE_DRENAGEM_DIAS
+    if resultado["mediana_dias"] > args.teto_mediana and not drenando:
+        piso = " (PISO: %d rota(s) anteriores ao registro)" % resultado["anterior_ao_registro"] \
+            if resultado["anterior_ao_registro"] else ""
+        lento = ""
+        if drenagem_dias is not None:
+            lento = "; drena o backlog em %.0f dia(s), acima do prazo de %d" % (
+                drenagem_dias, PRAZO_DE_DRENAGEM_DIAS)
+        problemas.append("%s_mediana_acima_do_teto:%s dia(s) para a primeira requisicao contra "
+                         "teto de %s%s%s" % (bot, _fmt(resultado["mediana_dias"], 1),
+                                            _fmt(args.teto_mediana, 1), piso, lento))
+    if queda_liquida <= 0:
+        problemas.append("%s_nunca_pedidas_nao_caiu:%s → %s em %d dia(s) (%s → %s), acervo %+d, "
+                         "queda liquida %+d" % (bot, _fmt(nunca_ini), _fmt(nunca_fim), span,
+                                                janela[0], janela[-1], acervo_delta, queda_liquida))
+    resultado["problemas"] = problemas
+    resultado["status"] = "fail" if problemas else "ok"
+    return resultado
+
+
+def _linha_tabela(r: dict) -> str:
+    marca = "*" if r["principal"] else " "
+    status = {"ok": "OK", "fail": "FALHA", "inconclusivo": "INCONCLUSIVO"}[r["status"]]
+    if "queda_liquida" in r:
+        # Movimento BRUTO primeiro (o que esta no ledger), e o liquido so quando
+        # o acervo mudou na janela — os dois numeros na mesma linha, para que
+        # nem "+95" (onda publicou 100) nem "-5" (o crawler achou 5) enganem.
+        bruto = -r["queda_bruta"]
+        tendencia = "%s → %s (%+d em %d d" % (_fmt(r["nunca_pedidas_inicio"]),
+                                               _fmt(r["nunca_pedidas"]), bruto, r["span_dias"])
+        if r["acervo_delta"]:
+            tendencia += ", acervo %+d, liquido %+d" % (r["acervo_delta"], -r["queda_liquida"])
+        if r["queda_por_dia"] is not None:
+            por_dia = -r["queda_por_dia"]
+            tendencia += ", %s%.1f/dia" % ("" if por_dia == 0 else "+" if por_dia > 0 else "-",
+                                           abs(por_dia))
+        tendencia += ")"
+    else:
+        tendencia = "%s — %s" % (_fmt(r.get("nunca_pedidas")), r.get("motivo", "sem medicao"))
+    return "  %-12s %s%-14s mediana %-5s p90 %-4s nunca %s" % (
+        status, marca, r["bot"], _fmt(r.get("mediana_dias"), 1), _fmt(r.get("p90_dias")), tendencia)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--teto-mediana", type=float, default=TETO_MEDIANA_PADRAO,
+                        help="mediana_dias acima disto reprova (padrao: %(default)s = triplo da "
+                             "mediana de 4 medida no Googlebot em 2026-09-01). NAO afrouxe para "
+                             "o gate passar.")
+    parser.add_argument("--janela-dias", type=int, default=JANELA_DIAS_PADRAO,
+                        help="nunca_pedidas tem de CAIR dentro destes dias (padrao: %(default)s)")
+    parser.add_argument("--coorte-minima", type=int, default=COORTE_MINIMA_PADRAO,
+                        help="rotas com primeira visita abaixo disto = INCONCLUSIVO (padrao: %(default)s)")
+    parser.add_argument("--atraso-max", type=int, default=ATRASO_MAX_DIAS_PADRAO,
+                        help="ultima linha mais velha que isto, em dias, = serie parada (padrao: %(default)s)")
+    parser.add_argument("--json", action="store_true")
+    # --serie e --hoje existem para o TESTE (tools/test_check_time_to_first_crawl.py).
+    # Gate que ninguem consegue apontar para um ledger sintetico e gate que
+    # ninguem consegue provar que reprova — e este nasce provando os dois lados.
+    parser.add_argument("--serie", default=SERIE,
+                        help="caminho do ledger (default: data/ops/time_to_first_crawl_daily.jsonl)")
+    parser.add_argument("--hoje", default=None,
+                        help="data de referencia ISO para o atraso (default: hoje em UTC)")
+    args = parser.parse_args()
+
+    hoje = _data(args.hoje) if args.hoje else _dt.datetime.now(_dt.timezone.utc).date()
+    if hoje is None:
+        print("check-time-to-first-crawl: FAIL", file=sys.stderr)
+        print("  --hoje invalido: %r" % args.hoje, file=sys.stderr)
+        return 1
+
+    por_bot = ler_serie(args.serie)
+    if not por_bot:
+        print("check-time-to-first-crawl: FAIL", file=sys.stderr)
+        print("  serie ausente ou vazia: %s" % args.serie, file=sys.stderr)
+        return 1
+
+    relatorio = []
+    # Principais primeiro, e SEMPRE presentes no relatorio: crawler ausente da
+    # serie entra como INCONCLUSIVO, com linha propria, e nunca some da conta.
+    ordem = list(CRAWLERS_PRINCIPAIS) + sorted(b for b in por_bot if b not in CRAWLERS_PRINCIPAIS)
+    for bot in ordem:
+        if bot not in por_bot:
+            relatorio.append({"bot": bot, "principal": True, "status": "inconclusivo",
+                              "problemas": [], "motivo": "ausente da serie"})
+            continue
+        relatorio.append(avalia_bot(bot, por_bot[bot], hoje, args))
+
+    print("time-to-first-crawl (dias entre publicar e a 1a requisicao; nunca = rotas jamais pedidas;"
+          " janela %d d, teto mediana %s d, coorte minima %d)"
+          % (args.janela_dias, _fmt(args.teto_mediana, 1), args.coorte_minima))
+    for r in relatorio:
+        print(_linha_tabela(r))
+    print("  (* crawler principal: so googlebot e bingbot decidem o exit code)")
+
+    problemas = [p for r in relatorio if r["principal"] for p in r["problemas"]]
+    inconclusivos = [(r["bot"], r.get("motivo", "")) for r in relatorio
+                     if r["principal"] and r["status"] == "inconclusivo"]
+
+    if args.json:
+        print(json.dumps({"problemas": problemas,
+                          "inconclusivos": [{"bot": b, "motivo": m} for b, m in inconclusivos],
+                          "crawlers": relatorio}, ensure_ascii=False, sort_keys=True))
+
+    # A tabela vai por stdout (buffer de bloco quando capturada por pipe) e o
+    # veredito por stderr (sem buffer): sem o flush o veredito sai ANTES da
+    # tabela em qualquer log — foi assim na primeira execucao.
+    sys.stdout.flush()
+
+    if problemas:
+        print("\ncheck-time-to-first-crawl: FAIL", file=sys.stderr)
+        for problema in problemas:
+            print("  - %s" % problema, file=sys.stderr)
+        for bot, motivo in inconclusivos:
+            print("  - %s INCONCLUSIVO: %s" % (bot, motivo), file=sys.stderr)
+        print("\n  Pagina nova levando mais de uma semana para ser PEDIDA, ou backlog de nunca-pedidas",
+              file=sys.stderr)
+        print("  que nao encolhe, e o canal de descoberta falhando: sitemap (lastmod, shards),",
+              file=sys.stderr)
+        print("  robots.txt, orfas de link interno, IndexNow. A cobertura acumulada so vai acusar",
+              file=sys.stderr)
+        print("  isso em semanas; esta serie acusa em dias.", file=sys.stderr)
+        return 1
+
+    if inconclusivos:
+        print("\ncheck-time-to-first-crawl: INCONCLUSIVO", file=sys.stderr)
+        for bot, motivo in inconclusivos:
+            print("  - %s: %s" % (bot, motivo), file=sys.stderr)
+        print("\n  Crawler principal sem medicao NAO e aprovacao: o gate nao pode dizer se a",
+              file=sys.stderr)
+        print("  descoberta melhorou. Verificar o produtor (wikijuridica-crawl-coverage.service,",
+              file=sys.stderr)
+        print("  segundo ExecStart) e a serie em data/ops/time_to_first_crawl_daily.jsonl.",
+              file=sys.stderr)
+        return 1
+
+    print("\ncheck-time-to-first-crawl: pass")
+    print("  googlebot e bingbot com mediana dentro do teto e nunca_pedidas caindo na janela")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

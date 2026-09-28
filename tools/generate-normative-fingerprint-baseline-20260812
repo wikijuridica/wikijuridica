@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+"""generate-normative-fingerprint-baseline-20260812 — a linha de base que responde
+"a fonte oficial mudou?".
+
+POR QUE EXISTE, com o número que originou a frente: hoje NÃO existe base nenhuma
+para essa pergunta. O campo que parecia respondê-la, `source_page_sha256`, é o
+hash do NOSSO próprio registro: 21.039 de 21.039 ocorrências são idênticas a
+`source_record_sha256`, porque `internal/v2ingest/v2ingest.go:284` grava
+`pageFingerprint = sha256(raw da nossa página)` e `internal/v2ingest/plan.go:1221`
+EXIGE que os dois sejam iguais. Medir o próprio umbigo não detecta alteração
+legislativa nenhuma.
+
+POR QUE O sha256 DO HTML TAMBÉM NÃO SERVE — medido, não opinado. Três buscas
+consecutivas das mesmas URLs oficiais (evidência em
+`.agents/runtime/tmp_rescue/20260812/.../pass{1,2,3}.jsonl`):
+
+    sha256 do corpo instável ............ 6 de 11 URLs
+    sha256 do texto visível instável .... 5 de 11 URLs
+    impressão normativa instável ........ 0 de 11 URLs
+
+O que muda entre duas buscas é token anti-bot (`f5_cspm` no Planalto, presente em
+298 dos 311 documentos deste cache; `csrf-token` no INPI; Rocket Loader na
+Anatel), banner e rodapé. Byte-hash como gatilho produziria alarme em massa por
+mudança cosmética — ruído que ninguém atende, e ruído que ninguém atende é gate
+morto.
+
+O DETECTOR CORRETO — impressão normativa, e por que ela resiste ao cosmético:
+ela só olha (a) o conjunto de âncoras NORMATIVAS do documento (ids/names no
+formato `art14`, `art37§6`, `capituloiv`, `anexoii` — a mesma coisa que as nossas
+citações endereçam) e (b) o conjunto de normas alteradoras extraído das notas do
+corpo (`(Redação dada pela Lei nº 14.133, de 2021)`), com o ano máximo de
+alteração. Script, banner, sessão, contador e rodapé não entram: não são
+`id`/`name` de dispositivo nem nota de alteração. Uma alteração legislativa
+REAL, ao contrário, obrigatoriamente aparece: ou acrescenta/revoga dispositivo
+(muda o conjunto de âncoras) ou traz a nota de redação nova (muda o conjunto de
+normas e o ano).
+
+GATILHO FAIL-CLOSED — a regra que este arquivo existe para cumprir. Na semente,
+quatro documentos distintos receberam a MESMA impressão `d8e09da58ba1…`:
+
+    https://www.stj.jus.br/docs_internet/SumulasSTJ.pdf            (200, 7,8 MB)
+    https://www.tst.jus.br/documents/10157/63003/Livro-Internet.pdf (200, 3,5 MB)
+    https://www.bcb.gov.br/estabilidadefinanceira/pix               (200, 2.871 B)
+    https://normativos.bcb.gov.br/…/Circ_3681_v10_P.pdf             (404,   724 B)
+
+Todos os quatro tinham extração VAZIA, e o protótipo hasheou o vazio. O último é
+uma PÁGINA DE ERRO 404: com "impressão igual ⇒ não mudou", uma fonte que morreu
+seria certificada como inalterada para sempre. Por isso, aqui, extração vazia
+NÃO produz impressão: produz `impressao_normativa: null` com motivo, e o
+comparador só sabe dizer `indeterminado`. Mesma coisa para status recusado,
+corpo ausente e mídia irreconhecível. Colisão nunca vira "igual"; vira "não sei,
+confere de novo".
+
+A semente `data/editorial/v2_planalto_anchor_conference_20260812.jsonl` não serve
+como está: ela gravou `ancoras_no_documento` como INTEIRO, não como conjunto.
+Medido nela: 383 dos 694 documentos caem na mesma tripla (0 âncoras, 0 normas,
+ano 0) — 382 por download que falhou e 1 PDF. Esta ferramenta regenera com hash
+de CONJUNTO e a LISTA das normas.
+
+O QUE ESTA FERRAMENTA NÃO FAZ: não escreve no estoque. Ela coleta e grava
+evidência em `data/ops/`. Quem aplica `official_document_sha256` /
+`sources_verified_at` nos JSONL de `data/editorial/v2_pages/` é gerador datado com
+lease e CAS — separar a coleta (lenta, de rede) da escrita (rápida, transacional)
+é o que permite reexecutar uma sem repetir a outra.
+
+RESPEITO A ÓRGÃO PÚBLICO: throttle POR HOST (1 req/s por padrão), hosts em
+paralelo, HEAD antes de GET, User-Agent identificado com contato. O envelope
+`Mozilla/5.0 (compatible; …)` não é disfarce: sem ele o WAF do Planalto derruba a
+conexão antes de responder qualquer coisa (medido em 2026-08-12), e o Planalto
+responde por 72% das fontes do acervo — rodar sem o envelope gravaria "fonte
+morta" para a maioria do acervo, que é mentira com cara de medição.
+
+AUDITÁVEL POR TERCEIRO: cada linha carrega `preimagem_impressao`, que é
+exatamente a string hasheada. Quem quiser conferir baixa a URL, recalcula e
+compara — ou simplesmente roda
+`python3 -c "import hashlib,sys;print(hashlib.blake2b(sys.argv[1].encode(),digest_size=16).hexdigest())" '<preimagem>'`.
+
+Uso:
+    tools/generate-normative-fingerprint-baseline-20260812
+        # linha de base a partir do cache local, sem tocar a rede
+
+    tools/generate-normative-fingerprint-baseline-20260812 --rede --limite 50
+        # completa pela rede, 1 req/s por host, no máximo 50 documentos
+
+    tools/generate-normative-fingerprint-baseline-20260812 --urls-de urls.txt --rede
+        # campanha completa: uma URL por linha
+
+    tools/generate-normative-fingerprint-baseline-20260812 --modo reconferencia --rede
+        # rebusca e compara com a linha de base: inalterado / mudou / indeterminado
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import hashlib
+import json
+import os
+import queue
+import re
+import ssl
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SEMENTE = ROOT / "data/editorial/v2_planalto_anchor_conference_20260812.jsonl"
+BASELINE = ROOT / "data/ops/official_source_normative_fingerprint_baseline.jsonl"
+# Mesmo motivo do selftest: /tmp nao sobrevive ao reboot e o cache regeneravel
+# pertence a .cache/, que ja esta no .gitignore.
+CACHE_PADRAO = Path(os.environ.get("PLANALTO_CACHE",
+                                   str(ROOT / ".cache/planalto-normative-fingerprint-20260812")))
+
+ESQUEMA = "normative_source_fingerprint_v1"
+
+# Mesmo conjunto que o gate Go aceita (internal/v2writingsemantic/material.go).
+# Duplicar constante cria duas verdades; `teto_do_gate_confere` reprova se
+# divergirem.
+STATUS_ACEITOS = (200, 203, 206)
+FONTE_DOS_STATUS = "internal/v2writingsemantic/material.go:222"
+
+# Identidade canonica (CLAUDE.md secao 11). Medido em 2026-09-05 com este UA:
+# www.planalto.gov.br 200/230.913 B (l13709compilado.htm), www.tst.jus.br
+# 200/3.496.811 B (Livro-Internet.pdf), informacoes.anatel.gov.br
+# 200/352.935 B, atos.cnj.jus.br 200/1.873.033 B.
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+    "+https://wikijuridica.com.br/bot/; impressao normativa de fonte oficial "
+    "citada, contato https://wikijuridica.com.br/contato/advogado/)"
+)
+
+# Âncora NORMATIVA: o que endereça dispositivo de norma. Derivada do corpus, não
+# inventada — sobre os 311 documentos HTML em cache, a lista de âncoras que ESTA
+# expressão descarta é encabeçada por `GENERATOR` (304 documentos) e `f5_cspm`
+# (298 documentos), que são exatamente o marcador de editor de texto e o token do
+# WAF F5. Ou seja: o filtro remove justamente o que muda sem a norma mudar.
+ANCORA_NORMATIVA = re.compile(
+    r"(?i)^(art|artigo|par|paragrafo|inc|incis|alinea|item|anexo|cap|capitulo|"
+    r"tit|titulo|liv|livro|sec|secao|subsecao|adct|preambulo|disposic)"
+    r"[\s._-]*(\d|[ivxlcdm]*$|[ivxlcdm]+[a-z0-9]*$)|§")
+
+# Só conta como ALTERAÇÃO a nota que muda o texto. "Vide" e "Vigência" são
+# remissão e data de vigor: aparecem numa versão e não na outra sem que o texto
+# tenha mudado.
+MARCA_DE_ALTERACAO = re.compile(
+    r"(Redação dada|Incluíd|Acrescid|Revogad|Renumerad)", re.I)
+ESPECIE_E_NUMERO = re.compile(
+    r"(Lei Complementar|Lei|Emenda Constitucional|Medida Provisória|"
+    r"Decreto-Lei|Decreto)[^\d]{0,20}?([\d][\d.]{2,})", re.I)
+ANO = re.compile(r"\b((?:19|20)\d{2})\b")
+
+# Piso de evidência para a impressão poder concluir "inalterado" sozinha.
+# Medido no cache: com este piso, 309 dos 311 HTML são `forte` e 2 são `fraca` —
+# a cauda que exige conferência humana é pequena e nomeada, não é o acervo todo.
+MINIMO_ANCORAS_FORTES = 3
+
+
+class ColetorDeAncoras(HTMLParser):
+    """Conjunto REAL de `id`/`name` do documento — o que um fragmento resolve."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.ids: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        for chave, valor in attrs:
+            if chave in ("id", "name") and valor:
+                self.ids.add(valor.strip())
+
+    handle_startendtag = handle_starttag
+
+
+def teto_do_gate_confere() -> tuple[bool, str]:
+    """Reprova se a lista de status aceitos do gate Go divergir desta.
+
+    A verdade vive no Go (`status != 200 && status != 203 && status != 206`).
+    Reproduzir a lista aqui sem conferir criaria duas verdades que divergem em
+    silêncio no dia em que uma das duas mudar.
+    """
+    caminho = ROOT / "internal/v2writingsemantic/material.go"
+    try:
+        texto = caminho.read_text(encoding="utf-8")
+    except OSError:
+        return True, "material.go ilegível — seguindo com os status locais"
+    achado = re.search(r"status\s*!=\s*(\d+)(?:\s*&&\s*status\s*!=\s*(\d+))+", texto)
+    if not achado:
+        return True, "lista de status não encontrada — seguindo com os status locais"
+    do_gate = {int(numero) for numero in re.findall(r"status\s*!=\s*(\d+)", achado.group(0))}
+    if do_gate != set(STATUS_ACEITOS):
+        return False, (
+            "o gate Go aceita %s e esta ferramenta aceita %s (%s)"
+            % (sorted(do_gate), list(STATUS_ACEITOS), FONTE_DOS_STATUS))
+    return True, ""
+
+
+def decodifica(bruto: bytes) -> tuple[str, str]:
+    for codificacao in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return bruto.decode(codificacao), codificacao
+        except UnicodeDecodeError:
+            continue
+    return bruto.decode("latin-1", "replace"), "latin-1/replace"
+
+
+# Marcação HTML de verdade, não esqueleto de documento. O Planalto serve leis
+# como FRAGMENTO: `l10.973.htm` (145.858 bytes) começa em `<title>` e não tem
+# `<html>`, `<head>` nem `<body>` em lugar nenhum. Exigir o esqueleto marcou dois
+# documentos reais como mídia irreconhecível — fail-closed na direção segura,
+# mas perdendo evidência que existe.
+MARCACAO_HTML = re.compile(
+    rb"(?i)<(html|head|body|title|div|table|tr|td|p|font|span|meta|a|br|h[1-6])[\s>/]")
+
+
+def midia_do_corpo(bruto: bytes, url: str) -> tuple[str, str]:
+    """Classifica pelo CONTEÚDO, nunca pela extensão da URL.
+
+    O caso real que obriga isto está no grupo de colisão: `Circ_3681_v10_P.pdf`
+    devolveu 724 bytes de HTML de erro. URL terminada em `.pdf` cujo corpo não
+    começa com `%PDF-` é `desconhecida` — nunca um PDF vazio comparável.
+    """
+    if bruto[:5] == b"%PDF-":
+        return "pdf", ""
+    if url.lower().split("?", 1)[0].endswith(".pdf"):
+        return "desconhecida", "corpo_nao_e_pdf"
+    if MARCACAO_HTML.search(bruto[:65536]):
+        return "html", ""
+    return "desconhecida", "midia_irreconhecivel"
+
+
+def normas_alteradoras(texto: str) -> tuple[list[str], int]:
+    plano = re.sub(r"<[^>]+>", " ", texto).replace("&nbsp;", " ")
+    plano = re.sub(r"&[a-z]+;", " ", plano)
+    plano = re.sub(r"\s+", " ", plano)
+    achados: set[str] = set()
+    anos: list[int] = []
+    for nota in re.findall(r"\(([^()]{0,240})\)", plano):
+        if not MARCA_DE_ALTERACAO.search(nota):
+            continue
+        anos_da_nota = ANO.findall(nota)
+        ano = anos_da_nota[-1] if anos_da_nota else ""
+        for especie, numero in ESPECIE_E_NUMERO.findall(nota):
+            # "10.467" e "10467" são a MESMA lei: sem normalizar o ponto, a
+            # comparação entre duas versões do documento inventa diferença.
+            achados.add(f"{especie.title()} {numero.replace('.', '')}/{ano}")
+        if ano:
+            anos.append(int(ano))
+    return sorted(achados), (max(anos) if anos else 0)
+
+
+def digest_de_conjunto(itens) -> str:
+    """blake2b sobre o conjunto ordenado.
+
+    blake2b, e nunca `hash()` do Python: `hash()` é semeado por processo
+    (PYTHONHASHSEED aleatório) e daria valor diferente a cada execução — uma
+    linha de base assim mentiria em toda reconferência.
+    """
+    material = "\n".join(sorted(itens)).encode("utf-8")
+    return hashlib.blake2b(material, digest_size=16).hexdigest()
+
+
+def preimagem(midia: str, ancoras_normativas, normas: list[str],
+              ano_max: int, sha256_documento: str) -> str:
+    """String EXATA que vira a impressão. Vai gravada na evidência.
+
+    A versão do esquema NÃO entra aqui de propósito: se entrasse, toda melhoria
+    do extrator mudaria a impressão de todo o acervo e produziria uma onda de
+    falso "mudou". A versão fica no registro, e o comparador recusa comparar
+    esquemas diferentes.
+    """
+    if midia == "pdf":
+        # PDF não tem âncora de HTML e o texto vem comprimido: aqui a identidade
+        # é o byte. Medido: o PDF de Súmulas do STJ (7,8 MB) veio idêntico nas
+        # três buscas. O modo de falha do byte-hash é acusar mudança que não
+        # houve (barulho que se confere), nunca calar mudança que houve.
+        corpo = {"midia": "pdf", "sha256": sha256_documento}
+    else:
+        corpo = {
+            "midia": "html",
+            "anc_norm_b2": digest_de_conjunto(ancoras_normativas),
+            "anc_norm_n": len(ancoras_normativas),
+            "normas": normas,
+            "ano_max": ano_max,
+        }
+    return json.dumps(corpo, sort_keys=True, ensure_ascii=True,
+                      separators=(",", ":"))
+
+
+def impressao_de(preimagem_texto: str) -> str:
+    return hashlib.blake2b(preimagem_texto.encode("utf-8"),
+                           digest_size=16).hexdigest()
+
+
+def classe_de_evidencia(midia: str, ancoras_normativas, normas: list[str]) -> str:
+    if midia == "pdf":
+        return "forte"
+    if len(normas) >= 1 or len(ancoras_normativas) >= MINIMO_ANCORAS_FORTES:
+        return "forte"
+    if ancoras_normativas or normas:
+        return "fraca"
+    return "nula"
+
+
+def registro_do_documento(url: str, bruto: bytes, http_status: int,
+                          origem: str, consultado_em: str,
+                          metodo: str = "", erro: str = "") -> dict:
+    """Uma linha de evidência. FAIL-CLOSED: sem prova, sem impressão."""
+    registro = {
+        "schema": ESQUEMA,
+        "tipo": "documento",
+        "ferramenta": Path(__file__).name,
+        "url": url,
+        "consultado_em": consultado_em,
+        "origem_do_corpo": origem,
+        "http_status": http_status,
+        # Corpo vindo do cache local não teve status medido NESTA execução: o 200
+        # é herdado da busca que gravou o arquivo (o cache só guarda resposta
+        # aceita). Dizer "medido" sem ter medido é a classe de defeito que este
+        # projeto trata como adjacente a fraude, então o registro diz qual dos
+        # dois é.
+        "http_status_medido": origem.startswith("rede"),
+        "metodo": metodo,
+        "erro": erro,
+        "bytes": len(bruto),
+        "sha256_documento": hashlib.sha256(bruto).hexdigest() if bruto else "",
+        "midia": "",
+        "encoding": "",
+        "ancoras_totais": 0,
+        "ancoras_totais_blake2b": "",
+        "ancoras_normativas": 0,
+        "ancoras_normativas_blake2b": "",
+        "ancoras_amostra": [],
+        "normas_alteradoras": [],
+        "ano_max_alteracao": 0,
+        "classe_de_evidencia": "nula",
+        "impressao_normativa": None,
+        "preimagem_impressao": "",
+        "motivo_sem_impressao": "",
+        "colisao_de_impressao": False,
+        "colide_com": [],
+    }
+
+    # A ordem importa: um 404 sem corpo é "status recusado", não "corpo ausente".
+    # Nomear o motivo certo é o que permite separar fonte MORTA (some do ar) de
+    # fonte NÃO BAIXADA (a varredura ainda não chegou nela) — dois problemas
+    # diferentes, com filas diferentes.
+    if http_status and http_status not in STATUS_ACEITOS:
+        # Este é o caso do 404 de 724 bytes que colidia com o PDF de 7,8 MB.
+        registro["motivo_sem_impressao"] = "http_recusado"
+        return registro
+    if not bruto:
+        registro["motivo_sem_impressao"] = "corpo_ausente"
+        return registro
+    if http_status not in STATUS_ACEITOS:
+        registro["motivo_sem_impressao"] = "http_recusado"
+        return registro
+
+    midia, defeito = midia_do_corpo(bruto, url)
+    registro["midia"] = midia
+    if midia == "desconhecida":
+        registro["motivo_sem_impressao"] = defeito
+        return registro
+
+    if midia == "html":
+        texto, codificacao = decodifica(bruto)
+        registro["encoding"] = codificacao
+        coletor = ColetorDeAncoras()
+        try:
+            coletor.feed(texto)
+        except Exception as erro_parse:  # HTML de portal quebra o parser
+            registro["erro"] = registro["erro"] or type(erro_parse).__name__
+        normativas = {a for a in coletor.ids if ANCORA_NORMATIVA.search(a)}
+        normas, ano_max = normas_alteradoras(texto)
+        registro |= {
+            "ancoras_totais": len(coletor.ids),
+            "ancoras_totais_blake2b": digest_de_conjunto(coletor.ids),
+            "ancoras_normativas": len(normativas),
+            "ancoras_normativas_blake2b": digest_de_conjunto(normativas),
+            "ancoras_amostra": sorted(normativas)[:12],
+            "normas_alteradoras": normas,
+            "ano_max_alteracao": ano_max,
+        }
+    else:
+        normativas, normas, ano_max = set(), [], 0
+
+    classe = classe_de_evidencia(midia, normativas, registro["normas_alteradoras"])
+    registro["classe_de_evidencia"] = classe
+    if classe == "nula":
+        # Extração vazia: era exatamente o que produzia `d8e09da58ba1`. Não se
+        # hasheia o vazio.
+        registro["motivo_sem_impressao"] = "extracao_vazia"
+        return registro
+
+    texto_preimagem = preimagem(midia, normativas,
+                                registro["normas_alteradoras"],
+                                registro["ano_max_alteracao"],
+                                registro["sha256_documento"])
+    registro["preimagem_impressao"] = texto_preimagem
+    registro["impressao_normativa"] = impressao_de(texto_preimagem)
+    return registro
+
+
+def marca_colisoes(registros: list[dict]) -> dict:
+    """Fingerprint repetida entre URLs distintas NUNCA conclui "inalterado"."""
+    por_impressao: dict[str, list[dict]] = collections.defaultdict(list)
+    for registro in registros:
+        if registro.get("impressao_normativa"):
+            por_impressao[registro["impressao_normativa"]].append(registro)
+    grupos = {}
+    for impressao, membros in por_impressao.items():
+        urls = sorted({m["url"] for m in membros})
+        if len(urls) < 2:
+            continue
+        shas = {m["sha256_documento"] for m in membros}
+        tipo = "alias_bytes_identicos" if len(shas) == 1 else "mesma_impressao_bytes_diferentes"
+        grupos[impressao] = {"tipo": tipo, "urls": urls}
+        for membro in membros:
+            membro["colisao_de_impressao"] = True
+            membro["colide_com"] = [u for u in urls if u != membro["url"]]
+    return grupos
+
+
+def veredito(base: dict, atual: dict) -> dict:
+    """Comparador FAIL-CLOSED. Só três respostas, e "igual" é a mais difícil."""
+    def indet(motivo):
+        return {"veredito": "indeterminado", "motivo": motivo}
+
+    if base.get("schema") != atual.get("schema"):
+        return {"veredito": "indeterminado_rebaseline",
+                "motivo": "esquema %s != %s" % (base.get("schema"), atual.get("schema"))}
+    if not base.get("impressao_normativa"):
+        return indet("linha de base sem impressão: " + (base.get("motivo_sem_impressao") or "desconhecido"))
+    if not atual.get("impressao_normativa"):
+        return indet("busca de hoje sem impressão: " + (atual.get("motivo_sem_impressao") or "desconhecido"))
+
+    if base.get("sha256_documento") and base["sha256_documento"] == atual.get("sha256_documento"):
+        # Byte a byte idêntico não é inferência, é fato.
+        return {"veredito": "inalterado", "motivo": "corpo byte a byte idêntico"}
+
+    if base["impressao_normativa"] != atual["impressao_normativa"]:
+        antes = set(base.get("normas_alteradoras") or [])
+        agora = set(atual.get("normas_alteradoras") or [])
+        return {
+            "veredito": "mudou",
+            "motivo": "impressão normativa diferente",
+            "normas_novas": sorted(agora - antes),
+            "normas_removidas": sorted(antes - agora),
+            "delta_ancoras_normativas": (atual.get("ancoras_normativas", 0)
+                                         - base.get("ancoras_normativas", 0)),
+            "ano_max_antes": base.get("ano_max_alteracao", 0),
+            "ano_max_agora": atual.get("ano_max_alteracao", 0),
+        }
+
+    if base.get("colisao_de_impressao") or atual.get("colisao_de_impressao"):
+        return indet("impressão colidente (%s): igualdade não distingue documento"
+                     % ", ".join(base.get("colide_com") or atual.get("colide_com") or []))
+    if base.get("classe_de_evidencia") != "forte" or atual.get("classe_de_evidencia") != "forte":
+        return indet("evidência fraca (%s/%s): igualdade não conclui"
+                     % (base.get("classe_de_evidencia"), atual.get("classe_de_evidencia")))
+    return {"veredito": "inalterado_por_impressao",
+            "motivo": "âncoras normativas e normas alteradoras idênticas; corpo mudou só no cosmético"}
+
+
+def host_de(url: str) -> str:
+    achado = re.match(r"https?://([^/]+)", url)
+    return achado.group(1).lower() if achado else ""
+
+
+def caminho_cache(cache: Path, url: str) -> Path:
+    """Mesmo endereçamento de `measure-planalto-anchor-coverage-20260812`, para
+    reaproveitar os 98 MB já baixados em vez de bater de novo nos portais."""
+    return cache / (hashlib.sha256(url.encode()).hexdigest()[:24] + ".htm")
+
+
+def busca(url: str, timeout: int = 30) -> tuple[bytes, int, str, str]:
+    """HEAD primeiro (barato), GET quando o status é aceitável ou o método é
+    recusado. Portal de governo devolve 403/405 a HEAD e 200 a GET."""
+    contexto = ssl.create_default_context()
+    cabecalhos = {"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf,*/*"}
+    status_head = 0
+    try:
+        pedido = urllib.request.Request(url, method="HEAD", headers=cabecalhos)
+        with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+            status_head = resposta.status
+    except urllib.error.HTTPError as erro:
+        status_head = erro.code
+        if erro.code not in (403, 405, 501) and erro.code not in STATUS_ACEITOS:
+            return b"", erro.code, "HEAD", ""
+    except Exception as erro:
+        status_head = 0
+        del erro
+    try:
+        pedido = urllib.request.Request(url, method="GET", headers=cabecalhos)
+        with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+            return resposta.read(), resposta.status, "HEAD+GET" if status_head else "GET", ""
+    except urllib.error.HTTPError as erro:
+        try:
+            corpo = erro.read()
+        except Exception:
+            corpo = b""
+        return corpo, erro.code, "GET", ""
+    except Exception as erro:
+        return b"", 0, "GET", type(erro).__name__
+
+
+def corpo_de(url: str, cache: Path, usar_rede: bool) -> tuple[bytes, int, str, str, str]:
+    destino = caminho_cache(cache, url)
+    if destino.is_file() and destino.stat().st_size > 0:
+        bruto = destino.read_bytes()
+        quando = datetime.datetime.utcfromtimestamp(
+            destino.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return bruto, 200, "cache", quando, ""
+    if not usar_rede:
+        return b"", 0, "ausente", "", "sem cache e sem rede"
+    bruto, status, metodo, erro = busca(url)
+    agora = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    if bruto and status in STATUS_ACEITOS:
+        cache.mkdir(parents=True, exist_ok=True)
+        destino.write_bytes(bruto)
+    return bruto, status, "rede:" + metodo, agora, erro
+
+
+def urls_da_semente() -> list[str]:
+    urls: list[str] = []
+    if not SEMENTE.is_file():
+        return urls
+    for linha in SEMENTE.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        try:
+            registro = json.loads(linha)
+        except ValueError:
+            continue
+        if registro.get("tipo") == "documento_conferido" and registro.get("url"):
+            urls.append(registro["url"])
+    return sorted(dict.fromkeys(urls))
+
+
+def escrita_atomica(caminho: Path, carga: bytes) -> None:
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporario = tempfile.mkstemp(prefix=f".{caminho.name}.", dir=caminho.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(carga)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporario, caminho)
+    finally:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+
+
+def coleta(urls: list[str], cache: Path, usar_rede: bool, rps_por_host: float,
+           hosts_paralelos: int) -> list[dict]:
+    por_host: dict[str, list[str]] = collections.defaultdict(list)
+    for url in urls:
+        por_host[host_de(url)].append(url)
+    resultados: list[dict] = []
+    trava = threading.Lock()
+    fila: queue.Queue = queue.Queue()
+    for host in por_host:
+        fila.put(host)
+    intervalo = 1.0 / max(rps_por_host, 0.01)
+    feitos = [0]
+
+    def trabalhar():
+        while True:
+            try:
+                host = fila.get_nowait()
+            except queue.Empty:
+                return
+            proximo = time.monotonic()
+            for url in por_host[host]:
+                destino = caminho_cache(cache, url)
+                da_rede = usar_rede and not (destino.is_file() and destino.stat().st_size > 0)
+                if da_rede:
+                    agora = time.monotonic()
+                    if agora < proximo:
+                        time.sleep(proximo - agora)
+                    proximo = max(proximo, agora) + intervalo
+                bruto, status, origem, quando, erro = corpo_de(url, cache, usar_rede)
+                registro = registro_do_documento(
+                    url, bruto, status, origem,
+                    quando or datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    metodo=origem.replace("rede:", "") if origem.startswith("rede:") else "",
+                    erro=erro)
+                with trava:
+                    resultados.append(registro)
+                    feitos[0] += 1
+                    if feitos[0] % 100 == 0:
+                        print("  %d/%d" % (feitos[0], len(urls)), flush=True)
+            fila.task_done()
+
+    threads = [threading.Thread(target=trabalhar, daemon=True)
+               for _ in range(max(1, min(hosts_paralelos, len(por_host))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    resultados.sort(key=lambda registro: registro["url"])
+    return resultados
+
+
+def replay_das_buscas(diretorio: Path) -> tuple[list[dict], dict]:
+    """Recalcula a impressão sobre os CORPOS de três buscas consecutivas.
+
+    Por que existe: a afirmação "o byte muda e a impressão não" precisa ser
+    medida com ESTA implementação, sobre corpo real de portal de governo, e a
+    medição precisa sobreviver ao `/tmp`. A entrada são os `pass{1,2,3}.jsonl`
+    (que já estão no repo, com `url` e `arquivo`) mais os corpos, enquanto
+    existirem; a saída é evidência durável em `data/ops/`.
+    """
+    por_url: dict[str, dict[str, dict]] = collections.defaultdict(dict)
+    for numero in ("1", "2", "3"):
+        caminho = diretorio / ("pass%s.jsonl" % numero)
+        if not caminho.is_file():
+            continue
+        for linha in caminho.read_text(encoding="utf-8").splitlines():
+            if not linha.strip():
+                continue
+            registro = json.loads(linha)
+            url = registro.get("url")
+            corpo = Path(registro.get("arquivo") or "")
+            if not url:
+                continue
+            bruto = corpo.read_bytes() if corpo.is_file() else b""
+            try:
+                status = int(registro.get("http_status") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            medido = registro_do_documento(
+                url, bruto, status,
+                "replay:pass%s" % numero,
+                registro.get("consultado_em") or "",
+                erro="" if bruto else "corpo da busca não está mais no disco")
+            por_url[url]["pass" + numero] = medido
+
+    linhas: list[dict] = []
+    sha_instavel = fp_instavel = comparaveis = 0
+    for url in sorted(por_url):
+        buscas = por_url[url]
+        shas = {b["sha256_documento"] for b in buscas.values() if b["sha256_documento"]}
+        impressoes = {b["impressao_normativa"] for b in buscas.values()
+                      if b["impressao_normativa"]}
+        sem_impressao = [n for n, b in sorted(buscas.items())
+                         if not b["impressao_normativa"]]
+        if len(buscas) >= 2 and len(shas) >= 1:
+            comparaveis += 1
+            if len(shas) > 1:
+                sha_instavel += 1
+            if len(impressoes) > 1:
+                fp_instavel += 1
+        linhas.append({
+            "schema": ESQUEMA, "tipo": "replay_de_buscas",
+            "ferramenta": Path(__file__).name,
+            "url": url,
+            "buscas": len(buscas),
+            "sha256_por_busca": {n: b["sha256_documento"] for n, b in sorted(buscas.items())},
+            "impressao_por_busca": {n: b["impressao_normativa"] for n, b in sorted(buscas.items())},
+            "classe_por_busca": {n: b["classe_de_evidencia"] for n, b in sorted(buscas.items())},
+            "motivo_por_busca": {n: b["motivo_sem_impressao"] for n, b in sorted(buscas.items())},
+            "sha256_estavel": len(shas) <= 1,
+            "impressao_estavel": len(impressoes) <= 1,
+            "buscas_sem_impressao": sem_impressao,
+        })
+    resumo = {
+        "schema": ESQUEMA, "tipo": "resumo_replay",
+        "ferramenta": Path(__file__).name,
+        "gerado_em": datetime.date.today().isoformat(),
+        "fonte": str(diretorio),
+        "urls": len(por_url),
+        "urls_comparaveis": comparaveis,
+        "sha256_instavel": sha_instavel,
+        "impressao_instavel": fp_instavel,
+    }
+    return linhas, resumo
+
+
+def carrega_baseline(caminho: Path) -> dict[str, dict]:
+    base: dict[str, dict] = {}
+    if not caminho.is_file():
+        return base
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        registro = json.loads(linha)
+        if registro.get("tipo") == "documento":
+            base[registro["url"]] = registro
+    return base
+
+
+def resumo_de(registros: list[dict], grupos: dict, fonte_urls: str) -> dict:
+    classes = collections.Counter(r["classe_de_evidencia"] for r in registros)
+    motivos = collections.Counter(r["motivo_sem_impressao"] for r in registros
+                                  if not r["impressao_normativa"])
+    midias = collections.Counter(r["midia"] or "sem_corpo" for r in registros)
+    return {
+        "schema": ESQUEMA,
+        "tipo": "resumo",
+        "ferramenta": Path(__file__).name,
+        "gerado_em": datetime.date.today().isoformat(),
+        "fonte_das_urls": fonte_urls,
+        "documentos": len(registros),
+        "com_impressao": sum(1 for r in registros if r["impressao_normativa"]),
+        "sem_impressao": sum(1 for r in registros if not r["impressao_normativa"]),
+        "motivos_sem_impressao": dict(motivos),
+        "classes_de_evidencia": dict(classes),
+        "midias": dict(midias),
+        "grupos_de_colisao": len(grupos),
+        "documentos_em_colisao": sum(len(g["urls"]) for g in grupos.values()),
+        "colisoes": [{"impressao": k, **v} for k, v in sorted(grupos.items())],
+    }
+
+
+def esquema_do_registro() -> dict:
+    return {
+        "schema": ESQUEMA,
+        "tipo": "esquema",
+        "ferramenta": Path(__file__).name,
+        "gerado_em": datetime.date.today().isoformat(),
+        "impressao": {
+            "algoritmo": "blake2b",
+            "digest_size_bytes": 16,
+            "preimagem": "campo preimagem_impressao, verbatim, codificado em UTF-8",
+            "html": "JSON canônico {anc_norm_b2, anc_norm_n, ano_max, midia, normas}",
+            "pdf": "JSON canônico {midia, sha256} — identidade por byte",
+            "por_que_sem_versao_na_preimagem":
+                "versão dentro da preimagem faria toda melhoria do extrator "
+                "reescrever a impressão do acervo inteiro e produzir falso 'mudou'",
+        },
+        "fail_closed": {
+            "corpo_ausente": "sem impressão",
+            "http_recusado": "sem impressão (status fora de %s)" % list(STATUS_ACEITOS),
+            "corpo_nao_e_pdf": "URL .pdf com corpo que não começa em %PDF- (soft-404)",
+            "midia_irreconhecivel": "sem impressão",
+            "extracao_vazia": "0 âncoras normativas e 0 normas alteradoras",
+            "colisao": "impressão repetida entre URLs distintas nunca conclui inalterado",
+            "evidencia_fraca": "abaixo de %d âncoras normativas e sem norma alteradora"
+                               % MINIMO_ANCORAS_FORTES,
+        },
+        "vereditos": ["inalterado", "inalterado_por_impressao", "mudou",
+                      "indeterminado", "indeterminado_rebaseline"],
+        "auditoria_por_terceiro":
+            "baixar a URL, recalcular sha256_documento e blake2b(preimagem_impressao)",
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--modo", choices=("baseline", "reconferencia", "replay"),
+                        default="baseline")
+    parser.add_argument("--passes", default="",
+                        help="diretório com pass1/2/3.jsonl das buscas repetidas (--modo replay)")
+    parser.add_argument("--cache", default=str(CACHE_PADRAO))
+    parser.add_argument("--urls-de", default="", help="arquivo com uma URL por linha")
+    parser.add_argument("--rede", action="store_true", help="busca o que não está em cache")
+    parser.add_argument("--rps-por-host", type=float, default=1.0)
+    parser.add_argument("--hosts-paralelos", type=int, default=8)
+    parser.add_argument("--limite", type=int, default=0)
+    parser.add_argument("--baseline", default=str(BASELINE))
+    parser.add_argument("--saida", default="")
+    args = parser.parse_args()
+
+    coerente, aviso = teto_do_gate_confere()
+    if not coerente:
+        print("ABORTA: " + aviso, file=sys.stderr)
+        return 2
+    if aviso:
+        print("aviso: " + aviso, file=sys.stderr)
+
+    cache = Path(args.cache)
+    caminho_baseline = Path(args.baseline)
+
+    if args.modo == "replay":
+        if not args.passes:
+            print("ABORTA: --modo replay exige --passes DIR", file=sys.stderr)
+            return 2
+        linhas_replay, resumo_replay = replay_das_buscas(Path(args.passes))
+        if not linhas_replay:
+            print("ABORTA: nenhum pass{1,2,3}.jsonl legível em %s" % args.passes,
+                  file=sys.stderr)
+            return 2
+        saida = Path(args.saida) if args.saida else (
+            ROOT / "data/ops/official_source_normative_fingerprint_pass_replay_20260812.jsonl")
+        carga = "".join(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n"
+                        for linha in [esquema_do_registro()] + linhas_replay + [resumo_replay])
+        escrita_atomica(saida, carga.encode("utf-8"))
+        print("URLs com 2+ buscas comparáveis: %d" % resumo_replay["urls_comparaveis"])
+        print("  sha256 do corpo instável entre buscas: %d" % resumo_replay["sha256_instavel"])
+        print("  impressão normativa instável:          %d" % resumo_replay["impressao_instavel"])
+        for linha in linhas_replay:
+            marca = []
+            if not linha["sha256_estavel"]:
+                marca.append("SHA-INSTAVEL")
+            if not linha["impressao_estavel"]:
+                marca.append("IMPRESSAO-INSTAVEL")
+            if linha["buscas_sem_impressao"]:
+                marca.append("sem impressão em " + ",".join(linha["buscas_sem_impressao"]))
+            print("  %-22s %s" % (" ".join(marca) or "estável", linha["url"][:88]))
+        print("\n%d registro(s) em %s" % (len(linhas_replay) + 2, os.path.relpath(saida, ROOT)))
+        return 0
+
+    if args.urls_de:
+        fonte_urls = args.urls_de
+        urls = [linha.strip() for linha in Path(args.urls_de).read_text(encoding="utf-8").splitlines()
+                if linha.strip() and not linha.startswith("#")]
+    elif args.modo == "reconferencia":
+        fonte_urls = str(caminho_baseline.relative_to(ROOT))
+        urls = sorted(carrega_baseline(caminho_baseline))
+    else:
+        fonte_urls = str(SEMENTE.relative_to(ROOT))
+        urls = urls_da_semente()
+    urls = sorted(dict.fromkeys(urls))
+    if args.limite:
+        urls = urls[: args.limite]
+    if not urls:
+        print("nenhuma URL para processar", file=sys.stderr)
+        return 2
+
+    print("documentos: %d | cache: %s | rede: %s"
+          % (len(urls), cache, "sim" if args.rede else "não"))
+    inicio = time.time()
+    registros = coleta(urls, cache, args.rede, args.rps_por_host, args.hosts_paralelos)
+    grupos = marca_colisoes(registros)
+    resumo = resumo_de(registros, grupos, fonte_urls)
+
+    if args.modo == "baseline":
+        saida = Path(args.saida) if args.saida else caminho_baseline
+        linhas = [esquema_do_registro()] + registros + [resumo]
+    else:
+        base = carrega_baseline(caminho_baseline)
+        if not base:
+            print("ABORTA: linha de base ausente em %s" % caminho_baseline, file=sys.stderr)
+            return 2
+        vereditos = []
+        contagem: collections.Counter = collections.Counter()
+        for registro in registros:
+            anterior = base.get(registro["url"])
+            if not anterior:
+                julgamento = {"veredito": "indeterminado", "motivo": "URL fora da linha de base"}
+            else:
+                julgamento = veredito(anterior, registro)
+            contagem[julgamento["veredito"]] += 1
+            vereditos.append({
+                "schema": ESQUEMA, "tipo": "reconferencia",
+                "ferramenta": Path(__file__).name,
+                "url": registro["url"],
+                "consultado_em": registro["consultado_em"],
+                "impressao_anterior": (anterior or {}).get("impressao_normativa"),
+                "impressao_atual": registro["impressao_normativa"],
+                "sha256_anterior": (anterior or {}).get("sha256_documento", ""),
+                "sha256_atual": registro["sha256_documento"],
+                "classe_de_evidencia": registro["classe_de_evidencia"],
+                "colisao_de_impressao": registro["colisao_de_impressao"],
+                **julgamento,
+            })
+        resumo["tipo"] = "resumo_reconferencia"
+        resumo["vereditos"] = dict(contagem)
+        saida = Path(args.saida) if args.saida else (
+            ROOT / ("data/ops/official_source_normative_fingerprint_recheck_%s.jsonl"
+                    % datetime.date.today().strftime("%Y%m%d")))
+        linhas = [esquema_do_registro()] + vereditos + [resumo]
+        print("\n=== vereditos ===")
+        for nome, quantas in contagem.most_common():
+            print("  %6d  %s" % (quantas, nome))
+
+    carga = "".join(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n"
+                    for linha in linhas)
+    escrita_atomica(saida, carga.encode("utf-8"))
+
+    print("\n=== classes de evidência ===")
+    for nome, quantas in sorted(resumo["classes_de_evidencia"].items()):
+        print("  %6d  %s" % (quantas, nome))
+    if resumo["motivos_sem_impressao"]:
+        print("=== sem impressão (fail-closed) ===")
+        for nome, quantas in sorted(resumo["motivos_sem_impressao"].items()):
+            print("  %6d  %s" % (quantas, nome))
+    if grupos:
+        print("=== colisões (nunca concluem 'inalterado') ===")
+        for impressao, grupo in sorted(grupos.items()):
+            print("  %s  %s  %d URLs" % (impressao[:12], grupo["tipo"], len(grupo["urls"])))
+            for url in grupo["urls"]:
+                print("        %s" % url)
+    print("\n%d registro(s) em %s (%.0f s)"
+          % (len(linhas), os.path.relpath(saida, ROOT), time.time() - inicio))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

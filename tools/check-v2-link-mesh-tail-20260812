@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""check-v2-link-mesh-tail-20260812 — reproduz a cadeia da malha e disseca a cauda.
+
+READ-ONLY. Não escreve no estoque, não publica, não commita. Escreve apenas os
+arquivos de diagnóstico que lhe forem pedidos por argumento.
+
+O QUE ELE REPRODUZ. A cadeia inteira que cmd/publish-v2-direct monta sobre o
+acervo aprovado, na ordem exata do publicador:
+
+  1. v2publish.LoadPages          -> estoque v2 (data/editorial/v2_pages/*.jsonl)
+  2. v2publish.SelectPublishable  -> censo de severidade + colisão de rota
+  3. v2publish.ResolveRelatedContent (truncada em capPrePiso = 6 - 2 = 4)
+  4. internallinkmesh.Load + content.MergeRelatedLinks (artefato primeiro)
+  5. v2publish.EnforceInboundFloor  (piso de 2 entradas de malha)
+  6. v2publish.BackfillReservedSlots (devolução dos slots reservados)
+
+A pontuação é a de internal/v2publish/relatedlinks.go, replicada termo a termo:
+subject = title + h1 + internal_link_topics, tokens de 4+ caracteres depois da
+dobra de acento, stopwords próprias, corte de termo comum em max(40, n/20),
+sobreposição mínima de 2 termos, score = 10*sobreposição (+15 mesma área) e
++100 por tópico declarado que É um intent publicado — este último some
+independentemente de sobreposição, e é a razão de enriquecer tópico funcionar.
+
+POR QUE EM PYTHON. A medição precisa rodar dezenas de vezes com o estoque
+mexendo (inclusive com sobreposição hipotética de tópicos, via --topics-overlay)
+para dizer quanto um enriquecimento renderia ANTES de escrever no acervo. Rodar
+o publicador para isso significaria build de ~5 min e um binário que grava. A
+fidelidade não fica no juramento: --anchors confere os números do ensaio real de
+2026-08-12 e falha se algum divergir.
+
+A COBERTURA DE RASTREIO vem por -coverage-ref porque o arquivo vivo
+(data/ops/crawl_coverage_never_requested.json) foi regerado no schema v2 e
+PERDEU a chave "googlebot" que o publicador exige; o ensaio que produziu os
+números desta investigação leu a versão de a4c48ea8 (2.678 rotas nunca pedidas).
+
+Uso:
+    tools/check-v2-link-mesh-tail-20260812 --anchors
+    tools/check-v2-link-mesh-tail-20260812 --diagnosis-out data/editorial/x.jsonl
+    tools/check-v2-link-mesh-tail-20260812 --topics-overlay plano.json
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# --------------------------------------------------------------------------
+# Constantes copiadas do Go. Mudou lá, muda aqui — e --anchors reprova.
+# --------------------------------------------------------------------------
+MAX_RELATED_LINKS = 6          # content.MaxRelatedLinksPerPage
+FLOOR_RESERVED_SLOTS = 2       # v2publish.InboundFloorReservedSlots
+CAP_PRE_PISO = MAX_RELATED_LINKS - FLOOR_RESERVED_SLOTS
+INBOUND_FLOOR = 2              # v2publish.InboundFloorMeshEntries
+MIN_TOPIC_OVERLAP = 2          # relatedlinks.minTopicOverlap
+DECLARED_TOPIC_BONUS = 100
+SAME_AREA_BONUS = 15
+BACKFILL_MAX_GAIN_PER_TARGET = 2
+BACKFILL_CANDIDATE_POOL = 24
+MESH_MAX_SPOKES_PER_PAGE = 3   # v2internallinkgraph.meshMaxSpokesPerPage
+
+# relatedlinks.stopwords, verbatim.
+STOPWORDS = {
+    "a", "o", "as", "os", "de", "da", "do", "das", "dos", "e", "em", "no",
+    "na", "nos", "nas", "para", "por", "com", "sem", "que", "ao", "aos", "um",
+    "uma", "se", "ou", "ate", "pelo", "pela",
+    "direito", "juridico", "juridica", "lei", "legal", "processo", "acao",
+    "caso", "sobre", "como", "quando", "onde", "qual", "quais",
+    "meu", "minha", "seu", "sua", "nao",
+}
+
+# relatedlinks.normalizeToken: SÓ estes acentos dobram; o resto do que não é
+# [a-z0-9] é descartado. Repare que è, ì, ò e ù não estão no Go — e por isso
+# também não podem estar aqui.
+FOLD = {
+    "á": "a", "à": "a", "â": "a", "ã": "a", "ä": "a",
+    "é": "e", "ê": "e", "ë": "e",
+    "í": "i", "î": "i", "ï": "i",
+    "ó": "o", "ô": "o", "õ": "o", "ö": "o",
+    "ú": "u", "û": "u", "ü": "u",
+    "ç": "c", "ñ": "n",
+}
+FIELD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def normalize_token(value: str) -> str:
+    out = []
+    for ch in value.lower():
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9"):
+            out.append(ch)
+        elif ch in FOLD:
+            out.append(FOLD[ch])
+    return "".join(out)
+
+
+def significant_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for field in FIELD_RE.findall(text):
+        token = normalize_token(field)
+        if len(token) < 4 or token in STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens
+
+
+def common_token_cutoff(total: int) -> int:
+    cutoff = total // 20
+    return 40 if cutoff < 40 else cutoff
+
+
+def slug(*parts: str) -> str:
+    """publicpath.Slug — SEM dobra de acento (o Go só aceita [a-z0-9])."""
+    tokens: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        for raw in re.split(r"[^a-z0-9]+", part.lower()):
+            if raw:
+                tokens.append(raw)
+    return "-".join(tokens)
+
+
+def seed_term_id(intent_id: str) -> str:
+    index = intent_id.find("-")
+    if index >= 0 and index + 1 < len(intent_id):
+        return intent_id[index + 1:]
+    return intent_id
+
+
+def public_path(area: str, intent_id: str) -> str:
+    return "/" + slug(area) + "/" + slug(seed_term_id(intent_id)) + "/"
+
+
+# --------------------------------------------------------------------------
+# Carga
+# --------------------------------------------------------------------------
+def git_show(ref: str, rel: str) -> bytes:
+    return subprocess.run(["git", "-C", os.fspath(ROOT), "show", f"{ref}:{rel}"],
+                          capture_output=True, check=True).stdout
+
+
+def load_stock(ref: str = "") -> list[dict]:
+    """v2publish.LoadPages: ordem de arquivo, descarta sem intent_id ou sem seção."""
+    pages: list[dict] = []
+    if ref:
+        listing = subprocess.run(
+            ["git", "-C", os.fspath(ROOT), "ls-tree", "--name-only", f"{ref}:data/editorial/v2_pages"],
+            capture_output=True, check=True, text=True).stdout.split()
+        shards = [(name, None) for name in sorted(n for n in listing if n.endswith(".jsonl"))]
+    else:
+        shards = [(p.name, p) for p in sorted((ROOT / "data/editorial/v2_pages").glob("*.jsonl"))]
+    for name, path in shards:
+        if path is None:
+            text = git_show(ref, f"data/editorial/v2_pages/{name}").decode("utf-8")
+        else:
+            text = path.read_text(encoding="utf-8")
+        for raw in text.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            record = json.loads(raw)
+            if not record.get("intent_id") or not record.get("sections"):
+                continue
+            record["_shard"] = name
+            pages.append(record)
+    return pages
+
+
+def load_severity(ref: str = "") -> dict[str, dict]:
+    rel = "data/editorial/v2_publication_severity.jsonl"
+    if ref:
+        text = git_show(ref, rel).decode("utf-8")
+    else:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+    index: dict[str, dict] = {}
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        row = json.loads(raw)
+        if row.get("intent_id"):
+            index[row["intent_id"]] = row
+    return index
+
+
+def select_publishable(stock: list[dict], severity: dict[str, dict]):
+    """v2publish.SelectPublishable, inclusive a colisão de rota."""
+    areas: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    by_path: dict[str, list[str]] = defaultdict(list)
+    candidates: list[dict] = []
+    for page in stock:
+        intent = page["intent_id"]
+        row = severity.get(intent)
+        if row is None:
+            skipped[intent] = "sem_linha_no_censo"
+            continue
+        if not row.get("publish"):
+            reasons = row.get("critical_reasons") or []
+            skipped[intent] = ",".join(reasons) if reasons else "critico"
+            continue
+        area = row.get("area") or slug(page.get("practice_area") or "")
+        if not area:
+            skipped[intent] = "area_indefinida"
+            continue
+        areas[intent] = area
+        path = public_path(area, intent)
+        by_path[path].append(intent)
+        candidates.append(page)
+
+    colliding: set[str] = set()
+    for path, intents in by_path.items():
+        if len(intents) > 1:
+            for intent in intents:
+                colliding.add(intent)
+                skipped[intent] = "rota_colidente:" + path
+
+    selected = [p for p in candidates if p["intent_id"] not in colliding]
+    for intent in colliding:
+        areas.pop(intent, None)
+    selected.sort(key=lambda p: p["intent_id"])
+    return selected, areas, skipped
+
+
+def load_suppressed_pairs() -> set[str]:
+    """internallinkmesh.LoadSuppressedPairs: pares de cluster de risco."""
+    prefixes = ("authorial-mass-draft-v2-", "authorial-mass-draft-",
+                "authorial-mass-content-", "v2-page-")
+
+    def intent_from_content_id(content_id: str) -> str:
+        cid = content_id.strip()
+        if not cid or "=" in cid:
+            return ""
+        for prefix in prefixes:
+            if cid.startswith(prefix):
+                return cid[len(prefix):]
+        return cid
+
+    pairs: set[str] = set()
+    path = ROOT / "data/editorial/semantic_cluster_index.jsonl"
+    if not path.is_file():
+        return pairs
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            record = json.loads(raw)
+            if record.get("record_kind") != "cluster":
+                continue
+            if record.get("max_public_members") != 0:
+                continue
+            members = record.get("member_content_ids") or record.get("assigned_content_id") or []
+            ids = [i for i in (intent_from_content_id(m) for m in members) if i]
+            if len(ids) < 2:
+                continue
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    a, b = ids[i], ids[j]
+                    pairs.add(a + "\x00" + b if a < b else b + "\x00" + a)
+    return pairs
+
+
+def load_mesh_artifact() -> dict[str, list[dict]]:
+    """internallinkmesh.Load — índice + fatias por offset/length dos shards."""
+    index_path = ROOT / "content/internal_link_mesh_index.jsonl"
+    if not index_path.is_file():
+        return {}
+    shard_cache: dict[str, bytes] = {}
+    by_intent: dict[str, list[dict]] = {}
+    with open(index_path, encoding="utf-8") as handle:
+        for raw in handle:
+            raw = raw.strip()
+            if not raw:
+                continue
+            entry = json.loads(raw)
+            shard_rel = entry["shard_path"]
+            if shard_rel not in shard_cache:
+                shard_cache[shard_rel] = (ROOT / shard_rel).read_bytes()
+            blob = shard_cache[shard_rel][entry["offset"]:entry["offset"] + entry["length"]]
+            if hashlib.sha256(blob).hexdigest() != entry["sha256"]:
+                raise SystemExit(f"sha256 divergente no artefato da malha: {entry['path']}")
+            record = json.loads(blob.decode("utf-8"))
+            by_intent[record["intent_id"]] = record.get("links") or []
+    return by_intent
+
+
+def load_institutional_paths() -> set[str]:
+    data = json.loads((ROOT / "content/pages.json").read_text(encoding="utf-8"))
+    paths = {page.get("path") for page in data if page.get("path")}
+    paths.add("/fontes/")
+    return paths
+
+
+def load_never_requested(ref: str) -> set[str]:
+    """Rotas que o Googlebot nunca pediu, lidas de um ref do git (read-only)."""
+    if ref:
+        blob = subprocess.run(
+            ["git", "-C", os.fspath(ROOT), "show",
+             f"{ref}:data/ops/crawl_coverage_never_requested.json"],
+            capture_output=True, check=True).stdout
+        coverage = json.loads(blob)
+    else:
+        coverage = json.loads(
+            (ROOT / "data/ops/crawl_coverage_never_requested.json").read_text(encoding="utf-8"))
+    googlebot = coverage.get("crawlers", {}).get("googlebot")
+    if not googlebot:
+        raise SystemExit(
+            "cobertura de rastreio sem a chave 'googlebot' — use --coverage-ref a4c48ea8")
+    return {p.strip() for p in googlebot.get("never_requested_paths", []) if p.strip()}
+
+
+# --------------------------------------------------------------------------
+# Índice de assunto e pontuação (relatedlinks.go)
+# --------------------------------------------------------------------------
+class SubjectIndex:
+    """buildSubjectIndex + overlapScores, com ids inteiros para caber no tempo."""
+
+    def __init__(self, selected: list[dict], areas: dict[str, str],
+                 overlay: dict[str, list[str]] | None = None,
+                 strip: dict[str, list[str]] | None = None):
+        self.ids: list[str] = [p["intent_id"] for p in selected]
+        self.pos: dict[str, int] = {iid: i for i, iid in enumerate(self.ids)}
+        self.area: list[str] = [areas.get(iid, "") for iid in self.ids]
+        self.shard: list[str] = [p.get("_shard", "") for p in selected]
+        self.topics: list[list[str]] = []
+        self.tokens: list[list[str]] = []
+        postings: dict[str, list[int]] = defaultdict(list)
+        for i, page in enumerate(selected):
+            topics = list(page.get("internal_link_topics") or [])
+            if strip:
+                remover = set(strip.get(page["intent_id"], []))
+                topics = [t for t in topics if t not in remover]
+            if overlay:
+                for extra in overlay.get(page["intent_id"], []):
+                    if extra not in topics:
+                        topics.append(extra)
+            self.topics.append(topics)
+            subject = " ".join([page.get("title") or "", page.get("h1") or "",
+                                " ".join(topics)])
+            tokens = significant_tokens(subject)
+            self.tokens.append(tokens)
+            for token in tokens:
+                postings[token].append(i)
+        self.postings = postings
+        self.cutoff = common_token_cutoff(len(self.ids))
+        # Termos que o corte descarta: pré-computar evita testar em cada consulta.
+        self.hot = {t for t, lst in postings.items() if len(lst) > self.cutoff}
+
+    def overlap_scores(self, i: int) -> dict[int, int]:
+        counter: Counter[int] = Counter()
+        for token in self.tokens[i]:
+            if token in self.hot:
+                continue
+            counter.update(self.postings[token])
+        counter.pop(i, None)
+        area = self.area[i]
+        scores: dict[int, int] = {}
+        for other, count in counter.items():
+            if count < MIN_TOPIC_OVERLAP:
+                continue
+            score = count * 10
+            if self.area[other] == area:
+                score += SAME_AREA_BONUS
+            scores[other] = score
+        return scores
+
+    def with_declared(self, i: int) -> dict[int, int]:
+        """overlapScores + bônus de tópico declarado que É um intent publicado."""
+        scores = self.overlap_scores(i)
+        for topic in self.topics[i]:
+            declared = topic.strip()
+            if not declared or declared == self.ids[i]:
+                continue
+            target = self.pos.get(declared)
+            if target is None:
+                continue
+            scores[target] = scores.get(target, 0) + DECLARED_TOPIC_BONUS
+        return scores
+
+
+# --------------------------------------------------------------------------
+# A cadeia
+# --------------------------------------------------------------------------
+def run_chain(index: SubjectIndex, selected: list[dict], areas: dict[str, str],
+              suppressed: set[str], artifact: dict[str, list[dict]],
+              never: set[str], verbose: bool = True,
+              pool: int = BACKFILL_CANDIDATE_POOL,
+              target_cap: int = BACKFILL_MAX_GAIN_PER_TARGET):
+    n = len(index.ids)
+    title = [(p.get("title") or "").strip() for p in selected]
+    path = [public_path(areas[p["intent_id"]], p["intent_id"]) for p in selected]
+    path_to_node = {path[i]: i for i in range(n)}
+
+    def is_suppressed(a: int, b: int) -> bool:
+        x, y = index.ids[a], index.ids[b]
+        return (x + "\x00" + y if x < y else y + "\x00" + x) in suppressed
+
+    # --- 1. malha base, truncada em capPrePiso -----------------------------
+    related: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        scores = index.with_declared(i)
+        for other in [o for o in scores if is_suppressed(i, o)]:
+            del scores[other]
+        if not scores:
+            continue
+        area = index.area[i]
+        ordered = sorted(scores.items(),
+                         key=lambda kv: (-kv[1], index.area[kv[0]] != area, index.ids[kv[0]]))
+        picked = [o for o, _ in ordered[:MAX_RELATED_LINKS]
+                  if path[o] and title[o]]
+        related[i] = picked[:CAP_PRE_PISO]
+
+    # --- 2. união com o artefato (artefato primeiro) -----------------------
+    servible = load_institutional_paths() | set(path)
+    artifact_edges = 0
+    for i in range(n):
+        links = artifact.get(index.ids[i]) or []
+        primary: list[int] = []
+        seen: set[str] = set()
+        for link in links:
+            target, anchor = (link.get("path") or "").strip(), (link.get("anchor") or "").strip()
+            if not target or not anchor or target == "/" or target == path[i] or target in seen:
+                continue
+            if target not in servible:
+                continue
+            seen.add(target)
+            primary.append(target)
+            if len(primary) >= MESH_MAX_SPOKES_PER_PAGE:
+                break
+        if not primary:
+            continue
+        merged: list[int] = []
+        used: set[str] = set()
+        for target in primary:
+            if len(merged) >= CAP_PRE_PISO:
+                break
+            node = path_to_node.get(target)
+            if node is None or target in used:
+                continue
+            used.add(target)
+            merged.append(node)
+            artifact_edges += 1
+        for node in related[i]:
+            if len(merged) >= CAP_PRE_PISO:
+                break
+            if path[node] in used:
+                continue
+            used.add(path[node])
+            merged.append(node)
+        related[i] = merged
+
+    artifact_count = [0] * n
+    for i in range(n):
+        for link in (artifact.get(index.ids[i]) or []):
+            target = (link.get("path") or "").strip()
+            if target and target in servible and target != path[i]:
+                artifact_count[i] += 1
+        artifact_count[i] = min(artifact_count[i], MESH_MAX_SPOKES_PER_PAGE)
+
+    inbound = Counter()
+    for i in range(n):
+        for node in related[i]:
+            inbound[node] += 1
+
+    # --- 3. piso de entradas ----------------------------------------------
+    floor = {"edges_added": 0, "targets_raised": 0, "suppressed_skipped": 0,
+             "still_below": [], "orphans_no_affinity": []}
+    outgoing = [set(related[i]) for i in range(n)]
+    targets = sorted(((inbound[i], index.ids[i], i) for i in range(n)
+                      if inbound[i] < INBOUND_FLOOR),
+                     key=lambda t: (t[0], t[1]))
+    floor["targets_below_before"] = len(targets)
+    for _, _, target in targets:
+        need = INBOUND_FLOOR - inbound[target]
+        if need <= 0:
+            floor["targets_raised"] += 1
+            continue
+        scores = index.overlap_scores(target)
+        if not scores:
+            floor["orphans_no_affinity"].append(index.ids[target])
+            floor["still_below"].append(index.ids[target])
+            continue
+        area = index.area[target]
+        ordered = sorted(scores.items(),
+                         key=lambda kv: (-kv[1], index.area[kv[0]] != area, index.ids[kv[0]]))
+        for source, _score in ordered:
+            if need <= 0:
+                break
+            if len(related[source]) >= MAX_RELATED_LINKS:
+                continue
+            if source == target or target in outgoing[source]:
+                continue
+            if is_suppressed(source, target):
+                floor["suppressed_skipped"] += 1
+                continue
+            related[source].append(target)
+            outgoing[source].add(target)
+            inbound[target] += 1
+            floor["edges_added"] += 1
+            need -= 1
+        if need <= 0:
+            floor["targets_raised"] += 1
+        else:
+            floor["still_below"].append(index.ids[target])
+
+    out_hist_pre = Counter(len(related[i]) for i in range(n))
+
+    # --- 4. backfill dos slots reservados ----------------------------------
+    back = Counter()
+    slots_idle_before = sum(max(0, MAX_RELATED_LINKS - len(related[i])) for i in range(n))
+    inbound_snapshot = dict(inbound)
+    never_node = [path[i] in never for i in range(n)]
+
+    queues: list[list[tuple]] = [[] for _ in range(n)]
+    for i in range(n):
+        if len(related[i]) >= MAX_RELATED_LINKS:
+            continue  # fila só é consumida por origem com espaço
+        scores = index.with_declared(i)
+        area = index.area[i]
+        candidates = []
+        for other, score in scores.items():
+            if other == i or other in outgoing[i]:
+                continue
+            if not path[other] or not title[other]:
+                continue
+            candidates.append((-score, not never_node[other],
+                               inbound_snapshot.get(other, 0),
+                               index.area[other] != area, index.ids[other], other))
+        candidates.sort()
+        queues[i] = candidates[:pool]
+
+    cursor = [0] * n
+    gained: Counter[int] = Counter()
+    filled: set[int] = set()
+    never_reached: set[int] = set()
+    # Motivo pelo qual cada origem parou, para o diagnóstico da cauda.
+    stopped: list[Counter] = [Counter() for _ in range(n)]
+
+    for _round in range(MAX_RELATED_LINKS):
+        added = 0
+        for i in range(n):
+            if len(related[i]) >= MAX_RELATED_LINKS:
+                continue
+            queue = queues[i]
+            k = cursor[i]
+            while k < len(queue):
+                _neg, _nc, _inb, _sa, _iid, other = queue[k]
+                if other == i or other in outgoing[i]:
+                    stopped[i]["ja_ligado"] += 1
+                    k += 1
+                    continue
+                if is_suppressed(i, other):
+                    back["suppressed_skipped"] += 1
+                    stopped[i]["quase_duplicata"] += 1
+                    k += 1
+                    continue
+                if i in outgoing[other]:
+                    back["reciprocal_skipped"] += 1
+                    stopped[i]["reciprocidade"] += 1
+                    k += 1
+                    continue
+                if gained[other] >= target_cap:
+                    back["target_cap_skipped"] += 1
+                    stopped[i]["teto_por_destino"] += 1
+                    k += 1
+                    continue
+                related[i].append(other)
+                outgoing[i].add(other)
+                inbound[other] += 1
+                gained[other] += 1
+                filled.add(i)
+                back["edges_added"] += 1
+                if never_node[other]:
+                    back["never_crawled_edges"] += 1
+                    never_reached.add(other)
+                added += 1
+                k += 1
+                break
+            cursor[i] = k
+        if added == 0:
+            break
+
+    slots_idle_after = 0
+    sources_without_candidates = 0
+    idle_sources: list[int] = []
+    for i in range(n):
+        space = MAX_RELATED_LINKS - len(related[i])
+        if space > 0:
+            slots_idle_after += space
+            sources_without_candidates += 1
+            idle_sources.append(i)
+
+    result = {
+        "n": n, "path": path, "title": title, "related": related,
+        "inbound": inbound, "artifact_edges": artifact_edges,
+        "floor": floor, "out_hist_pre_backfill": dict(sorted(out_hist_pre.items())),
+        "backfill": {
+            "slots_idle_before": slots_idle_before,
+            "slots_idle_after": slots_idle_after,
+            "edges_added": back["edges_added"],
+            "sources_filled": len(filled),
+            "never_crawled_edges": back["never_crawled_edges"],
+            "never_crawled_targets_reached": len(never_reached),
+            "suppressed_skipped": back["suppressed_skipped"],
+            "reciprocal_skipped": back["reciprocal_skipped"],
+            "target_gain_cap_skipped": back["target_cap_skipped"],
+            "sources_without_candidates": sources_without_candidates,
+        },
+        "idle_sources": idle_sources,
+        "queues": queues, "cursor": cursor, "stopped": stopped,
+        "gained": gained, "never_node": never_node,
+        "artifact_count": artifact_count,
+        "never_reached": never_reached, "outgoing": outgoing,
+    }
+    if verbose:
+        b = result["backfill"]
+        print(f"páginas aprovadas     : {n}")
+        print(f"malha base+artefato   : {artifact_edges} aresta(s) do artefato")
+        print(f"piso de entradas      : {floor['edges_added']} aresta(s); "
+              f"{floor['targets_raised']}/{floor['targets_below_before']} elevados; "
+              f"{len(floor['still_below'])} abaixo "
+              f"({len(floor['orphans_no_affinity'])} órfãos de afinidade)")
+        print(f"saída pré-backfill    : {result['out_hist_pre_backfill']}")
+        print(f"backfill              : {b['edges_added']} aresta(s) em "
+              f"{b['sources_filled']} página(s); slots {b['slots_idle_before']} -> "
+              f"{b['slots_idle_after']}; {b['never_crawled_edges']} aresta(s) para "
+              f"{b['never_crawled_targets_reached']} destino(s) nunca rastreado(s); "
+              f"{b['sources_without_candidates']} página(s) sem candidato afim")
+    return result
+
+
+ANCHORS = {
+    "slots_idle_before": 16877,
+    "slots_idle_after": 462,
+    "edges_added": 16415,
+    "sources_without_candidates": 458,
+    "never_crawled_targets_reached": 2403,
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--coverage-ref", default="a4c48ea8",
+                        help="ref do git de onde ler a cobertura de rastreio "
+                             "(vazio = arquivo vivo)")
+    parser.add_argument("--anchors", action="store_true",
+                        help="confere os números do ensaio real de 2026-08-12")
+    parser.add_argument("--topics-overlay", default="",
+                        help="JSON {intent_id: [tópicos]} somado ao estoque, sem escrever")
+    parser.add_argument("--diagnosis-out", default="",
+                        help="JSONL com a cauda dissecada página a página")
+    parser.add_argument("--summary-out", default="", help="JSON com o resumo")
+    parser.add_argument("--edges-out", default="",
+                        help="JSON {intent_id: [destinos]} do grafo final")
+    parser.add_argument("--topics-strip", default="",
+                        help="JSON {intent_id: [tópicos]} REMOVIDO do estoque antes de "
+                             "indexar — mede o ANTES sobre o estoque de agora")
+    parser.add_argument("--inbound-out", default="",
+                        help="JSON {intent_id: grau de entrada de malha} do grafo final")
+    parser.add_argument("--propose-overlay", default="",
+                        help="JSON com o par (fonte -> alvo) mecanicamente mais forte "
+                             "para cada alvo sem entrada nova; ainda NÃO é tópico")
+    parser.add_argument("--pool", type=int, default=BACKFILL_CANDIDATE_POOL,
+                        help="contrafactual: profundidade da fila de candidatos por origem")
+    parser.add_argument("--target-cap", type=int, default=BACKFILL_MAX_GAIN_PER_TARGET,
+                        help="contrafactual: teto de entradas que um destino ganha no passe")
+    parser.add_argument("--stock-ref", default="",
+                        help="ref do git de onde ler o estoque (prova de fidelidade)")
+    parser.add_argument("--severity-ref", default="",
+                        help="ref do git de onde ler o censo (prova de fidelidade)")
+    args = parser.parse_args()
+
+    stock = load_stock(args.stock_ref)
+    severity = load_severity(args.severity_ref)
+    selected, areas, skipped = select_publishable(stock, severity)
+    suppressed = load_suppressed_pairs()
+    artifact = load_mesh_artifact()
+    never = load_never_requested(args.coverage_ref)
+    overlay = {}
+    if args.topics_overlay:
+        overlay = json.loads(Path(args.topics_overlay).read_text(encoding="utf-8"))
+    print(f"estoque v2            : {len(stock)} páginas com corpo; "
+          f"{len(selected)} aprovadas; {len(skipped)} recusadas")
+    print(f"cobertura de rastreio : {len(never)} rota(s) nunca pedidas pelo Googlebot "
+          f"(ref {args.coverage_ref or 'árvore viva'})")
+    if overlay:
+        print(f"sobreposição de tópicos: {sum(len(v) for v in overlay.values())} "
+              f"tópico(s) em {len(overlay)} página(s)")
+
+    strip = {}
+    if args.topics_strip:
+        strip = json.loads(Path(args.topics_strip).read_text(encoding="utf-8"))
+        print(f"tópicos removidos     : {sum(len(v) for v in strip.values())} "
+              f"em {len(strip)} página(s) (medição do ANTES sobre o estoque de agora)")
+    index = SubjectIndex(selected, areas, overlay or None, strip or None)
+    result = run_chain(index, selected, areas, suppressed, artifact, never,
+                       pool=args.pool, target_cap=args.target_cap)
+
+    # Artigos nunca rastreados: quantos ganharam entrada nova no backfill.
+    never_articles = [i for i in range(result["n"]) if result["never_node"][i]]
+    without_new = [i for i in never_articles if i not in result["never_reached"]]
+    print(f"nunca rastreados      : {len(never_articles)} artigo(s) da malha; "
+          f"{len(result['never_reached'])} ganharam entrada nova; "
+          f"{len(without_new)} sem nenhuma")
+
+    if args.anchors:
+        got = dict(result["backfill"])
+        bad = [(k, v, got[k]) for k, v in ANCHORS.items() if got[k] != v]
+        if bad:
+            for key, want, have in bad:
+                print(f"ÂNCORA DIVERGIU: {key} esperado {want}, medido {have}",
+                      file=sys.stderr)
+            return 1
+        print("âncoras conferem com o ensaio real de 2026-08-12: "
+              + ", ".join(f"{k}={v}" for k, v in ANCHORS.items()))
+
+    if args.summary_out:
+        payload = {
+            "gerador": Path(__file__).name,
+            "coverage_ref": args.coverage_ref,
+            "topics_overlay": args.topics_overlay,
+            "paginas_aprovadas": result["n"],
+            "piso": {k: (len(v) if isinstance(v, list) else v)
+                     for k, v in result["floor"].items()},
+            "backfill": result["backfill"],
+            "saida_pre_backfill": result["out_hist_pre_backfill"],
+            "nunca_rastreados_artigos": len(never_articles),
+            "nunca_rastreados_com_entrada_nova": len(result["never_reached"]),
+            "nunca_rastreados_sem_entrada_nova": len(without_new),
+        }
+        Path(args.summary_out).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        print(f"resumo                : {args.summary_out}")
+
+    if args.diagnosis_out:
+        write_diagnosis(args.diagnosis_out, index, result, without_new)
+        print(f"diagnóstico           : {args.diagnosis_out}")
+
+    if args.inbound_out:
+        Path(args.inbound_out).write_text(json.dumps(
+            {index.ids[i]: result["inbound"][i] for i in range(result["n"])},
+            ensure_ascii=False), encoding="utf-8")
+        print(f"grau de entrada       : {args.inbound_out}")
+
+    if args.edges_out:
+        path_to_id = {result["path"][i]: index.ids[i] for i in range(result["n"])}
+        Path(args.edges_out).write_text(json.dumps(
+            {index.ids[i]: [index.ids[n] for n in result["related"][i]]
+             for i in range(result["n"])}, ensure_ascii=False), encoding="utf-8")
+        print(f"arestas finais        : {args.edges_out}")
+
+    if args.propose_overlay:
+        propose_overlay(args.propose_overlay, index, result, without_new, suppressed)
+        print(f"proposta de pares     : {args.propose_overlay}")
+    return 0
+
+
+def propose_overlay(out_path: str, index: SubjectIndex, result,
+                    without_new: list[int], suppressed: set[str]) -> None:
+    """Para cada alvo sem entrada nova, o vizinho afim MAIS FORTE que pode citá-lo.
+
+    É só a proposta MECÂNICA — o par ainda tem que ser conferido contra o texto
+    real das duas páginas antes de virar tópico. Serve para medir o teto do ganho
+    antes de gastar leitura com pares que não renderiam nada.
+    """
+    pares = []
+    for target in without_new:
+        scores = index.overlap_scores(target)
+        if not scores:
+            continue
+        area = index.area[target]
+        ordered = sorted(scores.items(),
+                         key=lambda kv: (-kv[1], index.area[kv[0]] != area, index.ids[kv[0]]))
+        opcoes = []
+        for source, score in ordered:
+            a, b = index.ids[source], index.ids[target]
+            chave = a + "\x00" + b if a < b else b + "\x00" + a
+            if chave in suppressed:
+                continue
+            if target in result["outgoing"][source]:
+                continue
+            if index.ids[target] in index.topics[source]:
+                continue
+            # Quantos tópicos da fonte JÁ resolvem para um intent publicado: cada
+            # um vale +100 e disputaria a mesma cabeça de fila com o novo.
+            concorrentes = sum(1 for t in index.topics[source]
+                               if t.strip() in index.pos and t.strip() != index.ids[source])
+            opcoes.append({
+                "fonte_intent_id": index.ids[source],
+                "fonte_path": result["path"][source],
+                "fonte_title": result["title"][source],
+                "fonte_area": index.area[source],
+                "fonte_shard": index.shard[source],
+                "score_afinidade": score,
+                "fonte_destinos_do_artefato": result["artifact_count"][source],
+                "fonte_topicos_intent_concorrentes": concorrentes,
+                "fonte_saida_hoje": len(result["related"][source]),
+                "termos_em_comum": sorted(
+                    set(index.tokens[source]) & set(index.tokens[target])),
+            })
+            if len(opcoes) >= 6:
+                break
+        if not opcoes:
+            continue
+        # A melhor fonte é a que faz o +100 PEGAR: sem concorrente de +100, com
+        # folga na base (artefato ocupa no máximo 3 dos 4 slots pré-piso) e com
+        # a maior afinidade real. Ordem só reordena o que já é afim.
+        opcoes.sort(key=lambda o: (o["fonte_topicos_intent_concorrentes"],
+                                   o["fonte_destinos_do_artefato"],
+                                   -o["score_afinidade"], o["fonte_intent_id"]))
+        pares.append({
+            "alvo_intent_id": index.ids[target],
+            "alvo_path": result["path"][target],
+            "alvo_title": result["title"][target],
+            "alvo_area": area,
+            "alvo_entradas_hoje": result["inbound"][target],
+            "fontes_candidatas": opcoes[:3],
+        })
+    Path(out_path).write_text(
+        json.dumps(pares, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(f"  {len(pares)} par(es) propostos para {len(without_new)} alvo(s)")
+
+
+def classify(index: SubjectIndex, result, i: int) -> tuple[str, dict]:
+    """Por que ESTA origem terminou com slot vazio."""
+    queue = result["queues"][i]
+    stop = result["stopped"][i]
+    scores = index.with_declared(i)
+    affine = len([o for o in scores if o != i])
+    detail = {
+        "candidatos_afins": affine,
+        "fila": len(queue),
+        "fila_consumida": result["cursor"][i],
+        "recusas": dict(stop),
+        "tokens": len(index.tokens[i]),
+        "topicos": len(index.topics[i]),
+        "slots_vazios": MAX_RELATED_LINKS - len(result["related"][i]),
+    }
+    if affine == 0:
+        return "sem_nenhum_candidato_afim", detail
+    if len(queue) == 0:
+        return "todos_candidatos_ja_ligados", detail
+    if result["cursor"][i] < len(queue):
+        return "fila_nao_esgotada", detail  # não deveria acontecer; sinaliza bug
+    dominante = stop.most_common(1)[0][0] if stop else "fila_curta"
+    if affine > len(queue) and dominante == "teto_por_destino":
+        return "pool_24_esgotado_por_teto_de_destino", detail
+    return "fila_esgotada_" + dominante, detail
+
+
+def write_diagnosis(out_path: str, index: SubjectIndex, result, without_new: list[int]) -> None:
+    lines: list[str] = []
+    causes = Counter()
+    for i in result["idle_sources"]:
+        cause, detail = classify(index, result, i)
+        causes[cause] += 1
+        lines.append(json.dumps({
+            "tipo": "slot_vazio",
+            "intent_id": index.ids[i],
+            "path": result["path"][i],
+            "area": index.area[i],
+            "title": result["title"][i],
+            "causa": cause,
+            **detail,
+        }, ensure_ascii=False))
+    # Artigos nunca rastreados sem entrada nova: quem PODERIA cita-los?
+    idle_set = set(result["idle_sources"])
+    for i in without_new:
+        scores = index.overlap_scores(i)
+        vizinhos_com_slot = [o for o in scores if o in idle_set]
+        lines.append(json.dumps({
+            "tipo": "nunca_rastreado_sem_entrada_nova",
+            "intent_id": index.ids[i],
+            "path": result["path"][i],
+            "area": index.area[i],
+            "title": result["title"][i],
+            "vizinhos_afins": len(scores),
+            "vizinhos_afins_com_slot_vazio": len(vizinhos_com_slot),
+            "entradas_hoje": result["inbound"][i],
+            "ganho_no_backfill": result["gained"][i],
+            "tokens": len(index.tokens[i]),
+            "topicos": len(index.topics[i]),
+        }, ensure_ascii=False))
+    Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("causas dos slots vazios:")
+    for cause, count in causes.most_common():
+        print(f"  {count:5d}  {cause}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

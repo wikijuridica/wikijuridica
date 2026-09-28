@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""generate-bot-ip-ranges — faixas oficiais de IP por operador, DERIVADAS da política.
+
+Escreve `data/ops/bot_ip_ranges/<operador>.json`, que é a verificação de
+identidade disponível na ORIGEM: no log do nginx não existe o
+`verifiedBotCategory` da borda, então a faixa publicada pelo operador (ou, na
+falta dela, o rDNS bidirecional) é o que separa "é mesmo o Googlebot" de "é
+alguém escrevendo Googlebot no User-Agent".
+
+O QUE MUDOU EM 2026-08-26, E POR QUE NÃO ERA COSMÉTICO.
+
+Até aqui as onze URLs e o mapeamento operador→agentes eram LITERAIS neste
+arquivo. Tabela literal dentro do consumidor não é conferível por gate nenhum, e
+envelheceu exatamente como se espera:
+
+  (a) as três URLs do Google respondiam **301**. O caminho canônico virou
+      `/static/crawling/ipranges/` e `googlebot.json` foi **renomeado** para
+      `common-crawlers.json` — o redirecionamento aponta para um arquivo de nome
+      diferente, e viver de redirect é depender de um redirect que o operador
+      nunca prometeu manter;
+
+  (b) o mapeamento estava **errado** para três agentes, com falso negativo
+      MEDIDO. `googleother`, `storebot-google` e `google-inspectiontool` estavam
+      apontados para `special-crawlers.json`. A doc oficial de crawlers de caso
+      especial lista cinco agentes (APIs-Google, AdsBot-Google-Mobile,
+      AdsBot-Google, Mediapartners-Google, Google-Safety) e nenhum dos três — eles
+      são crawlers COMUNS. Conferido contra o dado, não só contra a prosa: os três
+      IPs reais de `Google-InspectionTool` no log desta casa (66.249.73.97/.98/.99,
+      **42 requisições**) estão **3/3** dentro de `common-crawlers.json` e **0/3**
+      dentro de `special-crawlers.json`. Cada uma daquelas 42 requisições era
+      contada como "não verificável" por causa da linha errada;
+
+  (c) faltava `openai-adsbot` — existe, é oficial (developers.openai.com/api/docs/bots)
+      e responde 200.
+
+A fonte agora é `content/crawl_policy.json` → `bot_ip_range_sources`, gerada de
+`crawl.DefaultBotIPRangeSources()` e validada por `crawl.ValidatePolicy`. Este
+script não decide URL nem mapeamento: ele executa a política.
+
+A ARMADILHA DO VERDE POR AUSÊNCIA, que é a razão do campo `prefix_schema`.
+
+Os operadores não convergiram num formato. A Amazon, por exemplo, publica
+`ipv4Prefix` sem máscara, `ip_prefix` em CIDR /32 e `ipv4Prefix` solto — três
+formas incompatíveis entre si. Um coletor escrito contra o formato do Google e
+apontado para um publicador de outro formato **grava lista vazia**, e lista vazia
+passa em qualquer gate que só conte arquivos: o bot autêntico vira "não
+verificável" e nada fica vermelho. Por isso a política DECLARA a forma esperada,
+o parser reprova o que não reconhece, e **arquivo com zero prefixo não é escrito
+— é falha**.
+
+O QUE MUDOU EM 2026-08-28: O CAMPO `fetched_at`.
+
+Até aqui a única evidência da IDADE de uma faixa era o mtime do arquivo, que é
+metadado de sistema de arquivos: `git clone`, `git checkout`, `cp` e `rsync`
+reescrevem os doze mtimes para o instante da cópia, e `touch` falsifica todos em
+um comando. Quem lia a idade por ali (`check-bot-telemetry-honesty:332`, limiar
+de 7 dias) media a data da CÓPIA, não a data da COLETA — e o modo de falha é o
+mesmo de sempre nesta série: faixa vencida faz bot legítimo cair fora de todos os
+prefixos, vira "não verificável", e o projeto conclui que o bot sumiu quando ele
+só trocou de bloco.
+
+`fetched_at` é o instante UTC da coleta bem-sucedida daquele operador, gravado
+DENTRO do JSON e portanto versionado junto com os prefixos. É acrescentado, nunca
+substitui nada: os consumidores atuais leem `prefixes`, `authenticates_agents` e
+`source_url` por nome (`tools/botagents.py:236`, `tools/check-bot-ip-ranges-derivadas:94`,
+`tools/generate-bot-traffic-origin:175`) e nenhum deles rejeita chave
+desconhecida, então o formato continua válido para todos.
+
+O consumidor que exigiu MEDIÇÃO, e não leitura: `check-firewall-bot-safety:74`
+não lê chave nenhuma — ele varre o JSON inteiro com um regex de CIDR, de
+propósito, para não quebrar calado quando o upstream mudar de formato. Um campo
+de data novo entra nessa varredura. Medido em 2026-08-28, com o mesmo regex,
+antes e depois: **2.450 redes extraídas nos dois casos, zero rede nova**. O
+regex chega a capturar `:11:` de dentro do carimbo, e `ipaddress.ip_network` o
+descarta — carimbo ISO 8601 nunca contém `::` nem oito grupos, então não existe
+horário que vire IPv6 válido. Era o único jeito de o campo virar bloqueio de
+firewall errado, e não vira.
+
+NÃO confundir com `creation_time_upstream`, que é a data em que o OPERADOR
+montou a lista — e que aqui, medido em 2026-08-28, vai de 2024-01-03 (bingbot) a
+2026-08-27 (Google). Idade de coleta e idade de publicação são coisas
+diferentes: um gate de frescor que lesse `creationTime` reprovaria 5 dos 12 (medido: 5 acima de meio ano, 7 acima de trinta dias)
+arquivos que estão perfeitamente atualizados. O gate é
+`tools/check-bot-ip-ranges-frescor`.
+
+CUSTO ACEITO, para não descobrir depois: como `fetched_at` muda a cada execução
+bem-sucedida, o timer diário passa a deixar os 12 arquivos modificados todo dia,
+mesmo quando nenhum prefixo mudou. É o preço de ter a data de coleta auditável —
+gravar o carimbo só quando o conteúdo muda devolveria exatamente a ambiguidade
+que ele existe para remover ("não mudou" ficaria indistinguível de "não coletei").
+"""
+
+import argparse
+import datetime
+import ipaddress
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (o sys.path precisa existir antes do import)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+DESTINO = os.path.join(ROOT, "data/ops/bot_ip_ranges")
+POLITICA = os.path.join(ROOT, "content/crawl_policy.json")
+# Continua `v1` de propósito: `fetched_at` é ACRESCENTADO e nenhum consumidor
+# lê esta chave (medido em 2026-08-28: `grep -rn bot_ip_ranges_v1 tools/ internal/
+# cmd/` devolve só esta linha). Bumpar a versão sem ninguém que negocie versão
+# seria fingir um contrato que não existe.
+SCHEMA = "bot_ip_ranges_v1"
+
+# A única forma de JSON que este coletor entende. O nome é o mesmo declarado em
+# crawl.PrefixSchemaIPv4IPv6Prefix — divergência entre os dois reprova, em vez de
+# gravar lista vazia.
+SCHEMA_IPV4_IPV6_PREFIX = "prefixes_ipv4prefix_ipv6prefix"
+
+
+def agora_utc():
+    """Instante UTC em ISO 8601 com sufixo `Z`, segundo inteiro.
+
+    UTC, e não hora local, porque a série é comparada com `creationTime` de
+    operador (todos em UTC) e com log de borda; guardar -03:00 aqui obrigaria
+    cada leitor a converter, e leitor que esquece de converter erra por 3 horas
+    num limiar medido em dias. Microssegundo é descartado: o dado é a idade em
+    dias, e precisão falsa convida a comparação de string entre execuções.
+    """
+    return (datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"))
+
+
+def fontes_da_politica():
+    """Lê `bot_ip_range_sources` de content/crawl_policy.json.
+
+    Falta do arquivo, do campo ou de campo obrigatório é ERRO: sem a fonte não há
+    o que coletar, e coletar por default embutido recriaria o literal que esta
+    versão existe para eliminar.
+    """
+    with open(POLITICA, encoding="utf-8") as handle:
+        politica = json.load(handle)
+    fontes = politica.get("bot_ip_range_sources")
+    if not isinstance(fontes, list) or not fontes:
+        raise SystemExit(
+            "crawl_policy.json sem 'bot_ip_range_sources' — rode "
+            "./tools/go-modern run ./cmd/generate-crawl-policy")
+    for fonte in fontes:
+        for campo in ("operator", "url", "prefix_schema", "authenticates_agents"):
+            if not fonte.get(campo):
+                raise SystemExit("fonte de faixa sem '%s': %r" % (campo, fonte))
+    return fontes
+
+
+def operadores_sem_json(fontes):
+    """Agentes com método de verificação por rDNS e sem faixa publicada.
+
+    DERIVADO, não listado: é o que `botagents.RDNS` conhece menos o que as fontes
+    da política já autenticam. Assim, no dia em que um operador passar a publicar
+    faixa, ele sai desta lista sozinho — e no dia em que um agente novo ganhar
+    sufixo de rDNS, ele entra sozinho.
+    """
+    cobertos = {agente for fonte in fontes for agente in fonte["authenticates_agents"]}
+    return {chave: sufixos for chave, sufixos in sorted(botagents.RDNS.items())
+            if chave not in cobertos}
+
+
+# Identidade única de saída (CLAUDE.md §11 e internal/wikijuridicabot). As URLs
+# vêm de crawl_policy.json e são TODAS de operadores de bot externos — Google,
+# Bing, OpenAI, Anthropic, Perplexity, DuckDuckGo, Apple. Quem publica faixa de
+# IP para autenticar o próprio crawler é exatamente quem tem de conseguir
+# identificar quem a está lendo.
+#
+# MEDIDO em 2026-09-05, um GET por host, canônico e antigo lado a lado:
+#   developers.google.com/.../common-crawlers.json  200 / 21.768 B (os dois)
+#   openai.com/gptbot.json                          200 /  1.133 B (os dois)
+#   claude.com/crawling/bots.json                   200 /  1.162 B (os dois)
+#   www.perplexity.ai/perplexitybot.json            200 /    482 B (os dois)
+#   duckduckgo.com/duckduckbot.json                 200 / 32.101 B (os dois)
+#   www.bing.com/toolbox/bingbot.json               200 /  1.580 B (canônico)
+# search.developer.apple.com não pôde ser medido no caminho .json (a guarda
+# local protect-bot-ratelimit barra a URL por conter "applebot"); o host
+# respondeu 307, sem bloqueio de WAF, ao mesmo User-Agent.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; faixas-de-ip-de-bots)")
+
+
+def baixar(url):
+    pedido = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(pedido, timeout=30) as resposta:
+            bruto = resposta.read().decode("utf-8", errors="replace")
+            url_final = resposta.geturl()
+    except urllib.error.HTTPError as erro:
+        return None, None, "HTTP %s" % erro.code
+    except Exception as erro:
+        return None, None, str(erro)[:140]
+    try:
+        dados = json.loads(bruto)
+    except Exception:
+        # Um agente anterior chutou seis URLs da Anthropic e recebeu 404 com
+        # corpos de 58 KB e 578 KB de HTML de SPA. Teste por TAMANHO daria
+        # falso-positivo; só a checagem de forma salva.
+        return None, url_final, "resposta nao e JSON (%d bytes)" % len(bruto)
+    if not isinstance(dados, dict) or not isinstance(dados.get("prefixes"), list):
+        return None, url_final, "JSON sem a lista 'prefixes'"
+    return dados, url_final, ""
+
+
+def prefixos_validos(dados, schema):
+    """(bons, ruins) segundo o schema DECLARADO pela política.
+
+    Entrada que o schema não prevê entra em `ruins` com o que ela era — nunca é
+    ignorada. É a diferença entre "o operador publicou uma faixa que eu não
+    entendi" e "o operador não publicou faixa", e confundir as duas foi o que
+    faria um bot autêntico virar não-verificável em silêncio.
+    """
+    if schema != SCHEMA_IPV4_IPV6_PREFIX:
+        raise SystemExit("prefix_schema desconhecido: %r" % schema)
+    bons, ruins = [], []
+    for entrada in dados.get("prefixes", []):
+        if not isinstance(entrada, dict):
+            ruins.append(repr(entrada)[:60])
+            continue
+        bruto = entrada.get("ipv4Prefix") or entrada.get("ipv6Prefix")
+        if not bruto:
+            ruins.append(repr(entrada)[:60])
+            continue
+        try:
+            ipaddress.ip_network(bruto, strict=False)
+        except ValueError:
+            ruins.append(bruto)
+            continue
+        bons.append(bruto)
+    return bons, ruins
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    fontes = fontes_da_politica()
+    os.makedirs(DESTINO, exist_ok=True)
+    resumo = []
+    falhas = []
+    for fonte in sorted(fontes, key=lambda f: f["operator"]):
+        operador = fonte["operator"]
+        url = fonte["url"]
+        dados, url_final, erro = baixar(url)
+        # Carimbado AQUI, depois do download e antes de qualquer coisa poder
+        # falhar: `fetched_at` promete "este operador respondeu neste instante",
+        # não "o processo começou". Um carimbo único do início da execução
+        # mentiria por até 30 s x 12 operadores quando uma fonte fica lenta, e
+        # mentiria muito mais se uma fonte falhasse — a falha não escreve
+        # arquivo, e o carimbo antigo tem de sobreviver para o gate de frescor
+        # enxergar a faixa envelhecendo.
+        coletado_em = agora_utc()
+        if erro:
+            falhas.append((operador, url, erro))
+            print("  FALHA  %-26s %s" % (operador, erro), file=sys.stderr)
+            continue
+        prefixos, malformados = prefixos_validos(dados, fonte["prefix_schema"])
+        if not prefixos:
+            # ZERO PREFIXO NÃO É ARQUIVO, É FALHA. Gravar a lista vazia deixaria
+            # o diretório com um arquivo de aparência normal que não autentica
+            # ninguém, e o gate ficaria verde por ausência de dado — o modo de
+            # falha que o cabeçalho descreve.
+            motivo = "zero prefixo valido (%d entrada(s) nao reconhecida(s))" % len(malformados)
+            falhas.append((operador, url, motivo))
+            print("  FALHA  %-26s %s" % (operador, motivo), file=sys.stderr)
+            continue
+        registro = {
+            "schema_version": SCHEMA,
+            "operator": operador,
+            "source_url": url,
+            "prefix_schema": fonte["prefix_schema"],
+            "official_doc": fonte.get("official_doc", ""),
+            "authenticates_agents": list(fonte["authenticates_agents"]),
+            "creation_time_upstream": dados.get("creationTime", ""),
+            # A data em que ESTA CASA leu a fonte. Não confundir com a de cima,
+            # que é a data em que o operador montou a lista — medido em
+            # 2026-08-28, bingbot publica com creationTime de 2024-01-03 e está
+            # rigorosamente em dia.
+            "fetched_at": coletado_em,
+            "prefix_count": len(prefixos),
+            "prefixes": prefixos,
+            "malformed_prefixes": malformados,
+        }
+        caminho = os.path.join(DESTINO, operador + ".json")
+        with open(caminho, "w", encoding="utf-8") as handle:
+            json.dump(registro, handle, ensure_ascii=False, indent=1, sort_keys=True)
+            handle.write("\n")
+        redirecionou = url_final and url_final != url
+        resumo.append((operador, len(prefixos), len(malformados)))
+        print("  ok     %-26s %4d prefixo(s)%s%s" % (
+            operador, len(prefixos),
+            "  (%d malformado(s) descartado(s))" % len(malformados) if malformados else "",
+            "  ATENCAO: respondeu por redirecionamento -> %s" % url_final if redirecionou else ""))
+
+    for agente, sufixos in operadores_sem_json(fontes).items():
+        print("  --     %-26s sem faixa publicada; verificacao por rDNS %s" % (
+            agente, ", ".join(sufixos)))
+
+    print("\n%d operador(es) em %s" % (len(resumo), os.path.relpath(DESTINO, ROOT)))
+    if args.json:
+        print(json.dumps({"ok": resumo, "falhas": falhas}, ensure_ascii=False, indent=2))
+
+    # Falha de coleta é erro: um cache silenciosamente incompleto faria o
+    # coletor marcar bot autentico como "nao verificavel", e a serie perderia
+    # exatamente a distincao que ela existe para fazer.
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

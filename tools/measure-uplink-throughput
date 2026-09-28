@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""measure-uplink-throughput — quanto o uplink deste servidor ENTREGA de fato.
+
+POR QUE EXISTE: o bitrate que o `iw` mostra e a taxa NEGOCIADA do enlace, nao a
+vazao. Em 2026-08-19 o enlace anunciava 72,2 Mbit/s e entregava 47,1 Mbit/s
+reais — decidir troca de banda pelo numero negociado seria decidir por uma
+estimativa. Esta ferramenta existe para que "antes" e "depois" sejam a MESMA
+medida, feita do mesmo jeito, e nao duas impressoes.
+
+O QUE MEDE, e por que cada campo esta junto: vazao de descida, vazao de subida e
+latencia, gravadas SEMPRE ao lado do estado do radio no instante da medicao
+(SSID, banda, canal, largura, sinal, bitrate negociado). Numero de vazao sem o
+estado do radio ao lado nao permite comparar nada depois — e a comparacao e o
+proposito.
+
+ANTI-FRAUDE: mede contra `speed.cloudflare.com`, um destino de teste publico
+ALHEIO ao portal. E proibido medir baixando o proprio site: isso injetaria
+requisicao artificial na audiencia do wikijuridica.com.br e contaminaria a
+telemetria de crawler. Nenhum byte deste teste toca a origem do portal.
+
+★ POR QUE ELA NAO TEM TIMER, E ISSO NAO E UM GAP (verificado em 2026-08-19)
+
+Esta ferramenta nao tem chamador, e a ausencia e DELIBERADA. Nao e o caso do
+`tools/measure-ai-citation`, que ficou sete dias parado e perdeu serie: aquele le
+o access log do nginx, que ROTACIONA — dormir la destroi dado que nao volta. Aqui
+nao ha dado a perder: a vazao do enlace e mensuravel a qualquer instante, e uma
+medicao que nao foi feita hoje pode ser feita agora com o mesmo resultado.
+
+Tres razoes para nao ligar um timer:
+
+  1. CADA EXECUCAO SATURA O UPLINK QUE SERVE O PORTAL. Sao 25 MB de descida mais
+     10 MB de subida por amostra, pelo mesmo radio por onde as replicas do
+     cloudflared entregam a borda. Um vigia que degrada o que vigia e um
+     instrumento que mede a si mesmo.
+  2. O DESENHO E DE COMPARACAO A/B, NAO DE SERIE. O `--rotulo` (`antes-5ghz`,
+     `depois-migracao-5ghz`) existe para amarrar duas medicoes a UMA mudanca
+     deliberada, e e assim que as duas linhas de `data/ops/uplink_throughput.jsonl`
+     nasceram. Rotulo so tem sentido quando um humano sabe o que mudou.
+  3. A VIGILANCIA CONTINUA DO ENLACE JA EXISTE, e e a de 60 em 60 segundos do
+     `wikijuridica-network-health.timer` (associacao, retransmissao de radio e de
+     TCP, perda e RTT, DNS, rota). Ela NAO mede vazao — e nem deve, pelo motivo (1):
+     o vigia continuo tem que ser barato.
+
+Nao ha duplicacao entre as duas: `check-network-health` le contadores do kernel e
+pinga; esta mede bytes por segundo de ponta a ponta. Ela e o instrumento que se
+chama NA MAO quando ha uma decisao de infraestrutura para tomar (trocar banda,
+canal, largura, antena, provedor) — e e por isso que o cabecalho insiste que
+"antes" e "depois" sejam a MESMA medida.
+
+Uso:
+    tools/measure-uplink-throughput                  # 25 MB de descida
+    tools/measure-uplink-throughput --rotulo antes-5ghz --amostras 3
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+HISTORICO = os.path.join(ROOT, "data/ops/uplink_throughput.jsonl")
+IW = "/usr/sbin/iw"
+SCHEMA = "uplink_throughput_v1"
+DESTINO = "https://speed.cloudflare.com"
+
+# AO SAIR PARA A REDE, O PORTAL E O WikijuridicaBot (CLAUDE.md secao 11, ordem
+# do dono de 2026-09-05). Ate 2026-09-10 as duas medidas saiam como `curl/8.x`
+# para speed.cloudflare.com. O proposito e' proprio: nao se coleta nem se
+# submete nada aqui, mede-se a BANDA do enlace que serve o portal — e o volume
+# nao e' pequeno (25 MB por descida), entao quem recebe merece saber quem esta
+# do outro lado. A forma e' a que
+# `internal/wikijuridicabot.UserAgentComProposito` produziria.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; medicao-de-uplink)")
+
+
+def rodar(comando, timeout=120):
+    try:
+        r = subprocess.run(comando, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as erro:
+        return 1, "", str(erro)
+
+
+def estado_radio():
+    """O contexto sem o qual a vazao nao significa nada."""
+    rc, saida, _ = rodar(["ip", "-j", "route", "show", "default"], timeout=10)
+    interface = None
+    try:
+        rotas = json.loads(saida) if rc == 0 else []
+        interface = rotas[0].get("dev") if rotas else None
+    except (ValueError, IndexError, AttributeError):
+        pass
+    if not interface:
+        return {}
+    dados = {"interface": interface}
+    rc, link, _ = rodar([IW, "dev", interface, "link"], timeout=10)
+    if rc != 0 or "Not connected" in link:
+        return dados
+    for chave, padrao, conv in [
+        ("ssid", r"SSID:\s*(.+)", str.strip),
+        ("bssid", r"Connected to ([0-9a-f:]{17})", str.strip),
+        ("freq_mhz", r"freq:\s*(\d+)", int),
+        ("sinal_dbm", r"signal:\s*(-?\d+)", int),
+        ("tx_bitrate_mbit", r"tx bitrate:\s*([\d.]+)", float),
+        ("rx_bitrate_mbit", r"rx bitrate:\s*([\d.]+)", float),
+    ]:
+        m = re.search(padrao, link)
+        if m:
+            dados[chave] = conv(m.group(1))
+    if dados.get("freq_mhz"):
+        dados["banda"] = "5GHz" if dados["freq_mhz"] >= 5000 else "2.4GHz"
+    rc, info, _ = rodar([IW, "dev", interface, "info"], timeout=10)
+    m = re.search(r"channel (\d+).*width: (\d+) MHz", info)
+    if m:
+        dados["canal"] = int(m.group(1))
+        dados["largura_mhz"] = int(m.group(2))
+    return dados
+
+
+def medir_descida(bytes_alvo, timeout):
+    rc, saida, erro = rodar([
+        "curl", "-sS", "-o", "/dev/null", "--max-time", str(timeout),
+        "-A", USER_AGENT,
+        "-w", "%{speed_download} %{size_download} %{time_total}",
+        f"{DESTINO}/__down?bytes={bytes_alvo}"], timeout=timeout + 15)
+    if rc != 0 or not saida.strip():
+        return {"ok": False, "erro": (erro or "sem saida").strip()[:200]}
+    partes = saida.split()
+    try:
+        velocidade = float(partes[0])
+        return {"ok": True, "bytes": int(float(partes[1])),
+                "segundos": round(float(partes[2]), 3),
+                "mbit_s": round(velocidade * 8 / 1_000_000, 2)}
+    except (ValueError, IndexError):
+        return {"ok": False, "erro": saida[:200]}
+
+
+def medir_subida(bytes_alvo, timeout):
+    """Sobe de /dev/zero. A subida importa aqui porque o portal e SERVIDOR:
+    todo byte de pagina entregue a Cloudflare sai por este caminho."""
+    # O corpo sai de um arquivo de zeros, e nao de stdin: alimentar o pipe do
+    # curl de dentro do subprocess exigiria uma thread so para isso, e o que se
+    # mede — bytes por segundo subindo pelo radio — e exatamente o mesmo.
+    # Este e um dos poucos usos legitimos de /tmp: arquivo descartavel,
+    # reproduzivel em milissegundos, apagado no fim desta funcao.
+    caminho = "/tmp/uplink-upload-probe.bin"
+    try:
+        with open(caminho, "wb") as arquivo:
+            arquivo.write(b"\0" * bytes_alvo)
+    except OSError as erro_io:
+        return {"ok": False, "erro": str(erro_io)[:200]}
+    rc, saida, erro = rodar([
+        "curl", "-sS", "-o", "/dev/null", "--max-time", str(timeout),
+        "-A", USER_AGENT,
+        "-w", "%{speed_upload} %{size_upload} %{time_total}",
+        "-X", "POST", "--data-binary", f"@{caminho}", f"{DESTINO}/__up"],
+        timeout=timeout + 15)
+    try:
+        os.unlink(caminho)
+    except OSError:
+        pass
+    if rc != 0 or not saida.strip():
+        return {"ok": False, "erro": (erro or "sem saida").strip()[:200]}
+    partes = saida.split()
+    try:
+        return {"ok": True, "bytes": int(float(partes[1])),
+                "segundos": round(float(partes[2]), 3),
+                "mbit_s": round(float(partes[0]) * 8 / 1_000_000, 2)}
+    except (ValueError, IndexError):
+        return {"ok": False, "erro": saida[:200]}
+
+
+def medir_latencia(destino, pacotes=20):
+    rc, saida, _ = rodar(["ping", "-n", "-q", "-c", str(pacotes), "-i", "0.2",
+                          "-W", "2", destino], timeout=pacotes + 25)
+    resultado = {"destino": destino}
+    m = re.search(r"(\d+) packets transmitted, (\d+) received", saida)
+    if m:
+        env, rec = int(m.group(1)), int(m.group(2))
+        resultado["perda_pct"] = round(100.0 * (env - rec) / env, 2) if env else 100.0
+    m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", saida)
+    if m:
+        resultado.update({"rtt_min_ms": float(m.group(1)), "rtt_medio_ms": float(m.group(2)),
+                          "rtt_max_ms": float(m.group(3)), "rtt_desvio_ms": float(m.group(4))})
+    return resultado
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--rotulo", default="", help="marca esta medicao (ex.: antes-5ghz)")
+    p.add_argument("--bytes", type=int, default=25_000_000)
+    p.add_argument("--amostras", type=int, default=1)
+    p.add_argument("--timeout", type=int, default=90)
+    p.add_argument("--sem-subida", action="store_true")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args()
+
+    radio = estado_radio()
+    gateway = None
+    rc, saida, _ = rodar(["ip", "-j", "route", "show", "default"], timeout=10)
+    try:
+        gateway = json.loads(saida)[0].get("gateway") if rc == 0 else None
+    except (ValueError, IndexError, AttributeError):
+        pass
+
+    descidas, subidas = [], []
+    for _ in range(max(1, a.amostras)):
+        descidas.append(medir_descida(a.bytes, a.timeout))
+        if not a.sem_subida:
+            subidas.append(medir_subida(min(a.bytes, 10_000_000), a.timeout))
+
+    boas_d = [d["mbit_s"] for d in descidas if d.get("ok")]
+    boas_s = [s["mbit_s"] for s in subidas if s.get("ok")]
+    evento = {
+        "schema_version": SCHEMA,
+        "medido_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "rotulo": a.rotulo,
+        "radio": radio,
+        "descida": descidas,
+        "subida": subidas,
+        # Melhor amostra, e nao media: a media de uma serie curta e puxada para
+        # baixo por qualquer disputa passageira do meio, e o que se quer saber
+        # aqui e do que o enlace E CAPAZ.
+        "descida_melhor_mbit_s": max(boas_d) if boas_d else None,
+        "subida_melhor_mbit_s": max(boas_s) if boas_s else None,
+        "latencia_gateway": medir_latencia(gateway) if gateway else {},
+        "latencia_externa": medir_latencia("1.1.1.1", 10),
+    }
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(evento, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if a.json:
+        print(json.dumps(evento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(f"[{a.rotulo or 'sem rotulo'}] {radio.get('banda', '?')} "
+              f"canal {radio.get('canal', '?')} largura {radio.get('largura_mhz', '?')} MHz "
+              f"sinal {radio.get('sinal_dbm', '?')} dBm "
+              f"negociado {radio.get('tx_bitrate_mbit', '?')} Mbit/s")
+        print(f"  descida: {evento['descida_melhor_mbit_s']} Mbit/s  "
+              f"subida: {evento['subida_melhor_mbit_s']} Mbit/s")
+        lg = evento["latencia_gateway"]
+        print(f"  gateway: perda {lg.get('perda_pct', '?')}% rtt "
+              f"{lg.get('rtt_medio_ms', '?')}/{lg.get('rtt_max_ms', '?')} ms")
+    return 0 if boas_d else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

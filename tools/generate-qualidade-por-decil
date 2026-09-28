@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""generate-qualidade-por-decil — a régua de qualidade do acervo, página a página.
+
+Produz `data/ops/qualidade_por_decil.jsonl`: uma linha por página publicada, com
+os sinais que decidem o que reparar primeiro, e o decil em que ela cai.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTA SÉRIE EXISTE
+
+O plano de 2026-08-28 apontou como hipótese de maior dano para o rastreio do
+Google um perfil de *scaled content abuse* — 10 mil páginas geradas, molde
+repetido, texto raso —, e o veredito do plano de 08-11 diz que a causa dominante
+da queda "permanece indeterminada". Em 2026-09-03 três hipóteses de transporte
+foram DESCARTADAS por medição própria:
+
+  • malha de links: as 2.984 URLs que o Googlebot nunca pediu têm a MESMA
+    distribuição de links de entrada das rastreadas (mínimo 2, mediana 7);
+  • metadado: das 35 requisições do Googlebot em 2 dias, 22 foram sitemap, TODAS
+    com If-Modified-Since e TODAS respondidas 304;
+  • infra: o Bing rastreia 400–550 páginas/dia e o PerplexityBot leu 2.085 em
+    2 dias pela mesma infraestrutura.
+
+O que sobra é a qualidade do que se publica — e sobre isso o repositório tinha
+números avulsos ("605 páginas rasas", "2.018 falso-positivo") e nenhuma série
+por página. Sem ela, "reparar o pior decil" é conversa: não há decil.
+
+O QUE ENTRA NA RÉGUA, e por que cada sinal:
+  palavras          o corpo autoral (abertura + seções + FAQ). Abaixo de 400 o
+                    próprio contrato do projeto classifica como severidade média.
+  secoes / faq      estrutura: página com uma seção e nenhuma pergunta é a que o
+                    leitor abandona e o buscador classifica como fina.
+  fontes_oficiais   quantas fontes com URL a página cita, e quantas delas têm
+                    data de conferência — é a diferença entre "cita a lei" e
+                    "afirma sem base".
+  ancora_por_fonte  fração das fontes com `anchor_claim` (a frase que diz o que
+                    AQUELA fonte sustenta NESTA página). Fonte sem âncora é
+                    referência decorativa.
+  molde             a fração do corpo que se repete em OUTRAS páginas da mesma
+                    área, medida por 5-gramas de palavras. É a assinatura de
+                    conteúdo em escala — e a métrica que o CLAUDE.md avisa que
+                    pode não enxergar o molde quando há número intercalado, por
+                    isso ela entra como UM sinal, nunca como veredito sozinho.
+
+A NOTA é a média ponderada dos sinais normalizados, e o DECIL sai dela. Nenhuma
+página é reprovada aqui: esta ferramenta MEDE. Quem decide o que fazer com o
+decil pior é o plano de reparo, e a ordem do dono de 2026-08-06 continua valendo
+— erro médio publica e refina depois.
+
+Uso:
+    tools/generate-qualidade-por-decil
+    tools/generate-qualidade-por-decil --limite 500 --json
+"""
+
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PAGINAS = os.path.join(RAIZ, "content/pages.json")
+MANIFESTO = os.path.join(RAIZ, "data/editorial/published_manifest.jsonl")
+DESTINO = os.path.join(RAIZ, "data/ops/qualidade_por_decil.jsonl")
+SCHEMA = "qualidade_por_decil_v1"
+
+PALAVRA = re.compile(r"[0-9A-Za-zÀ-ÿ]+")
+# Piso de palavras do contrato: abaixo de 400 é severidade média (publica e
+# refina); abaixo de 250 é crítico e não publica.
+PISO_MEDIO = 400
+PISO_CRITICO = 250
+NGRAMA = 5
+
+
+def corpo_de(pagina):
+    partes = [pagina.get("summary") or ""]
+    for secao in pagina.get("body_sections") or []:
+        partes.append(secao.get("body") or "")
+    for item in pagina.get("faq") or []:
+        partes.append(item.get("answer") or "")
+    return "\n".join(p for p in partes if p)
+
+
+def ngramas(texto):
+    palavras = [p.lower() for p in PALAVRA.findall(texto)]
+    if len(palavras) < NGRAMA:
+        return set()
+    return {" ".join(palavras[i:i + NGRAMA]) for i in range(len(palavras) - NGRAMA + 1)}
+
+
+def area_de(caminho):
+    partes = [p for p in (caminho or "").split("/") if p]
+    return partes[0] if partes else ""
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--limite", type=int, default=0, help="processa no máximo N páginas (0 = todas)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        with open(PAGINAS, encoding="utf-8") as handle:
+            dados = json.load(handle)
+    except (OSError, ValueError) as erro:
+        print("generate-qualidade-por-decil: %s ilegível (%s)" % (PAGINAS, erro), file=sys.stderr)
+        return 2
+    paginas = dados if isinstance(dados, list) else dados.get("pages", [])
+
+    publicadas = set()
+    try:
+        with open(MANIFESTO, encoding="utf-8") as handle:
+            for bruto in handle:
+                try:
+                    publicadas.add(json.loads(bruto)["path"])
+                except (ValueError, KeyError):
+                    continue
+    except OSError as erro:
+        print("generate-qualidade-por-decil: manifesto ilegível (%s)" % erro, file=sys.stderr)
+        return 2
+    if not publicadas:
+        print("generate-qualidade-por-decil: manifesto vazio", file=sys.stderr)
+        return 2
+
+    alvo = [p for p in paginas if p.get("path") in publicadas]
+    if args.limite:
+        alvo = alvo[:args.limite]
+
+    # Primeira passada: corpo, contagens e n-gramas por área.
+    registros = []
+    por_area = collections.defaultdict(list)
+    for pagina in alvo:
+        corpo = corpo_de(pagina)
+        palavras = len(PALAVRA.findall(corpo))
+        fontes = pagina.get("source_provenance") or []
+        com_data = sum(1 for f in fontes if (f.get("checked_at") or "").strip())
+        com_ancora = sum(1 for f in fontes if (f.get("anchor_claim") or "").strip())
+        registro = {
+            "path": pagina.get("path"),
+            "area": area_de(pagina.get("path")),
+            "palavras": palavras,
+            "secoes": len(pagina.get("body_sections") or []),
+            "faq": len(pagina.get("faq") or []),
+            "fontes_oficiais": len(fontes),
+            "fontes_com_data": com_data,
+            "fontes_com_ancora": com_ancora,
+            "reviewed_at": pagina.get("reviewed_at") or "",
+        }
+        registros.append(registro)
+        por_area[registro["area"]].append((registro, ngramas(corpo)))
+
+    # Segunda passada: molde por área. Um 5-grama que aparece em outra página da
+    # MESMA área é repetição de fórmula; comparar entre áreas somaria vocabulário
+    # jurídico comum (que não é molde) ao numerador.
+    for area, itens in por_area.items():
+        frequencia = collections.Counter()
+        for _registro, grams in itens:
+            frequencia.update(grams)
+        for registro, grams in itens:
+            if not grams:
+                registro["molde_pct"] = None
+                continue
+            repetidos = sum(1 for g in grams if frequencia[g] > 1)
+            registro["molde_pct"] = round(100.0 * repetidos / len(grams), 2)
+
+    # NOTA: média ponderada de sinais normalizados em [0,1]. Os pesos declaram a
+    # prioridade editorial — corpo e fonte pesam mais que estrutura, e molde
+    # entra invertido (quanto mais molde, pior).
+    for registro in registros:
+        corpo_norm = min(1.0, registro["palavras"] / 900.0)
+        fonte_norm = min(1.0, registro["fontes_com_data"] / 3.0)
+        ancora_norm = (registro["fontes_com_ancora"] / registro["fontes_oficiais"]) if registro["fontes_oficiais"] else 0.0
+        estrutura_norm = min(1.0, (registro["secoes"] + registro["faq"]) / 8.0)
+        molde = registro.get("molde_pct")
+        molde_norm = 1.0 - min(1.0, (molde or 0.0) / 60.0)
+        registro["nota"] = round(
+            0.35 * corpo_norm + 0.25 * fonte_norm + 0.15 * ancora_norm +
+            0.10 * estrutura_norm + 0.15 * molde_norm, 4)
+
+    ordenados = sorted(registros, key=lambda r: r["nota"])
+    total = len(ordenados)
+    for posicao, registro in enumerate(ordenados):
+        registro["decil"] = min(10, 1 + (posicao * 10) // total)
+
+    agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    os.makedirs(os.path.dirname(DESTINO), exist_ok=True)
+    temporario = DESTINO + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as handle:
+        for registro in sorted(registros, key=lambda r: r["path"] or ""):
+            registro["schema_version"] = SCHEMA
+            registro["medido_em"] = agora
+            handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(temporario, DESTINO)
+
+    por_decil = collections.defaultdict(list)
+    for registro in registros:
+        por_decil[registro["decil"]].append(registro)
+    resumo = {
+        "schema_version": SCHEMA, "medido_em": agora, "paginas": total,
+        "abaixo_do_piso_medio": sum(1 for r in registros if r["palavras"] < PISO_MEDIO),
+        "abaixo_do_piso_critico": sum(1 for r in registros if r["palavras"] < PISO_CRITICO),
+        "sem_fonte_com_data": sum(1 for r in registros if r["fontes_com_data"] == 0),
+        "sem_faq": sum(1 for r in registros if r["faq"] == 0),
+        "decis": {str(d): {
+            "paginas": len(rs),
+            "palavras_medianas": sorted(r["palavras"] for r in rs)[len(rs) // 2],
+            "molde_pct_mediano": sorted((r.get("molde_pct") or 0) for r in rs)[len(rs) // 2],
+            "fontes_com_data_medianas": sorted(r["fontes_com_data"] for r in rs)[len(rs) // 2],
+            "areas_top": [a for a, _ in collections.Counter(r["area"] for r in rs).most_common(3)],
+        } for d, rs in sorted(por_decil.items())},
+    }
+    if args.json:
+        print(json.dumps(resumo, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("qualidade por decil: %d páginas publicadas" % total)
+        print("  abaixo de %d palavras: %d · abaixo de %d (crítico): %d · sem fonte com data: %d · sem FAQ: %d"
+              % (PISO_MEDIO, resumo["abaixo_do_piso_medio"], PISO_CRITICO,
+                 resumo["abaixo_do_piso_critico"], resumo["sem_fonte_com_data"], resumo["sem_faq"]))
+        print("  %-5s %-8s %-10s %-10s %-12s %s" % ("decil", "páginas", "palavras", "molde %", "fontes+data", "áreas"))
+        for d, info in sorted(resumo["decis"].items(), key=lambda kv: int(kv[0])):
+            print("  %-5s %-8d %-10d %-10s %-12d %s" % (d, info["paginas"], info["palavras_medianas"],
+                                                        info["molde_pct_mediano"], info["fontes_com_data_medianas"],
+                                                        ", ".join(info["areas_top"])))
+        print("\n  série: %s" % os.path.relpath(DESTINO, RAIZ))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

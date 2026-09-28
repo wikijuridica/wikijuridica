@@ -1,0 +1,1871 @@
+#!/usr/bin/env python3
+"""generate-painel — painel LOCAL do portal, em um HTML estático, para o dono ler
+com o Claude Code (frente F4).
+
+O QUE ISTO RESPONDE. Os ledgers de `data/ops/` já dizem, cada um, uma coisa
+verdadeira sobre a borda, os bots, o Bing, o Clarity, o cérebro local e a rede
+social — mas em quinze arquivos append-only com convenções diferentes, e
+ninguém os lê lado a lado. Este gerador lê todos com a convenção de cada um
+("última linha por dia vence" nos append-only, `serie_saneada` na borda, soma
+das janelas `summable` na origem), grava os mesmos números em JSON legível por
+máquina (`data/ops/painel/*.json`, `schema_version: painel_v1`) e um HTML
+único, sem JavaScript e sem recurso externo, em `var/painel/index.html`.
+
+O QUE CADA NÚMERO É / NÃO É está ao lado do número, no HTML e no JSON
+(`fonte`, `ressalvas`). As regras que valem para tudo:
+
+  - Ausência é `null`/"—", nunca zero. Linha que falta num dia não afirma que
+    nada aconteceu; campo ausente numa versão antiga de esquema idem.
+  - O último dia é PROVISÓRIO: a linha final do dia D nasce em D+1 (edge
+    traffic às 06:20 UTC). O painel marca `provisorio: true` e desenha o
+    ponto oco em vez de mostrar uma queda falsa na borda direita.
+  - Clarity é janela deslizante de N dias coletada no dia D — não se soma
+    entre dias nem se lê como "sessões por dia".
+  - Travessia origem÷borda replica o cálculo de tools/generate-cache-baseline
+    (borda = `requests_sampled`, origem = Σ `requests_authentic` das linhas
+    `summable`) e, quando a linha de base do dia existe, imprime a dela ao
+    lado: os dois têm de bater.
+  - Rede social: SÓ contagens agregadas (`count(*)`), banco aberto em
+    `mode=ro`; nenhuma coluna é lida.
+  - Previsão: o painel só LÊ data/ops/painel/previsao.json, escrito por
+    tools/generate-previsao-audiencia --gravar (unit wikijuridica-previsao,
+    07:10 UTC); ausente ou ilegível vira "ainda sem previsão" com o motivo.
+    A seção fica FORA do dict de seções gravadas em JSON — gravá-la aqui
+    sobrescreveria o arquivo da ferramenta.
+
+Uso:
+  tools/generate-painel [--dias 30] [--saida var/painel/index.html]
+                        [--json-dir data/ops/painel] [--raiz /opt/wiki]
+                        [--hoje AAAA-MM-DD] [--commit abc1234]
+
+Saída: exit 0 quando gerou; exit 2 quando o HTML estourou o teto de 400 KB ou
+a saída não pôde ser gravada. Os JSON só são regravados quando o conteúdo
+mudou (ignorando `gerado_em`, `mtime` e `commit`), para o timer de 3 h não
+sujar a árvore do git a cada execução: `gerado_em`/`commit` de um JSON são os
+da última mudança de conteúdo; o cabeçalho do HTML leva sempre o HEAD atual.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import math
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+RAIZ_PADRAO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCHEMA = "painel_v1"
+TETO_HTML_BYTES = 400_000
+TOP_N = 10
+AGENTES_NO_GRAFICO = 6
+# `function` do ledger da borda que conta como bot de IA: treino de modelo,
+# busca (motores e buscadores de IA) e agente disparado por usuário.
+FUNCOES_IA = frozenset({"training", "search", "user"})
+
+SECOES = (
+    ("borda", "Borda"),
+    ("bots", "Bots de IA"),
+    ("bing", "Bing"),
+    ("previsao", "Previsão"),
+    ("humanos", "Humanos"),
+    ("cerebro", "Cérebro"),
+    ("social", "Social"),
+    ("frescor", "Frescor e experimentos"),
+)
+
+FONTES = {
+    "edge_traffic": "data/ops/edge_traffic_daily.jsonl",
+    "edge_bots": "data/ops/edge_bot_agents_daily.jsonl",
+    "edge_purge": "data/ops/edge_cache_purge.jsonl",
+    "edge_warm": "data/ops/edge_cache_warm.jsonl",
+    "cache_baseline": "data/ops/cache_baseline_daily.jsonl",
+    "origin_bots": "data/ops/origin_bot_traffic_daily.jsonl",
+    "radar_ia": "data/ops/radar_ia_daily.jsonl",
+    "bot_return": "data/ops/bot_return_daily.jsonl",
+    "bing": "data/ops/bing_webmaster_daily.jsonl",
+    "bing_submit": "data/ops/bing_submit_ledger.jsonl",
+    "clarity": "data/ops/clarity_insights_daily.jsonl",
+    "ia_local": "data/ops/ia_local_daily.jsonl",
+    "fila": "data/ai/fila.sqlite",
+    "moderacao": "data/ops/moderacao_transparencia_diaria.jsonl",
+    "social_db": "var/social/social.db",
+    "frescor": "data/ops/edge_frescor_daily.jsonl",
+    "experimentos": "data/ai/experimentos.jsonl",
+    "previsao": "data/ops/painel/previsao.json",
+}
+
+SEM_SERIE = "sem série ainda"
+
+_RE_URLS = re.compile(r"(\d+)\s*URL\(s\)")
+_RE_TAGS = re.compile(r"(\d+)\s*tag\(s\)")
+
+
+# ---------------------------------------------------------------------------
+# leitura
+# ---------------------------------------------------------------------------
+
+class Fonte:
+    """Um arquivo JSONL lido inteiro, com o estado que o painel declara."""
+
+    def __init__(self, raiz: str, rel: str):
+        self.rel = rel
+        self.caminho = os.path.join(raiz, rel)
+        self.existe = os.path.isfile(self.caminho)
+        self.registros: list[dict] = []
+        self.invalidas = 0
+        self.mtime = None
+        if not self.existe:
+            return
+        self.mtime = dt.datetime.fromtimestamp(
+            os.path.getmtime(self.caminho), dt.timezone.utc).isoformat(timespec="seconds")
+        with open(self.caminho, encoding="utf-8") as handle:
+            for bruto in handle:
+                bruto = bruto.strip()
+                if not bruto:
+                    continue
+                try:
+                    registro = json.loads(bruto)
+                except json.JSONDecodeError:
+                    self.invalidas += 1
+                    continue
+                if isinstance(registro, dict):
+                    self.registros.append(registro)
+                else:
+                    self.invalidas += 1
+
+    def estado(self) -> dict:
+        return {
+            "arquivo": self.rel,
+            "existe": self.existe,
+            "linhas": len(self.registros),
+            "linhas_invalidas": self.invalidas,
+            "mtime": self.mtime,
+        }
+
+
+def ultima_por_chave(registros, chave):
+    """Convenção dos ledgers append-only: a ÚLTIMA linha de uma chave vence."""
+    saida = {}
+    for r in registros:
+        k = chave(r)
+        if k is None:
+            continue
+        saida[k] = r
+    return saida
+
+
+def numero(v):
+    """Número ou None — string numérica do Bing vira número; lixo vira None."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s.lower() == "none":
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            try:
+                return float(s)
+            except ValueError:
+                return None
+    return None
+
+
+def soma(valores):
+    """Soma ignorando None; devolve None quando NENHUM valor existe."""
+    presentes = [v for v in valores if v is not None]
+    if not presentes:
+        return None
+    return sum(presentes)
+
+
+def razao(num, den, casas=4):
+    if num is None or den is None or den == 0:
+        return None
+    return round(num / den, casas)
+
+
+def commit_atual(raiz: str) -> str:
+    try:
+        saida = subprocess.run(
+            ["git", "-C", raiz, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "sem-git"
+    if saida.returncode != 0 or not saida.stdout.strip():
+        return "sem-git"
+    return saida.stdout.strip()
+
+
+class Contexto:
+    def __init__(self, raiz: str, hoje: dt.date, dias: int, commit: str):
+        self.raiz = raiz
+        self.hoje = hoje
+        self.hoje_iso = hoje.isoformat()
+        self.dias = dias
+        self.datas = [(hoje - dt.timedelta(days=i)).isoformat() for i in range(dias - 1, -1, -1)]
+        self.commit = commit
+        self.gerado_em = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        self._fontes: dict[str, Fonte] = {}
+        self.ressalvas: list[str] = []
+        self.ultimo_dia_completo = (hoje - dt.timedelta(days=1)).isoformat()
+
+    def fonte(self, nome: str) -> Fonte:
+        if nome not in self._fontes:
+            self._fontes[nome] = Fonte(self.raiz, FONTES[nome])
+        return self._fontes[nome]
+
+    def rel(self, nome: str) -> str:
+        return FONTES[nome]
+
+    def na_janela(self, data) -> bool:
+        return isinstance(data, str) and self.datas[0] <= data <= self.datas[-1]
+
+    def estados(self) -> list[dict]:
+        saida = []
+        for nome, rel in FONTES.items():
+            caminho = os.path.join(self.raiz, rel)
+            if rel.endswith(".jsonl"):
+                saida.append(self.fonte(nome).estado())
+            else:
+                existe = os.path.isfile(caminho)
+                saida.append({
+                    "arquivo": rel, "existe": existe, "linhas": None, "linhas_invalidas": None,
+                    "mtime": dt.datetime.fromtimestamp(os.path.getmtime(caminho), dt.timezone.utc)
+                    .isoformat(timespec="seconds") if existe else None,
+                })
+        return saida
+
+
+# ---------------------------------------------------------------------------
+# seções
+# ---------------------------------------------------------------------------
+
+def _provisorio(r: dict, data: str, ctx: Contexto) -> bool:
+    if data >= ctx.hoje_iso:
+        return True
+    nota = str(r.get("self_warming_note") or "")
+    base = str(r.get("organic_requests_basis") or "")
+    return "dia em curso" in nota or base.startswith("provisional")
+
+
+def secao_borda(ctx: Contexto) -> dict:
+    et = ctx.fonte("edge_traffic")
+    por_dia = ultima_por_chave(et.registros, lambda r: r.get("date"))
+    trafego = []
+    completos = []
+    for d in ctx.datas:
+        r = por_dia.get(d)
+        if r is None:
+            trafego.append({"date": d, "presente": False})
+            continue
+        prov = _provisorio(r, d, ctx)
+        if not prov:
+            completos.append(d)
+        trafego.append({
+            "date": d, "presente": True, "provisorio": prov,
+            "requests": numero(r.get("requests")),
+            "self_warming_requests": numero(r.get("self_warming_requests")),
+            "organic_requests": numero(r.get("organic_requests")),
+            "page_views": numero(r.get("page_views")),
+            "uniques": numero(r.get("uniques")),
+            "schema_version": r.get("schema_version"),
+        })
+    if completos:
+        ctx.ultimo_dia_completo = max(completos)
+
+    cb = ctx.fonte("cache_baseline")
+    base_por_dia = ultima_por_chave(cb.registros, lambda r: r.get("date"))
+    cache = []
+    for d in ctx.datas:
+        r = base_por_dia.get(d)
+        if r is None:
+            continue
+        cs = (r.get("cache_status") or {}).get("por_status") or {}
+        csp = (r.get("cache_status_sem_trafego_proprio") or {}).get("por_status") or {}
+        share = r.get("share_autoaquecimento") or {}
+        aq = r.get("misses_do_aquecedor") or {}
+        pu = r.get("purgas_url") or {}
+        pt = r.get("purgas_tag") or {}
+        cache.append({
+            "date": d,
+            "graphql_disponivel": r.get("graphql_disponivel"),
+            "hit": numero((cs.get("hit") or {}).get("requests")),
+            "miss": numero((cs.get("miss") or {}).get("requests")),
+            "total": numero((r.get("cache_status") or {}).get("total_requests")),
+            "hit_pct": numero((cs.get("hit") or {}).get("pct")),
+            "miss_pct": numero((cs.get("miss") or {}).get("pct")),
+            "hit_pct_sem_trafego_proprio": numero((csp.get("hit") or {}).get("pct")),
+            "misses_do_aquecedor": numero(aq.get("requests")),
+            "misses_total": numero((r.get("misses_total") or {}).get("requests")),
+            "share_autoaquecimento": numero(share.get("share")),
+            "purgas_tudo": numero(r.get("purgas_tudo")),
+            "purgas_url_execucoes": numero(pu.get("execucoes")) if isinstance(pu, dict) else numero(pu),
+            "purgas_tag_execucoes": numero(pt.get("execucoes")) if isinstance(pt, dict) else numero(pt),
+        })
+
+    ew = ctx.fonte("edge_warm")
+    por_dia_aq: dict[str, dict] = {}
+    for r in ew.registros:
+        d = str(r.get("finished_at") or r.get("started_at") or "")[:10]
+        if not ctx.na_janela(d):
+            continue
+        e = por_dia_aq.setdefault(d, {
+            "date": d, "execucoes": 0, "urls": 0, "hit": 0, "miss": 0, "revalidated": 0,
+            "outro": 0, "so_frios": False, "pre_head_hit_pct": None, "pre_head_total": None,
+        })
+        cs = r.get("cache_status") or {}
+        e["execucoes"] += 1
+        e["urls"] += numero(r.get("urls")) or 0
+        for k in ("hit", "miss", "revalidated", "outro"):
+            e[k] += numero(cs.get(k)) or 0
+        e["so_frios"] = e["so_frios"] or bool(r.get("so_frios"))
+        pre = r.get("cobertura_pre_head")
+        if isinstance(pre, dict):
+            total = sum((numero(v) or 0) for k, v in pre.items() if k != "sem_head")
+            if total > 0:
+                e["pre_head_hit_pct"] = round(100.0 * (numero(pre.get("hit")) or 0) / total, 2)
+                e["pre_head_total"] = total
+    aquecimento = [por_dia_aq[d] for d in ctx.datas if d in por_dia_aq]
+
+    ep = ctx.fonte("edge_purge")
+    por_dia_pu: dict[str, dict] = {}
+    for r in ep.registros:
+        d = str(r.get("purged_at") or "")[:10]
+        if not ctx.na_janela(d):
+            continue
+        e = por_dia_pu.setdefault(d, {"date": d, "tudo": 0, "url": 0, "tag": 0,
+                                      "urls_total": 0, "tags_total": 0, "falhas": 0})
+        if r.get("success") is not True:
+            e["falhas"] += 1
+            continue
+        escopo = str(r.get("scope") or "")
+        cl = classifica_escopo_purga(escopo)
+        e["tudo"] += cl["tudo"]
+        e["url"] += cl["url"]
+        e["tag"] += cl["tag"]
+        e["urls_total"] += cl["urls_total"]
+        e["tags_total"] += cl["tags_total"]
+    purgas = [por_dia_pu[d] for d in ctx.datas if d in por_dia_pu]
+
+    ressalvas = [
+        "requests/page_views/uniques de edge_traffic_daily incluem o tráfego do próprio portal "
+        "(aquecedor, sondas); organic_requests = requests − self_warming_requests do ledger de aquecimento.",
+        "A linha final do dia D nasce em D+1 (06:20 UTC): o último ponto é provisório.",
+        "hit/miss por dia vêm de cache_baseline_daily (GraphQL, TODO o tráfego da zona); "
+        "cobertura_pre_head do aquecedor mede quanto estava quente ANTES do aquecedor tocar, "
+        "e as execuções so_frios cobrem só as URLs frias — são grandezas diferentes.",
+        "Purga por escopo conta EXECUÇÕES por tipo (tudo / por URL / por tag) e, ao lado, o total "
+        "de URLs e tags declaradas no escopo.",
+    ]
+    if not cb.existe:
+        ressalvas.append("cache_baseline_daily.jsonl ausente: hit/miss por dia " + SEM_SERIE + ".")
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "dias": ctx.dias,
+        "ultimo_dia_completo": ctx.ultimo_dia_completo,
+        "fontes": {k: ctx.rel(k) for k in ("edge_traffic", "cache_baseline", "edge_warm", "edge_purge")},
+        "trafego_por_dia": trafego,
+        "cache_por_dia": cache,
+        "aquecimento_por_dia": aquecimento,
+        "purgas_por_dia": purgas,
+        "ressalvas": ressalvas,
+    }
+
+
+def classifica_escopo_purga(escopo: str) -> dict:
+    """'tudo' → purga total; 'N URL(s) em …; M tag(s) em …' → por URL e/ou por tag."""
+    saida = {"tudo": 0, "url": 0, "tag": 0, "urls_total": 0, "tags_total": 0}
+    if escopo.strip().lower() == "tudo":
+        saida["tudo"] = 1
+        return saida
+    m_url = _RE_URLS.search(escopo)
+    m_tag = _RE_TAGS.search(escopo)
+    if m_url and int(m_url.group(1)) > 0:
+        saida["url"] = 1
+        saida["urls_total"] = int(m_url.group(1))
+    if m_tag and int(m_tag.group(1)) > 0:
+        saida["tag"] = 1
+        saida["tags_total"] = int(m_tag.group(1))
+    return saida
+
+
+def _borda_por_chave(ctx: Contexto):
+    """edge_bot_agents_daily lido como o produtor manda: serie_saneada quando o
+    módulo existe; senão, a mesma dedupe (última linha por (date, agent_key))."""
+    caminho = os.path.join(ctx.raiz, FONTES["edge_bots"])
+    tools_dir = os.path.join(RAIZ_PADRAO, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import edgetelemetry  # noqa: E402
+        por_chave, descartadas = edgetelemetry.serie_saneada(ctx.raiz, caminho=caminho)
+        return por_chave, len(descartadas), "tools/edgetelemetry.serie_saneada"
+    except ImportError as erro:
+        ctx.ressalvas.append("edgetelemetry indisponível (%s): borda deduplicada localmente" % erro)
+    fonte = ctx.fonte("edge_bots")
+    por_chave = ultima_por_chave(
+        fonte.registros, lambda r: (r.get("date"), r.get("agent_key")) if r.get("agent_key") else None)
+    return por_chave, 0, "última linha por (date, agent_key), sem saneamento"
+
+
+def _borda_valor(r: dict) -> tuple:
+    """Mesma escolha de campo de tools/generate-cache-baseline: o count
+    (`requests_sampled`) é a contagem; a faixa de IP entra quando a Cloudflare
+    não verifica o agente; `requests_estimated` só resta nas linhas antigas."""
+    total = numero(r.get("requests_sampled"))
+    faixa = numero(r.get("requests_sampled_ip_range")) or 0
+    if total is not None and total > 0:
+        return total, "requests_sampled"
+    if faixa > 0:
+        return faixa, "requests_sampled_ip_range"
+    if total is not None:
+        return 0, "requests_sampled"
+    est = numero(r.get("requests_estimated"))
+    est_ip = numero(r.get("requests_estimated_ip_range")) or 0
+    if est is not None and est > 0:
+        return est, "requests_estimated"
+    if est_ip > 0:
+        return est_ip, "requests_estimated_ip_range"
+    if est is not None:
+        return 0, "requests_estimated"
+    return None, None
+
+
+def secao_bots(ctx: Contexto) -> dict:
+    por_chave, descartadas, metodo = _borda_por_chave(ctx)
+    borda: dict[str, dict[str, dict]] = {}
+    for (d, agente), r in por_chave.items():
+        if not ctx.na_janela(d) or not agente:
+            continue
+        valor, campo = _borda_valor(r)
+        borda.setdefault(agente, {})[d] = {
+            "valor": valor, "campo": campo,
+            "ip_range": numero(r.get("requests_sampled_ip_range")) if "requests_sampled_ip_range" in r
+            else numero(r.get("requests_estimated_ip_range")),
+            "cloudflare_verified": numero(r.get("requests_sampled_cloudflare_verified")),
+            "function": r.get("function"),
+        }
+
+    ob = ctx.fonte("origin_bots")
+    origem: dict[str, dict[str, dict]] = {}
+    for r in ob.registros:
+        d = r.get("date")
+        agente = r.get("agent_key")
+        if not ctx.na_janela(d) or not agente or r.get("summable") is False:
+            continue
+        e = origem.setdefault(agente, {}).setdefault(d, {"valor": 0, "campo": None, "linhas": 0})
+        if r.get("requests_authentic") is not None:
+            e["valor"] += numero(r.get("requests_authentic")) or 0
+            e["campo"] = e["campo"] or "requests_authentic"
+        else:
+            e["valor"] += numero(r.get("requests")) or 0
+            e["campo"] = e["campo"] or "requests"
+        e["linhas"] += 1
+
+    funcoes = {}
+    for a, dias in borda.items():
+        for d in sorted(dias):
+            if dias[d].get("function"):
+                funcoes[a] = dias[d]["function"]
+    totais = {a: sum((v["valor"] or 0) for v in dias.values()) for a, dias in borda.items()}
+    ordenados = sorted(totais, key=lambda a: (-totais[a], a))
+    # O gráfico é de bots de IA: treino, busca e agente de usuário. SEO, social,
+    # diagnóstico e scanner ficam em `outros` (e inteiros na tabela de travessia).
+    de_ia = [a for a in ordenados if funcoes.get(a) in FUNCOES_IA]
+    principais = de_ia[:AGENTES_NO_GRAFICO]
+    demais = [a for a in ordenados if a not in principais]
+    leituras = []
+    for d in ctx.datas:
+        linha = {"date": d, "provisorio": d > ctx.ultimo_dia_completo, "por_agente": {}}
+        for a in principais:
+            v = borda.get(a, {}).get(d)
+            linha["por_agente"][a] = None if v is None else v["valor"]
+        outros = [borda[a][d]["valor"] for a in demais if d in borda.get(a, {})]
+        linha["por_agente"]["outros"] = soma(outros) if demais else None
+        leituras.append(linha)
+
+    dia = ctx.ultimo_dia_completo
+    cb = ctx.fonte("cache_baseline")
+    base_dia = ultima_por_chave(cb.registros, lambda r: r.get("date")).get(dia)
+    base_trav = (base_dia or {}).get("travessia_por_bot") or {}
+    travessia = []
+    for a in sorted(set(borda) | set(origem)):
+        b = borda.get(a, {}).get(dia)
+        o = origem.get(a, {}).get(dia)
+        bv = None if b is None else b["valor"]
+        ov = None if o is None else o["valor"]
+        if bv is None and ov is None:
+            continue
+        item = {
+            "agente": a, "funcao": funcoes.get(a),
+            "borda": bv, "borda_campo": None if b is None else b["campo"],
+            "origem": ov, "origem_campo": None if o is None else o["campo"],
+            "origem_linhas": 0 if o is None else o["linhas"],
+            "travessia": razao(ov if ov is not None else 0, bv) if bv else None,
+            "status": "ok" if bv else "nao_mensuravel",
+            "baseline_travessia": (base_trav.get(a) or {}).get("travessia") if a in base_trav else None,
+        }
+        travessia.append(item)
+    travessia.sort(key=lambda i: (-(i["borda"] or 0), i["agente"]))
+
+    radar = ctx.fonte("radar_ia")
+    radar_por_dia = ultima_por_chave(radar.registros, lambda r: r.get("date"))
+    radar_serie = []
+    for d in ctx.datas:
+        r = radar_por_dia.get(d)
+        if r is None:
+            continue
+        lp = r.get("leituras_por_agente") or {}
+        mp = r.get("markdown_por_agente") or {}
+        radar_serie.append({
+            "date": d,
+            "leituras_total": soma(numero(v) for v in lp.values()),
+            "markdown_total": soma(numero(v) for v in mp.values()),
+            "leituras_por_agente": {k: numero(v) for k, v in sorted(lp.items())},
+            "markdown_por_agente": {k: numero(v) for k, v in sorted(mp.items())},
+            "descontos": r.get("descontos") or {},
+        })
+
+    br = ctx.fonte("bot_return")
+    br_chave = ultima_por_chave(
+        br.registros, lambda r: (r.get("date"), r.get("agent_key")) if r.get("agent_key") else None)
+    datas_br = sorted({d for (d, _a) in br_chave if ctx.na_janela(d)})
+    dia_br = datas_br[-1] if datas_br else None
+    retorno = []
+    if dia_br:
+        for (d, a), r in sorted(br_chave.items()):
+            if d != dia_br:
+                continue
+            retorno.append({
+                "agente": a, "funcao": r.get("funcao"), "veio_hoje": r.get("veio_hoje"),
+                "dias_desde_visita_anterior": numero(r.get("dias_desde_visita_anterior")),
+                "requisicoes": numero(r.get("requisicoes")),
+                "cobertura_acumulada_pct": numero(r.get("cobertura_acumulada_pct")),
+                "urls_novas_no_dia": numero(r.get("urls_novas_no_dia")),
+                "citacao_clique_de_volta": numero(r.get("citacao_clique_de_volta")),
+                "identidade": r.get("identidade"),
+            })
+        retorno.sort(key=lambda i: (-(i["requisicoes"] or 0), i["agente"]))
+
+    ressalvas = [
+        "Leituras por agente = campo `%s` de edge_bot_agents_daily via %s "
+        "(%d linha(s) descartada(s) pela série saneada). O gráfico mostra os %d maiores agentes de IA "
+        "(function em %s); todo o resto — SEO, social, diagnóstico, scanner e IA menores — soma em `outros`."
+        % ("requests_sampled (senão requests_estimated nas linhas antigas)", metodo, descartadas,
+           AGENTES_NO_GRAFICO, ", ".join(sorted(FUNCOES_IA))),
+        "Travessia = origem ÷ borda no último dia completo (%s): origem = Σ requests_authentic das "
+        "janelas summable de origin_bot_traffic_daily; mesma fórmula de cache_baseline_daily, cujo valor "
+        "aparece em `baseline_travessia` quando a linha do dia existe. Acima de 1 significa que o bot "
+        "chegou à origem mais vezes do que a borda contou (cache MISS, Markdown dinâmico ou identidade "
+        "não verificada na borda)." % dia,
+        "radar_ia_daily conta leituras VERIFICADAS na origem (descontando forjadas); não é a mesma "
+        "grandeza da borda.",
+        "bot_return_daily: `citacao_clique_de_volta` é limite inferior de interesse, nunca contagem de citação.",
+    ]
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "dias": ctx.dias,
+        "ultimo_dia_completo": dia,
+        "fontes": {k: ctx.rel(k) for k in ("edge_bots", "origin_bots", "cache_baseline", "radar_ia", "bot_return")},
+        "agentes_no_grafico": principais + (["outros"] if demais else []),
+        "agentes_em_outros": demais,
+        "funcoes_por_agente": dict(sorted(funcoes.items())),
+        "funcoes_de_ia": sorted(FUNCOES_IA),
+        "leituras_por_dia": leituras,
+        "travessia": travessia,
+        "radar_ia_por_dia": radar_serie,
+        "retorno_ultimo_dia": {"date": dia_br, "agentes": retorno},
+        "ressalvas": ressalvas,
+    }
+
+
+def secao_bing(ctx: Contexto) -> dict:
+    bw = ctx.fonte("bing")
+    por_tipo: dict[str, list] = {}
+    for r in bw.registros:
+        por_tipo.setdefault(str(r.get("tipo") or ""), []).append(r)
+
+    busca = ultima_por_chave(por_tipo.get("busca_diaria", []), lambda r: r.get("Date"))
+    rastreio = ultima_por_chave(por_tipo.get("rastreio_diario", []), lambda r: r.get("Date"))
+    busca_serie = []
+    rastreio_serie = []
+    for d in ctx.datas:
+        r = busca.get(d)
+        if r is not None:
+            busca_serie.append({"date": d, "impressions": numero(r.get("Impressions")),
+                                "clicks": numero(r.get("Clicks"))})
+        r = rastreio.get(d)
+        if r is not None:
+            rastreio_serie.append({
+                "date": d, "in_index": numero(r.get("InIndex")),
+                "crawled_pages": numero(r.get("CrawledPages")),
+                "code_5xx": numero(r.get("Code5xx")), "crawl_errors": numero(r.get("CrawlErrors")),
+                "in_links": numero(r.get("InLinks")),
+            })
+
+    def top(tipo):
+        linhas = [r for r in por_tipo.get(tipo, []) if ctx.na_janela(r.get("Date"))]
+        if not linhas:
+            return None, []
+        dia = max(r["Date"] for r in linhas)
+        chave = ultima_por_chave([r for r in linhas if r["Date"] == dia],
+                                 lambda r: (r.get("Query") or "").strip() or None)
+        itens = [{
+            "query": q, "impressions": numero(r.get("Impressions")) or 0,
+            "clicks": numero(r.get("Clicks")) or 0,
+            "avg_impression_position": numero(r.get("AvgImpressionPosition")),
+        } for q, r in chave.items()]
+        itens.sort(key=lambda i: (-i["impressions"], -i["clicks"], i["query"]))
+        return dia, itens[:TOP_N]
+
+    dia_consultas, consultas = top("consulta_diaria")
+    dia_paginas, paginas = top("pagina_diaria")
+
+    infos = ultima_por_chave(por_tipo.get("url_info", []), lambda r: r.get("Url"))
+    url_info = None
+    if infos:
+        com_rastreio = sum(1 for r in infos.values()
+                           if str(r.get("LastCrawledDate") or "").strip().lower() not in ("", "none"))
+        status: dict[str, int] = {}
+        for r in infos.values():
+            k = str(r.get("HttpStatus"))
+            status[k] = status.get(k, 0) + 1
+        url_info = {
+            "urls_consultadas": len(infos), "com_last_crawled_date": com_rastreio,
+            "http_status": dict(sorted(status.items())),
+            "coletado_em": max(str(r.get("coletado_em") or "") for r in infos.values()) or None,
+        }
+
+    submit = ctx.fonte("bing_submit")
+    submit_por_dia = None
+    if submit.existe:
+        cont: dict[str, int] = {}
+        for r in submit.registros:
+            # A CHAVE REAL DO LEDGER VEM PRIMEIRO (2026-09-10). As três chaves
+            # inglesas abaixo foram escritas por suposição e NENHUMA existe em
+            # data/ops/bing_submit_ledger.jsonl, que grava `submetido_em`. O
+            # efeito era silencioso do pior jeito: `submit.existe` é true, então
+            # o painel mostrava a seção com `envios_por_dia: []` e nenhuma
+            # ressalva — 200 submissões reais ao Bing, em dois lotes, invisíveis
+            # para quem lê o painel. As chaves inglesas ficam como tolerância a
+            # ledger antigo, nunca como fonte principal.
+            d = str(r.get("submetido_em") or r.get("date") or r.get("submitted_at") or r.get("ts") or "")[:10]
+            if ctx.na_janela(d):
+                cont[d] = cont.get(d, 0) + 1
+        submit_por_dia = [{"date": d, "linhas": n} for d, n in sorted(cont.items())]
+
+    ressalvas = [
+        "Impressions/Clicks = Bing Webmaster `busca_diaria` (última coleta por Date vence); "
+        "InIndex/CrawledPages/Code5xx = `rastreio_diario`. O Bing publica com atraso de dias: "
+        "os últimos dias podem vir zerados por ainda não terem sido computados, não por ausência de busca.",
+        "Top consultas/páginas = `consulta_diaria`/`pagina_diaria` do último Date presente na janela, "
+        "ordenadas por Impressions; `avg_impression_position` −1 significa sem dado.",
+    ]
+    if url_info is None:
+        ressalvas.append("`url_info` " + SEM_SERIE + ".")
+    if submit_por_dia is None:
+        ressalvas.append("bing_submit_ledger.jsonl ausente: envios " + SEM_SERIE + ".")
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "dias": ctx.dias,
+        "fontes": {k: ctx.rel(k) for k in ("bing", "bing_submit")},
+        "busca_por_dia": busca_serie,
+        "rastreio_por_dia": rastreio_serie,
+        "top_consultas": {"date": dia_consultas, "itens": consultas},
+        "top_paginas": {"date": dia_paginas, "itens": paginas},
+        "url_info": url_info,
+        "envios_por_dia": submit_por_dia,
+        "ressalvas": ressalvas,
+    }
+
+
+def _metrica(registro: dict, nome: str) -> list:
+    for m in registro.get("metricas") or []:
+        if m.get("metricName") == nome:
+            return m.get("information") or []
+    return []
+
+
+def secao_humanos(ctx: Contexto) -> dict:
+    cl = ctx.fonte("clarity")
+    janelas = ultima_por_chave(
+        [r for r in cl.registros if r.get("dimensoes") == ["Device"]],
+        lambda r: (str(r.get("coletado_em") or "")[:10], numero(r.get("janela_dias"))))
+    serie = []
+    for (d, janela), r in sorted(janelas.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0)):
+        if not ctx.na_janela(d):
+            continue
+        traf = _metrica(r, "Traffic")
+        item = {
+            "coletado_em_dia": d, "janela_dias": janela,
+            "sessoes": soma(numero(x.get("totalSessionCount")) for x in traf),
+            "sessoes_bot": soma(numero(x.get("totalBotSessionCount")) for x in traf),
+            "usuarios_distintos": soma(numero(x.get("distinctUserCount")) for x in traf),
+            "por_dispositivo": {str(x.get("Device")): numero(x.get("totalSessionCount")) for x in traf},
+        }
+        for chave, nome in (("dead_clicks", "DeadClickCount"), ("rage_clicks", "RageClickCount"),
+                            ("quickback_clicks", "QuickbackClick"), ("script_errors", "ScriptErrorCount"),
+                            ("error_clicks", "ErrorClickCount"), ("excessive_scroll", "ExcessiveScroll")):
+            item[chave] = soma(numero(x.get("subTotal")) for x in _metrica(r, nome))
+        eng = _metrica(r, "EngagementTime")
+        item["tempo_total_s"] = soma(numero(x.get("totalTime")) for x in eng)
+        item["tempo_ativo_s"] = soma(numero(x.get("activeTime")) for x in eng)
+        prof = [numero(x.get("averageScrollDepth")) for x in _metrica(r, "ScrollDepth")]
+        prof = [p for p in prof if p is not None]
+        item["scroll_depth_media_pct"] = round(sum(prof) / len(prof), 2) if prof else None
+        serie.append(item)
+
+    urls_linhas = [r for r in cl.registros if r.get("dimensoes") == ["URL"]]
+    top_urls = None
+    if urls_linhas:
+        r = urls_linhas[-1]
+        dead = {x.get("Url"): numero(x.get("subTotal")) for x in _metrica(r, "DeadClickCount")}
+        itens = []
+        for x in _metrica(r, "Traffic"):
+            url = x.get("Url")
+            if not url:
+                continue
+            itens.append({
+                "url": url, "sessoes": numero(x.get("totalSessionCount")) or 0,
+                "sessoes_bot": numero(x.get("totalBotSessionCount")),
+                "usuarios_distintos": numero(x.get("distinctUserCount")),
+                "dead_clicks": dead.get(url),
+            })
+        itens.sort(key=lambda i: (-i["sessoes"], i["url"]))
+        top_urls = {"coletado_em": r.get("coletado_em"), "janela_dias": numero(r.get("janela_dias")),
+                    "itens": itens[:TOP_N]}
+
+    ressalvas = [
+        "Clarity entrega JANELA deslizante de `janela_dias` dias coletada no dia D (dimensão Device): "
+        "não é 'sessões por dia' e não se soma entre dias. Cada ponto é a janela inteira.",
+        "dead/rage/quickback = Σ `subTotal` das dimensões Device; `sessoes_bot` é a contagem do próprio Clarity.",
+    ]
+    if top_urls is None:
+        ressalvas.append("Linha com dimensão URL ausente: top URLs " + SEM_SERIE + ".")
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "dias": ctx.dias,
+        "fontes": {"clarity": ctx.rel("clarity")},
+        "janelas": serie,
+        "top_urls": top_urls,
+        "ressalvas": ressalvas,
+    }
+
+
+def le_fila(ctx: Contexto) -> dict:
+    caminho = os.path.join(ctx.raiz, FONTES["fila"])
+    if not os.path.isfile(caminho):
+        return {"disponivel": False, "motivo": "arquivo ausente", "por_tipo_estado": []}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % caminho, uri=True, timeout=5)
+        try:
+            linhas = con.execute(
+                "select tipo, estado, count(*) from tarefa group by 1, 2 order by 1, 2").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as erro:
+        return {"disponivel": False, "motivo": "sqlite: %s" % erro, "por_tipo_estado": []}
+    return {"disponivel": True, "motivo": None,
+            "por_tipo_estado": [{"tipo": t, "estado": e, "n": n} for t, e, n in linhas]}
+
+
+def secao_cerebro(ctx: Contexto) -> dict:
+    il = ctx.fonte("ia_local")
+    por_dia: dict[str, dict] = {}
+    taxa: dict[tuple, dict] = {}
+    for r in il.registros:
+        d = r.get("date") or str(r.get("ts") or "")[:10]
+        if not ctx.na_janela(d):
+            continue
+        e = por_dia.setdefault(d, {"date": d, "lotes": 0, "itens": 0, "segundos_maquina": 0.0,
+                                   "erros": 0, "por_tipo": {}})
+        tipo = str(r.get("tipo") or "")
+        lote = numero(r.get("lote")) or 0
+        seg = numero(r.get("custo_segundos_maquina"))
+        if seg is None:
+            seg = (numero(r.get("parede_ms")) or 0) / 1000.0
+        ok = r.get("resultado") == "ok"
+        e["lotes"] += 1
+        e["itens"] += lote
+        e["segundos_maquina"] += seg
+        if not ok:
+            e["erros"] += 1
+        pt = e["por_tipo"].setdefault(tipo, {"itens": 0, "segundos_maquina": 0.0})
+        pt["itens"] += lote
+        pt["segundos_maquina"] += seg
+        modelo = str(r.get("modelo") or "")
+        if ok and modelo:
+            t = taxa.setdefault((tipo, modelo), {"tipo": tipo, "modelo": modelo, "lotes": 0, "itens": 0,
+                                                 "prompt_tokens": 0, "eval_tokens": 0, "segundos": 0.0})
+            t["lotes"] += 1
+            t["itens"] += lote
+            t["prompt_tokens"] += numero(r.get("prompt_tokens")) or 0
+            t["eval_tokens"] += numero(r.get("eval_tokens")) or 0
+            t["segundos"] += (numero(r.get("parede_ms")) or 0) / 1000.0
+    serie = []
+    for d in ctx.datas:
+        if d in por_dia:
+            e = por_dia[d]
+            e["segundos_maquina"] = round(e["segundos_maquina"], 1)
+            for pt in e["por_tipo"].values():
+                pt["segundos_maquina"] = round(pt["segundos_maquina"], 1)
+            serie.append(e)
+    taxas = []
+    for t in sorted(taxa.values(), key=lambda t: (t["tipo"], t["modelo"])):
+        seg = t["segundos"]
+        taxas.append({
+            **t, "segundos": round(seg, 1),
+            "tok_s_total": razao(t["prompt_tokens"] + t["eval_tokens"], seg, 2),
+            "prompt_tok_s": razao(t["prompt_tokens"], seg, 2),
+            "eval_tok_s": razao(t["eval_tokens"], seg, 2) if t["eval_tokens"] else None,
+            "segundos_por_item": razao(seg, t["itens"], 2),
+        })
+    tipos = sorted({tipo for e in serie for tipo in e["por_tipo"]})
+    ressalvas = [
+        "itens = Σ `lote` por dia (páginas embutidas, acórdãos extraídos…); segundos-máquina = Σ "
+        "`custo_segundos_maquina` (parede do lote). Lotes com `resultado` ≠ ok contam em `erros` e "
+        "ficam fora das taxas.",
+        "tok/s = Σ tokens ÷ Σ segundos de parede por (tipo, modelo) — média ponderada, não média das "
+        "taxas por lote. Embeddings têm eval_tokens = 0 por natureza; `eval_tok_s` só existe quando houve geração.",
+        "fila = `select tipo, estado, count(*) from tarefa` em data/ai/fila.sqlite (mode=ro), estado no "
+        "instante da geração — não é série.",
+    ]
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "dias": ctx.dias,
+        "fontes": {"ia_local": ctx.rel("ia_local"), "fila": ctx.rel("fila")},
+        "tipos": tipos,
+        "por_dia": serie,
+        "taxa_por_modelo": taxas,
+        "fila": le_fila(ctx),
+        "ressalvas": ressalvas,
+    }
+
+
+TABELAS_SOCIAL = ("perfis", "duvidas", "respostas", "posts_blog", "follows")
+
+
+def contagens_social(ctx: Contexto) -> dict:
+    caminho = os.path.join(ctx.raiz, FONTES["social_db"])
+    saida = {"disponivel": False, "motivo": None, "contagens": {t: None for t in TABELAS_SOCIAL}}
+    if not os.path.isfile(caminho):
+        saida["motivo"] = "arquivo ausente"
+        return saida
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % caminho, uri=True, timeout=5)
+    except sqlite3.Error as erro:
+        saida["motivo"] = "sqlite: %s" % erro
+        return saida
+    try:
+        existentes = {n for (n,) in con.execute("select name from sqlite_master where type='table'")}
+        for t in TABELAS_SOCIAL:
+            if t not in existentes:
+                continue
+            try:
+                saida["contagens"][t] = con.execute('select count(*) from "%s"' % t).fetchone()[0]
+            except sqlite3.Error as erro:
+                saida["motivo"] = "sqlite em %s: %s" % (t, erro)
+        saida["disponivel"] = True
+    except sqlite3.Error as erro:
+        saida["motivo"] = "sqlite: %s" % erro
+    finally:
+        con.close()
+    return saida
+
+
+def secao_social(ctx: Contexto) -> dict:
+    mo = ctx.fonte("moderacao")
+    por_dia = ultima_por_chave(mo.registros, lambda r: r.get("data"))
+    moderacao = []
+    for d in ctx.datas:
+        r = por_dia.get(d)
+        if r is None:
+            continue
+        moderacao.append({"data": d, "estado": r.get("estado"), "coletas": numero(r.get("coletas")),
+                          "banco_presente": r.get("banco_presente"),
+                          "piso_de_agregacao": numero(r.get("piso_de_agregacao"))})
+    ressalvas = [
+        "Contagens = `count(*)` das tabelas perfis, duvidas, respostas, posts_blog e follows de "
+        "var/social/social.db, abertas em mode=ro; nenhuma coluna é lida. Snapshot, não série.",
+        "moderacao_transparencia_diaria: estado da coleta por dia (última linha por `data` vence); "
+        "os números por categoria seguem o piso de agregação e ficam no próprio ledger.",
+    ]
+    if not mo.existe:
+        ressalvas.append("moderacao_transparencia_diaria.jsonl ausente: " + SEM_SERIE + ".")
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "dias": ctx.dias,
+        "fontes": {"social_db": ctx.rel("social_db"), "moderacao": ctx.rel("moderacao")},
+        "banco": contagens_social(ctx),
+        "moderacao_por_dia": moderacao,
+        "ressalvas": ressalvas,
+    }
+
+
+def serie_generica(ctx: Contexto, nome: str) -> dict:
+    """Ledger cujo esquema ainda não existe: contagem de linhas por dia e os
+    campos escalares da última linha — o que dá para afirmar sem inventar."""
+    f = ctx.fonte(nome)
+    if not f.existe:
+        return {"arquivo": ctx.rel(nome), "estado": SEM_SERIE, "linhas_por_dia": [], "ultima_linha": None}
+    cont: dict[str, int] = {}
+    for r in f.registros:
+        d = str(r.get("date") or r.get("data") or r.get("ts") or r.get("gerado_em") or "")[:10]
+        if ctx.na_janela(d):
+            cont[d] = cont.get(d, 0) + 1
+    ultima = f.registros[-1] if f.registros else None
+    escalares = None
+    if ultima is not None:
+        escalares = {k: v for k, v in ultima.items() if isinstance(v, (str, int, float, bool)) or v is None}
+    return {"arquivo": ctx.rel(nome), "estado": "com série" if f.registros else "arquivo vazio",
+            "linhas_por_dia": [{"date": d, "linhas": n} for d, n in sorted(cont.items())],
+            "ultima_linha": escalares}
+
+
+PREVISAO_SCHEMA = "previsao_v1"
+PREVISAO_EM_DESTAQUE = ("borda.organic_requests", "borda.uniques", "bots.total", "bing.impressions")
+
+
+def le_previsao(ctx: Contexto) -> dict:
+    """data/ops/painel/previsao.json é escrito por tools/generate-previsao-audiencia
+    --gravar (unit wikijuridica-previsao, 07:10 UTC) — o painel só LÊ. Ausente
+    ou ilegível vira "ainda sem previsão" com o motivo, nunca zero."""
+    if "_previsao" in ctx.__dict__:
+        return ctx._previsao
+    caminho = os.path.join(ctx.raiz, FONTES["previsao"])
+    saida = {"disponivel": False, "motivo": None, "dados": None, "arquivo": FONTES["previsao"]}
+    if not os.path.isfile(caminho):
+        saida["motivo"] = ("arquivo ausente — tools/generate-previsao-audiencia --gravar ainda não rodou "
+                           "(unit wikijuridica-previsao.timer, 07:10 UTC)")
+    else:
+        dados = None
+        try:
+            with open(caminho, encoding="utf-8") as handle:
+                dados = json.load(handle)
+        except (OSError, ValueError) as erro:
+            saida["motivo"] = "arquivo ilegível: %s" % erro
+        if dados is not None:
+            if not isinstance(dados, dict) or dados.get("schema_version") != PREVISAO_SCHEMA:
+                saida["motivo"] = "schema_version %r, esperado %r" % (
+                    dados.get("schema_version") if isinstance(dados, dict) else type(dados).__name__, PREVISAO_SCHEMA)
+            elif not isinstance(dados.get("series"), dict):
+                saida["motivo"] = "objeto sem o campo `series`"
+            else:
+                saida["disponivel"] = True
+                saida["dados"] = dados
+    ctx._previsao = saida
+    return saida
+
+
+def resumo_previsao(p: dict) -> dict:
+    dados = p["dados"] or {}
+    series = dados.get("series") or {}
+    return {
+        "disponivel": p["disponivel"],
+        "motivo": p["motivo"],
+        "date": dados.get("date"),
+        "gerado_em": dados.get("gerado_em"),
+        "janela_dias": dados.get("janela_dias"),
+        "series_projetadas": sum(1 for s in series.values() if isinstance(s, dict) and s.get("previsao")),
+        "series_total": len(series),
+        "top_areas": [a.get("area") for a in (dados.get("areas") or [])[:3] if isinstance(a, dict)],
+        "fonte": p["arquivo"],
+    }
+
+
+def _ultimo(itens, chave):
+    for item in reversed(itens):
+        if item.get(chave) is not None:
+            return item
+    return None
+
+
+def secao_resumo(ctx: Contexto, secoes: dict) -> dict:
+    borda, bots, bing, humanos, cerebro, social = (
+        secoes["borda"], secoes["bots"], secoes["bing"], secoes["humanos"], secoes["cerebro"], secoes["social"])
+    dia = ctx.ultimo_dia_completo
+    traf = next((t for t in borda["trafego_por_dia"] if t.get("date") == dia and t.get("presente")), None)
+    cache = _ultimo(borda["cache_por_dia"], "hit_pct")
+    lei = next((l for l in bots["leituras_por_dia"] if l["date"] == dia), None)
+    busca = _ultimo(bing["busca_por_dia"], "impressions")
+    rastreio = _ultimo(bing["rastreio_por_dia"], "in_index")
+    janela = humanos["janelas"][-1] if humanos["janelas"] else None
+    cer = next((e for e in cerebro["por_dia"] if e["date"] == dia), None)
+    fila = {}
+    for item in cerebro["fila"]["por_tipo_estado"]:
+        fila[item["estado"]] = fila.get(item["estado"], 0) + item["n"]
+    frescor = serie_generica(ctx, "frescor")
+    experimentos = serie_generica(ctx, "experimentos")
+    previsao = resumo_previsao(le_previsao(ctx))
+    return {
+        "schema_version": SCHEMA,
+        "gerado_em": ctx.gerado_em,
+        "commit": ctx.commit,
+        "hoje": ctx.hoje_iso,
+        "dias": ctx.dias,
+        "janela": {"inicio": ctx.datas[0], "fim": ctx.datas[-1]},
+        "ultimo_dia_completo": dia,
+        "borda": {
+            "date": dia,
+            "requests": None if traf is None else traf.get("requests"),
+            "self_warming_requests": None if traf is None else traf.get("self_warming_requests"),
+            "organic_requests": None if traf is None else traf.get("organic_requests"),
+            "uniques": None if traf is None else traf.get("uniques"),
+            "hit_pct": None if cache is None else cache.get("hit_pct"),
+            "hit_pct_date": None if cache is None else cache.get("date"),
+            "fonte": [borda["fontes"]["edge_traffic"], borda["fontes"]["cache_baseline"]],
+        },
+        "bots": {
+            "date": dia,
+            "leituras_borda_por_agente": None if lei is None else lei["por_agente"],
+            "travessia": {t["agente"]: t["travessia"] for t in bots["travessia"]},
+            "fonte": [bots["fontes"]["edge_bots"], bots["fontes"]["origin_bots"]],
+        },
+        "bing": {
+            "impressions": None if busca is None else busca.get("impressions"),
+            "clicks": None if busca is None else busca.get("clicks"),
+            "busca_date": None if busca is None else busca.get("date"),
+            "in_index": None if rastreio is None else rastreio.get("in_index"),
+            "crawled_pages": None if rastreio is None else rastreio.get("crawled_pages"),
+            "rastreio_date": None if rastreio is None else rastreio.get("date"),
+            "fonte": bing["fontes"]["bing"],
+        },
+        "humanos": {
+            "sessoes_janela": None if janela is None else janela.get("sessoes"),
+            "janela_dias": None if janela is None else janela.get("janela_dias"),
+            "coletado_em_dia": None if janela is None else janela.get("coletado_em_dia"),
+            "dead_clicks_janela": None if janela is None else janela.get("dead_clicks"),
+            "fonte": humanos["fontes"]["clarity"],
+        },
+        "cerebro": {
+            "date": dia,
+            "itens": None if cer is None else cer.get("itens"),
+            "segundos_maquina": None if cer is None else cer.get("segundos_maquina"),
+            "fila_por_estado": fila,
+            "fila_disponivel": cerebro["fila"]["disponivel"],
+            "fonte": [cerebro["fontes"]["ia_local"], cerebro["fontes"]["fila"]],
+        },
+        "social": {
+            "contagens": social["banco"]["contagens"],
+            "banco_disponivel": social["banco"]["disponivel"],
+            "fonte": social["fontes"]["social_db"],
+        },
+        "frescor": frescor,
+        "experimentos": experimentos,
+        "previsao": previsao,
+        "fontes": ctx.estados(),
+        "ressalvas": list(ctx.ressalvas),
+    }
+
+
+# ---------------------------------------------------------------------------
+# formatação e SVG
+# ---------------------------------------------------------------------------
+
+def esc(v) -> str:
+    return html.escape("" if v is None else str(v), quote=True)
+
+
+def fmt_int(v) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, float) and not v.is_integer():
+        return fmt_dec(v, 1)
+    return "{:,}".format(int(v)).replace(",", ".")
+
+
+def fmt_dec(v, casas=1) -> str:
+    if v is None:
+        return "—"
+    return ("{:,.%df}" % casas).format(v).replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+def fmt_pct(v, casas=1) -> str:
+    return "—" if v is None else fmt_dec(v, casas) + " %"
+
+
+def compacto(v) -> str:
+    if v is None:
+        return "—"
+    a = abs(v)
+    if a >= 1_000_000:
+        return fmt_dec(v / 1_000_000, 2) + " mi"
+    if a >= 10_000:
+        return fmt_dec(v / 1_000, 1) + " mil"
+    return fmt_int(v)
+
+
+def ddmm(data: str) -> str:
+    return data[8:10] + "/" + data[5:7] if len(data) >= 10 else data
+
+
+def passo_bonito(maximo: float, alvo: int = 4) -> float:
+    if maximo <= 0:
+        return 1.0
+    bruto = maximo / alvo
+    exp = 10 ** math.floor(math.log10(bruto))
+    for m in (1, 2, 2.5, 5, 10):
+        if m * exp >= bruto:
+            return m * exp
+    return 10 * exp
+
+
+def fmt_tick(v: float) -> str:
+    if v == int(v):
+        return fmt_int(int(v))
+    return fmt_dec(v, 1)
+
+
+# MR reserva espaço para o rótulo direto do último ponto (até "150.943 %", ~60 px a 11 px).
+SVG_W, SVG_H, ML, MR, MT, MB = 760, 230, 56, 66, 14, 30
+SLOTS = ("var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)", "var(--s6)", "var(--s7)", "var(--s8)")
+
+
+def cor_slot(i: int, nome: str) -> str:
+    if nome == "outros":
+        return "var(--outros)"
+    return SLOTS[i % len(SLOTS)]
+
+
+def _eixos(top: float, passo: float, n: int, datas: list, xs) -> str:
+    partes = []
+    plot_h = SVG_H - MT - MB
+    t = 0.0
+    while t <= top + 1e-9:
+        y = MT + plot_h * (1 - t / top)
+        partes.append('<line class="grade" x1="%d" x2="%d" y1="%.1f" y2="%.1f"/>' % (ML, SVG_W - MR, y, y))
+        partes.append('<text class="tick" x="%d" y="%.1f" text-anchor="end">%s</text>' % (ML - 6, y + 3.5, fmt_tick(t)))
+        t += passo
+    partes.append('<line class="eixo" x1="%d" x2="%d" y1="%.1f" y2="%.1f"/>' % (ML, SVG_W - MR, MT + plot_h, MT + plot_h))
+    k = max(1, math.ceil(n / 6))
+    for i, d in enumerate(datas):
+        if i % k == 0 or i == n - 1:
+            partes.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>'
+                          % (xs(i), SVG_H - 8, esc(ddmm(d))))
+    return "".join(partes)
+
+
+def svg_linhas(datas: list, series: list, provisorio: list | None = None, fmt=fmt_int) -> str:
+    """series: [{"nome", "valores": [num|None]*n, "slot": int}]; provisorio: [bool]*n."""
+    n = len(datas)
+    if n == 0 or not series:
+        return '<p class="vazio">' + SEM_SERIE + "</p>"
+    todos = [v for s in series for v in s["valores"] if v is not None]
+    maximo = max(todos) if todos else 0
+    passo = passo_bonito(maximo)
+    top = max(passo, math.ceil(maximo / passo) * passo) if maximo > 0 else passo
+    plot_h = SVG_H - MT - MB
+    plot_w = SVG_W - ML - MR
+    xs = (lambda i: ML + (plot_w * i / (n - 1) if n > 1 else plot_w / 2))
+    ys = (lambda v: MT + plot_h * (1 - v / top))
+    partes = ['<svg class="graf" viewBox="0 0 %d %d" role="img" aria-label="%s">'
+              % (SVG_W, SVG_H, esc("; ".join(s["nome"] for s in series)))]
+    partes.append(_eixos(top, passo, n, datas, xs))
+    banda = plot_w / (n - 1) if n > 1 else plot_w
+    for i, d in enumerate(datas):
+        linhas = ["%s%s" % (ddmm(d), " (provisório)" if provisorio and provisorio[i] else "")]
+        for s in series:
+            linhas.append("%s: %s" % (s["nome"], fmt(s["valores"][i])))
+        partes.append('<rect class="alvo" x="%.1f" y="%d" width="%.1f" height="%d"><title>%s</title></rect>'
+                      % (xs(i) - banda / 2, MT, banda, plot_h, esc("\n".join(linhas))))
+    rotulos = []
+    for s in series:
+        cor = cor_slot(s["slot"], s["nome"])
+        seg = []
+        d_atual = []
+        for i, v in enumerate(s["valores"]):
+            if v is None:
+                if d_atual:
+                    seg.append(d_atual)
+                d_atual = []
+                continue
+            d_atual.append((xs(i), ys(v)))
+        if d_atual:
+            seg.append(d_atual)
+        for pontos in seg:
+            if len(pontos) == 1:
+                continue
+            path = "M" + " L".join("%.1f %.1f" % p for p in pontos)
+            partes.append('<path class="linha" d="%s" stroke="%s"/>' % (path, cor))
+        for i, v in enumerate(s["valores"]):
+            if v is None:
+                continue
+            oco = bool(provisorio and provisorio[i])
+            # A COR VAI EM ATRIBUTO DE APRESENTACAO SVG (fill/stroke), nunca em
+            # style="": o painel e servido sob a CSP do nginx, que so admite
+            # folha por hash e nada de estilo inline (nem 'unsafe-hashes').
+            # Atributo de apresentacao nao e estilo inline para a CSP, e o CSS
+            # abaixo deixa fill/stroke da marca livres para ele valer.
+            partes.append('<circle class="marca%s" cx="%.1f" cy="%.1f" r="4" %s="%s"/>'
+                          % (" oca" if oco else "", xs(i), ys(v), "stroke" if oco else "fill", cor))
+        ultimo = next((i for i in range(n - 1, -1, -1) if s["valores"][i] is not None), None)
+        if ultimo is not None:
+            rotulos.append((ys(s["valores"][ultimo]), xs(ultimo), fmt(s["valores"][ultimo])))
+    usados = []
+    for y, x, texto in sorted(rotulos):
+        if any(abs(y - u) < 12 for u in usados):
+            continue
+        usados.append(y)
+        partes.append('<text class="rotulo" x="%.1f" y="%.1f">%s</text>' % (x + 8, y + 4, esc(texto)))
+    partes.append("</svg>")
+    return "".join(partes)
+
+
+def svg_colunas(datas: list, series: list, provisorio: list | None = None, fmt=fmt_int) -> str:
+    """Colunas empilhadas (1 série = colunas simples). Teto de 24 px, vão de 2 px
+    entre segmentos, topo arredondado de 4 px no segmento de cima."""
+    n = len(datas)
+    if n == 0 or not series:
+        return '<p class="vazio">' + SEM_SERIE + "</p>"
+    totais = [sum((s["valores"][i] or 0) for s in series) for i in range(n)]
+    maximo = max(totais) if totais else 0
+    passo = passo_bonito(maximo)
+    top = max(passo, math.ceil(maximo / passo) * passo) if maximo > 0 else passo
+    plot_h = SVG_H - MT - MB
+    plot_w = SVG_W - ML - MR
+    banda = plot_w / n
+    largura = min(24.0, banda * 0.7)
+    xs = (lambda i: ML + banda * i + banda / 2)
+    base = MT + plot_h
+    partes = ['<svg class="graf" viewBox="0 0 %d %d" role="img" aria-label="%s">'
+              % (SVG_W, SVG_H, esc("; ".join(s["nome"] for s in series)))]
+    partes.append(_eixos(top, passo, n, datas, xs))
+    for i, d in enumerate(datas):
+        prov = bool(provisorio and provisorio[i])
+        linhas = ["%s%s" % (ddmm(d), " (provisório)" if prov else "")]
+        for s in series:
+            linhas.append("%s: %s" % (s["nome"], fmt(s["valores"][i])))
+        if len(series) > 1:
+            linhas.append("total: %s" % fmt(totais[i] if any(s["valores"][i] is not None for s in series) else None))
+        partes.append('<g class="coluna%s"><title>%s</title>' % (" prov" if prov else "", esc("\n".join(linhas))))
+        partes.append('<rect class="alvo" x="%.1f" y="%d" width="%.1f" height="%d"/>'
+                      % (xs(i) - banda / 2, MT, banda, plot_h))
+        acumulado = 0.0
+        presentes = [(s, s["valores"][i]) for s in series if s["valores"][i]]
+        x0 = xs(i) - largura / 2
+        for j, (s, v) in enumerate(presentes):
+            h = plot_h * v / top
+            topo = j == len(presentes) - 1
+            y_top = base - acumulado - h
+            cor = cor_slot(s["slot"], s["nome"])
+            if topo:
+                r = min(4.0, h / 2, largura / 2)
+                partes.append(
+                    '<path class="seg" fill="%s" d="M%.1f %.1f a%.1f %.1f 0 0 1 %.1f -%.1f h%.1f a%.1f %.1f 0 0 1 %.1f %.1f V%.1f H%.1f Z"/>'
+                    % (cor, x0, y_top + r, r, r, r, r, largura - 2 * r, r, r, r, r, base - acumulado, x0))
+            else:
+                alt = max(0.0, h - 2)
+                if alt > 0:
+                    partes.append('<rect class="seg" fill="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>'
+                                  % (cor, x0, y_top + 2, largura, alt))
+            acumulado += h
+        partes.append("</g>")
+    partes.append("</svg>")
+    return "".join(partes)
+
+
+def legenda(series: list, tipo: str = "linha") -> str:
+    if len(series) < 2:
+        return ""
+    # Amostra de cor como SVG com fill em atributo (ver a marca do grafico):
+    # <i style="background:..."> seria estilo inline barrado pela CSP.
+    itens = "".join('<li><svg class="chave chave-%s" aria-hidden="true" focusable="false">'
+                    '<rect width="100%%" height="100%%" fill="%s"/></svg>%s</li>'
+                    % (tipo, cor_slot(s["slot"], s["nome"]), esc(s["nome"])) for s in series)
+    return '<ul class="legenda">%s</ul>' % itens
+
+
+def tabela(cabecalho: list, linhas: list, resumo: str = "Tabela") -> str:
+    if not linhas:
+        return ""
+    th = "".join("<th>%s</th>" % esc(c) for c in cabecalho)
+    corpo = []
+    for l in linhas:
+        corpo.append("<tr>" + "".join(
+            '<td class="%s">%s</td>' % ("num" if isinstance(v, (int, float)) or v is None else "txt", esc(_cel(v)))
+            for v in l) + "</tr>")
+    return ('<details class="tabela"><summary>%s</summary><div class="rolagem"><table><thead><tr>%s</tr></thead>'
+            "<tbody>%s</tbody></table></div></details>" % (esc(resumo), th, "".join(corpo)))
+
+
+def _cel(v):
+    if v is None:
+        return "—"
+    if isinstance(v, bool):
+        return "sim" if v else "não"
+    if isinstance(v, float):
+        return fmt_dec(v, 2)
+    if isinstance(v, int):
+        return fmt_int(v)
+    return v
+
+
+def tile(rotulo: str, valor: str, fonte: str, nota: str = "") -> str:
+    return ('<div class="tile"><div class="rotulo">%s</div><div class="valor">%s</div>'
+            '<div class="fonte">%s%s</div></div>'
+            % (esc(rotulo), esc(valor), esc(fonte), (" · " + esc(nota)) if nota else ""))
+
+
+def figura(titulo: str, svg: str, leg: str, tab: str, fonte: str, nota: str = "") -> str:
+    return ('<figure class="grafico"><figcaption><strong>%s</strong> <span class="fonte">%s</span>%s</figcaption>'
+            "%s%s%s</figure>"
+            % (esc(titulo), esc(fonte), (' <span class="nota">%s</span>' % esc(nota)) if nota else "",
+               svg, leg, tab))
+
+
+def lista_ressalvas(itens: list) -> str:
+    if not itens:
+        return ""
+    return '<details class="ressalvas"><summary>O que cada número é — e não é</summary><ul>%s</ul></details>' % "".join(
+        "<li>%s</li>" % esc(i) for i in itens)
+
+
+CSS = """
+:root{color-scheme:light;--surface:#fcfcfb;--plano:#f9f9f7;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
+--grade:#e1e0d9;--eixo:#c3c2b7;--borda:rgba(11,11,11,.10);--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;
+--s5:#e87ba4;--s6:#008300;--s7:#4a3aa7;--s8:#e34948;--outros:#898781;--bom:#006300;--critico:#d03b3b}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--surface:#1a1a19;--plano:#0d0d0d;
+--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--grade:#2c2c2a;--eixo:#383835;--borda:rgba(255,255,255,.10);--s1:#3987e5;
+--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--bom:#0ca30c}}
+:root[data-theme="dark"]{color-scheme:dark;--surface:#1a1a19;--plano:#0d0d0d;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;
+--grade:#2c2c2a;--eixo:#383835;--borda:rgba(255,255,255,.10);--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;
+--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--bom:#0ca30c}
+*{box-sizing:border-box}
+body{margin:0;padding:0 20px 56px;background:var(--plano);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+header.topo{padding:20px 0 8px;border-bottom:1px solid var(--borda);margin-bottom:12px}
+header.topo h1{font-size:22px;margin:0 0 4px;font-weight:650}
+header.topo .meta{color:var(--ink2);font-size:13px}
+nav.secoes{display:flex;flex-wrap:wrap;gap:6px 14px;margin:8px 0 20px;font-size:13px}
+nav.secoes a{color:var(--ink2);text-decoration:none;border-bottom:1px solid var(--borda)}
+nav.secoes a:hover{color:var(--ink)}
+section.secao{margin:0 0 36px}
+section.secao h2{font-size:18px;margin:0 0 10px;font-weight:650}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:14px}
+.tile{background:var(--surface);border:1px solid var(--borda);border-radius:8px;padding:10px 12px;min-width:0}
+.tile .rotulo{color:var(--ink2);font-size:12px}
+.tile .valor{font-size:26px;font-weight:600;margin:2px 0 4px}
+.fonte{color:var(--muted);font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+.nota{color:var(--ink2);font-size:12px}
+figure.grafico{background:var(--surface);border:1px solid var(--borda);border-radius:8px;padding:12px 14px 10px;margin:0 0 14px}
+figure.grafico figcaption{margin-bottom:6px;font-size:13px}
+svg.graf{display:block;width:100%;height:auto;max-height:320px}
+svg.graf .grade{stroke:var(--grade);stroke-width:1}
+svg.graf .eixo{stroke:var(--eixo);stroke-width:1}
+svg.graf .tick{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+svg.graf .rotulo{fill:var(--ink2);font-size:11px;font-weight:600}
+svg.graf .linha{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+svg.graf .marca{stroke:var(--surface);stroke-width:2}
+svg.graf .marca.oca{fill:var(--surface);stroke-width:2}
+svg.graf .alvo{fill:transparent}
+svg.graf g.coluna:hover .seg{opacity:.8}
+svg.graf g.coluna.prov .seg{opacity:.55}
+svg.graf .alvo:hover{fill:var(--borda)}
+ul.legenda{list-style:none;display:flex;flex-wrap:wrap;gap:4px 16px;margin:6px 0 0;padding:0;font-size:12px;color:var(--ink2)}
+ul.legenda li{display:inline-flex;align-items:center;gap:6px}
+svg.chave{display:inline-block;flex:none}
+svg.chave-linha{width:16px;height:2px}
+svg.chave-coluna{width:10px;height:10px}
+details.tabela,details.ressalvas{margin-top:8px;font-size:12px}
+details summary{cursor:pointer;color:var(--ink2)}
+details.ressalvas ul{margin:6px 0 0;padding-left:18px;color:var(--ink2)}
+.rolagem{overflow-x:auto}
+table{border-collapse:collapse;margin-top:6px;font-size:12px;min-width:320px}
+th,td{padding:3px 8px;border-bottom:1px solid var(--grade);text-align:left;vertical-align:top}
+th{color:var(--ink2);font-weight:600}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+p.vazio{color:var(--muted);font-style:italic;margin:8px 0}
+footer.fontes{border-top:1px solid var(--borda);padding-top:10px;color:var(--ink2);font-size:12px}
+footer.fontes table{min-width:0}
+"""
+
+
+def html_borda(s: dict) -> str:
+    datas = [t["date"] for t in s["trafego_por_dia"]]
+    prov = [bool(t.get("provisorio")) for t in s["trafego_por_dia"]]
+    ft = s["fontes"]
+    ult = next((t for t in s["trafego_por_dia"] if t.get("date") == s["ultimo_dia_completo"] and t.get("presente")), None)
+    cache = _ultimo(s["cache_por_dia"], "hit_pct")
+    aq = s["aquecimento_por_dia"][-1] if s["aquecimento_por_dia"] else None
+    kpis = "".join([
+        tile("Requisições na borda (último dia completo)", compacto(None if ult is None else ult["requests"]),
+             ft["edge_traffic"], s["ultimo_dia_completo"]),
+        tile("Auto-aquecimento (self_warming_requests)", compacto(None if ult is None else ult["self_warming_requests"]),
+             ft["edge_traffic"], s["ultimo_dia_completo"]),
+        tile("Orgânicas (requests − aquecimento)", compacto(None if ult is None else ult["organic_requests"]),
+             ft["edge_traffic"], s["ultimo_dia_completo"]),
+        tile("HIT na borda (toda a zona)", fmt_pct(None if cache is None else cache["hit_pct"]),
+             ft["cache_baseline"], "" if cache is None else cache["date"]),
+        tile("HIT sem tráfego próprio", fmt_pct(None if cache is None else cache["hit_pct_sem_trafego_proprio"]),
+             ft["cache_baseline"], "" if cache is None else cache["date"]),
+        tile("Quente antes do aquecedor (última execução)", fmt_pct(None if aq is None else aq["pre_head_hit_pct"]),
+             ft["edge_warm"], "" if aq is None else aq["date"]),
+    ])
+    series = [
+        {"nome": "requests (bruto)", "slot": 0, "valores": [t.get("requests") for t in s["trafego_por_dia"]]},
+        {"nome": "self_warming_requests", "slot": 1, "valores": [t.get("self_warming_requests") for t in s["trafego_por_dia"]]},
+        {"nome": "organic_requests", "slot": 2, "valores": [t.get("organic_requests") for t in s["trafego_por_dia"]]},
+    ]
+    f1 = figura("Requisições por dia na borda", svg_linhas(datas, series, prov), legenda(series),
+                tabela(["dia", "requests", "self_warming", "organic", "page_views", "uniques", "provisório"],
+                       [[t["date"], t.get("requests"), t.get("self_warming_requests"), t.get("organic_requests"),
+                         t.get("page_views"), t.get("uniques"), t.get("provisorio")]
+                        for t in s["trafego_por_dia"] if t.get("presente")]),
+                ft["edge_traffic"], "ponto oco = dia em curso, linha final chega em D+1")
+    dc = [c["date"] for c in s["cache_por_dia"]]
+    sc = [{"nome": "HIT", "slot": 0, "valores": [c["hit"] for c in s["cache_por_dia"]]},
+          {"nome": "MISS", "slot": 1, "valores": [c["miss"] for c in s["cache_por_dia"]]}]
+    f2 = figura("HIT × MISS por dia (toda a zona)", svg_colunas(dc, sc), legenda(sc, "coluna"),
+                tabela(["dia", "hit", "miss", "total", "hit %", "hit % sem próprio", "misses do aquecedor",
+                        "share auto-aquec.", "purgas tudo"],
+                       [[c["date"], c["hit"], c["miss"], c["total"], c["hit_pct"], c["hit_pct_sem_trafego_proprio"],
+                         c["misses_do_aquecedor"], c["share_autoaquecimento"], c["purgas_tudo"]]
+                        for c in s["cache_por_dia"]]),
+                ft["cache_baseline"], "GraphQL; série começa quando a linha de base passou a existir")
+    da = [a["date"] for a in s["aquecimento_por_dia"]]
+    sa = [{"nome": "quente antes do aquecedor (%)", "slot": 0,
+           "valores": [a["pre_head_hit_pct"] for a in s["aquecimento_por_dia"]]}]
+    f3 = figura("Cobertura quente antes do aquecedor tocar", svg_linhas(da, sa, fmt=fmt_pct), "",
+                tabela(["dia", "execuções", "urls", "hit", "miss", "revalidated", "só frios", "quente antes %"],
+                       [[a["date"], a["execucoes"], a["urls"], a["hit"], a["miss"], a["revalidated"], a["so_frios"],
+                         a["pre_head_hit_pct"]] for a in s["aquecimento_por_dia"]]),
+                ft["edge_warm"], "última execução do dia; hit/miss são do próprio GET do aquecedor")
+    dp = [p["date"] for p in s["purgas_por_dia"]]
+    sp = [{"nome": "tudo", "slot": 0, "valores": [p["tudo"] for p in s["purgas_por_dia"]]},
+          {"nome": "por URL", "slot": 1, "valores": [p["url"] for p in s["purgas_por_dia"]]},
+          {"nome": "por tag", "slot": 2, "valores": [p["tag"] for p in s["purgas_por_dia"]]}]
+    f4 = figura("Purgas por escopo (execuções por dia)", svg_colunas(dp, sp), legenda(sp, "coluna"),
+                tabela(["dia", "tudo", "por URL", "por tag", "URLs declaradas", "tags declaradas", "falhas"],
+                       [[p["date"], p["tudo"], p["url"], p["tag"], p["urls_total"], p["tags_total"], p["falhas"]]
+                        for p in s["purgas_por_dia"]]),
+                ft["edge_purge"])
+    return '<div class="kpis">%s</div>%s%s%s%s%s' % (kpis, f1, f2, f3, f4, lista_ressalvas(s["ressalvas"]))
+
+
+def html_bots(s: dict) -> str:
+    ft = s["fontes"]
+    datas = [l["date"] for l in s["leituras_por_dia"]]
+    prov = [bool(l.get("provisorio")) for l in s["leituras_por_dia"]]
+    agentes = s["agentes_no_grafico"]
+    series = [{"nome": a, "slot": i, "valores": [l["por_agente"].get(a) for l in s["leituras_por_dia"]]}
+              for i, a in enumerate(agentes)]
+    ult = next((l for l in s["leituras_por_dia"] if l["date"] == s["ultimo_dia_completo"]), None)
+    kpis = []
+    for a in agentes[:4]:
+        kpis.append(tile("Leituras na borda · " + a, compacto(None if ult is None else ult["por_agente"].get(a)),
+                         ft["edge_bots"], s["ultimo_dia_completo"]))
+    f1 = figura("Leituras por agente e dia (borda)", svg_colunas(datas, series, prov), legenda(series, "coluna"),
+                tabela(["dia"] + agentes, [[l["date"]] + [l["por_agente"].get(a) for a in agentes]
+                                           for l in s["leituras_por_dia"]
+                                           if any(v is not None for v in l["por_agente"].values())]),
+                ft["edge_bots"], "outros = " + ", ".join(s["agentes_em_outros"][:12]) +
+                ("…" if len(s["agentes_em_outros"]) > 12 else "") if s["agentes_em_outros"] else "")
+    trav = tabela(["agente", "função", "borda", "campo", "origem", "campo", "janelas", "travessia", "linha de base"],
+                  [[t["agente"], t["funcao"], t["borda"], t["borda_campo"], t["origem"], t["origem_campo"],
+                    t["origem_linhas"], t["travessia"], t["baseline_travessia"]] for t in s["travessia"]],
+                  "Travessia origem ÷ borda em %s (%d agentes)" % (s["ultimo_dia_completo"], len(s["travessia"])))
+    trav_kpi = ""
+    principais = [a for a in agentes if a != "outros"]
+    for t in [t for t in s["travessia"] if t["agente"] in principais][:4]:
+        trav_kpi += tile("Travessia · " + t["agente"], "—" if t["travessia"] is None else fmt_dec(t["travessia"], 2),
+                         ft["origin_bots"] + " ÷ " + ft["edge_bots"], s["ultimo_dia_completo"])
+    dr = [r["date"] for r in s["radar_ia_por_dia"]]
+    sr = [{"nome": "leituras verificadas", "slot": 0, "valores": [r["leituras_total"] for r in s["radar_ia_por_dia"]]},
+          {"nome": "das quais Markdown", "slot": 1, "valores": [r["markdown_total"] for r in s["radar_ia_por_dia"]]}]
+    ult_r = s["radar_ia_por_dia"][-1] if s["radar_ia_por_dia"] else None
+    f2 = figura("Radar IA — leituras verificadas na origem por dia", svg_linhas(dr, sr), legenda(sr),
+                tabela(["agente", "leituras", "markdown"],
+                       [[a, v, ult_r["markdown_por_agente"].get(a)] for a, v in
+                        sorted(ult_r["leituras_por_agente"].items(), key=lambda kv: -(kv[1] or 0))] if ult_r else [],
+                       "Por agente em %s" % (ult_r["date"] if ult_r else "")),
+                ft["radar_ia"])
+    ret = s["retorno_ultimo_dia"]
+    f3 = tabela(["agente", "função", "veio", "dias desde a visita anterior", "requisições", "cobertura acumulada %",
+                 "URLs novas", "clique de volta"],
+                [[a["agente"], a["funcao"], a["veio_hoje"], a["dias_desde_visita_anterior"], a["requisicoes"],
+                  a["cobertura_acumulada_pct"], a["urls_novas_no_dia"], a["citacao_clique_de_volta"]]
+                 for a in ret["agentes"]],
+                "Retorno por agente em %s (%s)" % (ret["date"], ft["bot_return"]))
+    return ('<div class="kpis">%s</div>%s<div class="kpis">%s</div>%s%s%s%s'
+            % ("".join(kpis), f1, trav_kpi, trav, f2, f3, lista_ressalvas(s["ressalvas"])))
+
+
+def html_bing(s: dict) -> str:
+    ft = s["fontes"]
+    busca = _ultimo(s["busca_por_dia"], "impressions")
+    rast = _ultimo(s["rastreio_por_dia"], "in_index")
+    kpis = "".join([
+        tile("Impressões (último dia com dado)", compacto(None if busca is None else busca["impressions"]),
+             ft["bing"], "" if busca is None else busca["date"]),
+        tile("Cliques", compacto(None if busca is None else busca["clicks"]), ft["bing"], "" if busca is None else busca["date"]),
+        tile("Páginas no índice (InIndex)", compacto(None if rast is None else rast["in_index"]),
+             ft["bing"], "" if rast is None else rast["date"]),
+        tile("Rastreadas (CrawledPages)", compacto(None if rast is None else rast["crawled_pages"]),
+             ft["bing"], "" if rast is None else rast["date"]),
+        tile("Erros 5xx vistos pelo Bing", fmt_int(None if rast is None else rast["code_5xx"]),
+             ft["bing"], "" if rast is None else rast["date"]),
+    ])
+    db = [b["date"] for b in s["busca_por_dia"]]
+    f1 = figura("Impressões por dia", svg_linhas(db, [{"nome": "Impressions", "slot": 0,
+                                                       "valores": [b["impressions"] for b in s["busca_por_dia"]]}]),
+                "", "", ft["bing"], "busca_diaria")
+    f2 = figura("Cliques por dia", svg_colunas(db, [{"nome": "Clicks", "slot": 0,
+                                                     "valores": [b["clicks"] for b in s["busca_por_dia"]]}]),
+                "", tabela(["dia", "impressions", "clicks"],
+                           [[b["date"], b["impressions"], b["clicks"]] for b in s["busca_por_dia"]]),
+                ft["bing"], "busca_diaria")
+    dr = [r["date"] for r in s["rastreio_por_dia"]]
+    f3 = figura("Páginas no índice (InIndex) por dia",
+                svg_linhas(dr, [{"nome": "InIndex", "slot": 0, "valores": [r["in_index"] for r in s["rastreio_por_dia"]]}]),
+                "", "", ft["bing"], "rastreio_diario")
+    f4 = figura("Páginas rastreadas por dia (CrawledPages)",
+                svg_colunas(dr, [{"nome": "CrawledPages", "slot": 0,
+                                  "valores": [r["crawled_pages"] for r in s["rastreio_por_dia"]]}]),
+                "", tabela(["dia", "InIndex", "CrawledPages", "Code5xx", "CrawlErrors", "InLinks"],
+                           [[r["date"], r["in_index"], r["crawled_pages"], r["code_5xx"], r["crawl_errors"], r["in_links"]]
+                            for r in s["rastreio_por_dia"]]),
+                ft["bing"], "rastreio_diario")
+    tc = tabela(["consulta", "impressions", "clicks", "posição média"],
+                [[i["query"], i["impressions"], i["clicks"], i["avg_impression_position"]] for i in s["top_consultas"]["itens"]],
+                "Top consultas em %s (consulta_diaria)" % s["top_consultas"]["date"]) or '<p class="vazio">consultas: %s</p>' % SEM_SERIE
+    tp = tabela(["página", "impressions", "clicks", "posição média"],
+                [[i["query"], i["impressions"], i["clicks"], i["avg_impression_position"]] for i in s["top_paginas"]["itens"]],
+                "Top páginas em %s (pagina_diaria)" % s["top_paginas"]["date"]) or '<p class="vazio">páginas: %s</p>' % SEM_SERIE
+    ui = s["url_info"]
+    tu = ("<p class=\"nota\">url_info: %s URLs consultadas, %s com LastCrawledDate, HTTP %s (coleta %s) "
+          "<span class=\"fonte\">%s</span></p>"
+          % (fmt_int(ui["urls_consultadas"]), fmt_int(ui["com_last_crawled_date"]), esc(json.dumps(ui["http_status"])),
+             esc(ui["coletado_em"]), esc(ft["bing"]))) if ui else '<p class="vazio">url_info: %s</p>' % SEM_SERIE
+    env = (tabela(["dia", "linhas"], [[e["date"], e["linhas"]] for e in s["envios_por_dia"]], "Envios por dia (bing_submit_ledger)")
+           if s["envios_por_dia"] else '<p class="vazio">envios (bing_submit_ledger.jsonl): %s</p>' % SEM_SERIE)
+    return '<div class="kpis">%s</div>%s%s%s%s%s%s%s%s%s' % (kpis, f1, f2, f3, f4, tc, tp, tu, env, lista_ressalvas(s["ressalvas"]))
+
+
+def _fmt_grande(v) -> str:
+    """Projeção pode passar de 1e9 (extrapolação de série em rampa): notação
+    científica em vez de uma fila de pontos de milhar."""
+    if v is None:
+        return "—"
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) >= 1e9:
+        return "%.2e" % v
+    return compacto(v)
+
+
+def _ic_txt(par, casas=1) -> str:
+    if not par or len(par) != 2:
+        return "—"
+    return "%s a %s" % (fmt_dec(par[0], casas), fmt_dec(par[1], casas))
+
+
+def html_previsao(p: dict) -> str:
+    """Só lê o que tools/generate-previsao-audiencia gravou; por série: último
+    valor, taxa semanal com IC e as três projeções, em texto e em tabela."""
+    if not p["disponivel"]:
+        return '<p class="vazio">ainda sem previsão: %s <span class="fonte">%s</span></p>' % (
+            esc(p["motivo"]), esc(p["arquivo"]))
+    d = p["dados"]
+    series = {k: v for k, v in d["series"].items() if isinstance(v, dict)}
+    janela = d.get("janela") or {}
+    cab = ('<p class="nota">gerado_em %s · janela de %s dia(s) (%s → %s) · último dia completo %s · modelo: %s '
+           '<span class="fonte">%s</span></p>'
+           % (esc(d.get("gerado_em")), esc(d.get("janela_dias")), esc(janela.get("inicio")), esc(janela.get("fim")),
+              esc(d.get("ultimo_dia_completo")), esc(d.get("modelo")), esc(p["arquivo"])))
+    kpis = []
+    for nome in PREVISAO_EM_DESTAQUE:
+        s = series.get(nome)
+        if s is None:
+            continue
+        pv = s.get("previsao") or {}
+        if pv:
+            valor = fmt_pct(s.get("taxa_semanal_pct")) + " / semana"
+            nota = "IC80 %s · 30 d ≈ %s" % (_ic_txt(s.get("ic80")), _fmt_grande((pv.get("30") or {}).get("ponto")))
+        else:
+            valor = "—"
+            nota = str(s.get("motivo") or "")
+        kpis.append(tile(nome, valor, p["arquivo"], nota))
+    frases = []
+    for nome, s in series.items():
+        pv = s.get("previsao") or {}
+        if pv:
+            partes = []
+            for h in ("30", "90", "180"):
+                item = pv.get(h) or {}
+                partes.append("%s d (%s) ≈ %s [IC80 %s]" % (
+                    h, esc(item.get("data")), _fmt_grande(item.get("ponto")),
+                    _ic_txt(item.get("ic80"), 0) if item.get("ic80") and all(
+                        isinstance(x, (int, float)) for x in item["ic80"]) else "—"))
+            frases.append("<li><strong>%s</strong>: último %s em %s; taxa semanal %s (IC80 %s; IC95 %s); %s; r² %s.</li>"
+                          % (esc(nome), _fmt_grande(s.get("ultimo_valor")), esc(s.get("ultimo_dia")),
+                             fmt_pct(s.get("taxa_semanal_pct")), _ic_txt(s.get("ic80")), _ic_txt(s.get("ic95")),
+                             "; ".join(partes), fmt_dec(s.get("r2"), 2)))
+        else:
+            frases.append("<li><strong>%s</strong>: %s — %s (n = %s, último %s em %s).</li>"
+                          % (esc(nome), esc(s.get("motivo")), esc(s.get("detalhe")), esc(s.get("n")),
+                             _fmt_grande(s.get("ultimo_valor")), esc(s.get("ultimo_dia"))))
+    texto = "<ul>%s</ul>" % "".join(frases)
+    linhas = []
+    for nome, s in series.items():
+        pv = s.get("previsao") or {}
+        linhas.append([nome, s.get("n"), s.get("ultimo_dia"), _fmt_grande(s.get("ultimo_valor")),
+                       s.get("taxa_semanal_pct"), _ic_txt(s.get("ic80")), _ic_txt(s.get("ic95")),
+                       _fmt_grande((pv.get("30") or {}).get("ponto")), _fmt_grande((pv.get("90") or {}).get("ponto")),
+                       _fmt_grande((pv.get("180") or {}).get("ponto")), s.get("r2"), s.get("motivo")])
+    tab = tabela(["série", "n", "último dia", "último valor", "taxa/sem %", "IC80 da taxa", "IC95 da taxa",
+                  "30 d", "90 d", "180 d", "r² (log)", "motivo"], linhas,
+                 "Tabela por série (ponto = mediana condicional; %s séries)" % len(linhas))
+    meta = d.get("areas_meta") or {}
+    ja = meta.get("janela") or {}
+    itens_areas = [a for a in (d.get("areas") or []) if isinstance(a, dict)][:TOP_N]
+    areas = tabela(["#", "área", "páginas", "leituras 14 d", "por página", "fator", "valor esperado", "por agente"],
+                   [[a.get("posicao"), a.get("area"), a.get("paginas_publicadas"), a.get("leituras_14d"),
+                     a.get("leituras_por_pagina"), meta.get("fator"), a.get("valor_esperado"),
+                     ", ".join("%s %s" % (k, v) for k, v in list((a.get("por_agente") or {}).items())[:3])]
+                    for a in itens_areas],
+                   "Top %d áreas por valor esperado (%s → %s; leituras × (1 + taxa de %s), fator %s)"
+                   % (TOP_N, ja.get("inicio"), ja.get("fim"), meta.get("fator_serie"), fmt_dec(meta.get("fator"), 4)))
+    if not areas:
+        areas = '<p class="vazio">áreas: %s</p>' % esc(meta.get("motivo") or SEM_SERIE)
+    return '%s<div class="kpis">%s</div>%s%s%s%s' % (
+        cab, "".join(kpis), texto, tab, areas, lista_ressalvas(d.get("ressalvas") or []))
+
+
+def html_humanos(s: dict) -> str:
+    ft = s["fontes"]["clarity"]
+    j = s["janelas"][-1] if s["janelas"] else None
+    nota = "" if j is None else "janela de %s dia(s) coletada em %s" % (j["janela_dias"], j["coletado_em_dia"])
+    kpis = "".join([
+        tile("Sessões (janela Clarity)", fmt_int(None if j is None else j["sessoes"]), ft, nota),
+        tile("Sessões de bot (Clarity)", fmt_int(None if j is None else j["sessoes_bot"]), ft, nota),
+        tile("Dead clicks", fmt_int(None if j is None else j["dead_clicks"]), ft, nota),
+        tile("Rage clicks", fmt_int(None if j is None else j["rage_clicks"]), ft, nota),
+        tile("Quickback clicks", fmt_int(None if j is None else j["quickback_clicks"]), ft, nota),
+        tile("Profundidade média de rolagem", fmt_pct(None if j is None else j["scroll_depth_media_pct"]), ft, nota),
+    ])
+    dj = [x["coletado_em_dia"] for x in s["janelas"]]
+    ss = [{"nome": "sessões (janela)", "slot": 0, "valores": [x["sessoes"] for x in s["janelas"]]},
+          {"nome": "sessões de bot", "slot": 1, "valores": [x["sessoes_bot"] for x in s["janelas"]]}]
+    f1 = figura("Sessões por janela Clarity, por dia de coleta", svg_linhas(dj, ss), legenda(ss),
+                tabela(["coleta", "janela (dias)", "sessões", "bots", "usuários", "dead", "rage", "quickback",
+                        "erros de script", "tempo ativo (s)", "rolagem média %"],
+                       [[x["coletado_em_dia"], x["janela_dias"], x["sessoes"], x["sessoes_bot"], x["usuarios_distintos"],
+                         x["dead_clicks"], x["rage_clicks"], x["quickback_clicks"], x["script_errors"],
+                         x["tempo_ativo_s"], x["scroll_depth_media_pct"]] for x in s["janelas"]]),
+                ft, "cada ponto é a janela inteira, não o dia")
+    tu = s["top_urls"]
+    top = (tabela(["URL", "sessões", "bots", "usuários", "dead clicks"],
+                  [[i["url"], i["sessoes"], i["sessoes_bot"], i["usuarios_distintos"], i["dead_clicks"]] for i in tu["itens"]],
+                  "Top URLs (dimensão URL, janela de %s dia(s), coleta %s)" % (tu["janela_dias"], tu["coletado_em"]))
+           if tu else '<p class="vazio">top URLs: %s</p>' % SEM_SERIE)
+    return '<div class="kpis">%s</div>%s%s%s' % (kpis, f1, top, lista_ressalvas(s["ressalvas"]))
+
+
+def html_cerebro(s: dict) -> str:
+    ft = s["fontes"]
+    fila = s["fila"]
+    por_estado: dict[str, int] = {}
+    for item in fila["por_tipo_estado"]:
+        por_estado[item["estado"]] = por_estado.get(item["estado"], 0) + item["n"]
+    kpis = "".join(tile("Fila · " + e, fmt_int(por_estado.get(e, 0) if fila["disponivel"] else None), ft["fila"],
+                        "" if fila["disponivel"] else str(fila["motivo"]))
+                   for e in ("pendente", "executando", "concluida", "erro"))
+    ult = s["por_dia"][-1] if s["por_dia"] else None
+    kpis += tile("Itens processados (último dia da série)", fmt_int(None if ult is None else ult["itens"]), ft["ia_local"],
+                 "" if ult is None else ult["date"])
+    kpis += tile("Segundos-máquina", fmt_int(None if ult is None else round(ult["segundos_maquina"])), ft["ia_local"],
+                 "" if ult is None else ult["date"])
+    dd = [e["date"] for e in s["por_dia"]]
+    tipos = s["tipos"][:7]
+    si = [{"nome": t, "slot": i, "valores": [(e["por_tipo"].get(t) or {}).get("itens") for e in s["por_dia"]]}
+          for i, t in enumerate(tipos)]
+    f1 = figura("Itens por dia e tipo", svg_colunas(dd, si), legenda(si, "coluna"),
+                tabela(["dia", "lotes", "itens", "segundos-máquina", "erros"] + tipos,
+                       [[e["date"], e["lotes"], e["itens"], e["segundos_maquina"], e["erros"]] +
+                        [(e["por_tipo"].get(t) or {}).get("itens") for t in tipos] for e in s["por_dia"]]),
+                ft["ia_local"])
+    f2 = figura("Segundos-máquina por dia",
+                svg_colunas(dd, [{"nome": "segundos-máquina", "slot": 0, "valores": [e["segundos_maquina"] for e in s["por_dia"]]}]),
+                "", "", ft["ia_local"], "Σ custo_segundos_maquina")
+    tf = tabela(["tipo", "estado", "n"], [[i["tipo"], i["estado"], i["n"]] for i in fila["por_tipo_estado"]],
+                "Fila por tipo e estado (%s)" % ft["fila"]) or '<p class="vazio">fila: %s</p>' % esc(fila["motivo"])
+    tt = tabela(["tipo", "modelo", "lotes", "itens", "prompt tokens", "eval tokens", "segundos", "tok/s total",
+                 "prompt tok/s", "eval tok/s", "s/item"],
+                [[t["tipo"], t["modelo"], t["lotes"], t["itens"], t["prompt_tokens"], t["eval_tokens"], t["segundos"],
+                  t["tok_s_total"], t["prompt_tok_s"], t["eval_tok_s"], t["segundos_por_item"]] for t in s["taxa_por_modelo"]],
+                "Taxa por (tipo, modelo) na janela — Σ tokens ÷ Σ segundos") or '<p class="vazio">taxas: %s</p>' % SEM_SERIE
+    return '<div class="kpis">%s</div>%s%s%s%s%s' % (kpis, tf, f1, f2, tt, lista_ressalvas(s["ressalvas"]))
+
+
+def html_social(s: dict) -> str:
+    ft = s["fontes"]
+    b = s["banco"]
+    kpis = "".join(tile(t, fmt_int(b["contagens"].get(t)), ft["social_db"], "" if b["disponivel"] else str(b["motivo"]))
+                   for t in TABELAS_SOCIAL)
+    tm = tabela(["dia", "estado", "coletas", "banco presente", "piso de agregação"],
+                [[m["data"], m["estado"], m["coletas"], m["banco_presente"], m["piso_de_agregacao"]] for m in s["moderacao_por_dia"]],
+                "Transparência da moderação por dia (%s)" % ft["moderacao"]) or '<p class="vazio">moderação: %s</p>' % SEM_SERIE
+    return '<div class="kpis">%s</div>%s%s' % (kpis, tm, lista_ressalvas(s["ressalvas"]))
+
+
+def html_frescor(resumo: dict) -> str:
+    partes = []
+    for titulo, bloco in (("Frescor da borda", resumo["frescor"]), ("Experimentos", resumo["experimentos"])):
+        if bloco["estado"] == SEM_SERIE:
+            partes.append('<p class="vazio">%s: %s <span class="fonte">%s</span></p>' % (esc(titulo), SEM_SERIE, esc(bloco["arquivo"])))
+            continue
+        partes.append('<h3>%s <span class="fonte">%s</span></h3>' % (esc(titulo), esc(bloco["arquivo"])))
+        partes.append(tabela(["dia", "linhas"], [[l["date"], l["linhas"]] for l in bloco["linhas_por_dia"]], "Linhas por dia")
+                      or '<p class="vazio">nenhuma linha na janela</p>')
+        if bloco["ultima_linha"]:
+            partes.append(tabela(["campo", "valor"], [[k, v] for k, v in bloco["ultima_linha"].items()], "Última linha (campos escalares)"))
+    return "".join(partes)
+
+
+def monta_html(ctx: Contexto, secoes: dict, resumo: dict) -> str:
+    corpo = {
+        "borda": html_borda(secoes["borda"]),
+        "bots": html_bots(secoes["bots"]),
+        "bing": html_bing(secoes["bing"]),
+        "previsao": html_previsao(le_previsao(ctx)),
+        "humanos": html_humanos(secoes["humanos"]),
+        "cerebro": html_cerebro(secoes["cerebro"]),
+        "social": html_social(secoes["social"]),
+        "frescor": html_frescor(resumo),
+    }
+    nav = "".join('<a href="#%s">%s</a>' % (i, esc(t)) for i, t in SECOES)
+    partes = [
+        "<!doctype html>",
+        '<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+        "<title>Painel wikijuridica</title><meta name=\"robots\" content=\"noindex,nofollow\">",
+        "<style>%s</style></head><body>" % CSS,
+        '<header class="topo"><h1>Painel local — wikijuridica.com.br</h1><div class="meta">gerado_em %s · commit %s · hoje %s · '
+        "janela %d dia(s) (%s → %s) · último dia completo %s</div></header>"
+        % (esc(ctx.gerado_em), esc(ctx.commit), esc(ctx.hoje_iso), ctx.dias, esc(ctx.datas[0]), esc(ctx.datas[-1]),
+           esc(ctx.ultimo_dia_completo)),
+        '<nav class="secoes">%s</nav>' % nav,
+    ]
+    for ident, titulo in SECOES:
+        partes.append('<section class="secao" id="%s"><h2>%s</h2>%s</section>' % (ident, esc(titulo), corpo[ident]))
+    linhas_fontes = [[f["arquivo"], f["existe"], f["linhas"], f["linhas_invalidas"], f["mtime"]] for f in resumo["fontes"]]
+    partes.append('<footer class="fontes">%s%s</footer>' % (
+        tabela(["arquivo", "existe", "linhas", "inválidas", "mtime (UTC)"], linhas_fontes, "Fontes lidas nesta geração"),
+        lista_ressalvas(resumo["ressalvas"])))
+    partes.append("</body></html>")
+    return "\n".join(partes)
+
+
+# ---------------------------------------------------------------------------
+# gravação
+# ---------------------------------------------------------------------------
+
+VOLATEIS = frozenset({"gerado_em", "mtime", "commit"})
+
+
+def _sem_volateis(obj):
+    """`commit` é volátil de propósito: HEAD avança várias vezes por hora neste
+    repositório, e o JSON só deve mudar quando o CONTEÚDO mudou. Assim,
+    `gerado_em`/`commit` do JSON são os da última mudança de conteúdo; o HTML
+    leva sempre o HEAD corrente."""
+    if isinstance(obj, dict):
+        return {k: _sem_volateis(v) for k, v in obj.items() if k not in VOLATEIS}
+    if isinstance(obj, list):
+        return [_sem_volateis(v) for v in obj]
+    return obj
+
+
+def grava_json(caminho: str, dados: dict) -> bool:
+    """Grava só quando o conteúdo mudou (ignorando gerado_em/mtime)."""
+    if os.path.isfile(caminho):
+        try:
+            with open(caminho, encoding="utf-8") as handle:
+                antigo = json.load(handle)
+        except (OSError, ValueError):
+            antigo = None
+        if antigo is not None and _sem_volateis(antigo) == _sem_volateis(dados):
+            return False
+    grava_atomico(caminho, json.dumps(dados, ensure_ascii=False, indent=1) + "\n")
+    return True
+
+
+def grava_atomico(caminho: str, texto: str) -> None:
+    os.makedirs(os.path.dirname(caminho) or ".", exist_ok=True)
+    tmp = caminho + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(texto)
+    os.replace(tmp, caminho)
+
+
+def gerar(raiz: str, hoje: dt.date, dias: int, saida: str, json_dir: str, commit: str | None = None) -> dict:
+    inicio = time.monotonic()
+    ctx = Contexto(raiz, hoje, dias, commit or commit_atual(raiz))
+    secoes = {"borda": secao_borda(ctx)}
+    secoes["bots"] = secao_bots(ctx)
+    secoes["bing"] = secao_bing(ctx)
+    secoes["humanos"] = secao_humanos(ctx)
+    secoes["cerebro"] = secao_cerebro(ctx)
+    secoes["social"] = secao_social(ctx)
+    resumo = secao_resumo(ctx, secoes)
+    pagina = monta_html(ctx, secoes, resumo)
+    tamanho = len(pagina.encode("utf-8"))
+    gravados = []
+    for nome, dados in list(secoes.items()) + [("resumo", resumo)]:
+        caminho = os.path.join(json_dir, nome + ".json")
+        if grava_json(caminho, dados):
+            gravados.append(caminho)
+    if tamanho > TETO_HTML_BYTES:
+        return {"ok": False, "motivo": "HTML com %d bytes excede o teto de %d" % (tamanho, TETO_HTML_BYTES),
+                "html_bytes": tamanho, "json_gravados": gravados, "segundos": round(time.monotonic() - inicio, 2)}
+    grava_atomico(saida, pagina)
+    return {"ok": True, "html": saida, "html_bytes": tamanho, "json_gravados": gravados,
+            "segundos": round(time.monotonic() - inicio, 2), "commit": ctx.commit,
+            "ultimo_dia_completo": ctx.ultimo_dia_completo}
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="gera o painel local (HTML + JSON) a partir dos ledgers de data/ops")
+    parser.add_argument("--dias", type=int, default=30, help="janela em dias, terminando hoje (padrão 30)")
+    parser.add_argument("--saida", default="var/painel/index.html", help="HTML de saída (relativo à raiz)")
+    parser.add_argument("--json-dir", default="data/ops/painel", help="diretório dos JSON (relativo à raiz)")
+    parser.add_argument("--raiz", default=RAIZ_PADRAO, help="raiz do repositório")
+    parser.add_argument("--hoje", default=None, help="data de referência AAAA-MM-DD (padrão: hoje em UTC)")
+    parser.add_argument("--commit", default=None, help="identificador do commit (padrão: git rev-parse --short HEAD)")
+    args = parser.parse_args(argv)
+    if args.dias < 1:
+        parser.error("--dias precisa ser >= 1")
+    try:
+        hoje = dt.date.fromisoformat(args.hoje) if args.hoje else dt.datetime.now(dt.timezone.utc).date()
+    except ValueError:
+        parser.error("--hoje precisa ser AAAA-MM-DD")
+    raiz = os.path.abspath(args.raiz)
+    saida = args.saida if os.path.isabs(args.saida) else os.path.join(raiz, args.saida)
+    json_dir = args.json_dir if os.path.isabs(args.json_dir) else os.path.join(raiz, args.json_dir)
+    try:
+        resultado = gerar(raiz, hoje, args.dias, saida, json_dir, args.commit)
+    except OSError as erro:
+        print("generate-painel: falha ao gravar: %s" % erro, file=sys.stderr)
+        return 2
+    print(json.dumps(resultado, ensure_ascii=False))
+    return 0 if resultado["ok"] else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

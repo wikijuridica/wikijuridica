@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Publica em public/datasets/ os dados estruturados que o portal ja produz,
+versionados por data, com sha256, licenca e proveniencia — a "maquina de dados
+juridicos" para IA (ordem do dono, 2026-09-08).
+
+POR QUE EXISTE: medido na origem em 2026-09-08, os agentes de IA reais leem as
+paginas HTML (PerplexityBot 11.555 em 8 dias, OAI-SearchBot 3.957) e quase nunca
+as rotas de maquina; e o que o portal produz de mais denso — o grafo juridico
+(24.376 nos), o corpus do STJ (9.236 acordaos, CC-BY), as extracoes por LLM com
+URN, a co-citacao legal — ficava so no disco. Um laboratorio que quer ingerir
+tudo de uma vez nao pagina 10 mil URLs: baixa um dump com hash (o padrao de
+echanges.dila.gouv.fr/OPENDATA e do bulk data do CourtListener).
+
+O QUE SAI (e o que NAO sai):
+  stj-espelhos-acordaos     data/corpus/jurisprudencia/stj-espelhos/registros-*.jsonl
+                            + proveniencia do manifest (URL da fonte, sha256, coletado_em);
+                            licenca CC-BY do STJ (dados abertos), registrada por linha.
+  extracoes-dispositivos    data/ai/extracoes_dispositivos.jsonl — ULTIMA linha por chave
+                            (o cerebro reprocessa e apende; o grafo faz o mesmo).
+  grafo-juridico-nos / -arestas   data/ai/grafo.sqlite, nos e arestas por chave.
+  cocitacao-legal           content/legal_cocitation_index.jsonl (percursos por dispositivo).
+  acervo-metadados          published_manifest ∩ indexavel (a MESMA intersecao que
+                            /api/v1/pages serve — nunca pageLastModified, que anuncia
+                            7 caminhos que a API nega com 404): url, titulo, area,
+                            datas, html_sha256, fontes oficiais, dispositivos citados.
+                            SEM o corpo: os Termos de Uso do portal vedam a reproducao
+                            integral sem autorizacao; texto integral e decisao do dono.
+
+DETERMINISMO: registros ordenados, JSON com sort_keys, gzip com mtime=0 — o mesmo
+insumo produz os mesmos bytes, e o sha256 do manifesto e conferivel por qualquer um.
+VERSIONAMENTO: <dataset>-AAAAMMDD.jsonl.gz; o datasets.json aponta o mais recente e
+mantem as duas versoes anteriores; o resto e removido daqui (so deste diretorio).
+MEDICAO: uma linha por execucao em data/ops/datasets_publicos_daily.jsonl.
+
+Uso:
+    tools/generate-datasets-publicos [--root R] [--data AAAA-MM-DD] [--dry-run]
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import gzip
+import hashlib
+import io
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCHEMA = "datasets_publicos_v1"
+MANTER_VERSOES = 3
+LICENCA_STJ = "CC-BY (Creative Commons Atribuicao) — dados abertos do STJ, dadosabertos.web.stj.jus.br"
+LICENCA_DERIVADOS = ("Dado derivado do portal, uso permitido com atribuicao a wikijuridica.com.br "
+                     "(autoria e responsabilidade tecnica em datasets.json); nao contem o texto das paginas.")
+
+
+def le_jsonl(caminho):
+    if not os.path.isfile(caminho):
+        return
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                yield json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+
+
+def serializa(registros):
+    """bytes gzip deterministicos de uma lista de dicts (ja ordenada)."""
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+        for r in registros:
+            gz.write((json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+    return buf.getvalue()
+
+
+def escrita_atomica(caminho, dados):
+    pasta = os.path.dirname(caminho)
+    os.makedirs(pasta, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=pasta)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(dados)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, caminho)
+
+
+# --- fontes -------------------------------------------------------------------
+
+def stj_espelhos(root):
+    base = os.path.join(root, "data", "corpus", "jurisprudencia", "stj-espelhos")
+    prov = {}
+    for m in le_jsonl(os.path.join(base, "manifest.jsonl")):
+        prov[m.get("arquivo")] = m
+    saida = []
+    if os.path.isdir(base):
+        for nome in sorted(os.listdir(base)):
+            if not (nome.startswith("registros-") and nome.endswith(".jsonl")):
+                continue
+            m = prov.get(nome, {})
+            for r in le_jsonl(os.path.join(base, nome)):
+                r = dict(r)
+                r["_proveniencia"] = {
+                    "dataset_stj": m.get("dataset"), "competencia": m.get("competencia"),
+                    "url_fonte": m.get("url"), "sha256_fonte": m.get("sha256_fonte"),
+                    "coletado_em": m.get("coletado_em"), "licenca": m.get("licenca") or LICENCA_STJ,
+                }
+                saida.append(r)
+    saida.sort(key=lambda r: (str(r.get("tribunal")), str(r.get("id_fonte"))))
+    return saida
+
+
+def extracoes(root):
+    por_chave = {}
+    for r in le_jsonl(os.path.join(root, "data", "ai", "extracoes_dispositivos.jsonl")):
+        if r.get("chave"):
+            por_chave[r["chave"]] = r  # ultima vence, como no grafo (fonte 6)
+    return [por_chave[k] for k in sorted(por_chave)]
+
+
+def wikidata_por_urn(root):
+    """URN LexML (base, sem !artN) -> QID, de data/corpus/wikidata/lexml_qids.jsonl
+    (tools/generate-wikidata-lexml, P9119). Ausente = sem sameAs, nunca erro."""
+    mapa = {}
+    for r in le_jsonl(os.path.join(root, "data", "corpus", "wikidata", "lexml_qids.jsonl")):
+        if r.get("urn") and r.get("qid"):
+            mapa[r["urn"].lower()] = r["qid"]
+    return mapa
+
+
+def urn_base_da_chave(chave):
+    u = chave
+    for prefixo in ("norma:", "dispositivo:"):
+        if u.startswith(prefixo):
+            u = u[len(prefixo):]
+    return u.split("!", 1)[0].lower()
+
+
+def grafo(root):
+    caminho = os.path.join(root, "data", "ai", "grafo.sqlite")
+    if not os.path.isfile(caminho):
+        return [], []
+    qids = wikidata_por_urn(root)
+    conn = sqlite3.connect("file:%s?mode=ro" % caminho, uri=True)
+    nos = []
+    chave_por_id = {}
+    for id_, tipo, chave, rotulo, atributos in conn.execute("SELECT id, tipo, chave, rotulo, atributos FROM nos ORDER BY chave"):
+        chave_por_id[id_] = chave
+        try:
+            atrib = json.loads(atributos)
+        except (TypeError, json.JSONDecodeError):
+            atrib = {}
+        no = {"tipo": tipo, "chave": chave, "rotulo": rotulo, "atributos": atrib}
+        if tipo in ("norma", "dispositivo"):
+            qid = qids.get(urn_base_da_chave(chave))
+            if qid:
+                # sameAs do DIPLOMA: o QID identifica a norma inteira; o artigo
+                # fica no fragmento !artN da propria chave. Nunca inventar QID por artigo.
+                no["wikidata_qid"] = qid
+                no["sameAs"] = "https://www.wikidata.org/wiki/" + qid
+        nos.append(no)
+    arestas = []
+    for o, d, tipo, peso, fonte, evidencia in conn.execute("SELECT origem, destino, tipo, peso, fonte, evidencia FROM arestas"):
+        arestas.append({"origem": chave_por_id.get(o), "destino": chave_por_id.get(d), "tipo": tipo,
+                        "peso": peso, "fonte": fonte, "evidencia": evidencia})
+    conn.close()
+    arestas.sort(key=lambda a: (a["origem"] or "", a["tipo"], a["destino"] or ""))
+    return nos, arestas
+
+
+def cocitacao(root):
+    regs = list(le_jsonl(os.path.join(root, "content", "legal_cocitation_index.jsonl")))
+    regs.sort(key=lambda r: r.get("public_path") or "")
+    return regs
+
+
+def acervo_metadados(root, base_url):
+    """published_manifest ∩ paginas indexaveis de content/pages.json."""
+    paginas = {}
+    try:
+        with open(os.path.join(root, "content", "pages.json"), encoding="utf-8") as handle:
+            for p in json.load(handle):
+                if p.get("path"):
+                    paginas[p["path"]] = p
+    except (OSError, json.JSONDecodeError):
+        return []
+    dispositivos = {}
+    for r in le_jsonl(os.path.join(root, "content", "legal_cocitation_index.jsonl")):
+        dispositivos[r.get("public_path")] = [{"urn": p.get("urn"), "rotulo": p.get("rotulo")} for p in r.get("percursos") or []]
+    saida = []
+    for rec in le_jsonl(os.path.join(root, "data", "editorial", "published_manifest.jsonl")):
+        path = rec.get("path")
+        pag = paginas.get(path)
+        if not pag or rec.get("page_status") != "published" or rec.get("index_policy") != "index":
+            continue
+        if (pag.get("robots") or "").lower().find("noindex") >= 0 or pag.get("index_policy") == "noindex":
+            continue
+        saida.append({
+            "intent_id": rec.get("unique_intent_id"), "path": path,
+            "url": rec.get("canonical_url") or (base_url + path), "title": rec.get("title"),
+            "area": path.split("/")[1] if path.count("/") >= 2 else "",
+            "approved_at": rec.get("approved_at"), "reviewed_at": rec.get("reviewed_at"),
+            "html_sha256": rec.get("html_sha256"),
+            "markdown_url": (rec.get("canonical_url") or (base_url + path)) + "index.md",
+            "citar_url": base_url + "/api/v1/citar" + path,
+            "fontes": [{"id": s.get("source_id"), "nome": s.get("source_name"), "url": s.get("source_url"),
+                        "checked_at": s.get("checked_at")} for s in rec.get("source_provenance") or []],
+            "dispositivos": dispositivos.get(path, []),
+        })
+    saida.sort(key=lambda r: r["path"])
+    return saida
+
+
+# --- publicacao ---------------------------------------------------------------
+
+def descreve(nome, arquivo, dados, registros, licenca, fonte, base_url, data):
+    return {
+        "nome": nome, "arquivo": arquivo, "url": base_url + "/datasets/" + arquivo,
+        "registros": registros, "bytes": len(dados),
+        "sha256": hashlib.sha256(dados).hexdigest(), "formato": "application/x-ndjson+gzip",
+        "gerado_em": data, "licenca": licenca, "fonte": fonte,
+    }
+
+
+def jsonld_dataset(desc, site, base_url):
+    ident = (site.get("editorial_identity") or {})
+    return {
+        "@type": "Dataset", "@id": desc["url"], "name": desc["nome"], "url": desc["url"],
+        "description": desc["fonte"], "license": desc["licenca"], "dateModified": desc["gerado_em"],
+        "isAccessibleForFree": True, "inLanguage": "pt-BR",
+        "creator": {"@type": "Person", "name": ident.get("author_name"),
+                    "identifier": "OAB/%s %s" % (ident.get("oab_section"), ident.get("oab_number"))},
+        "publisher": {"@type": "Organization", "name": "Wiki Jurídica", "url": base_url},
+        "distribution": [{"@type": "DataDownload", "contentUrl": desc["url"], "encodingFormat": desc["formato"],
+                          "contentSize": str(desc["bytes"]), "sha256": desc["sha256"]}],
+    }
+
+
+def purga_na_borda(url):
+    """Chama tools/purge-edge-cache --url; falha vira aviso no stderr."""
+    import subprocess
+    ferramenta = os.path.join(ROOT, "tools", "purge-edge-cache")
+    caminho = url.split("//", 1)[-1].split("/", 1)[1] if "//" in url else url
+    try:
+        r = subprocess.run([ferramenta, "--url", "/" + caminho], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print("datasets-publicos: AVISO purga da borda falhou (%s): %s" % (r.returncode, (r.stderr or r.stdout).strip()[-200:]), file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print("datasets-publicos: AVISO purga da borda nao rodou: %s" % exc, file=sys.stderr)
+
+
+def gera(root, data, dry_run=False, medicao="data/ops/datasets_publicos_daily.jsonl", purgar=purga_na_borda):
+    with open(os.path.join(root, "content", "site.json"), encoding="utf-8") as handle:
+        site = json.load(handle)
+    base_url = (site.get("base_url") or "https://wikijuridica.com.br").rstrip("/")
+    carimbo = data.replace("-", "")
+    nos, arestas = grafo(root)
+    conjuntos = [
+        ("stj-espelhos-acordaos", stj_espelhos(root), LICENCA_STJ,
+         "Espelhos de acordaos do STJ (dados abertos, CKAN), com proveniencia por arquivo mensal."),
+        ("extracoes-dispositivos", extracoes(root), LICENCA_DERIVADOS,
+         "Dispositivos legais e sumulas extraidos das ementas do STJ por LLM local, com URN LexML quando provada pelo parser; ultima extracao por acordao."),
+        ("grafo-juridico-nos", nos, LICENCA_DERIVADOS,
+         "Nos do grafo juridico: pagina, norma, dispositivo (URN LexML), sumula, tema, tribunal, area, acordao."),
+        ("grafo-juridico-arestas", arestas, LICENCA_DERIVADOS,
+         "Arestas do grafo juridico (cita, pertence_a, cocitada_com, julgado_por, da_area, revoga...), com peso, fonte e evidencia."),
+        ("cocitacao-legal", cocitacao(root), LICENCA_DERIVADOS,
+         "Percursos por fundamento legal: para cada pagina, os dispositivos que ela invoca e as outras paginas apoiadas nos mesmos."),
+        ("acervo-metadados", acervo_metadados(root, base_url), LICENCA_DERIVADOS,
+         "Metadados de cada pagina publicada e indexavel: URL canonica, titulo, area, datas, html_sha256, fontes oficiais e dispositivos citados. Sem o corpo."),
+    ]
+    pasta = os.path.join(root, "public", "datasets")
+    descricoes = []
+    for nome, registros, licenca, fonte in conjuntos:
+        dados = serializa(registros)
+        arquivo = "%s-%s.jsonl.gz" % (nome, carimbo)
+        desc = descreve(nome, arquivo, dados, len(registros), licenca, fonte, base_url, data)
+        if not dry_run:
+            escrita_atomica(os.path.join(pasta, arquivo), dados)
+            # versoes antigas alem de MANTER_VERSOES, so deste dataset e so aqui
+            antigas = sorted(f for f in os.listdir(pasta) if f.startswith(nome + "-") and f.endswith(".jsonl.gz")
+                             and f[len(nome) + 1:len(nome) + 9].isdigit())
+            for f in antigas[:-MANTER_VERSOES]:
+                os.remove(os.path.join(pasta, f))
+            desc["versoes_anteriores"] = [base_url + "/datasets/" + f for f in antigas[-MANTER_VERSOES:-1]]
+        descricoes.append(desc)
+    ident = site.get("editorial_identity") or {}
+    manifesto = {
+        "schema_version": SCHEMA, "gerado_em": data, "base_url": base_url,
+        "responsavel": {"nome": ident.get("author_name"), "oab": "OAB/%s %s" % (ident.get("oab_section"), ident.get("oab_number"))},
+        "como_verificar": "sha256 dos bytes baixados (gzip, sem descomprimir) deve ser igual ao campo sha256; o gzip e gerado com mtime=0, entao o mesmo insumo produz os mesmos bytes.",
+        "termos": "Corpus do STJ sob CC-BY do STJ; demais conjuntos sao derivados do portal, uso com atribuicao; nenhum contem o texto integral das paginas (Termos de Uso do portal).",
+        "datasets": descricoes,
+        "jsonld": {"@context": "https://schema.org", "@type": "DataCatalog", "name": "Wiki Jurídica — dados abertos para IA",
+                   "url": base_url + "/datasets/datasets.json",
+                   "dataset": [jsonld_dataset(d, site, base_url) for d in descricoes]},
+    }
+    texto = json.dumps(manifesto, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+    if not dry_run:
+        anterior = ""
+        caminho_manifesto = os.path.join(pasta, "datasets.json")
+        if os.path.isfile(caminho_manifesto):
+            with open(caminho_manifesto, encoding="utf-8") as handle:
+                anterior = handle.read()
+        escrita_atomica(caminho_manifesto, texto.encode("utf-8"))
+        # A BORDA GUARDA datasets.json POR 7 DIAS (s-maxage=604800): sem purga o
+        # agente leria o manifesto de ontem apontando para arquivos de ontem. Os
+        # arquivos datados sao URLs novas e nunca estiveram na borda; so o
+        # manifesto muda de conteudo na mesma URL. Falha de purga e aviso, nao
+        # erro: o dump ja esta no disco e a origem ja serve o novo.
+        if anterior != texto and purgar is not None:
+            purgar(base_url + "/datasets/datasets.json")
+        if medicao:
+            linha = {"schema_version": SCHEMA, "date": data,
+                     "datasets": {d["nome"]: {"registros": d["registros"], "bytes": d["bytes"], "sha256": d["sha256"]} for d in descricoes}}
+            caminho = os.path.join(root, medicao)
+            os.makedirs(os.path.dirname(caminho), exist_ok=True)
+            with open(caminho, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+    return manifesto
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=ROOT)
+    ap.add_argument("--data", default=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"))
+    ap.add_argument("--medicao", default="data/ops/datasets_publicos_daily.jsonl")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    m = gera(args.root, args.data, dry_run=args.dry_run, medicao=args.medicao)
+    for d in m["datasets"]:
+        print("%-24s %7d registros %10d bytes sha256=%s" % (d["nome"], d["registros"], d["bytes"], d["sha256"][:12]))
+    print("datasets-publicos: %d conjuntos em public/datasets/ (datasets.json)%s" % (len(m["datasets"]), " [dry-run]" if args.dry_run else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

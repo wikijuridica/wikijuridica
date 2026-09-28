@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""generate-edge-ledger-compaction — 68 cópias do mesmo fato viram um fato.
+
+`data/ops/edge_bot_agents_daily.jsonl` é append-only e cada execução do produtor
+reescreve TODA a janela que consegue enxergar. Medido em 2026-08-26: **23.021
+linhas para 339 fatos canônicos — 67,9× de redundância**, 17,2 MB crescendo
+~730 KB/dia.
+
+POR QUE ISSO NÃO É SÓ DESPERDÍCIO DE DISCO. É a causa material da armadilha que
+mais mordeu este projeto: quem soma as linhas do arquivo — o gesto mais natural
+do mundo diante de um JSONL — infla a métrica em ~68×. O leitor canônico
+(`tools/edgetelemetry.serie_saneada`) já deduplica por (date, agent_key)
+mantendo a última linha, mas leitor canônico protege quem o usa, não quem não
+sabe que ele existe. Compactar tira a armadilha do caminho de todo mundo.
+
+O QUE ESTE COMPACTADOR PRESERVA, e a lista é o contrato:
+
+  1. TODO fato canônico. Para cada (date, agent_key) fica a ÚLTIMA linha válida
+     — exatamente a que `serie_saneada` já elege. Nenhum consumidor honesto
+     enxerga diferença: é isso que a verificação de hash abaixo prova.
+  2. TODA linha que o leitor canônico DESCARTA (magnitude impossível, ou já em
+     quarentena). Elas não são lixo: são a evidência da anomalia, referenciadas
+     por SHA-256 no ledger de quarentena. Apagá-las quebraria a referência e
+     faria `check-bot-telemetry-honesty` deixar de reportar o que hoje reporta.
+  3. O arquivo inteiro de antes, em `.gz` versionado no repositório. Nada é
+     destruído — a compactação é reversível por descompressão.
+
+A PROVA DE QUE NADA MUDOU é feita com o instrumento do consumidor, não com
+contagem de linhas: o hash blake2b da série saneada é calculado ANTES e DEPOIS,
+e divergência ABORTA a operação com o arquivo original restaurado. Contagem de
+linhas provaria só que o arquivo encolheu, que é o que se espera de uma
+compactação errada também.
+
+A CORRIDA COM O PRODUTOR É REAL, e o timer prova: `wikijuridica-bot-telemetry`
+roda `tools/generate-bot-agents-daily` de meia em meia hora, e ele APPENDA neste
+arquivo. Um append caindo no meio da reescrita entraria num arquivo que está
+sendo substituído, e o dado perdido seria uma janela de rastreio que não volta —
+a borda não reexpõe o passado. Por isso:
+
+  - produtor e compactador travam o MESMO `<ledger>.lock` (flock exclusivo);
+  - a reescrita é NO MESMO INODE (truncate + write), nunca `os.replace`: um
+    produtor que já tivesse o arquivo aberto em modo append escreveria no inode
+    velho, e essas linhas sumiriam com a troca.
+"""
+
+import argparse
+import datetime
+import fcntl
+import gzip
+import hashlib
+import json
+import os
+import shutil
+import sys
+
+ROOT = os.environ.get("WIKI_ROOT", os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import edgetelemetry as et  # noqa: E402
+
+LEDGER = os.path.join(ROOT, "data", "ops", "edge_bot_agents_daily.jsonl")
+
+
+def hash_da_serie(caminho):
+    """Impressão digital do que o CONSUMIDOR enxerga, não do arquivo.
+
+    blake2b, nunca `hash()` do Python — que é aleatorizado por processo e
+    devolveria valores diferentes para o mesmo dado em duas execuções, o que
+    transformaria a verificação num carimbo sem conteúdo.
+    """
+    por_chave, descartadas = et.serie_saneada(ROOT, caminho=caminho)
+    digest = hashlib.blake2b(digest_size=16)
+    for chave in sorted(por_chave, key=lambda c: (str(c[0]), str(c[1]))):
+        digest.update(json.dumps(por_chave[chave], sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    resumo = hashlib.blake2b(digest_size=16)
+    for item in sorted(descartadas, key=lambda d: d["line_sha256"]):
+        resumo.update(item["line_sha256"].encode("utf-8"))
+    return digest.hexdigest(), resumo.hexdigest(), len(por_chave), len(descartadas)
+
+
+def escolher_linhas(bruto_das_linhas):
+    """Índices das linhas a manter, na ordem original do arquivo.
+
+    Mantém a ÚLTIMA linha válida de cada (date, agent_key) e TODA linha que o
+    leitor canônico descarta.
+    """
+    acervo = et.acervo_urls(ROOT)
+    quarentena = et.carregar_quarentena(ROOT)
+    ultimo_por_chave = {}
+    descartadas = set()
+    for indice, bruto in enumerate(bruto_das_linhas):
+        texto = bruto.strip()
+        if not texto:
+            continue
+        try:
+            registro = json.loads(texto)
+        except json.JSONDecodeError:
+            # Linha ilegível: o leitor canônico a pula em silêncio. Manter é a
+            # decisão conservadora — descartar seria apagar o que ninguém leu.
+            descartadas.add(indice)
+            continue
+        if et.avaliar_linha(registro, acervo) or et.sha_linha(texto) in quarentena:
+            descartadas.add(indice)
+            continue
+        ultimo_por_chave[(registro.get("date"), registro.get("agent_key"))] = indice
+    return sorted(descartadas | set(ultimo_por_chave.values()))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ensaio", action="store_true",
+                        help="mede e mostra o que faria; NAO escreve nada")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    if not os.path.isfile(LEDGER):
+        print("ledger inexistente: %s" % LEDGER)
+        return 1
+
+    with open(LEDGER + ".lock", "w", encoding="utf-8") as trava:
+        fcntl.flock(trava, fcntl.LOCK_EX)
+
+        with open(LEDGER, encoding="utf-8") as handle:
+            linhas = handle.readlines()
+        antes_bytes = os.path.getsize(LEDGER)
+        h_antes, q_antes, fatos_antes, desc_antes = hash_da_serie(LEDGER)
+        manter = escolher_linhas(linhas)
+
+        print("ANTES  linhas=%d bytes=%d fatos_canonicos=%d descartadas=%d redundancia=%.1fx"
+              % (len(linhas), antes_bytes, fatos_antes, desc_antes,
+                 len(linhas) / fatos_antes if fatos_antes else 0))
+        print("       hash da serie saneada = %s | hash dos descartes = %s" % (h_antes, q_antes))
+        print("DEPOIS linhas=%d (mantem a ULTIMA valida de cada chave + todo descarte)" % len(manter))
+
+        if args.ensaio:
+            print("\n--ensaio: NADA foi escrito")
+            if args.json:
+                print(json.dumps({"linhas_antes": len(linhas), "linhas_depois": len(manter),
+                                  "fatos": fatos_antes, "hash": h_antes}, indent=2))
+            return 0
+
+        if len(manter) >= len(linhas):
+            print("\nnada a compactar — o arquivo ja esta na forma minima")
+            return 0
+
+        carimbo = datetime.date.today().isoformat()
+        arquivo_morto = os.path.join(
+            os.path.dirname(LEDGER),
+            "edge_bot_agents_daily.pre-compactacao-%s.jsonl.gz" % carimbo)
+        with open(LEDGER, "rb") as origem, gzip.open(arquivo_morto, "wb") as destino:
+            shutil.copyfileobj(origem, destino)
+        print("\noriginal preservado em %s (%d bytes)"
+              % (os.path.relpath(arquivo_morto, ROOT), os.path.getsize(arquivo_morto)))
+
+        conteudo = "".join(linhas[i] for i in manter)
+        if conteudo and not conteudo.endswith("\n"):
+            conteudo += "\n"
+        # MESMO INODE, de propósito: `os.replace` faria um produtor com o
+        # arquivo já aberto em append escrever no inode velho, e essas linhas
+        # sumiriam. Ver o cabeçalho.
+        with open(LEDGER, "r+", encoding="utf-8") as handle:
+            handle.seek(0)
+            handle.write(conteudo)
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        h_depois, q_depois, fatos_depois, desc_depois = hash_da_serie(LEDGER)
+        if (h_depois, q_depois) != (h_antes, q_antes):
+            # RESTAURAÇÃO IMEDIATA, ainda sob a trava. O original está inteiro na
+            # memória desta execução — não há janela em que o arquivo fique
+            # errado e destravado.
+            with open(LEDGER, "r+", encoding="utf-8") as handle:
+                handle.seek(0)
+                handle.write("".join(linhas))
+                handle.truncate()
+            print("\nABORTADO: a serie saneada MUDOU (%s -> %s / descartes %s -> %s)."
+                  " Arquivo original restaurado." % (h_antes, h_depois, q_antes, q_depois),
+                  file=sys.stderr)
+            return 1
+
+        depois_bytes = os.path.getsize(LEDGER)
+        print("VERIFICADO: serie saneada identica (%s), %d fato(s), %d descarte(s) preservado(s)"
+              % (h_depois, fatos_depois, desc_depois))
+        print("bytes %d -> %d (%.1f%% do original)"
+              % (antes_bytes, depois_bytes, 100.0 * depois_bytes / antes_bytes))
+        if args.json:
+            print(json.dumps({
+                "linhas_antes": len(linhas), "linhas_depois": len(manter),
+                "bytes_antes": antes_bytes, "bytes_depois": depois_bytes,
+                "hash_serie": h_depois, "fatos": fatos_depois,
+                "descartes_preservados": desc_depois,
+                "arquivo_morto": os.path.relpath(arquivo_morto, ROOT),
+            }, ensure_ascii=False, indent=2))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

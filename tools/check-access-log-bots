@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""check-access-log-bots — vigia o enforcement de bots no tráfego real.
+
+A política vigente é a da DEC-023, por ordem do titular do conteúdo: PERMISSIVA.
+Nenhum User-Agent é negado por ser bot — nem crawler de treinamento. O que
+permanece é rate limit por IP em duas pistas (proteção de DISPONIBILIDADE, não
+de identidade), com pista generosa para bot de busca/usuário.
+
+Este check descreveu a DEC-022 até 2026-08-07 — o 403 no ingress para bot de
+treinamento — e essa política foi REVERTIDA pela DEC-023 no mesmo dia em que
+entrou. O vhost vivo não bloqueia ninguém (`wikijuridica.conf`: "VAZIA — nenhum
+User-Agent é negado por ser bot"), e a medição confirma: GPTBot responde 200. Um
+gate que afirma a política errada reprova, ou aprova, pelo motivo errado.
+
+O risco concreto: um bot VALIOSO (Googlebot, Bingbot, OAI-SearchBot,
+Claude-SearchBot, PerplexityBot…) passar a receber 403 ou 429 por um erro de
+regex, de ordem de `map` ou de rate limit. O portal sairia silenciosamente do
+índice — e a única testemunha seria o access log, que hoje ninguém lê.
+
+Este check é READ-ONLY e não depende de serviço externo: lê o log que o nginx já
+grava com `log_format wj_main` (ops/nginx/wikijuridica.conf) e reprova quando o
+tráfego contradiz a política declarada.
+
+O que REPROVA (exit 1):
+  - bot valioso (allow=1) que recebeu 403 ou 429 — o portal sairia do índice em
+    silêncio;
+  - bot de TREINAMENTO que recebeu 403 — a DEC-023 proíbe negar por identidade,
+    e um bloqueio reaparecendo é regressão de política, não conserto.
+
+O que apenas informa: volume por status, rotas mais pedidas, bots vistos. É a
+base de medição de tráfego sem uma linha de JavaScript na página — o contrato de
+HTML leve proíbe script, então analytics de terceiro está fora por construção.
+
+★ IDENTIDADE DE QUEM APARECE NO LOG (correção de 2026-08-12)
+
+O ranking de "bots vistos" contava pela STRING do User-Agent e, com isso,
+liderava com as sondas de auditoria deste próprio repositório. Medido no log
+vivo em 2026-08-12: **2.053 das 2.062 linhas com "Googlebot" eram
+`bot_sim=true`** — 229x mais sonda do que crawler. Quem lesse o ranking
+concluiria que o Googlebot é o visitante dominante do portal.
+
+Aqui, diferente da borda da Cloudflare, existem DOIS sinais de identidade, e
+este check usa os dois:
+
+  1. `bot_sim` — o campo que o próprio nginx grava quando a requisição traz
+     `X-Bot-Simulation` (ops/nginx: log_format wj_main). É o discriminador
+     exato da sonda, e a borda nunca o vê: cabeçalho arbitrário não aparece no
+     GraphQL da Cloudflare. Por isso a série da borda precisou de
+     `verifiedBotCategory` e esta aqui não.
+  2. faixa de IP oficial publicada pelo operador (data/ops/bot_ip_ranges/,
+     mantida pelo timer `wikijuridica-bot-ipranges`, lida por
+     `botagents.ler_faixas`). É o que separa crawler real de forjador.
+
+O ALARME NÃO MUDOU DE SEVERIDADE, DE PROPÓSITO: bot valioso bloqueado continua
+reprovando mesmo quando a linha é sonda ou forjador. O bloqueio no nginx é
+decidido por User-Agent, então uma sonda levando 429 prova que o crawler de
+verdade levaria 429 na mesma rota — é o alarme funcionando, não ruído. O que
+mudou é que cada ocorrência agora diz QUEM era (`sonda_local`, `faixa_oficial`
+ou `nao_verificado`), para que o diagnóstico não comece no escuro.
+
+Uso:
+    ./tools/check-access-log-bots
+    ./tools/check-access-log-bots --log /caminho/do/access.log --top 15
+    ./tools/check-access-log-bots --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+DEFAULT_LOG = "/var/log/nginx/wikijuridica/access.log"
+
+# Espelha log_format wj_main. Campos tolerantes a vazio ("allow=" sem valor)
+# porque o nginx emite string vazia quando o map não casa.
+#
+# O bloco do meio precisa aceitar TRÊS gerações de log_format ao mesmo tempo,
+# porque o arquivo de log é append-only e atravessa os reloads:
+#
+#   (1) até 2026-08-04 16:35  "deny=0 allow=1 block=0"
+#   (2) DEC-023, 16:35        "allow=1"            (deny/block removidos com a
+#                                                   política permissiva)
+#   (3) 2026-08-04 17h        "allow=1 bot_sim="   (marca de requisição de
+#                                                   ENSAIO, para não contar
+#                                                   smoke de rastreio como
+#                                                   audiência real)
+#
+# Este parser estava ancorado na geração (1) e, desde 16:35, NÃO casava mais
+# nenhuma linha que o nginx vivo escreve: a verificação anti-fraude de tráfego
+# passava a ver zero linha e não tinha como acusar nada. Por isso `deny` e
+# `block` viraram opcionais e `bot_sim` entrou opcional — ler o histórico é
+# requisito, não gentileza. Quem consumir os grupos precisa tratar None.
+#
+#   (4) FASE 2 (2026-08-11)   "... rt=... cf_ray=... reqlen=..."  ($request_length
+#                             acrescentado ao fim do log_format para medir o
+#                             tamanho da requisição inteira, não só a resposta)
+#
+# `reqlen` entra como grupo opcional pelo mesmo motivo dos anteriores: o log é
+# append-only e atravessa o reload — linhas escritas ANTES da mudança de
+# log_format não têm o campo, e o parser precisa continuar casando as duas.
+#
+#   (5) 2026-08-12            "... ref=\"...\" warm=..."  (referer, para medir
+#                             clique de volta de assistente de IA — a borda no
+#                             plano Free NÃO expõe clientRequestReferer —, e a
+#                             marca do aquecimento, que até aqui era inferida
+#                             pelo PREFIXO do User-Agent)
+#
+# A LIÇÃO QUE ESTA GERAÇÃO OBRIGA A APRENDER — e a razão de o padrão terminar
+# diferente de todas as anteriores: o parser estava ancorado em `$`, então CADA
+# campo novo no fim do log_format o fazia casar ZERO linha. Não é hipótese: já
+# aconteceu na geração (2), e o comentário acima registra o estrago — "a
+# verificação anti-fraude passava a ver zero linha e não tinha como acusar
+# nada". Um verificador que emudece quando o formato muda é pior que verificador
+# nenhum, porque o silêncio se parece com aprovação.
+#
+# O sufixo `campos_futuros` existe para que a geração (6) NÃO quebre nada: ele
+# absorve qualquer par `chave=valor` acrescentado ao fim. Quando um campo novo
+# passar a importar, ele ganha grupo nomeado próprio acima desta linha; até lá,
+# é ignorado sem derrubar a leitura das 57.540 linhas que o log já tem.
+#
+# `ref` usa [^"]* e NUNCA \S*: referer contém espaços em URL malformada, e um
+# \S* comeria o campo seguinte.
+LINE = re.compile(
+    r'^(?P<addr>\S+) - \[(?P<time>[^\]]*)\] host=(?P<host>\S*) '
+    r'"(?P<request>[^"]*)" (?P<status>\d{3}) (?P<bytes>\S+) '
+    r'"(?P<agent>[^"]*)" '
+    r'(?:deny=(?P<deny>\S*) )?allow=(?P<allow>\S*)'
+    # `bot_sim` e ate ` rt=`, NAO ate o primeiro espaco.
+    #
+    # O valor vem de $http_x_bot_simulation, ou seja, e TEXTO ARBITRARIO que o
+    # cliente escolhe -- e com `\S*` ele parava no primeiro espaco, a linha
+    # inteira deixava de casar e ia para `malformadas`, que sai de TODA contagem.
+    # Achado no log de 12/08 20:21:38, numa sonda que mandou
+    # `X-Bot-Simulation: um dois tres` justamente para testar isto: 1 linha em
+    # 109.902. O buraco nao e o tamanho, e a natureza -- qualquer cliente se
+    # esconderia da telemetria anti-fraude mandando um espaco no cabecalho.
+    r'(?: block=(?P<block>\S*))?(?: bot_sim=(?P<bot_sim>.*?))? '
+    r'rt=(?P<rt>\S*) cf_ray=(?P<ray>\S*)'
+    r'(?: reqlen=(?P<reqlen>\S*))?'
+    r'(?: ref="(?P<ref>[^"]*)")?'
+    r'(?: warm=(?P<warm>\S*))?'
+    r'(?P<campos_futuros>(?: \S+)*)\s*$'
+)
+
+BLOCKED_STATUSES = {"403", "429"}
+ROBOTS_PATH = "/robots.txt"
+
+
+def parse_request(request: str) -> tuple[str, str]:
+    """Devolve (método, caminho) de uma linha de request do nginx."""
+    parts = request.split()
+    if len(parts) >= 2:
+        return parts[0], parts[1].split("?", 1)[0]
+    return "", request
+
+
+def identidade_de(ip: str, user_agent: str, e_sonda: bool, faixas: dict) -> str:
+    """Quem é, de verdade, o cliente desta linha do log.
+
+    `sonda_local` vem do campo que o nginx grava e é exato. `faixa_oficial` é a
+    autenticação por IP publicado pelo operador. `nao_verificado` é o que
+    sobra — e é dito assim, nunca "forjado": operador sem faixa publicada
+    (ClaudeBot, GPTBot em parte do período) cairia aqui sem ter feito nada de
+    errado, e chamar isso de fraude seria inventar acusação.
+    """
+    if e_sonda:
+        return "sonda_local"
+    # IP não-roteável na internet: é esta máquina, a rede local ou uma fixture
+    # de teste. Vem ANTES do User-Agent porque o endereço não se escolhe — a
+    # string, sim. Foi assim que `WikiJuridicaInfraAudit/1.0` (203.0.113.x, faixa
+    # de documentação) contava como visitante em todo ranking.
+    if botagents.ip_nao_publico(ip):
+        return "origem_nao_publica"
+    chave = botagents.agente_de(user_agent)
+    if not chave:
+        return "nao_bot_conhecido"
+    redes = faixas.get(chave) or []
+    if redes and botagents.em_faixa(ip, redes):
+        return "faixa_oficial"
+    return "nao_verificado"
+
+
+def marcado_como_aquecimento(warm: str | None) -> bool:
+    """A marca CATEGÓRICA de aquecimento, gravada pelo próprio nginx.
+
+    O aquecedor de borda manda `X-Warming-Request: true` desde sempre, mas o
+    log_format nunca registrou o cabeçalho — então a exclusão do aquecimento
+    era feita por CONVENÇÃO de prefixo de User-Agent. Convenção falha: já falhou
+    uma vez, com 2.000 linhas de `Audit/1.0` e `curl-teste/1.0` entrando na
+    audiência real, e é por causa daquele episódio que `botagents.ip_nao_publico`
+    existe.
+
+    Ausência do campo (linha anterior à geração 5 do log_format, ou aquecimento
+    que de fato não mandou o cabeçalho) devolve False e a linha volta para a
+    classificação por convenção — degradação declarada, nunca silenciosa: o
+    relatório conta as duas separadamente.
+    """
+    valor = (warm or "").strip().lower()
+    return valor not in ("", "-", "0", "false")
+
+
+def origem_do_referer(referer: str | None, host: str) -> str:
+    """Classifica a procedência de uma requisição pelo `Referer`.
+
+    Três respostas, e a terceira é a que impede o auto-engano: `sem_campo` diz
+    que o log_format daquela linha ainda não gravava referer, o que é diferente
+    de `ausente` (o cliente veio sem referer, caso de crawler e de acesso
+    direto). Somar as duas faria o relatório afirmar que ninguém chega por link
+    quando o que houve foi mudança de formato.
+    """
+    if referer is None:
+        return "sem_campo"
+    limpo = referer.strip()
+    if limpo in ("", "-"):
+        return "ausente"
+    # Comparação por host, e não por string inteira: o esquema varia (http/https)
+    # e a porta pode aparecer. `host` vem do próprio campo do log, então não há
+    # domínio hardcoded aqui.
+    try:
+        origem = urllib.parse.urlsplit(limpo).netloc.split("@")[-1].lower()
+    except ValueError:
+        return "malformado"
+    if not origem:
+        return "malformado"
+    if origem.split(":")[0] == (host or "").strip().lower().split(":")[0]:
+        return "interno"
+    return "externo"
+
+
+def analyze(path: pathlib.Path, top: int) -> dict:
+    total = 0
+    malformadas = 0
+    sondas = 0
+    internas = 0
+    por_status: collections.Counter = collections.Counter()
+    por_rota: collections.Counter = collections.Counter()
+    por_agente: collections.Counter = collections.Counter()
+    por_agente_sonda: collections.Counter = collections.Counter()
+    por_agente_interno: collections.Counter = collections.Counter()
+    por_identidade: collections.Counter = collections.Counter()
+    por_origem_referer: collections.Counter = collections.Counter()
+    aquecimento_marcado = 0
+    aquecimento_so_pela_marca = 0
+    valioso_bloqueado: list[dict] = []
+    treino_bloqueado: list[dict] = []
+    faixas = botagents.ler_faixas(ROOT)
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            raw = raw.rstrip("\n")
+            if not raw.strip():
+                continue
+            total += 1
+            match = LINE.match(raw)
+            if not match:
+                malformadas += 1
+                continue
+            campos = match.groupdict()
+            status = campos["status"]
+            _, caminho = parse_request(campos["request"])
+            por_status[status] += 1
+            por_rota[caminho] += 1
+            agente = campos["agent"][:80] or "(vazio)"
+            # `bot_sim` vazio, "-" ou "0" é requisição de verdade; qualquer
+            # outro valor é a sonda que este repositório dispara contra o
+            # próprio site (tools/check-what-bots-see e o harness de smoke).
+            e_sonda = (campos["bot_sim"] or "").strip() not in ("", "-", "0")
+            identidade = identidade_de(campos["addr"], campos["agent"], e_sonda, faixas)
+            por_identidade[identidade] += 1
+            por_origem_referer[origem_do_referer(campos["ref"], campos["host"])] += 1
+
+            # O aquecimento por MARCA do nginx, e o quanto a convenção antiga
+            # deixaria passar. `aquecimento_so_pela_marca` é a medida do defeito
+            # que esta geração do log fecha: cada linha contada aí é uma
+            # requisição nossa que o ranking de audiência engoliria como visita.
+            e_aquecimento = marcado_como_aquecimento(campos["warm"])
+            convencao_pegaria = agente.lower().startswith("wikijuridica-")
+            if e_aquecimento:
+                aquecimento_marcado += 1
+                if not convencao_pegaria:
+                    aquecimento_so_pela_marca += 1
+
+            if e_sonda:
+                # Contada, nomeada e FORA do ranking de quem visitou. Somar a
+                # sonda ao ranking foi o que fez "Googlebot" liderar o log com
+                # 2.053 de 2.062 linhas sendo nossas.
+                sondas += 1
+                por_agente_sonda[agente] += 1
+            elif e_aquecimento or identidade == "origem_nao_publica" or convencao_pegaria:
+                # Ferramenta desta casa que se identifica honestamente com UA
+                # próprio (aquecimento de borda, auditoria, watchdog). Não manda
+                # X-Bot-Simulation porque não simula bot nenhum — e ainda assim
+                # não é visitante. Sem esta separação o ranking de "quem veio"
+                # era liderado pelo nosso próprio aquecimento, respondendo à
+                # pergunta errada.
+                #
+                # `e_aquecimento` vem PRIMEIRO porque é a única das três provas
+                # que não depende de convenção: o nginx grava o cabeçalho que a
+                # requisição de fato trouxe. As outras duas continuam porque o
+                # log é append-only — as linhas anteriores à geração 5 não têm
+                # o campo e só podem ser classificadas pelo que se sabia então.
+                internas += 1
+                por_agente_interno[agente] += 1
+            else:
+                por_agente[agente] += 1
+
+            # `deny` só existe nas linhas anteriores à DEC-023: o log_format
+            # atual não emite o campo. Grupo opcional que não casa vem None, e
+            # None.strip() derrubaria a checagem inteira ao encontrar a primeira
+            # linha moderna — por isso o default "" em vez de acesso direto.
+            allow = (campos["allow"] or "").strip()
+            deny = (campos["deny"] or "").strip()
+
+            # Bot valioso levando bloqueio: o portal some do índice em silêncio.
+            if allow and allow != "0" and status in BLOCKED_STATUSES:
+                valioso_bloqueado.append({
+                    "user_agent": campos["agent"][:120],
+                    "path": caminho,
+                    "status": status,
+                    "time": campos["time"],
+                    # A sonda continua no alarme: o bloqueio do nginx é decidido
+                    # por User-Agent, então sonda levando 429 prova que o
+                    # crawler levaria 429 na mesma rota.
+                    "identity": identidade,
+                    # De onde o bot veio quando levou o bloqueio. Distingue o
+                    # crawler varrendo o acervo por link interno (referer nosso)
+                    # do que chegou por lista externa — muda o diagnóstico e,
+                    # portanto, a correção.
+                    "referer_origin": origem_do_referer(campos["ref"], campos["host"]),
+                })
+            # Bot de treinamento BLOQUEADO: regressão contra a DEC-023.
+            #
+            # A regra era o inverso — reprovava treino recebendo 2xx, porque a
+            # DEC-022 mandava negar com 403. A DEC-023 reverteu isso por ordem do
+            # titular do conteúdo, e a regra antiga passou a reprovar exatamente
+            # o comportamento correto. O campo `deny` só existe nas linhas
+            # anteriores à DEC-023; onde ele existir e marcar negação, é sinal de
+            # que o bloqueio voltou.
+            if deny and deny != "0" and status in BLOCKED_STATUSES:
+                treino_bloqueado.append({
+                    "user_agent": campos["agent"][:120],
+                    "path": caminho,
+                    "status": status,
+                    "time": campos["time"],
+                    "identity": identidade,
+                    "referer_origin": origem_do_referer(campos["ref"], campos["host"]),
+                })
+
+    return {
+        "log": str(path),
+        "linhas": total,
+        "malformadas": malformadas,
+        # Quantas das linhas acima são sonda deste repositório. Sem este número
+        # o ranking de agentes parece medir visitante e mede a nós mesmos.
+        "linhas_sonda_local": sondas,
+        "linhas_ferramenta_interna": internas,
+        # O PAR (BRUTO, LÍQUIDO) COM O CRITÉRIO NA PRÓPRIA LINHA (BUG-070).
+        #
+        # Este relatório já publicava `linhas` e `linhas_ferramenta_interna`
+        # lado a lado, e mesmo assim quem lia o número tinha de fazer a
+        # subtração de cabeça e adivinhar o critério. Medido em 2026-08-29:
+        # 95,7% do log de origem é ferramenta desta casa, então a diferença
+        # entre os dois denominadores é de 23×, não de arredondamento. O par vem
+        # de botagents.denominador — a MESMA função de todos os consumidores,
+        # para que dois relatórios do mesmo repositório não descontem coisas
+        # diferentes e ninguém consiga dizer qual está certo.
+        "denominador": botagents.denominador(total, sondas + internas),
+        # Aquecimento pela MARCA do nginx (X-Warming-Request), não por convenção
+        # de User-Agent. O segundo número é o tamanho do buraco que a convenção
+        # deixava: linhas de aquecimento que o prefixo do UA não pegaria e que
+        # entrariam na audiência como visita real.
+        "linhas_aquecimento_marcado": aquecimento_marcado,
+        "linhas_aquecimento_so_pela_marca": aquecimento_so_pela_marca,
+        # Procedência declarada. `sem_campo` NÃO é o mesmo que `ausente`: o
+        # primeiro é log antigo, o segundo é cliente sem referer.
+        "origem_do_referer": dict(por_origem_referer.most_common()),
+        "identidade": dict(por_identidade.most_common()),
+        "identity_method": "nginx bot_sim + faixa de IP oficial (data/ops/bot_ip_ranges)",
+        "por_status": dict(por_status.most_common()),
+        "rotas_mais_pedidas": dict(por_rota.most_common(top)),
+        # SEM a sonda: é o ranking de quem de fato pediu página.
+        "agentes_mais_vistos": dict(por_agente.most_common(top)),
+        # Nada some — cada um fica no seu próprio ranking, para conferência.
+        "agentes_sonda_local": dict(por_agente_sonda.most_common(top)),
+        "agentes_ferramenta_interna": dict(por_agente_interno.most_common(top)),
+        "bot_valioso_bloqueado": valioso_bloqueado,
+        "bot_treino_bloqueado": treino_bloqueado,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log", default=DEFAULT_LOG, help="caminho do access log (padrão: %(default)s)")
+    parser.add_argument("--top", type=int, default=10, help="quantas rotas/agentes listar")
+    parser.add_argument("--json", action="store_true", help="saída estruturada")
+    args = parser.parse_args()
+
+    path = pathlib.Path(args.log)
+    if not path.exists():
+        # LOG AUSENTE E ANOMALIA (2026-08-29, BUG-069).
+        #
+        # A mensagem antiga — "o site pode nao ter recebido trafego ainda" —
+        # descrevia um portal que nao existe mais: o acervo esta no ar desde
+        # 2026-08-13 e recebe milhares de requisicoes por dia. Log ausente hoje
+        # significa rotacao mal configurada, caminho errado ou permissao
+        # perdida — e aprovar com exit 0 faz o gate de telemetria de bots dizer
+        # "tudo certo" exatamente quando perdeu a fonte de dados.
+        print(f"check-access-log-bots: log AUSENTE em {path} — rotacao, caminho ou permissao", file=sys.stderr)
+        return 2
+    try:
+        resultado = analyze(path, args.top)
+    except PermissionError:
+        print(f"check-access-log-bots: sem permissão de leitura em {path}; "
+              f"rode como o usuário que lê o log do nginx", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=1))
+    else:
+        print(f"check-access-log-bots: linhas={resultado['linhas']} "
+              f"malformadas={resultado['malformadas']} "
+              f"sonda_local={resultado['linhas_sonda_local']} "
+              f"ferramenta_interna={resultado['linhas_ferramenta_interna']}")
+        print("  " + botagents.denominador_em_uma_linha(
+            resultado["denominador"], "denominador do log de origem"))
+        print(f"  identidade: {resultado['identidade']}")
+        print(f"  status: {resultado['por_status']}")
+        print(f"  rotas: {resultado['rotas_mais_pedidas']}")
+        print(f"  agentes EXTERNOS: {list(resultado['agentes_mais_vistos'])[:5]}")
+        print(f"  sonda deste repositorio: {list(resultado['agentes_sonda_local'])[:5]}")
+        print(f"  ferramenta interna: {list(resultado['agentes_ferramenta_interna'])[:5]}")
+
+    problemas = 0
+    if resultado["bot_valioso_bloqueado"]:
+        problemas += len(resultado["bot_valioso_bloqueado"])
+        print(f"\nREPROVADO: {len(resultado['bot_valioso_bloqueado'])} requisição(ões) de bot VALIOSO bloqueada(s) — "
+              f"o portal está saindo do índice:", file=sys.stderr)
+        for item in resultado["bot_valioso_bloqueado"][:20]:
+            print(f"  {item['status']} [{item['identity']}] {item['path']} — {item['user_agent']}",
+                  file=sys.stderr)
+    if resultado["bot_treino_bloqueado"]:
+        problemas += len(resultado["bot_treino_bloqueado"])
+        print(f"\nREPROVADO: {len(resultado['bot_treino_bloqueado'])} requisição(ões) de bot de TREINAMENTO "
+              f"bloqueada(s) — a DEC-023 proíbe negar por identidade de bot:", file=sys.stderr)
+        for item in resultado["bot_treino_bloqueado"][:20]:
+            print(f"  {item['status']} [{item['identity']}] {item['path']} — {item['user_agent']}",
+                  file=sys.stderr)
+
+    if problemas:
+        return 1
+    # A linha de veredito NÃO sai em modo --json: ela vinha depois do documento
+    # e tornava a saída inteira impossível de dar `json.load` ("Extra data: line
+    # 95"). Achado ao ligar o par (bruto, líquido) em 2026-08-29 — quem
+    # consumisse este JSON estava, na prática, obrigado a cortar o rodapé com
+    # regex. As reprovações continuam saindo sempre, porque vão para o STDERR e
+    # não contaminam o documento.
+    if not args.json:
+        print("\ncheck-access-log-bots: OK — nenhum bot bloqueado por identidade (politica permissiva da DEC-023)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

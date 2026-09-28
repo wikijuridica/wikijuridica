@@ -1,0 +1,1695 @@
+#!/usr/bin/env python3
+"""generate-legal-corpus — baixa o texto consolidado das leis mais citadas e indexa por artigo.
+
+POR QUE EXISTE: o acervo tem 20.232 citações legais e nenhuma forma de conferir
+se a afirmação bate com o dispositivo. Sem o texto da norma, "o art. 27 do CDC
+fixa cinco anos" é fé — e citação legal errada é a única classe de defeito deste
+acervo com risco real sob o Provimento OAB 205/2021.
+
+ACESSO, mapeado em 2026-08-06. O `planalto.gov.br` recusa requisição sem os
+cabeçalhos de um navegador (WAF), e foi por isso que ficou registrado como
+"bloqueado" na primeira tentativa. Com `Accept-Language`, `Accept` e
+`--compressed` ele responde o texto compilado inteiro. LexML devolve página de
+verificação de segurança; `normas.leg.br` dá 404 nas rotas públicas testadas.
+Câmara (`www2.camara.leg.br/legin`) serve de segunda fonte.
+
+LICENÇA: texto de lei é domínio público — Lei 9.610/1998, art. 8º, IV ("os
+textos de tratados ou convenções, leis, decretos, regulamentos, decisões
+judiciais e demais atos oficiais" não são objeto de proteção autoral). O corpus
+é referência de conferência, NUNCA corpo de página: o contrato do projeto proíbe
+espelho e paráfrase mecânica de fonte.
+
+EDUCAÇÃO: uma requisição por diploma, com pausa entre elas e User-Agent que
+identifica o projeto e o contato. São 12 arquivos, baixados uma vez.
+
+O QUE ELE GRAVA: `data/legal-corpus/<slug>.json` com o texto por artigo, a URL de
+origem, a data da coleta e o SHA-256 do documento baixado — proveniência, que é
+o que o contrato exige de toda fonte.
+
+Uso:
+    tools/generate-legal-corpus --dry-run
+    tools/generate-legal-corpus
+    tools/generate-legal-corpus --apenas cdc
+"""
+from __future__ import annotations
+
+import argparse
+import codecs
+import datetime
+import hashlib
+import html
+import json
+import os
+import re
+import unicodedata
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+CORPUS = os.path.join(ROOT, "data/legal-corpus")
+
+NAVEGADOR = {
+    # AO SAIR PARA A REDE, O PORTAL É O WikijuridicaBot (ordem do dono,
+    # 2026-09-05). Este ponto mandava `Chrome/126.0.0.0` — o disfarce que o
+    # contrato nomeia — com a identificação anexada ao fim do comentário. A
+    # justificativa gravada aqui ("o Planalto rejeita requisição sem estes
+    # cabeçalhos") era verdadeira sobre a AUSÊNCIA de cabeçalhos e falsa sobre
+    # a necessidade do disfarce: medido em 2026-09-05 contra a URL exata que
+    # este gerador baixa (ccivil_03/decreto-lei/del5452.htm), o UA abaixo
+    # devolveu 200 e 3.531.201 bytes. O prefixo `Mozilla/5.0 (compatible;` é o
+    # que o WAF exige, e é a mesma forma que Googlebot e bingbot usam: nosso
+    # nome e a URL de documentação ficam dentro do parêntese, onde o operador
+    # do site olha. Accept-Language continua obrigatório.
+    #
+    # O gate Go TestNenhumPontoDeSaidaSaiDisfarcado não alcançava esta linha, e
+    # por DOIS motivos independentes — o segundo só apareceu ao ler o detector:
+    #   1. ele varria só `internal/` e `cmd/`, e este ponto é Python em `tools/`;
+    #   2. EhNavegadorDisfarcado isentava QUALQUER UA que contivesse
+    #      "wikijuridica", e este trazia "+wikijuridica.com.br" colado no fim.
+    # Ou seja: mesmo reescrito em Go, este disfarce teria passado verde. Os dois
+    # furos foram fechados no mesmo commit — o walk alcança tools/ e a isenção
+    # virou nominal por arquivo, com o motivo medido ao lado.
+    "User-Agent": ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+                   "+https://wikijuridica.com.br/bot/; corpus juridico de conferencia)"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+# Os diplomas por volume de citação no inventário. Cobrem a maior parte das
+# 20.232 citações do acervo.
+DIPLOMAS = [
+    # Coletados em 2026-08-12 para fechar duas pendencias de `anchor_claim`: as
+    # paginas citavam estas normas como fonte e o corpus nao as tinha, entao o
+    # claim ficava sem texto de conferencia possivel.
+    ("decreto_22626_1933", "Lei da Usura (Decreto 22.626/1933)",
+     "https://www.planalto.gov.br/ccivil_03/decreto/d22626.htm"),
+    ("lei_12653_2012", "Lei 12.653/2012 (garantia de atendimento em emergência)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2011-2014/2012/lei/l12653.htm"),
+    ("codigo_civil", "Código Civil (Lei 10.406/2002)",
+     "https://www.planalto.gov.br/ccivil_03/leis/2002/l10406compilada.htm"),
+    ("cdc", "Código de Defesa do Consumidor (Lei 8.078/1990)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l8078compilado.htm"),
+    ("cpc", "Código de Processo Civil (Lei 13.105/2015)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2015/lei/l13105.htm"),
+    ("constituicao", "Constituição Federal de 1988",
+     "https://www.planalto.gov.br/ccivil_03/constituicao/constituicao.htm"),
+    ("clt", "CLT (Decreto-Lei 5.452/1943)",
+     "https://www.planalto.gov.br/ccivil_03/decreto-lei/del5452.htm"),
+    ("codigo_penal", "Código Penal (Decreto-Lei 2.848/1940)",
+     "https://www.planalto.gov.br/ccivil_03/decreto-lei/del2848compilado.htm"),
+    # ★ COMPILADO, como todo o resto desta lista (2026-08-30). A LGPD era a UNICA
+    # entrada coletada do texto NAO compilado, enquanto Codigo Civil, CDC, Codigo
+    # Penal, CTB, CTN e CPP ja vinham do compilado. A inconsistencia tinha preco
+    # medido: `internal/v2ingest/current_legal_facts_lgpd.go:22` so aceita
+    # `l13709compilado.htm` como caminho canonico, e 98 paginas de LGPD ficavam
+    # FORA do estoque publicavel por `current_legal_fact_source_stale`.
+    #
+    # As duas URLs sao documentos vivos e diferentes -- nenhuma redireciona para a
+    # outra (medido em v2_official_source_verify_url_cache.jsonl) --, e a que
+    # descreve a lei VIGENTE e a compilada: a Lei 13.709/2018 foi alterada pela
+    # 13.853/2019 e seguintes, e o texto original nao carrega essas alteracoes.
+    ("lgpd", "LGPD (Lei 13.709/2018)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2018/lei/l13709compilado.htm"),
+    ("ctb", "Código de Trânsito Brasileiro (Lei 9.503/1997)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l9503compilado.htm"),
+    ("ctn", "Código Tributário Nacional (Lei 5.172/1966)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l5172compilado.htm"),
+    ("cpp", "Código de Processo Penal (Decreto-Lei 3.689/1941)",
+     "https://www.planalto.gov.br/ccivil_03/decreto-lei/del3689compilado.htm"),
+    ("eca", "Estatuto da Criança e do Adolescente (Lei 8.069/1990)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l8069compilado.htm"),
+    ("marco_civil", "Marco Civil da Internet (Lei 12.965/2014)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2011-2014/2014/lei/l12965.htm"),
+    # LEIS ESPECIAIS mais citadas pelo acervo, por frequência medida no
+    # inventário. Sem elas, 3.463 citações ficavam sem como conferir — e são
+    # justamente as áreas de maior valor comercial do portal (previdenciário,
+    # seguros, servidor, saúde suplementar, locação, INPI).
+    ("lei_8213_1991", "Benefícios da Previdência Social (Lei 8.213/1991)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l8213compilado.htm"),
+    ("lei_8112_1990", "Regime Jurídico dos Servidores Federais (Lei 8.112/1990)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l8112compilado.htm"),
+    ("lei_6015_1973", "Registros Públicos (Lei 6.015/1973)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l6015compilada.htm"),
+    ("lei_9656_1998", "Planos de Saúde (Lei 9.656/1998)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l9656compilado.htm"),
+    ("lei_9099_1995", "Juizados Especiais (Lei 9.099/1995)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l9099.htm"),
+    ("lei_9279_1996", "Propriedade Industrial (Lei 9.279/1996)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l9279.htm"),
+    ("lei_8245_1991", "Locação de Imóveis Urbanos (Lei 8.245/1991)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l8245compilado.htm"),
+    ("lei_4591_1964", "Condomínio e Incorporações (Lei 4.591/1964)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l4591compilado.htm"),
+    ("lei_6830_1980", "Execução Fiscal (Lei 6.830/1980)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l6830.htm"),
+    ("lc_123_2006", "Simples Nacional (Lei Complementar 123/2006)",
+     "https://www.planalto.gov.br/ccivil_03/leis/lcp/lcp123.htm"),
+    ("lei_8036_1990", "FGTS (Lei 8.036/1990)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l8036consol.htm"),
+    ("lei_9784_1999", "Processo Administrativo Federal (Lei 9.784/1999)",
+     "https://www.planalto.gov.br/ccivil_03/leis/l9784.htm"),
+    ("lei_14790_2023", "Apostas de Quota Fixa (Lei 14.790/2023)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2023-2026/2023/lei/l14790.htm"),
+    ("lei_15040_2024", "Marco Legal dos Seguros (Lei 15.040/2024)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2023-2026/2024/lei/l15040.htm"),
+    # Acrescentada em 2026-08-29 durante a triagem do BUG-116. A Lei Maria da
+    # Penha era a lacuna mais cara do corpus: 266 citacoes em 19 shards do
+    # acervo, incluindo dez ocorrencias de "art. 24-A" que nao tinham como ser
+    # conferidas contra o texto oficial — justamente o dispositivo cuja
+    # existencia estava em duvida. Sem ela, a triagem dependeria de memoria, e
+    # o contrato R9 exige fonte oficial primaria com URL e data.
+    ("lei_11340_2006", "Lei Maria da Penha (Lei 11.340/2006)",
+     "https://www.planalto.gov.br/ccivil_03/_ato2004-2006/2006/lei/l11340.htm"),
+]
+
+# "Art. 1.723." / "Art. 5º" / "Art. 27." — o separador de milhar é opcional e o
+# ordinal aparece nos artigos baixos.
+# O SUFIXO FAZ PARTE DO NÚMERO: art. 43-A, 61-A, 103-A, 148-A são dispositivos
+# PRÓPRIOS, não variações do 43 ou do 103. Sem capturá-lo, o corpus indexava
+# apenas o artigo-base e a conferência comparava a afirmação da página com o
+# texto do dispositivo errado — foi o que gerou "acusações" contra páginas
+# corretas sobre o art. 43-A da Lei 4.591/1964 (tolerância de 180 dias) e o
+# art. 103 da Lei 8.213/1991.
+#
+# O ponto final também é opcional: "Art. 103 É de dez anos" aparece sem ele.
+#
+# O ORDINAL É SEMPRE MINÚSCULO, e pode vir SEPARADO DO NÚMERO POR MARCAÇÃO.
+# Antes ele era `\s*([ºo°]?)` com IGNORECASE, e em "Art. 103. O prazo de
+# decadência…" o "O" (artigo definido) era engolido como se fosse ordinal — o
+# corpus guardava o caput sem a primeira palavra. Foi assim que o art. 103 da
+# Lei 8.213/1991 apareceu decapitado e quase virou acusação contra uma página
+# correta. `(?-i:...)` mantém essa parte sensível a maiúscula mesmo com o
+# IGNORECASE do restante.
+#
+# A correção de então exigiu o ordinal COLADO ao número, e essa parte estava
+# errada: o Planalto compõe o ordinal em elemento próprio
+# (`Art. 1<sup>o</sup> Toda pessoa…`), e `texto_limpo` troca a tag por espaço.
+# O ordinal chegava aqui separado por espaço ou quebra de linha, o regex não o
+# reconhecia e ele sobrava como PRIMEIRO CARACTERE do caput: o art. 1º do
+# Código Civil entrou no corpus como "o\n Toda pessoa é capaz de direitos".
+# Medido em 2026-09-10 sobre os 29 diplomas: 59 artigos começavam com esse
+# ordinal solto, em 12 diplomas.
+#
+# A guarda contra o falso positivo é `(?![\wÀ-ÿ])`: o "o" só é ordinal quando
+# está SOZINHO. Sem ela, "Art. 5 os direitos" perderia a primeira palavra —
+# exatamente o defeito que a correção de agosto consertou, ao contrário. Caput
+# de dispositivo nunca começa em minúscula no texto oficial, e o "o" isolado
+# entre o número e o caput não tem outra leitura possível.
+# O sufixo vem DEPOIS do ordinal ("Art. 2o-A", "Art. 8º-A") e sempre colado por
+# hífen sem espaço. Aceitar hífen com espaço em volta transformaria "Art. 1.078
+# - A assembleia…" no inexistente art. 1.078-A.
+#
+# CABEÇALHO vs REFERÊNCIA CRUZADA. O texto de um artigo cita outros artigos, e
+# tratar essa citação como início de dispositivo PARTE o artigo ao meio: o art.
+# 109 do Código Penal terminava em "salvo o disposto no § 1º do" e o art. 110
+# começava em "deste Código", porque a referência interna virou cabeçalho.
+# Dois sinais separam um do outro, e ambos são exigidos:
+#   1. o Planalto escreve o cabeçalho com A maiúsculo ("Art. 110") e a
+#      referência em minúscula ("no art. 110 deste Código");
+#   2. cabeçalho nunca é precedido de preposição ou conectivo.
+# O SUFIXO PODE TER MAIS DE UM SEGMENTO, e capturar só o primeiro apaga
+# dispositivo do Código Penal. A técnica legislativa brasileira insere artigo
+# dentro de artigo já sufixado: a Lei 14.197/2021 criou os arts. 359-L a 359-T e
+# uma lei posterior acrescentou o **359-M-A** e o **359-M-B**, que o Planalto
+# imprime exatamente assim (`del2848compilado.htm`, medido em 2026-09-10 — os
+# dois estão na variante compilada E na simples).
+#
+# Com `(-[A-Z])?` o cabeçalho "Art. 359-M-A." era lido como art. 359-M e o
+# segundo "-A" sobrava no caput ("A. Quando os delitos deste Capítulo estão
+# inseridos no mesmo contexto…"). Consequência medida no corpus:
+#
+#   * `articles["359-M"]` guardava o texto do 359-M-A no lugar do art. 359-M
+#     (Golpe de Estado) — o corpus atribuía ao dispositivo um texto que não é
+#     dele, no capítulo dos crimes contra o Estado Democrático de Direito; e
+#   * 359-M-A e 359-M-B não existiam no corpus, então `internal/legalcorpusindex`
+#     acusaria de inexistente a citação CORRETA dos dois.
+#
+# `(?:-[A-Z])+` não afrouxa a guarda contra o travessão de redação: o hífen
+# continua tendo de vir COLADO e seguido de maiúscula, então "Art. 1.078 - A
+# assembleia…" segue fora (há espaço em volta) e "Art. 43-A. A entrega…" para
+# no primeiro segmento (o que vem depois é ". A", com ponto).
+ARTIGO_RE = re.compile(
+    r"(?:Art|ART)\s*\.?\s*(\d[\d.]*)"
+    r"(?:[ \t\r\n]*(?-i:[º°o])(?![\wÀ-ÿ]))?"
+    r"((?:-[A-Z])+)?\s*[\.\-–—]?\s*")
+
+# O SUFIXO NÃO SOBREVIVE AO ORDINAL COMPOSTO EM MARCAÇÃO, e tolerar espaço
+# acima não basta: o sufixo vem COLADO ao ordinal e o `\s*` do meio do regex
+# nunca chega a ele.
+#
+# Medido em 2026-09-10 no HTML oficial do CTB (`l9503compilado.htm`,
+# sha256 7a947802e6c3…): o Planalto escreve
+#
+#     Art. 7<u><sup>o</sup></u>-A.&nbsp;A autoridade portuária ou a entidade…
+#
+# e `texto_limpo` troca cada tag por espaço, entregando `Art. 7 o -A.`. O grupo
+# `(-[A-Z])?` exige o hífen imediatamente depois do ordinal, encontra um espaço
+# e desiste; o `[\.\-–—]?` seguinte engole o hífen; o dispositivo entra no
+# corpus com o NÚMERO 7. Consequência medida, e são as duas piores falhas desta
+# ferramenta ao mesmo tempo:
+#
+#   * `articles["7"]` do CTB guardava o texto do art. 7-A ("A autoridade
+#     portuária…") no lugar do art. 7 verdadeiro ("Compõem o Sistema Nacional
+#     de Trânsito os seguintes órgãos e entidades"); e
+#   * o art. 7-A deixava de existir no corpus — e é `internal/legalcorpusindex`
+#     que usa esta lista para acusar página que cita artigo inexistente.
+#
+# A CORREÇÃO É NA MARCAÇÃO, NÃO NO REGEX DE CABEÇALHO: aqui o separador tem de
+# CONTER tag (`<[^>]*>` obrigatório), então espaço de verdade jamais é
+# colapsado e nem "Art. 5 os direitos" nem "Art. 1.078 - A assembleia…" são
+# tocados — o falso positivo que a correção de agosto consertou não volta por
+# esta porta. As tags que fecham o ordinal também saem, porque é só elas que
+# separam o `-A` do número.
+# ★ O PARÁGRAFO TEM A MESMA CAUSA-RAIZ DO ARTIGO (2026-09-10).
+#
+# `§ 1<sup><u>o</u></sup>` sofre exatamente o que `Art. 3<sup><u>o</u></sup>`
+# sofria: a troca da tag por espaço separa o ordinal do número e o texto do
+# corpo vira "§ 1 o". Medido no HTML cru dos 43 documentos do cache: 3.589
+# ocorrências em 34 arquivos (3.299 com o `o` minúsculo, 289 com `º`, 1 com
+# `°`), e no corpo já gravado 2.680 ocorrências em 787 artigos.
+#
+# FALSO POSITIVO MEDIDO, e é o que autoriza a mudança: das 3.589, as que têm o
+# `o` minúsculo e são seguidas de palavra em minúscula são 10, e as 10 foram
+# lidas uma a uma — em todas o `o` está DENTRO de `<sup><u>` e o que vem depois
+# são as tags de fechamento ("§ 1<sup><u>o</u></sup> serão atribuídas…").
+# Nenhuma é artigo definido. O `§` é ainda mais seguro que o `Art`: ele nunca é
+# chave de artigo, então o pior caso desta regra é texto do corpo, nunca um
+# dispositivo indexado sob número errado.
+ORDINAL_SEPARADO_POR_MARCACAO_RE = re.compile(
+    r"((?:(?:Art|ART)\s*\.?\s*|§+\s*)\d[\d.]*)"
+    r"(?:[ \t\r\n]*<[^>]*>[ \t\r\n]*)+"
+    r"([º°o])(?![\wÀ-ÿ])"
+    r"(?:<[^>]*>)*")
+
+# Palavra imediatamente anterior que denuncia referência, não cabeçalho.
+ANTES_DE_REFERENCIA = {
+    "do", "da", "no", "na", "ao", "à", "pelo", "pela", "nos", "nas", "dos",
+    "das", "e", "ou", "o", "a", "com", "em", "de", "os", "as", "pelos",
+    "pelas", "aos", "às", "referido", "citado", "previsto", "prevista",
+    "disposto", "constante", "mencionado", "vide", "conforme", "art", "arts",
+    "artigo", "artigos", "caput", "parágrafo", "inciso", "seguintes",
+}
+
+
+def baixar(url, timeout=45.0):
+    pedido = urllib.request.Request(url, headers=NAVEGADOR)
+    with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+        bruto = resposta.read()
+        if resposta.headers.get("Content-Encoding") == "gzip":
+            import gzip
+            bruto = gzip.decompress(bruto)
+    return bruto
+
+
+def decodificar(bruto):
+    """Devolve o texto do documento do Planalto, seja qual for a codificação.
+
+    PARTE DO ACERVO DO PLANALTO É UTF-16, e essa é a causa de lacuna silenciosa
+    no corpus — medida em 2026-08-29 na Lei Maria da Penha. O arquivo
+    `l11340.htm` foi salvo pelo "Microsoft FrontPage 6.0" em UTF-16 LE, com BOM
+    `FF FE`. A cascata anterior tentava utf-8 (que falha no `FF`, byte inválido)
+    e caía em **latin-1, que NUNCA levanta exceção**: qualquer byte é um
+    caractere válido nela. O resultado não era erro, era `"<\x00h\x00t\x00m\x00l"`
+    — HTML legítimo intercalado de NUL, no qual o regex de artigo não casa nada.
+    O gerador então reprovava com "só 0 artigos (resposta provavelmente não é a
+    lei)", acusando o Planalto de devolver a página errada quando o defeito era
+    nosso. Foi por isso que a lei mais citada do acervo em violência doméstica
+    (266 citações em 19 shards) ficou fora do corpus.
+
+    Por isso a BOM decide ANTES da cascata: latin-1 sempre "funciona", então
+    tentativa por tentativa nunca chegaria ao utf-16.
+
+    O documento também pode vir com um byte ímpar sobrando (o `l11340.htm` tem
+    264.515 bytes, ímpar). Truncar o último byte é correto aqui: em UTF-16 um
+    byte solto não forma unidade de código, e descartá-lo perde no máximo meio
+    caractere no fim do rodapé — enquanto abortar perderia a lei inteira.
+    """
+    for bom, codificacao in ((codecs.BOM_UTF8, "utf-8-sig"),
+                             (codecs.BOM_UTF16_LE, "utf-16-le"),
+                             (codecs.BOM_UTF16_BE, "utf-16-be")):
+        if not bruto.startswith(bom):
+            continue
+        corpo = bruto[len(bom):]
+        if codificacao != "utf-8-sig" and len(corpo) % 2:
+            corpo = corpo[:-1]
+        return corpo.decode(codificacao, "replace")
+
+    # cp1252 ANTES de latin-1, e a ordem e o defeito, nao o detalhe.
+    #
+    # O acervo do Planalto e cp1252 (`Presid\xeancia`, `\xe7\xe3o`), e cp1252 usa
+    # a faixa 0x80-0x9F para travessao, aspas curvas e apostrofo. latin-1 mapeia
+    # essa MESMA faixa para os controles C1 do Unicode, e NUNCA levanta excecao:
+    # com latin-1 na frente, todo cp1252 decodificava "sem erro" e cada
+    # travessao virava U+0096 - um caractere de controle invisivel.
+    #
+    # Medido em 2026-09-10 sobre `data/legal-corpus/`: 145 artigos em 12
+    # arquivos com controle C1, sendo 111 travessoes (U+0096), 46 aspas
+    # (U+0093/U+0094) e 11 apostrofos (U+0092). O efeito saiu publicado: um
+    # inciso perdeu o travessao no meio da frase e virou "I  orientacao quanto
+    # as principais escolhas".
+    #
+    # cp1252 e estrito so em cinco bytes (0x81, 0x8D, 0x8F, 0x90, 0x9D), que nao
+    # existem em texto do Planalto; documento que os traga cai em latin-1, e ai
+    # `normaliza_controles_c1` recupera os C1 conhecidos sem apagar byte algum.
+    for codificacao in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return bruto.decode(codificacao)
+        except UnicodeDecodeError:
+            continue
+    return bruto.decode("utf-8", "replace")
+
+
+# O MAPA OFICIAL cp1252 DA FAIXA C1 - recuperacao, NUNCA remocao.
+#
+# Apagar o byte produz a frase mutilada que ja foi publicada; substitui-lo pelo
+# caractere que ele sempre significou no documento de origem devolve o texto da
+# lei. Os cinco pontos indefinidos em cp1252 (0x81, 0x8D, 0x8F, 0x90, 0x9D) nao
+# entram no mapa: sobre eles nao ha o que afirmar, e inventar seria pior.
+CONTROLES_C1 = {
+    "\u0080": "\u20ac", "\u0082": "\u201a", "\u0083": "\u0192", "\u0084": "\u201e",
+    "\u0085": "\u2026", "\u0086": "\u2020", "\u0087": "\u2021", "\u0088": "\u02c6",
+    "\u0089": "\u2030", "\u008a": "\u0160", "\u008b": "\u2039", "\u008c": "\u0152",
+    "\u008e": "\u017d", "\u0091": "\u2018", "\u0092": "\u2019", "\u0093": "\u201c",
+    "\u0094": "\u201d", "\u0095": "\u2022", "\u0096": "\u2013", "\u0097": "\u2014",
+    "\u0098": "\u02dc", "\u0099": "\u2122", "\u009a": "\u0161", "\u009b": "\u203a",
+    "\u009c": "\u0153", "\u009e": "\u017e", "\u009f": "\u0178",
+}
+
+
+def normaliza_controles_c1(texto):
+    """Devolve o caractere que o documento quis dizer onde sobrou controle C1.
+
+    Rede de seguranca para o que a cascata de decodificacao nao pegar: pagina
+    servida como utf-8 com os C1 ja recodificados, e cache de coleta anterior.
+    Nenhum caractere e descartado - controle C1 nao tem uso legitimo em texto de
+    lei, e todo ponto do mapa tem origem documentada em cp1252.
+    """
+    if not any(controle in texto for controle in CONTROLES_C1):
+        return texto
+    for controle, real in CONTROLES_C1.items():
+        texto = texto.replace(controle, real)
+    return texto
+
+
+def texto_limpo(bruto):
+    texto = normaliza_controles_c1(decodificar(bruto))
+
+    # SCRIPT E STYLE SAEM COM O CONTEUDO DENTRO. `<[^>]+>` troca a TAG por
+    # espaco e preserva o miolo, entao o JavaScript do WAF do Planalto entrava
+    # no corpus como se fosse texto de lei: o art. 119 do CDC e o art. 2.046 do
+    # Codigo Civil terminavam em `f5_cspm.set_byte(str,40,...)`. Sao 24 artigos
+    # (um por diploma, sempre o ultimo, porque o corte vai ate o fim do
+    # documento). Descartar aqui e o unico ponto em que conteudo de script pode
+    # sair sem levar texto normativo junto.
+    texto = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", texto,
+                   flags=re.IGNORECASE | re.DOTALL)
+
+    # O ORDINAL VOLTA A COLAR NO NÚMERO ENQUANTO A MARCAÇÃO AINDA ESTÁ AQUI —
+    # é ela que separa os dois, então é aqui, e só aqui, que dá para desfazer a
+    # separação sem adivinhar. Depois de `<[^>]+>` virar espaço, `Art. 7 o -A.`
+    # e `Art. 5 os direitos` têm a MESMA forma, e nenhum regex sobre texto limpo
+    # distingue o ordinal do artigo definido sem arriscar decapitar o caput.
+    # O motivo completo, com o dispositivo que o defeito trocou, está em
+    # ORDINAL_SEPARADO_POR_MARCACAO_RE.
+    texto = ORDINAL_SEPARADO_POR_MARCACAO_RE.sub(r"\1\2", texto)
+
+    # O PLANALTO PUBLICA A REDAÇÃO REVOGADA JUNTO COM A VIGENTE, e marca a
+    # revogada como TACHADA. Remover as tags antes de separar as duas mistura
+    # texto morto com texto em vigor.
+    #
+    # Foi assim que o art. 61 da Lei 9.099/1995 entrou no corpus como "pena
+    # máxima não superior a um ano" — a redação de 1995, tachada na página,
+    # substituída por dois anos pela Lei 11.313/2006. Com ela, o verificador
+    # acusou de errada uma página CERTA, que é o pior defeito possível numa
+    # ferramenta de conferência.
+    #
+    # Descartar antes de limpar: <strike>, <s>, <del> e qualquer elemento com
+    # line-through no atributo style ou em classe.
+    texto = re.sub(r"<(strike|s|del)\b[^>]*>.*?</\1>", " ", texto, flags=re.IGNORECASE | re.DOTALL)
+    texto = re.sub(
+        r"<(\w+)[^>]*(?:text-decoration\s*:\s*line-through|class=\"[^\"]*(?:tachado|revogad|riscad)[^\"]*\")[^>]*>.*?</\1>",
+        " ", texto, flags=re.IGNORECASE | re.DOTALL)
+
+    # Marca fim de bloco antes de remover tag, senão parágrafos colam.
+    texto = re.sub(r"</(p|div|br|tr|li)[^>]*>", "\n", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"<[^>]+>", " ", texto)
+    texto = html.unescape(texto)
+    texto = texto.replace("\xa0", " ")
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r"\n\s*\n+", "\n", texto)
+
+    # "A rt. 107" — a palavra PARTIDA por marcação. O Planalto formata a inicial
+    # em elemento próprio (`<b>A</b>rt.`) em alguns dispositivos, e ao remover a
+    # tag sobra um espaço no meio. O art. 107 do Código Penal (extinção da
+    # punibilidade, citado por 8 páginas do acervo) sumiu inteiro do corpus por
+    # causa disso: o cabeçalho não era reconhecido, e o texto virava rabo do
+    # art. 106.
+    texto = re.sub(r"\bA\s+rt\s*\.", "Art.", texto)
+    texto = re.sub(r"\bAr\s+t\s*\.", "Art.", texto)
+
+    # "Art. . 189" — o PONTO DUPLICADO, e ele está no texto do Planalto, não é
+    # resíduo de marcação removida. O bruto da CLT compilada traz literalmente
+    # `<font face="Arial" size="2">Art. . 189 -`.
+    #
+    # Medido em 2026-08-29 na CLT: 13 dispositivos escritos assim, e os MESMOS 13
+    # eram as 13 lacunas do corpus — correspondência exata, sem sobra dos dois
+    # lados. Entre eles os arts. 189 e 195, que definem atividade insalubre e a
+    # perícia que a caracteriza; o BUG-046 os catalogou como "artigo que existe
+    # na CLT e falta no corpus", e a causa era esta grafia.
+    #
+    # O efeito é o mesmo dos dois casos acima: o cabeçalho não é reconhecido e o
+    # texto do artigo vira rabo do anterior — pior que ausência, porque o
+    # conferidor passa a acusar como inexistente uma citação correta, que é a
+    # classe P1 permanente ao contrário.
+    texto = re.sub(r"\bArt\s*\.\s*\.\s*(?=\d)", "Art. ", texto)
+    return texto.strip()
+
+
+# A palavra anterior só conta se o cabeçalho estiver COLADO nela por espaço ou
+# vírgula. Ponto, dois-pontos e fecha-parêntese encerram bloco — depois deles
+# vem cabeçalho, não continuação de frase.
+#
+# Atravessar parênteses derrubava artigo legítimo: no ECA, o art. 122 vem
+# precedido da nota "(Vide)", e a regra lia "Vide" como conectivo de
+# referência. O art. 122 (internação de adolescente) sumiu inteiro do corpus
+# por causa disso.
+PALAVRA_ANTERIOR_RE = re.compile(r"([\wÀ-ÿ]+)[\s,;\"'§º°\-–—]*$")
+
+# BLOCO DE TRANSCRIÇÃO — a causa-raiz do BUG-118.
+#
+# O Brasil legisla alteração SEMPRE do mesmo jeito, e o Planalto imprime assim:
+# uma frase PRÓPRIA do diploma que anuncia a alteração e termina em dois-pontos
+# ("O art. 313 do Decreto-Lei nº 3.689 [...] passa a vigorar acrescido do
+# seguinte inciso IV:"), a aspa de abertura, o texto do artigo ALHEIO — que
+# repete o cabeçalho dele —, a aspa de fechamento e, às vezes, "(NR)". O
+# cabeçalho transcrito tem forma IDÊNTICA à de um cabeçalho próprio, e era isso
+# que punha o art. 2.027 do Código Civil dentro do "cpc.json", o art. 135-A do
+# Código Penal dentro do "lei_12653_2012.json", os arts. 167 e 169 da Lei 6.015
+# dentro do "lei_8245_1991.json" e os arts. 61/129 do CP, 152 da LEP e 313 do
+# CPP dentro do "lei_11340_2006.json".
+#
+# POR QUE NÃO SE RESOLVE COM JANELA. A primeira tentativa (2026-08-29) olhava 60
+# caracteres atrás procurando aspa e 400 atrás procurando a frase de alteração.
+# Medido contra o HTML oficial, ela falhava dos DOIS lados:
+#   - deixava passar a Lei 12.653/2012, porque entre a aspa de abertura e o
+#     "Art. 135-A." está a RUBRICA do crime ("Condicionamento de atendimento
+#     médico-hospitalar emergencial"), que joga a aspa para fora dos 60;
+#   - apagava os arts. 83, 84 e 87 da Lei 8.245/1991, que são PRÓPRIOS: eles vêm
+#     logo depois da aspa de FECHAMENTO do bloco anterior (indistinguível da de
+#     abertura quando o Planalto usa aspa reta) e a frase de alteração daquele
+#     bloco ainda cabia nos 400.
+# Corpus que NEGA artigo existente é pior que corpus contaminado: ele acusa de
+# errada uma página CERTA — o que já aconteceu com o art. 61 da Lei 9.099/1995.
+#
+# O QUE FUNCIONA É DELIMITAR O BLOCO, não medir distância. `blocos_de_transcricao`
+# devolve os trechos [abertura, fechamento] de cada bloco de alteração; cabeçalho
+# DENTRO de um deles é de outra lei, cabeçalho fora é próprio. A delimitação
+# segue a tipografia do Planalto e não depende de quantos caracteres o texto
+# transcrito tenha.
+#
+# POLARIDADE DA FALHA, e ela é deliberada: bloco que NÃO FECHA não suprime nada.
+# Contaminação que sobra é visível (`articles_fora_do_diploma`, o salto de
+# numeração de `internal/legalcorpusintegrity`, a conferência viva); supressão
+# silenciosa não é visível em lugar nenhum e vira acusação falsa. Na dúvida,
+# indexa-se a mais.
+#
+# O byte 0x93/0x94 entra na classe de aspa porque é o par “ ” (U+201C/U+201D)
+# decodificado como cp1252 e caído no ramo latin-1 de `decodificar()` — que
+# nunca levanta exceção e por isso nunca chega ao cp1252 da cascata. Ele aparece
+# assim no corpus hoje (Lei 12.653/2012 e CDC, arts. 114-117). Aceitar as duas
+# formas evita que a transcrição volte a vazar por essa segunda armadilha de
+# codificação; corrigir a cascata de decodificação é outro achado, fora do
+# escopo do BUG-118.
+ASPAS_DE_ABERTURA = "\u201c\u201e\x93"
+ASPAS_DE_FECHAMENTO = "\u201d\x94"
+ASPAS_RETAS = "\"\u00ab\u00bb"
+
+INTRODUCAO_DE_ALTERACAO_RE = re.compile(
+    r"passam?\s+a\s+(?:vigorar|ter\s+a\s+seguinte\s+reda[çc][ãa]o)"
+    r"|fica(?:m)?\s+acrescid[oa]s?"
+    r"|acrescente-se"
+    r"|com\s+a\s+seguinte\s+reda[çc][ãa]o"
+    r"|seguinte\s+(?:par[áa]grafo|inciso|al[íi]nea|dispositivo|artigo)"
+    r"|renumerando-se",
+    re.IGNORECASE)
+
+# Da frase de alteração até o dois-pontos que a fecha. A mais longa medida nos
+# 29 diplomas ("[...] passa a vigorar acrescida do seguinte art. 216-A:", no
+# art. 1.071 do CPC) tem 33 caracteres depois do fim da frase; 200 dá folga para
+# a enumeração de dispositivos sem alcançar o parágrafo seguinte.
+FIM_DA_INTRODUCAO = 200
+
+# Teto do bloco. O maior bloco de transcrição medido no corpus é a inserção do
+# Capítulo XV inteiro na Lei 6.015 pelo art. 1.071 do CPC. O teto existe só para
+# que uma aspa solta não engula o resto do documento; estourá-lo NÃO suprime
+# nada (ver polaridade acima).
+LIMITE_DO_BLOCO = 60000
+
+
+def _abre_aspa(texto, i):
+    """A aspa em `i` abre citação? Só é chamada com `i` no início de um token.
+
+    Aspa curva tem lado próprio. Aspa RETA é ambígua, e o lado se lê pela
+    colagem: o Planalto fecha colada à última palavra ("[...] locação.") e abre
+    solta depois do dois-pontos ou da quebra de linha. Como `i` já vem de um
+    salto de espaços em branco, aqui a reta é sempre de abertura.
+    """
+    caractere = texto[i]
+    return caractere in ASPAS_DE_ABERTURA or caractere in ASPAS_RETAS
+
+
+def _fecha_bloco(texto, inicio, limite):
+    """Índice da aspa que fecha o bloco aberto, ou None se ele não fecha.
+
+    Fechamento é aspa curva de fechamento, ou aspa reta COLADA ao caractere
+    anterior — é assim que o Planalto imprime o fim da transcrição
+    ("[...] direito de preferência."). Aspa reta solta no meio do texto
+    transcrito é abertura de citação interna e não fecha o bloco.
+    """
+    for i in range(inicio, min(len(texto), limite)):
+        caractere = texto[i]
+        if caractere in ASPAS_DE_FECHAMENTO:
+            return i
+        if caractere in ASPAS_RETAS and i > 0 and not texto[i - 1].isspace():
+            return i
+    return None
+
+
+# ANOTAÇÃO DO PLANALTO entre o dois-pontos e a aspa. O documento oficial
+# intercala marcadores de vigência e de alteração — "(Vigência)", "(Vide)",
+# "(Incluído pela Lei nº ...)" — entre a frase que anuncia a alteração e o texto
+# transcrito. Medido em 2026-08-29: é exatamente isso que separava o
+# "passa a vigorar acrescida do seguinte art. 216-A:" do "“Art. 216-A." no art.
+# 1.071 do CPC, e o "passam a vigorar com a seguinte redação:" do "“Art. 2.027."
+# no art. 1.068 — os dois artigos que o corpus atribuía ao CPC sendo da Lei
+# 6.015 e do Código Civil.
+#
+# O limite de 80 caracteres e a ausência de cabeçalho dentro dos parênteses são
+# o que impede este salto de atravessar conteúdo: anotação é curta e nunca
+# contém dispositivo.
+ANOTACAO_RE = re.compile(r"\(([^()]{0,80})\)")
+
+
+def _proximo_visivel(texto, i):
+    """Próximo caractere de conteúdo, saltando espaço e anotação do Planalto."""
+    for _ in range(8):
+        while i < len(texto) and texto[i].isspace():
+            i += 1
+        anotacao = ANOTACAO_RE.match(texto, i)
+        if not anotacao or ARTIGO_RE.search(anotacao.group(1)):
+            return i
+        i = anotacao.end()
+    return i
+
+
+def blocos_de_transcricao(texto):
+    """Trechos em que o texto reproduz artigo de OUTRA lei, por alteração.
+
+    Cada bloco começa na aspa que sucede o dois-pontos da frase de alteração e
+    termina na aspa que fecha a última citação seguida — a Lei 8.245/1991
+    transcreve os arts. 167 e 169 da Lei 6.015 em DUAS citações dentro do mesmo
+    art. 81, e tratá-las como blocos independentes deixaria a segunda de fora.
+    """
+    blocos = []
+    for anuncio in INTRODUCAO_DE_ALTERACAO_RE.finditer(texto):
+        janela = texto[anuncio.end():anuncio.end() + FIM_DA_INTRODUCAO]
+        dois_pontos = janela.find(":")
+        if dois_pontos < 0:
+            continue
+        # Cabeçalho entre a frase e o dois-pontos significa que o dois-pontos é
+        # de OUTRA frase: o bloco não começa aqui.
+        if ARTIGO_RE.search(janela[:dois_pontos]):
+            continue
+        posicao = anuncio.end() + dois_pontos + 1
+        inicio, fim = posicao, None
+        while True:
+            abertura = _proximo_visivel(texto, posicao)
+            if abertura >= len(texto) or not _abre_aspa(texto, abertura):
+                break
+            fechamento = _fecha_bloco(texto, abertura + 1, abertura + LIMITE_DO_BLOCO)
+            if fechamento is None:
+                fim = None  # bloco sem fecho: não suprime nada
+                break
+            posicao = fechamento + 1
+            depois = _proximo_visivel(texto, posicao)
+            if texto.startswith("(NR)", depois):
+                posicao = depois + 4
+            fim = posicao
+        if fim is not None and fim > inicio:
+            blocos.append((inicio, fim))
+    return blocos
+
+
+def dentro_de_bloco(blocos, posicao):
+    return any(inicio <= posicao < fim for inicio, fim in blocos)
+
+
+def e_cabecalho(texto, achado):
+    """Distingue o início de um dispositivo de uma referência a ele.
+
+    Cabeçalho: "Art. 110 - A prescrição…". Referência: "no § 1º do art. 110
+    deste Código", que fica DENTRO do art. 109 e não pode cortá-lo.
+
+    A transcrição de artigo de outra lei não se decide aqui — ela depende do
+    bloco em que o cabeçalho cai, e quem sabe isso é `indexar_artigos`, que
+    delimita os blocos uma vez para o documento inteiro.
+    """
+    anterior = texto[max(0, achado.start() - 60):achado.start()]
+    palavra = PALAVRA_ANTERIOR_RE.search(anterior)
+    if palavra and palavra.group(1).lower() in ANTES_DE_REFERENCIA:
+        return False
+    return True
+
+
+# ATO APROVADOR × ANEXO — a estrutura que fez o art. 1º da CLT ficar errado.
+#
+# Decreto-lei que APROVA um texto anexo tem artigos PRÓPRIOS antes do anexo:
+# "Art. 1º Fica aprovada a Consolidação das Leis do Trabalho, que a este
+# decreto-lei acompanha" e "Art. 2º O presente decreto-lei entrará em vigor em
+# 10 de novembro de 1943". Só depois começa a CLT, com o seu próprio Art. 1º
+# ("Esta Consolidação estatui as normas que regulam as relações individuais e
+# coletivas de trabalho").
+#
+# Quem cita "CLT, art. 1º" quer o do ANEXO. O que o corpus guardava era o do ato
+# aprovador — e a atribuição saía com a URL oficial do Planalto ao lado, dando
+# lastro ao texto errado. Citação legal mal atribuída é a única classe de defeito
+# com risco real sob a OAB.
+#
+# POR QUE O ART. 2º ESCAPOU, E POR QUE ISSO NÃO CONSOLA: a heurística de
+# `em_sequencia` (base >= maior) foi desenhada para bloco de alteração, e trata o
+# ato aprovador como se fosse a lei. O art. 1º do anexo reaparece depois do
+# art. 2º do aprovador (1 >= 2 é falso) e é descartado; o art. 2º do anexo
+# EMPATA (2 >= 2 é verdadeiro), disputa por tamanho e vence porque é mais longo.
+# O acerto do art. 2º foi acidente aritmético, não regra.
+#
+# ALCANCE MEDIDO (2026-09-05, sobre os 29 diplomas de data/legal-corpus/): UM
+# arquivo casa a forma do ato aprovador no art. 1 — clt.json. Os outros 28
+# começam com norma própria ("Esta Lei dispõe...", "O presente código..."), e
+# esta função não muda nada para eles: sem ato aprovador detectado, o corte é o
+# de sempre.
+ATO_APROVADOR_RE = re.compile(
+    r"(?:Fica|Ficam)\s+aprovad[oa]s?\b[^.]{0,400}?"
+    r"(?:que\s+a\s+est[ea]\s+(?:decreto-lei|decreto|lei)\s+acompanha|anex[oa]\b)",
+    re.IGNORECASE | re.DOTALL)
+
+
+def inicio_do_anexo_aprovado(texto, ocorrencias):
+    """Posição em que o texto ANEXO começa, ou None quando não há ato aprovador.
+
+    O ato aprovador é reconhecido pelo CORPO do primeiro artigo, nunca pelo
+    nome do arquivo ou pela URL: é o texto que diz "Fica aprovada ... que a
+    este decreto-lei acompanha". Havendo ato aprovador, o anexo começa na
+    PRIMEIRA reaparição de um número de artigo já visto — que é exatamente onde
+    a numeração recomeça.
+
+    Fail-closed: sem ato aprovador, sem reaparição, ou com menos de dois
+    artigos no anexo, devolve None e o documento é cortado como sempre. Um
+    detector que na dúvida truncasse o documento perderia artigos inteiros, que
+    é dano maior do que o que ele conserta.
+    """
+    if len(ocorrencias) < 2:
+        return None
+    primeiro = ocorrencias[0]
+    fim_do_primeiro = ocorrencias[1].start()
+    if not ATO_APROVADOR_RE.search(texto[primeiro.end():fim_do_primeiro]):
+        return None
+    vistos = set()
+    for indice, achado in enumerate(ocorrencias):
+        numero = (achado.group(1).replace(".", "").replace(" ", "")
+                  + (achado.group(2) or "")).upper()
+        if numero in vistos:
+            if len(ocorrencias) - indice < 2:
+                return None
+            return achado.start()
+        vistos.add(numero)
+    return None
+
+
+# ONDE O DISPOSITIVO TERMINA — a causa de 924 artigos contaminados.
+#
+# `indexar_artigos` corta o texto no PRÓXIMO cabeçalho de artigo, e entre o fim
+# de um artigo e o começo do seguinte o documento oficial traz coisa que não é
+# texto do artigo:
+#
+#   * o cabeçalho da DIVISÃO seguinte. O art. 7º do Código de Defesa do
+#     Consumidor terminava em "…costumes e eqüidade. Parágrafo único. […]
+#     normas de consumo." e seguia com "CAPÍTULO IV / Da Qualidade de Produtos
+#     e Serviços, da Prevenção e da Reparação dos Danos / SEÇÃO I / Da Proteção
+#     à Saúde e Segurança" dentro do corpo — o título do capítulo do art. 8º
+#     transcrito como se fosse a lei falando no art. 7º.
+#   * o FECHO DA PUBLICAÇÃO, no último artigo de cada diploma: local e data de
+#     promulgação, assinaturas, "Este texto não substitui o publicado no DOU", o
+#     índice do código inteiro (15.280 bytes dentro do art. 2.046 do Código
+#     Civil) e o script do WAF do Planalto.
+#
+# Medido em 2026-09-10 sobre os 29 diplomas: 924 dos 8.830 artigos traziam
+# cabeçalho de divisão no corpo e 24 traziam o fecho da publicação.
+#
+# O QUE ESTA REGRA NÃO CORTA, e é onde ela causaria dano maior do que conserta:
+#
+#   1. NOTA DE VIGÊNCIA. "(Redação dada pela Lei nº 13.146, de 2015)", "(Vide
+#      ADI 6050)", "(Revogado)" e "(Vigência)" são TEXTO OFICIAL do artigo a que
+#      se referem, e carregam a informação mais importante que existe sobre o
+#      dispositivo: se ele ainda vale. Ficam no corpo, íntegras, e são ALÉM
+#      DISSO extraídas para `notas_de_vigencia`. Nota só cai quando está depois
+#      de um cabeçalho de divisão ou do fecho — nunca por ser nota.
+#   2. REFERÊNCIA A DIVISÃO DENTRO DA FRASE. "o disposto neste\nCapítulo," e
+#      "Seção II do Capítulo II." começam linha por acaso da marcação, e cortar
+#      ali amputaria o dispositivo. Por isso a designação (romano, ÚNICO,
+#      GERAL…) é OBRIGATÓRIA e o que sobra na linha tem de começar em maiúscula:
+#      das 2.397 ocorrências de rótulo em início de linha medidas no corpus, 552
+#      eram continuação de frase e nenhuma delas casa esta regra.
+#
+# A grafia com i minúsculo ("CAPíTULO III", "TíTULO") está no HTML do Planalto e
+# entra na classe de propósito.
+# SUBTÍTULO É RÓTULO, e tem de vir ANTES de TÍTULO na alternância — sem ele, os
+# 6 subtítulos do Livro IV do Código Civil ficavam no corpo do artigo anterior
+# ("…(arts. 45 e 1.150). SUBTÍTULO I Da Sociedade Não Personificada", art. 985),
+# medido em 2026-09-10 sobre os 29 diplomas.
+_ROTULO_DE_DIVISAO = (r"(?:SUBT[ÍIí]TULO|T[ÍIí]TULO|CAP[ÍIí]TULO|SE[ÇC][ÃA]O|SUBSE[ÇC][ÃA]O"
+                      r"|LIVRO|PARTE"
+                      r"|Subt[íi]tulo|T[íi]tulo|Cap[íi]tulo|Se[çc][ãa]o|Subse[çc][ãa]o"
+                      r"|Livro|Parte)")
+_ROTULO_EM_CAIXA_ALTA = (r"(?:SUBT[ÍIí]TULO|T[ÍIí]TULO|CAP[ÍIí]TULO|SE[ÇC][ÃA]O"
+                         r"|SUBSE[ÇC][ÃA]O|LIVRO|PARTE)")
+_DESIGNACAO_DE_DIVISAO = (
+    r"(?:[IVXLCDM]+(?:-[A-Z])?|\d+(?:-[A-Z])?"
+    r"|[ÚU]NIC[OA]|[ÚU]nic[oa]"
+    r"|GERAL|Geral|ESPECIAL|Especial|COMPLEMENTAR|Complementar"
+    r"|PRELIMINAR|Preliminar|PRIMEIRA|Primeira|SEGUNDA|Segunda"
+    r"|TERCEIRA|Terceira|QUARTA|Quarta)")
+
+CABECALHO_DE_DIVISAO_RE = re.compile(
+    r"(?m)^[ \t]*(?:"
+    # rótulo + designação, e o resto da linha (o nome da divisão) em maiúscula.
+    #
+    # A QUEBRA DE LINHA ENTRE O RÓTULO E A DESIGNAÇÃO é do `<br>` do Planalto,
+    # não da lei: a CLT imprime "Seção\r\n IV-A \n Do Serviço do Motorista", e
+    # com `[ \t]+` o cabeçalho escapava inteiro para dentro do art. 235. Aceitar
+    # `\r\n` aqui não afrouxa nada, porque a DESIGNAÇÃO continua obrigatória e o
+    # resto da linha continua tendo de começar em maiúscula — que é o par de
+    # exigências que descarta "o disposto neste\nCapítulo," e "no\nCapítulo IV
+    # do Título IX da Lei nº 5.869".
+    #
+    # O PONTO DEPOIS DA DESIGNAÇÃO também é grafia do documento
+    # ("CAPÍTULO I-A. DO PATRIMÔNIO DE AFETAÇÃO", art. 31 da Lei 4.591/1964) e
+    # só é aceito COLADO à designação, então "Livro D - indicador pessoal"
+    # (art. 132 da Lei 6.015/1973, que é texto normativo) segue fora.
+    r"%s[ \t\r\n]+%s\.?(?:[ \t]*(?=\r?\n|$)|[ \t]+(?=[A-ZÀ-ÖØ-Þ]))"
+    # ou o rótulo sozinho em caixa alta fechando a linha ("CAPÍTULO\n IV")
+    r"|%s[ \t]*(?=\r?\n|$)"
+    r")" % (_ROTULO_DE_DIVISAO, _DESIGNACAO_DE_DIVISAO, _ROTULO_EM_CAIXA_ALTA))
+
+# O FECHO DA PUBLICAÇÃO, reconhecido POR CORPO e nunca sobre o documento
+# inteiro: a Constituição traz o ADCT DEPOIS da assinatura, com a numeração
+# recomeçando, e truncar o documento na promulgação apagaria o ADCT inteiro.
+FECHO_DA_PUBLICACAO_RE = re.compile(
+    r"(?m)^[ \t]*(?:"
+    r"(?:Bras[íi]lia|Rio de Janeiro)\s*,\s*\d{1,2}[º°o]?\s+de\s+[\wÀ-ÿ]+\s+de\s+\d{3,4}"
+    r"|Este texto n[ãa]o substitui"
+    r"|[ÍI]NDICE[ \t]*(?=\r?\n|$)"
+    r")"
+    # A FÓRMULA DE PROMULGAÇÃO DISPENSA A ÂNCORA DE LINHA quando vem completa.
+    # Na Lei 8.213/1991 o "Brasília, 24 de julho de 1991" não abre linha, e o
+    # art. 156 terminava em "170º da Independência e 103º da República. FERNANDO
+    # COLLOR Antonio Magri" — assinatura do Presidente e do Ministro dentro do
+    # texto do artigo. "Nº da Independência e Nº da República" é fórmula fechada
+    # do art. 84, IV da Constituição para o ato de promulgação: ela não ocorre em
+    # dispositivo nenhum, e é por trazê-la inteira que esta alternativa pode
+    # dispensar o `^`. O corte cai no "Brasília" quando ele existe, para não
+    # deixar a data pendurada no fim do artigo.
+    r"|(?:(?:Bras[íi]lia|Rio de Janeiro)\s*,\s*)?"
+    r"\d{1,2}[º°o]?\s+de\s+[\wÀ-ÿ]+\s+de\s+\d{3,4}\s*[;,.]?\s*"
+    r"\d{1,3}\s*[º°o]?\s*d[ao]\s+Independ[êe]ncia\s+e\s+"
+    r"\d{1,3}\s*[º°o]?\s*d[ao]\s+Rep[úu]blica")
+
+
+def fim_do_dispositivo(corpo, blocos=None, base=0):
+    """Trunca o corpo do artigo onde o texto DELE acaba.
+
+    Fail-open em dois pontos, e os dois são deliberados: sem sinal de fim o
+    corpo volta inteiro, e corte que esvaziaria o artigo também devolve o corpo
+    inteiro. Artigo vazio é DESCARTADO por `indexar_artigos`, e corpus que NEGA
+    dispositivo existente faz o conferidor acusar de errada uma página certa —
+    o pior modo de falha desta ferramenta, já ocorrido com o art. 61 da Lei
+    9.099/1995. Perder uma nota é menos grave que amputar a lei.
+    """
+    return fim_do_dispositivo_com_cauda(corpo, blocos, base)[0]
+
+
+def fim_do_dispositivo_com_cauda(corpo, blocos=None, base=0):
+    """Como `fim_do_dispositivo`, e devolve TAMBÉM o texto cortado.
+
+    ★ O QUE SE CORTA DO CORPO NÃO SE JOGA FORA (2026-09-10).
+    O cabeçalho de divisão é contaminação DENTRO do artigo e ao mesmo tempo é a
+    única fonte em disco do ENDEREÇO do artigo na norma — em que Livro, Título,
+    Capítulo e Seção ele mora. Medido nesta data: descartar a cauda levou a
+    cobertura desse endereço de 239 de 255 dispositivos (93,7%) para ZERO.
+    Truncar e guardar são a mesma passada; separar as duas custaria uma segunda
+    leitura do documento e perderia a cauda das ocorrências que o desempate de
+    variante não elege."""
+    # ★ CABEÇALHO DENTRO DE BLOCO DE TRANSCRIÇÃO NÃO CORTA (2026-09-10).
+    #
+    # Lei que altera outra transcreve o texto alterado, e a técnica legislativa
+    # transcreve CAPÍTULO inteiro quando o insere. Cortar ali truncaria o artigo
+    # da própria lei no meio da citação que ele faz. Nenhum dos 29 diplomas de
+    # hoje transcreve capítulo — por isso a amostra não pega —, mas a exposição
+    # é real e silenciosa: o corte sairia certo no gate e errado na lei.
+    # `blocos` ausente (chamador antigo, como o gate de contaminação) mantém o
+    # comportamento anterior: sem coordenada não há como decidir, e decidir
+    # errado é pior que não filtrar.
+    def fora_de_transcricao(achado):
+        if not blocos or achado is None:
+            return achado
+        return None if dentro_de_bloco(blocos, base + achado.start()) else achado
+
+    limites = [achado.start() for achado in (
+        fora_de_transcricao(CABECALHO_DE_DIVISAO_RE.search(corpo)),
+        fora_de_transcricao(FECHO_DA_PUBLICACAO_RE.search(corpo)))
+        if achado]
+    if not limites:
+        return corpo, ""
+    corte = min(limites)
+    truncado = corpo[:corte].strip()
+    if not truncado:
+        # Fail-open do docstring acima: o corpo volta inteiro, e então NÃO há
+        # cauda a colher — devolver as duas coisas duplicaria o texto.
+        return corpo, ""
+    return truncado, corpo[corte:]
+
+
+# NOTA DE VIGÊNCIA — o que o texto oficial diz sobre o dispositivo ainda valer.
+#
+# O art. 1.790 do Código Civil foi declarado inconstitucional pelo STF no RE
+# 878.694 (Tema 809), e a transcrição do Planalto avisa: "(Vide Recurso
+# Extraordinário nº 878.694)". A nota estava no corpus — dissolvida no meio do
+# caput, indistinguível do texto normativo —, e uma página publicada afirmou que
+# o artigo "continua em vigor: sim". Extrair para campo próprio não muda o
+# corpo: põe a mesma frase onde quem consome consegue vê-la.
+#
+# O CAMPO REGISTRA O QUE O TEXTO OFICIAL DIZ, E SÓ ISSO. A remissão prova que
+# existe um processo, nunca como ele terminou: derivar "inconstitucional" de
+# "(Vide ADI 6050)" seria inventar desfecho de julgamento.
+NOTA_ENTRE_PARENTESES_RE = re.compile(r"\(([^()]{1,240})\)")
+GATILHO_DE_NOTA_RE = re.compile(
+    r"Revogad|Reda[çc][ãa]o dada|Inclu[íi]d|Acrescid|Renumerad|Vig[êe]ncia|\bVide\b"
+    r"|Vetad|Regulamento|Produ[çc][ãa]o de efeito|Execu[çc][ãa]o suspensa|Revigorad"
+    r"|Suspens",
+    re.IGNORECASE)
+
+# A ordem classifica: o primeiro que casar nomeia a nota. Revogação e suspensão
+# vêm antes de tudo porque decidem se o dispositivo ainda produz efeito.
+TIPOS_DE_NOTA = (
+    # O Senado escreve a suspensao de tres jeitos, e o corpus tem os tres: "Execucao
+    # suspensa pela Resolucao...", "Suspensa a execucao pela RSF no 337, de 1983"
+    # (art. 85 do CTN) e a forma abreviada com RSF. Dispositivo cuja execucao o
+    # Senado suspendeu nao produz mais efeito - classificar isso como remissao
+    # generica esconderia a nota mais grave que existe depois da revogacao.
+    ("execucao_suspensa_pelo_senado",
+     re.compile(r"Execu[çc][ãa]o suspensa|Suspens[ao] a execu[çc][ãa]o"
+                r"|Suspens[ao] pel[ao] (?:Resolu[çc][ãa]o|RSF)", re.IGNORECASE)),
+    ("revogacao", re.compile(r"Revogad", re.IGNORECASE)),
+    # A quebra de linha no meio da remissão é do próprio HTML do Planalto
+    # ("(Vide \n ADIN 3392)", medido no art. 93 da Constituição), e é por isso
+    # que o `\s+` depois de "Vide" é obrigatório aqui.
+    ("desafio_constitucional",
+     re.compile(r"Vide\s+(?:ADI|ADIN|ADPF|ADC|A[çc][ãa]o Direta|Recurso Extraordin[áa]rio"
+                r"|RE\b|S[úu]mula Vinculante|Tema)\b", re.IGNORECASE)),
+    ("redacao_alterada", re.compile(r"Reda[çc][ãa]o dada", re.IGNORECASE)),
+    ("inclusao", re.compile(r"Inclu[íi]d|Acrescid", re.IGNORECASE)),
+    ("renumeracao", re.compile(r"Renumerad", re.IGNORECASE)),
+    ("revigoracao", re.compile(r"Revigorad", re.IGNORECASE)),
+    ("veto", re.compile(r"Vetad", re.IGNORECASE)),
+    ("vigencia", re.compile(r"Vig[êe]ncia|Produ[çc][ãa]o de efeito", re.IGNORECASE)),
+    ("regulamento", re.compile(r"Regulamento", re.IGNORECASE)),
+    ("remissao", re.compile(r"\bVide\b", re.IGNORECASE)),
+)
+
+
+def notas_de_vigencia(corpo):
+    """Notas de vigência do artigo, na ordem em que o texto oficial as traz.
+
+    Devolve `[{"texto": …, "tipo": …}]`. O `texto` é literal — só os espaços
+    colapsados, porque a marcação do Planalto quebra linha dentro do parêntese —
+    e o `tipo` sai da família de palavra que o próprio texto usa, nunca de
+    interpretação. Parêntese sem gatilho não vira nota: o corpo do artigo está
+    cheio de parênteses que são texto normativo comum ("16 (dezesseis) anos").
+    """
+    saida = []
+    for achado in NOTA_ENTRE_PARENTESES_RE.finditer(corpo):
+        miolo = " ".join(achado.group(1).split())
+        if not miolo or not GATILHO_DE_NOTA_RE.search(miolo):
+            continue
+        tipo = "nao_classificada"
+        for nome, regex in TIPOS_DE_NOTA:
+            if regex.search(miolo):
+                tipo = nome
+                break
+        saida.append({"texto": "(%s)" % miolo, "tipo": tipo})
+    return saida
+
+
+def _ocorrencias_de_artigo(texto):
+    """(numero, achado, em_sequencia, corpo_bruto) por cabeçalho de artigo.
+
+    UMA fonte para as duas leituras que precisam da mesma lista — o índice de
+    artigos e o endereço deles na norma. Duplicar esta triagem faria as duas
+    divergirem no dia em que uma regra mudasse, e é ela que carrega três
+    decisões caras: cabeçalho de verdade (`e_cabecalho`), fora de bloco de
+    transcrição (`dentro_de_bloco`) e depois do ato aprovador
+    (`inicio_do_anexo_aprovado`).
+    """
+    blocos = blocos_de_transcricao(texto)
+    ocorrencias = [a for a in ARTIGO_RE.finditer(texto)
+                   if e_cabecalho(texto, a) and not dentro_de_bloco(blocos, a.start())]
+
+    # O ato aprovador sai da conta ANTES de qualquer critério de preferência:
+    # se ele continuasse na lista, `em_sequencia` seguiria elegendo o artigo
+    # errado como "próprio da lei".
+    inicio = inicio_do_anexo_aprovado(texto, ocorrencias)
+    if inicio is not None:
+        ocorrencias = [a for a in ocorrencias if a.start() >= inicio]
+
+    # ARTIGO DE OUTRA LEI, DENTRO DE BLOCO DE ALTERAÇÃO. Uma lei que altera
+    # outra transcreve os artigos alterados, e eles têm a mesma forma de
+    # cabeçalho. A Lei 14.790/2023 tem DOIS "Art. 32": o próprio (Seção III, Da
+    # Prescrição — o apostador perde o prêmio não reclamado em 90 dias) e o art.
+    # 32 da Lei 13.756/2018 que ela institui num bloco fechado por "(NR)". O
+    # corpus guardava o alheio, e três páginas CORRETAS sobre apostas apareceram
+    # como divergentes.
+    #
+    # O sinal é a numeração: dentro da lei os artigos sobem, e um número que
+    # reaparece depois de outro maior está em bloco de alteração. Não se
+    # descarta — a ocorrência em sequência apenas tem preferência, para não
+    # perder artigo de lei cuja numeração fuja do padrão.
+    maior = 0
+    for indice, achado in enumerate(ocorrencias):
+        base = int(re.match(r"\d+", achado.group(1).replace(".", "")).group())
+        em_sequencia = base >= maior
+        if em_sequencia:
+            maior = base
+        numero = (achado.group(1).replace(".", "").replace(" ", "")
+                  + (achado.group(2) or "")).upper()
+        fim = (ocorrencias[indice + 1].start() if indice + 1 < len(ocorrencias)
+               else len(texto))
+        bruto = texto[achado.end():fim]
+        # A BASE ABSOLUTA VAI JUNTO porque o corte tem de saber se o cabeçalho
+        # que ele encontrou é da PRÓPRIA lei ou está dentro de um bloco de
+        # transcrição de outra — e `dentro_de_bloco` só responde em coordenada
+        # do documento.
+        deslocamento = achado.end() + (len(bruto) - len(bruto.lstrip()))
+        yield numero, achado, em_sequencia, bruto.strip(), blocos, deslocamento
+
+
+# A HIERARQUIA DAS DIVISÕES, do mais amplo ao mais estreito. Abrir um nível
+# zera os de baixo: entrar no Capítulo II apaga a Seção que valia no Capítulo I,
+# porque a numeração de seção recomeça dentro de cada capítulo.
+NIVEIS_DE_DIVISAO = ("parte", "livro", "titulo", "subtitulo", "capitulo",
+                     "secao", "subsecao")
+_NIVEL_POR_ROTULO = {
+    "parte": "parte", "livro": "livro", "titulo": "titulo",
+    "subtitulo": "subtitulo", "capitulo": "capitulo",
+    "secao": "secao", "subsecao": "subsecao",
+}
+
+
+def _nivel_do_rotulo(bruto):
+    """"SUBSEÇÃO", "Subseção", "SUBSECAO" -> "subsecao"."""
+    texto = unicodedata.normalize("NFKD", bruto or "")
+    texto = "".join(c for c in texto if not unicodedata.combining(c)).lower()
+    return _NIVEL_POR_ROTULO.get(texto.replace(" ", ""))
+
+
+def divisoes_da_cauda(cauda):
+    """Cada cabeçalho de divisão da cauda, em ordem: (nivel, designacao, nome).
+
+    O NOME NÃO ESTÁ NO CASAMENTO, e é por isso que ele é lido aqui em vez de
+    sair de um grupo da regex: `CABECALHO_DE_DIVISAO_RE` casa rótulo +
+    designação e deixa o nome fora, num lookahead, justamente para não ter de
+    decidir onde o nome acaba. Aqui o nome é o resto da linha do casamento —
+    ou, quando o rótulo fecha a linha ("CAPÍTULO\n IV\n DO NOME"), a linha
+    seguinte à designação.
+
+    Nome ausente não é erro: `("capitulo", "IV", "")` continua sendo endereço
+    útil. Inventar nome seria o defeito.
+    """
+    achadas = []
+    for achado in CABECALHO_DE_DIVISAO_RE.finditer(cauda):
+        casado = achado.group(0)
+        rotulo = re.match(r"[ \t]*([A-Za-zÀ-ÿ]+)", casado)
+        nivel = _nivel_do_rotulo(rotulo.group(1)) if rotulo else None
+        if nivel is None:
+            continue
+        designacao = ""
+        depois = re.search(r"[ \t\r\n]+([^\s.]+)\.?[ \t]*$", casado)
+        if depois:
+            designacao = depois.group(1)
+        # O NOME QUASE SEMPRE ESTÁ NA LINHA SEGUINTE, não na do rótulo: o
+        # Planalto imprime "CAPÍTULO III\r\nDO PROCESSO DO REGISTRO". Medido em
+        # 2026-09-10 sobre os 43 documentos do cache: lendo só o resto da linha
+        # do casamento, o nome saía VAZIO em todos os 1.348 capítulos.
+        linhas = [linha.strip().strip(".").strip()
+                  for linha in cauda[achado.end():].split("\n")]
+        proximas = [linha for linha in linhas[:4] if linha]
+        nome = proximas[0] if proximas else ""
+        if not designacao:
+            # O rótulo fechou a linha: a designação é a primeira linha não
+            # vazia, e o nome vem depois dela.
+            designacao = nome
+            nome = proximas[1] if len(proximas) > 1 else ""
+        # Nome que é outro cabeçalho (divisão vazia, sem rubrica) não vira nome:
+        # "TÍTULO I\nCAPÍTULO I" tem título sem nome, e copiar "CAPÍTULO I" para
+        # lá afirmaria uma rubrica que a lei não escreveu.
+        if nome and CABECALHO_DE_DIVISAO_RE.match(nome):
+            nome = ""
+        if not nome and not designacao:
+            continue
+        achadas.append((nivel, designacao, nome))
+    return achadas
+
+
+def posicao_dos_artigos(texto):
+    """artigo -> {nivel: {"designacao": …, "nome": …}} pela ordem do DOCUMENTO.
+
+    ★ O ENDEREÇO SAI DA MESMA PASSADA QUE TRUNCA, e a ordem é a do documento e
+    não a numérica: a Constituição reinicia a numeração no ADCT, e ordenar por
+    número embaralharia as divisões dos dois blocos.
+
+    Só ocorrência EM SEQUÊNCIA move o estado. Artigo transcrito dentro de bloco
+    de alteração traz o cabeçalho da OUTRA lei, e deixá-lo abrir divisão faria
+    todo artigo seguinte herdar endereço alheio.
+    """
+    posicao = {}
+    estado = {nivel: None for nivel in NIVEIS_DE_DIVISAO}
+    primeira = None
+    for numero, achado, em_sequencia, corpo_bruto, blocos, base in _ocorrencias_de_artigo(texto):
+        if primeira is None:
+            # ★ AS DIVISÕES QUE ABREM A LEI NÃO ESTÃO NA CAUDA DE NINGUÉM.
+            #   "LIVRO I / TÍTULO I / CAPÍTULO II / Seção I" vem ANTES do
+            #   primeiro artigo, e uma varredura que só lê caudas nunca as vê:
+            #   o art. 319 do CPC ficava sem endereço nenhum. O trecho anterior
+            #   à primeira ocorrência é a cauda inicial.
+            primeira = achado.start()
+            for nivel, designacao, nome in divisoes_da_cauda(texto[:primeira]):
+                estado[nivel] = {"designacao": designacao, "nome": nome}
+                for abaixo in NIVEIS_DE_DIVISAO[NIVEIS_DE_DIVISAO.index(nivel) + 1:]:
+                    estado[abaixo] = None
+        _, cauda = fim_do_dispositivo_com_cauda(corpo_bruto, blocos, base)
+        if not em_sequencia:
+            continue
+        # O endereço é o que valia ANTES de a cauda deste artigo abrir a divisão
+        # seguinte: o cabeçalho que vem depois do art. 5º é o endereço do 6º.
+        posicao[numero] = {nivel: dict(valor) for nivel, valor in estado.items()
+                           if valor}
+        for nivel, designacao, nome in divisoes_da_cauda(cauda):
+            estado[nivel] = {"designacao": designacao, "nome": nome}
+            for abaixo in NIVEIS_DE_DIVISAO[NIVEIS_DE_DIVISAO.index(nivel) + 1:]:
+                estado[abaixo] = None
+    return posicao
+
+
+def indexar_artigos(texto):
+    """Corta o texto em artigos. A chave é o número SEM separador de milhar.
+
+    O acervo cita ora "art. 1.723" ora "art. 1723"; normalizar na chave faz a
+    conferência funcionar nos dois casos sem depender de como foi escrito.
+    """
+    artigos = {}
+    proprios = {}
+    for numero, _achado, proprio, bruto, blocos, base in _ocorrencias_de_artigo(texto):
+        # O TRUNCAMENTO VEM ANTES DA DISPUTA DE VERSÃO, e a ordem importa: o
+        # critério de desempate abaixo prefere o corpo mais longo, então um
+        # corpo ainda contaminado pelo capítulo seguinte venceria o corpo certo.
+        corpo = fim_do_dispositivo(bruto, blocos, base)
+        if not corpo:
+            continue
+        # QUAL DAS VERSÕES É A VIGENTE.
+        #
+        # A página do Planalto traz a redação original E as posteriores. Escolher
+        # "a mais longa" produziu texto REVOGADO: o art. 61 da Lei 9.099/1995
+        # entrou no corpus como "pena máxima não superior a um ano", que é a
+        # redação de 1995 — a Lei 11.313/2006 mudou para dois anos. Com isso o
+        # verificador acusou de errada uma página que estava certa, que é o pior
+        # resultado possível para uma ferramenta de conferência.
+        #
+        # "Redação dada pela" e "Incluído pela" marcam o texto que vigora. Entre
+        # dois trechos marcados, vence o mais longo (carrega parágrafos e
+        # incisos); um trecho marcado sempre vence um sem marca.
+        vigente = bool(re.search(r"Reda[çc][ãa]o dada pel|Inclu[íi]d[oa] pel", corpo))
+        atual = artigos.get(numero)
+        if atual is None:
+            artigos[numero] = corpo
+            proprios[numero] = proprio
+            continue
+        # Artigo da PRÓPRIA lei vence artigo transcrito de outra, antes de
+        # qualquer critério de redação ou tamanho.
+        if proprio != proprios.get(numero, True):
+            if proprio:
+                artigos[numero] = corpo
+                proprios[numero] = True
+            continue
+        atual_vigente = bool(re.search(r"Reda[çc][ãa]o dada pel|Inclu[íi]d[oa] pel", atual))
+        if vigente and not atual_vigente:
+            artigos[numero] = corpo
+        elif vigente == atual_vigente and len(corpo) > len(atual):
+            artigos[numero] = corpo
+    return artigos
+
+
+# ---------------------------------------------------------------------------
+# DUAS PERGUNTAS, DOIS ENDEREÇOS — o desenho que separa citação de conferência.
+#
+# Até 2026-08-12 um campo só respondia às duas, e o veredito saía do NOME da
+# URL (`re.search(r"compilad[oa]|consol", url)`). Isso está errado nas duas
+# pontas, e cada erro tem medição própria:
+#
+#   1. QUAL URL O LEITOR RECEBE. `l10406.htm` (página simples do Código Civil)
+#      tem 6.421 âncoras; `l10406compilada.htm` tem 11. Deep link para a
+#      compilada cai no topo da lei — só a simples resolve no artigo. Isso é
+#      `citation_url`, e sai da contagem REAL de âncoras normativas.
+#   2. QUAL TEXTO O VERIFICADOR COMPARA. A página simples publica a redação
+#      original E a vigente no mesmo documento; a compilada publica só a
+#      vigente. Isso é `conference_url` (== `source_url`, de onde os `articles`
+#      saem), e sai da CONTENÇÃO das notas de alteração, nunca do nome.
+#
+# `confiavel_para_acusar_divergencia` continua significando exatamente o que
+# significava: garantia sobre o TEXTO indexado. Ele não olha, e não pode olhar,
+# para a escolha do link.
+#
+# REGRA, fail-closed em todo ramo que a medição não fecha:
+#   citação   → variante com mais âncoras normativas (200, ≥5 artigos);
+#               empate mantém a URL declarada na tabela.
+#   conferência → variante compilada válida (≥5 artigos) que NÃO esteja atrasada
+#               em relação à simples (ver `ha_atraso`); atraso ⇒ confiável=false.
+#   sem variante compilada (404 medido) e ZERO nota de alteração na simples ⇒ a
+#               simples é o texto vigente por não haver o que consolidar.
+#   qualquer outro caso ⇒ false.
+SUFIXOS_DE_CONSOLIDACAO = ("compilado", "compilada", "consolidado", "consol", "cons")
+
+MEDICAO = os.path.join(ROOT, "data/source-audit/legal_corpus_variant_measurement.jsonl")
+
+
+def _ferramentas_de_medicao():
+    """Importa, tarde, os medidores já existentes. Reuso, não reimplementação.
+
+    Tarde de propósito: `check-legal-corpus-extractor` carrega ESTE arquivo por
+    SourceFileLoader, e import de outra ferramenta no topo do módulo faria o
+    check depender de rede/caminho que ele não usa.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    def carrega(nome, caminho):
+        spec = importlib.util.spec_from_loader(
+            nome, importlib.machinery.SourceFileLoader(nome, caminho))
+        modulo = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(modulo)
+        return modulo
+
+    ancoras = carrega("medidor_ancoras",
+                      os.path.join(ROOT, "tools/measure-planalto-anchor-coverage-20260812"))
+    impressao = carrega("medidor_impressao",
+                        os.path.join(ROOT, "tools/generate-normative-fingerprint-baseline-20260812"))
+    return ancoras, impressao
+
+
+def variantes_do_documento(url):
+    """Variantes do MESMO documento oficial, com o sufixo que faltava.
+
+    `measure-planalto-anchor-coverage-20260812.variantes` reconhece
+    `compilado`/`compilada`/`cons`, e por isso NÃO enxerga `l8036consol.htm`:
+    "l8036consol".endswith("cons") é falso. O FGTS ficava sem a variante simples
+    e a descoberta da URL de citação degradava em silêncio. Aqui a lista de
+    sufixos é a mesma que o regex deste arquivo já aceitava.
+    """
+    achado = re.match(r"^(.*/)([^/]+)\.(htm|html)$", url)
+    if not achado:
+        return []
+    prefixo, nome, extensao = achado.groups()
+    baixo = nome.lower()
+    saida = []
+    for sufixo in SUFIXOS_DE_CONSOLIDACAO:
+        if baixo.endswith(sufixo):
+            saida.append("%s%s.%s" % (prefixo, nome[:-len(sufixo)], extensao))
+            break
+    else:
+        saida += ["%s%scompilado.%s" % (prefixo, nome, extensao),
+                  "%s%scompilada.%s" % (prefixo, nome, extensao)]
+    return [u for u in saida if u != url]
+
+
+def e_consolidada(url):
+    nome = re.sub(r"\.(htm|html)$", "", url.rsplit("/", 1)[-1]).lower()
+    return nome.endswith(SUFIXOS_DE_CONSOLIDACAO)
+
+
+def medir_documento(url, cache, pausa):
+    """Baixa (ou lê do cache) e mede o que decide cada pergunta.
+
+    Devolve status HTTP REAL — 404 de variante inexistente é evidência, não
+    falha: é ele que prova "não há texto compilado a consolidar".
+    """
+    ancoras_mod, impressao_mod = _ferramentas_de_medicao()
+    destino = os.path.join(cache, hashlib.sha256(url.encode()).hexdigest()[:24] + ".htm")
+    origem, status, bruto = "cache", 200, b""
+    if os.path.isfile(destino) and os.path.getsize(destino) > 0:
+        bruto = open(destino, "rb").read()
+    else:
+        origem = "rede"
+        os.makedirs(cache, exist_ok=True)
+        try:
+            bruto = baixar(url)
+            with open(destino, "wb") as handle:
+                handle.write(bruto)
+        except urllib.error.HTTPError as erro:
+            status, bruto = erro.code, b""
+        except Exception as erro:
+            status, bruto = 0, b""
+            print("      %s: %s" % (url.rsplit("/", 1)[-1], str(erro)[:60]))
+        time.sleep(pausa)
+
+    registro = {
+        "url": url,
+        "http_status": status,
+        # Corpo vindo do cache não teve status observado HOJE: o 200 é herdado da
+        # busca que gravou o arquivo. Dizer o contrário seria medição forjada.
+        "http_status_medido": origem == "rede",
+        "origem_do_corpo": origem if bruto else "ausente",
+        "bytes": len(bruto),
+        "sha256_documento": hashlib.sha256(bruto).hexdigest() if bruto else "",
+        "ancoras_totais": 0,
+        "ancoras_normativas": 0,
+        "normas_alteradoras": [],
+        "ano_max_alteracao": 0,
+        "artigos_indexados": 0,
+        # A resposta tem a FORMA de uma lei publicada? É isto, e não uma
+        # contagem mínima de artigos, que separa o texto oficial da página de
+        # erro — ver `documento_e_lei`.
+        "forma_de_lei": False,
+        "e_consolidada_por_nome": e_consolidada(url),
+        # HTML só para a decisão desta execução; sai antes de qualquer gravação
+        # (a prova gravada é o sha256, não o corpo).
+        "_html": "",
+    }
+    if not bruto:
+        return registro
+
+    texto_html, _ = ancoras_mod.decodifica(bruto)
+    registro["_html"] = texto_html
+    coletor = ancoras_mod.ColetorDeAncoras()
+    try:
+        coletor.feed(texto_html)
+    except Exception:
+        pass
+    ids = coletor.ids
+    registro["ancoras_totais"] = len(ids)
+    registro["ancoras_normativas"] = len(
+        [i for i in ids if impressao_mod.ANCORA_NORMATIVA.search(i)])
+    normas, ano = impressao_mod.normas_alteradoras(texto_html)
+    registro["normas_alteradoras"] = normas
+    registro["ano_max_alteracao"] = ano
+    texto_da_lei = texto_limpo(bruto)
+    artigos_medidos = indexar_artigos(texto_da_lei)
+    registro["artigos_indexados"] = len(artigos_medidos)
+    registro["forma_de_lei"] = documento_e_lei(texto_da_lei, artigos_medidos)
+    return registro
+
+
+# Nota que ACRESCENTA texto ao que vigora. A distinção importa: uma norma que só
+# REVOGA dispositivo desaparece legitimamente do texto compilado (o dispositivo
+# não existe mais), e cobrá-la da compilada reprovaria documento correto.
+NOTA_ADITIVA = re.compile(r"(Reda[çc][ãa]o dada|Inclu[íi]d|Acrescid|Renumerad)", re.IGNORECASE)
+
+
+def normas_aditivas(html_texto, regex_norma, regex_ano):
+    """Normas citadas em nota ADITIVA, com o ano da nota."""
+    plano = re.sub(r"<[^>]+>", " ", html_texto).replace("&nbsp;", " ")
+    plano = re.sub(r"&[a-z]+;", " ", plano)
+    plano = re.sub(r"\s+", " ", plano)
+    achados = {}
+    for nota in re.findall(r"\(([^()]{0,240})\)", plano):
+        if not NOTA_ADITIVA.search(nota):
+            continue
+        anos = regex_ano.findall(nota)
+        ano = int(anos[-1]) if anos else 0
+        for especie, numero in regex_norma.findall(nota):
+            chave = "%s %s" % (especie.title(), numero.replace(".", ""))
+            achados[chave] = max(ano, achados.get(chave, 0))
+    return achados
+
+
+def ha_atraso(simples, consolidada):
+    """A versão consolidada perdeu alteração que a simples já registra?
+
+    ESTA É A PERGUNTA DO CAMPO `confiavel_para_acusar_divergencia`, e a resposta
+    NÃO é contenção de conjuntos — medido em 2026-08-12 sobre os 26 diplomas.
+    A página simples publica a redação ORIGINAL junto da vigente, e cada etapa da
+    cadeia leva a sua nota; a compilada guarda só a última. Por isso a simples do
+    Código Penal cita 108 normas aditivas e a compilada 92, sem que a compilada
+    esteja atrasada um dia: as 16 restantes são elos vencidos. Exigir contenção
+    reprovaria 9 diplomas corretos — inclusive o Código Civil e o Código Penal.
+    Contraprova do mesmo conjunto: a nota "(Redação dada pela Lei nº 15.229, de
+    2025)" do art. 121 do Código Penal não está na compilada porque a Lei
+    15.397/2026 revogou aquela redação — a compilada está à frente, não atrás.
+    O que denuncia atraso REAL é a alteração RECENTE que a compilada não tem em
+    lugar nenhum do documento. Foi assim que se apanhou, com o nome de arquivo
+    dizendo o contrário, `l9656compilado.htm` sem a Lei 15.233/2025 e
+    `l13709compilado.htm` sem a Lei 15.452/2026.
+    """
+    ancoras_mod, _ = _ferramentas_de_medicao()
+    aditivas_s = normas_aditivas(simples["_html"], ancoras_mod.NORMA, ancoras_mod.ANO)
+    aditivas_c = normas_aditivas(consolidada["_html"], ancoras_mod.NORMA, ancoras_mod.ANO)
+    texto_c = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", consolidada["_html"]))
+    ausentes = []
+    for norma, ano in aditivas_s.items():
+        if norma in aditivas_c:
+            continue
+        numero = norma.split()[-1]
+        com_ponto = numero[:-3] + "." + numero[-3:] if len(numero) > 3 else numero
+        if numero in texto_c or com_ponto in texto_c:
+            continue
+        ausentes.append((ano, "%s/%s" % (norma, ano or "?")))
+
+    horizonte = simples["ano_max_alteracao"]
+    ano_ausente = max([a for a, _ in ausentes], default=0)
+    if consolidada["ano_max_alteracao"] < horizonte:
+        return True, ("consolidada para no ano %d enquanto a simples já registra %d"
+                      % (consolidada["ano_max_alteracao"], horizonte)), ausentes
+    if horizonte and ano_ausente >= horizonte:
+        recentes = sorted((n for a, n in ausentes if a >= horizonte), reverse=True)
+        return True, ("alteração de %d ausente do documento inteiro: %s"
+                      % (ano_ausente, ", ".join(recentes[:3]))), ausentes
+    return False, ("nenhuma alteração de %d em diante falta na consolidada (%d elo(s) "
+                   "vencido(s) da cadeia, o mais recente de %d)"
+                   % (horizonte, len(ausentes), ano_ausente)), ausentes
+
+
+def corpo_medido(url, cache):
+    """Bytes já baixados por `medir_documento`. Zero requisição extra."""
+    destino = os.path.join(cache, hashlib.sha256(url.encode()).hexdigest()[:24] + ".htm")
+    if os.path.isfile(destino) and os.path.getsize(destino) > 0:
+        return open(destino, "rb").read()
+    return b""
+
+
+def decidir_enderecos(url_declarada, medidas):
+    """As duas respostas, cada uma da sua medição. Sem nome de arquivo."""
+    # O MESMO PISO ARBITRÁRIO DE CINCO ARTIGOS estava aqui, e aqui ele custava
+    # mais caro: variante nunca "válida" significa que NENHUM ramo da decisão
+    # roda, e o diploma sai com `confiavel=false` e o motivo "medição não
+    # decidiu" — fail-closed por um critério que nada tem a ver com atualidade
+    # do texto. Medido em 2026-08-29 na Lei 12.653/2012, que tem quatro
+    # artigos: ela ficava eternamente inconfiável por ser CURTA. O critério
+    # correto é o mesmo de `documento_e_lei` — a resposta tem forma de lei.
+    validas = [m for m in medidas
+               if m["http_status"] == 200 and m.get("forma_de_lei")]
+    por_url = {m["url"]: m for m in medidas}
+
+    # PERGUNTA 1 — o link que resolve no artigo.
+    citacao, motivo_citacao = url_declarada, "sem variante válida medida"
+    if validas:
+        melhor = max(validas, key=lambda m: (m["ancoras_normativas"], m["url"] == url_declarada))
+        declarada = por_url.get(url_declarada)
+        if declarada and melhor["ancoras_normativas"] <= declarada.get("ancoras_normativas", 0):
+            citacao = url_declarada
+            motivo_citacao = ("URL declarada tem o maior número de âncoras normativas (%d)"
+                              % declarada.get("ancoras_normativas", 0))
+        else:
+            citacao = melhor["url"]
+            motivo_citacao = ("mais âncoras normativas medidas: %d contra %d da URL declarada"
+                              % (melhor["ancoras_normativas"],
+                                 declarada.get("ancoras_normativas", 0) if declarada else 0))
+
+    # PERGUNTA 2 — o texto que o verificador pode comparar.
+    simples = [m for m in validas if not m["e_consolidada_por_nome"]]
+    consolidadas = [m for m in validas if m["e_consolidada_por_nome"]]
+    base = simples[0] if simples else None
+    conferencia, confiavel = None, False
+    motivo = "medição não decidiu"
+
+    for candidata in sorted(consolidadas, key=lambda m: -m["artigos_indexados"]):
+        if base is None:
+            conferencia, confiavel = candidata["url"], True
+            motivo = ("única versão consolidada acessível (%d artigos); a simples não respondeu"
+                      % candidata["artigos_indexados"])
+            break
+        atrasada, explicacao, _ = ha_atraso(base, candidata)
+        if not atrasada:
+            conferencia, confiavel = candidata["url"], True
+            motivo = "consolidada em dia com a simples: " + explicacao
+            break
+        conferencia, confiavel = None, False
+        motivo = "consolidada atrasada em relação à simples: " + explicacao
+
+    if conferencia is None and base is not None and not consolidadas:
+        # Nada a consolidar: a simples é o texto vigente porque a lei nunca foi
+        # alterada e o Planalto não publica versão compilada dela (404 medido).
+        houve_404 = any(m["http_status"] == 404 and m["e_consolidada_por_nome"] for m in medidas)
+        if houve_404 and not base["normas_alteradoras"]:
+            conferencia, confiavel = base["url"], True
+            motivo = ("sem variante compilada (404 medido) e nenhuma nota de alteração no "
+                      "texto: não há o que consolidar")
+        elif base["normas_alteradoras"]:
+            motivo = ("sem variante compilada acessível e a simples traz %d normas alteradoras "
+                      "(ano máximo %d): a redação vigente não é separável com garantia"
+                      % (len(base["normas_alteradoras"]), base["ano_max_alteracao"]))
+        else:
+            motivo = "sem variante compilada acessível e sem prova de que ela não exista"
+
+    if conferencia is None:
+        # FAIL-CLOSED: a conferência continua saindo da URL declarada — é dela
+        # que os artigos foram indexados —, mas sem autorização para acusar.
+        conferencia = url_declarada
+    return {
+        "citation_url": citacao,
+        "citation_url_motivo": motivo_citacao,
+        "conference_url": conferencia,
+        "confiavel_para_acusar_divergencia": bool(confiavel),
+        "conference_url_motivo": motivo,
+    }
+
+
+# A RESPOSTA É MESMO A LEI? — guarda contra gravar página de erro como corpus.
+#
+# O critério era "pelo menos 5 artigos", e ele REPROVA LEI CURTA DE VERDADE.
+# Medido em 2026-08-29: a Lei 12.653/2012 tem QUATRO artigos, e só passava
+# porque o extrator contava junto o art. 135-A do Código Penal que ela insere —
+# a contaminação do BUG-118 estava mascarando o defeito deste piso. Corrigido o
+# extrator, o texto oficial correto passou a ser recusado, e o corpus ficaria
+# preso na versão contaminada. Piso arbitrário que reprova documento correto é
+# a mesma classe de erro que o corpus existe para evitar.
+#
+# O que separa a lei da página de erro não é a quantidade: é a FORMA. Toda lei
+# federal publicada pelo Planalto traz a fórmula de promulgação e um artigo
+# final de vigência; nenhuma página de challenge ou de erro traz qualquer das
+# duas. Medido nos 29 diplomas do corpus em 2026-08-29: 28/29 têm as duas
+# marcas. A exceção é o Decreto 22.626/1933, cujo preâmbulo é de 1933 ("O Chefe
+# do Govêrno Provisorio da Republica dos Estados Unidos do Brasil:") e não usa
+# nenhuma das fórmulas modernas — ele tem 19 artigos e nunca chega a este teste,
+# que só é consultado abaixo de cinco. O teste NÃO foi alargado para acomodá-lo:
+# alargar sem necessidade medida é como se afrouxa uma guarda.
+PROMULGACAO_RE = re.compile(
+    r"(?:o\s+)?(?:PRESIDENTE|PRESIDENTA)\s+DA\s+REP[ÚU]BLICA"
+    r"|Fa[çc]o\s+saber\s+que\s+o\s+Congresso\s+Nacional"
+    r"|decreta\s+e\s+eu\s+sanciono"
+    r"|promulga\s+a\s+seguinte\s+lei",
+    re.IGNORECASE)
+
+VIGENCIA_RE = re.compile(r"entra(?:r[áa])?\s+em\s+vigor", re.IGNORECASE)
+
+
+def documento_e_lei(texto, artigos):
+    """O corpo baixado tem a forma de uma lei publicada, e não de página de erro."""
+    if not artigos:
+        return False
+    if len(artigos) >= 5:
+        return True
+    tem_vigencia = any(VIGENCIA_RE.search(corpo) for corpo in artigos.values())
+    return bool(PROMULGACAO_RE.search(texto)) and tem_vigencia
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--apenas", default="", help="baixa só um diploma (slug)")
+    parser.add_argument("--pausa", type=float, default=2.0, help="segundos entre requisições")
+    parser.add_argument("--cache", default=os.environ.get(
+        "PLANALTO_CACHE", "/tmp/wiki-planalto-cache-20260812"),
+        help="cache de HTML das variantes (regenerável; a prova é o sha256 gravado)")
+    args = parser.parse_args()
+
+    alvos = [d for d in DIPLOMAS if not args.apenas or d[0] == args.apenas]
+    if not alvos:
+        print("nenhum diploma corresponde a %r" % args.apenas, file=sys.stderr)
+        return 2
+
+    print("=== CORPUS LEGAL ===")
+    print("diplomas a baixar : %d" % len(alvos))
+    print("licença           : texto de lei é domínio público (Lei 9.610/1998, art. 8º, IV)")
+    print()
+
+    os.makedirs(CORPUS, exist_ok=True)
+    agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    total_artigos = 0
+    falhas = []
+
+    medicoes = []
+    for indice, (slug, nome, url) in enumerate(alvos):
+        if args.dry_run:
+            print("  %-14s %s" % (slug, url))
+            continue
+
+        # MEDIR ANTES DE INDEXAR. A URL da tabela é a hipótese; quem decide de
+        # onde sai o texto de conferência e para onde aponta a citação é a
+        # medição das variantes do mesmo documento oficial.
+        medidas = [medir_documento(u, args.cache, args.pausa)
+                   for u in [url] + variantes_do_documento(url)]
+        decisao = decidir_enderecos(url, medidas)
+        medidas = [{k: v for k, v in m.items() if k != "_html"} for m in medidas]
+        for medida in medidas:
+            medicoes.append(dict(medida, slug=slug, diploma=nome, medido_em=agora,
+                                 ferramenta="generate-legal-corpus",
+                                 url_declarada_na_tabela=url))
+        medicoes.append(dict(decisao, slug=slug, diploma=nome, tipo="decisao",
+                             medido_em=agora, url_declarada_na_tabela=url))
+
+        conferencia = decisao["conference_url"]
+        bruto = corpo_medido(conferencia, args.cache)
+        if not bruto:
+            falhas.append((slug, "sem corpo para %s" % conferencia))
+            print("  %-14s FALHOU  sem corpo em %s" % (slug, conferencia))
+            continue
+
+        texto = texto_limpo(bruto)
+        artigos = indexar_artigos(texto)
+        # O ENDEREÇO DO ARTIGO NA NORMA, da mesma passada que trunca o corpo.
+        # Ver `fim_do_dispositivo_com_cauda`: o cabeçalho de divisão é
+        # contaminação dentro do artigo e ao mesmo tempo o único lastro em disco
+        # de em que Livro/Título/Capítulo/Seção ele mora.
+        posicao = posicao_dos_artigos(texto)
+        if not documento_e_lei(texto, artigos):
+            # Página de erro ou challenge devolve 200 com pouco conteúdo. Gravar
+            # isso como corpus seria pior que não ter corpus.
+            falhas.append((slug, "%d artigos e sem forma de lei — resposta suspeita"
+                           % len(artigos)))
+            print("  %-14s FALHOU  %d artigos e sem forma de lei (a resposta "
+                  "provavelmente não é o texto oficial)" % (slug, len(artigos)))
+            continue
+
+        # CONFIABILIDADE DECLARADA POR DIPLOMA — sem isto o corpus mente.
+        #
+        # A URL "compilado"/"compilada"/"consol" do Planalto traz o texto com as
+        # alterações incorporadas. A URL simples traz, em alguns casos, a redação
+        # ORIGINAL: l9099.htm serve o art. 61 como "pena máxima não superior a um
+        # ano", redação de 1995 que a Lei 11.313/2006 substituiu por dois anos.
+        #
+        # Um verificador que compare afirmação de página contra texto original
+        # acusa de errada a página CERTA — foi o que aconteceu com
+        # /criminal/quais-crimes-vao-para-o-juizado/, que diz dois anos e está
+        # correta. Por isso o campo abaixo, e por isso quem consome o corpus deve
+        # recusar-se a acusar divergência quando ele for "texto_original".
+        # O veredito NÃO sai mais do nome do arquivo: sai de `decidir_enderecos`,
+        # que compara conjunto de normas alteradoras e ano máximo entre as
+        # variantes REALMENTE baixadas. Continua sendo garantia sobre o TEXTO —
+        # e continua fail-closed onde a medição não fecha.
+        confiavel = decisao["confiavel_para_acusar_divergencia"]
+        por_url = {m["url"]: m for m in medidas}
+
+        # AS NOTAS DE VIGÊNCIA SAEM DO CORPO SEM SAIR DO CORPO: o texto do
+        # artigo continua íntegro em `articles`, e o mapa abaixo diz onde estão
+        # e o que cada uma é. Quem confere citação passa a poder recusar-se a
+        # afirmar vigência de dispositivo com nota de revogação, de suspensão
+        # pelo Senado ou de desafio constitucional — hoje ninguém consegue,
+        # porque a nota está dissolvida no meio do caput.
+        notas = {numero: encontradas
+                 for numero, encontradas in ((n, notas_de_vigencia(c))
+                                             for n, c in artigos.items())
+                 if encontradas}
+        resumo = {"artigos_com_nota": len(notas), "notas": sum(len(v) for v in notas.values())}
+        for encontradas in notas.values():
+            for nota in encontradas:
+                resumo[nota["tipo"]] = resumo.get(nota["tipo"], 0) + 1
+        resumo["artigos_com_revogacao_suspensao_ou_desafio"] = sum(
+            1 for encontradas in notas.values()
+            if any(nota["tipo"] in ("revogacao", "execucao_suspensa_pelo_senado",
+                                    "desafio_constitucional") for nota in encontradas))
+
+        registro = {
+            # v3 acrescenta `notas_de_vigencia`; `articles` mantém o significado
+            # e o formato que sempre teve.
+            "schema_version": "legal_corpus_v3",
+            "slug": slug,
+            "nome": nome,
+            "text_version": ("compilado" if confiavel and e_consolidada(conferencia)
+                             else "texto_vigente_sem_versao_compilada" if confiavel
+                             else "texto_original"),
+            "confiavel_para_acusar_divergencia": confiavel,
+            # `source_url` MANTÉM o significado que sempre teve: a URL de onde os
+            # `articles` abaixo foram extraídos, isto é, o texto de conferência.
+            # Quem lê `source_url` para conferir texto continua recebendo texto
+            # de conferência — nunca a URL de citação.
+            "source_url": conferencia,
+            "conference_url": conferencia,
+            "citation_url": decisao["citation_url"],
+            "citation_url_normative_anchors":
+                por_url.get(decisao["citation_url"], {}).get("ancoras_normativas", 0),
+            "conference_url_normative_anchors":
+                por_url.get(conferencia, {}).get("ancoras_normativas", 0),
+            "declared_url": url,
+            "text_version_evidence": {
+                "medido_em": agora,
+                "ferramenta": "generate-legal-corpus (âncoras de "
+                              "measure-planalto-anchor-coverage-20260812, notas de alteração de "
+                              "generate-normative-fingerprint-baseline-20260812)",
+                "regra_citacao": decisao["citation_url_motivo"],
+                "regra_conferencia": decisao["conference_url_motivo"],
+                "variantes": medidas,
+            },
+            "fetched_at": agora,
+            "document_sha256": hashlib.sha256(bruto).hexdigest(),
+            "document_bytes": len(bruto),
+            "article_count": len(artigos),
+            "notas_de_vigencia": notas,
+            "articles_posicao": {numero: divisoes
+                                 for numero, divisoes in sorted(posicao.items())
+                                 if divisoes and numero in artigos},
+            "notas_de_vigencia_resumo": resumo,
+            "license": "dominio_publico_lei_9610_1998_art_8_IV",
+            "uso": "referencia_de_conferencia_nunca_corpo_de_pagina",
+            "articles": artigos,
+        }
+        destino = os.path.join(CORPUS, slug + ".json")
+        with open(destino, "w", encoding="utf-8") as handle:
+            json.dump(registro, handle, ensure_ascii=False, indent=1, sort_keys=True)
+        total_artigos += len(artigos)
+        print("  %-14s %5d artigos  %7d bytes  %s" % (slug, len(artigos), len(bruto), nome[:40]))
+
+    if args.dry_run:
+        print("\n--dry-run: nada baixado.")
+        return 0
+    if medicoes:
+        # A medição fica no repo, não no cache: o HTML se regenera, a prova é o
+        # sha256 e o status observado de cada variante.
+        os.makedirs(os.path.dirname(MEDICAO), exist_ok=True)
+        modo = "a" if (args.apenas and os.path.exists(MEDICAO)) else "w"
+        with open(MEDICAO, modo, encoding="utf-8") as handle:
+            for linha in medicoes:
+                handle.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+        print("medição variantes : %s (%d linhas)"
+              % (os.path.relpath(MEDICAO, ROOT), len(medicoes)))
+
+    print("\nartigos indexados : %d" % total_artigos)
+    print("corpus            : %s" % os.path.relpath(CORPUS, ROOT))
+    if falhas:
+        print("\nfalhas:")
+        for slug, motivo in falhas:
+            print("  %-14s %s" % (slug, motivo))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

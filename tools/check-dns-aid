@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""check-dns-aid — prova que a descoberta por DNS existe E que a cadeia DNSSEC fecha.
+
+POR QUE EXISTE. Em 2026-08-19 o portal publicou o registro DNS-AID
+(_index._agents, SVCB ServiceMode) e ativou DNSSEC na Cloudflare, e mesmo assim
+o auditor externo reprovava. A causa nao estava no registro nem na assinatura:
+faltava o DS na zona pai com.br. Zona assinada sem DS no pai e uma "ilha de
+seguranca" — os RRSIG existem, nenhum resolvedor validante consegue chegar ate
+eles a partir da raiz, e a resposta volta com AD=0. O check do auditor le
+exatamente esse campo AD.
+
+O QUE ESTE CHECK IMPEDE. O modo de falha caro nao e o de hoje, e o de amanha:
+
+  1. DS ORFAO. Se alguem desativar e reativar o DNSSEC na Cloudflare, ela gera
+     uma KSK nova. O DS publicado no Registro.br continua apontando para a chave
+     antiga, que nao existe mais — e ai a zona nao fica apenas sem validacao,
+     fica BOGUS: todo resolvedor validante passa a RECUSAR as respostas, e o
+     dominio some da internet para quem valida (incluindo boa parte dos
+     resolvedores publicos). E uma queda total, causada por um clique.
+  2. DS removido do pai, silenciosamente — volta o fail do auditor.
+  3. SVCB apagado, despromovido para AliasMode ou com TargetName contendo
+     underscore (a secao 3.2 do draft exige nome sem underscore, por causa do
+     certificado x.509).
+
+COMO ELE PROVA, EM VEZ DE CONFIAR. O vinculo DS <-> DNSKEY nao e verificado por
+"parece igual": o check recalcula, a partir da DNSKEY publicada na zona, o
+keytag (RFC 4034 apendice B.1) e o digest SHA-256 do DS (RFC 4034 secao 5.1.4,
+sha256 do nome canonico em wire format concatenado com o RDATA da DNSKEY) e
+compara com o que a zona pai realmente serve. Se baterem, a cadeia fecha por
+aritmetica, nao por opiniao. A consulta do DS vai ao autoritativo do .br para
+nao ser respondida por cache.
+
+USO: tools/check-dns-aid [--json]     exit 0 = passou, 1 = reprovou
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+NS_PAI = ["a.dns.br", "b.dns.br"]
+RESOLVEDORES_DOH = [
+    ("cloudflare", "https://cloudflare-dns.com/dns-query?name={nome}&type={tipo}&do=true"),
+    ("google", "https://dns.google/resolve?name={nome}&type={tipo}&do=1"),
+]
+
+# AO SAIR PARA A REDE, O PORTAL E O WikijuridicaBot (CLAUDE.md secao 11, ordem
+# do dono de 2026-09-05). Ate 2026-09-10 as consultas DoH saiam como
+# `Python-urllib/3.x` para cloudflare-dns.com e dns.google — anonimas para quem
+# as recebe e para o nosso proprio log.
+#
+# O proposito e' proprio: aqui nao se coleta fonte nem se pede rastreio, e sim
+# se CONFERE a cadeia DNSSEC do proprio dominio contra dois resolvedores
+# independentes. A forma e' a que `internal/wikijuridicabot.UserAgentComProposito`
+# produziria.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; verificacao-dnssec)")
+
+
+def dominio_do_site() -> str:
+    base = json.loads((RAIZ / "content" / "site.json").read_text(encoding="utf-8"))["base_url"]
+    return base.split("://", 1)[1].strip("/")
+
+
+def doh(nome: str, tipo: str, resolvedor: int = 0) -> dict:
+    _, molde = RESOLVEDORES_DOH[resolvedor]
+    req = urllib.request.Request(
+        molde.format(nome=nome, tipo=tipo),
+        headers={"accept": "application/dns-json", "User-Agent": USER_AGENT}
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def dig(nome: str, tipo: str, servidor: str) -> list[str]:
+    saida = subprocess.run(
+        ["dig", "+norec", "+short", "+time=5", "+tries=2", tipo, nome, "@" + servidor],
+        capture_output=True, text=True, timeout=30,
+    )
+    return [l.strip() for l in saida.stdout.splitlines() if l.strip()]
+
+
+def nome_wire(nome: str) -> bytes:
+    """Nome de dominio canonico em wire format, minusculo, com raiz."""
+    saida = b""
+    for rotulo in nome.rstrip(".").lower().split("."):
+        saida += bytes([len(rotulo)]) + rotulo.encode("ascii")
+    return saida + b"\x00"
+
+
+def keytag(rdata: bytes) -> int:
+    """RFC 4034 apendice B.1 — vale para todo algoritmo exceto o 1 (RSA/MD5)."""
+    total = 0
+    for i, octeto in enumerate(rdata):
+        total += octeto if i % 2 else octeto << 8
+    total += (total >> 16) & 0xFFFF
+    return total & 0xFFFF
+
+
+def rdata_dnskey(flags: int, protocolo: int, algoritmo: int, chave_b64: str) -> bytes:
+    return (
+        flags.to_bytes(2, "big")
+        + bytes([protocolo, algoritmo])
+        + base64.b64decode(chave_b64)
+    )
+
+
+def digest_ds(dominio: str, rdata: bytes) -> str:
+    """RFC 4034 5.1.4 — digest_type 2 (SHA-256)."""
+    return hashlib.sha256(nome_wire(dominio) + rdata).hexdigest().upper()
+
+
+def main() -> int:
+    dominio = dominio_do_site()
+    alvo = f"_index._agents.{dominio}"
+    falhas: list[str] = []
+    provas: dict[str, object] = {"dominio": dominio, "nome_dns_aid": alvo}
+
+    # 1. O registro DNS-AID existe e esta em ServiceMode, com alpn e alvo sem underscore.
+    resposta = doh(alvo, "SVCB")
+    svcb = [a for a in resposta.get("Answer", []) if a.get("type") == 64]
+    if not svcb:
+        falhas.append(f"nenhum SVCB em {alvo} — a descoberta por DNS sumiu")
+        provas["svcb"] = None
+    else:
+        dado = svcb[0]["data"]
+        provas["svcb"] = dado
+        campos = dado.split()
+        prioridade = campos[0] if campos else ""
+        alvo_svcb = campos[1] if len(campos) > 1 else ""
+        if prioridade == "0":
+            falhas.append(f"SVCB em AliasMode (prioridade 0); DNS-AID exige ServiceMode: {dado}")
+        if "_" in alvo_svcb:
+            falhas.append(
+                f"TargetName com underscore ({alvo_svcb}); a secao 3.2 do draft proibe, "
+                "por compatibilidade com certificado x.509"
+            )
+        if "alpn=" not in dado:
+            falhas.append(f"SVCB sem SvcParam alpn, que e como o protocolo do agente e sinalizado: {dado}")
+
+    # 2. O DS existe na zona pai, lido no autoritativo do .br (sem cache).
+    ds_bruto: list[str] = []
+    for servidor in NS_PAI:
+        ds_bruto = dig(dominio, "DS", servidor)
+        if ds_bruto:
+            provas["ds_lido_em"] = servidor
+            break
+    provas["ds"] = ds_bruto
+    if not ds_bruto:
+        falhas.append(
+            f"nenhum DS para {dominio} em {'/'.join(NS_PAI)} — a zona esta assinada mas e uma "
+            "ilha de seguranca: resolvedor validante devolve AD=0 e o auditor reprova"
+        )
+
+    # 3. Cada DS do pai corresponde, por calculo, a uma DNSKEY publicada na zona.
+    dnskeys = [a["data"] for a in doh(dominio, "DNSKEY").get("Answer", []) if a.get("type") == 48]
+    provas["dnskeys_publicadas"] = len(dnskeys)
+    calculadas: dict[int, str] = {}
+    for chave in dnskeys:
+        partes = chave.split(None, 3)
+        if len(partes) < 4:
+            continue
+        rdata = rdata_dnskey(int(partes[0]), int(partes[1]), int(partes[2]), partes[3].replace(" ", ""))
+        calculadas[keytag(rdata)] = digest_ds(dominio, rdata)
+
+    for linha in ds_bruto:
+        partes = linha.split(None, 3)
+        if len(partes) < 4:
+            falhas.append(f"DS ilegivel na zona pai: {linha!r}")
+            continue
+        tag, _alg, tipo_digest = int(partes[0]), int(partes[1]), int(partes[2])
+        digest_publicado = partes[3].replace(" ", "").upper()
+        if tipo_digest != 2:
+            continue  # so o SHA-256 e recalculado aqui; outro tipo nao invalida a cadeia
+        esperado = calculadas.get(tag)
+        if esperado is None:
+            falhas.append(
+                f"DS ORFAO: o pai publica keytag {tag}, que NAO existe entre as "
+                f"{len(dnskeys)} DNSKEY da zona. A zona esta BOGUS para todo resolvedor "
+                "validante — o dominio sai do ar para quem valida. Causa tipica: DNSSEC "
+                "desativado e reativado na Cloudflare, que gera KSK nova."
+            )
+        elif esperado != digest_publicado:
+            falhas.append(
+                f"digest do DS keytag {tag} nao confere com a DNSKEY da zona "
+                f"(pai={digest_publicado[:16]}..., calculado={esperado[:16]}...)"
+            )
+
+    # 4. O criterio que o auditor externo realmente le: a flag AD.
+    for indice, (rotulo, _) in enumerate(RESOLVEDORES_DOH):
+        try:
+            ad = doh(alvo, "SVCB", indice).get("AD")
+        except Exception as erro:  # resolvedor fora do ar nao e defeito do portal
+            provas[f"ad_{rotulo}"] = f"indisponivel: {erro}"
+            continue
+        provas[f"ad_{rotulo}"] = ad
+        if ad is not True:
+            falhas.append(
+                f"resolvedor {rotulo} devolve AD={ad} para {alvo}: a resposta nao e autenticada, "
+                "que e exatamente o que o check dnsAid do auditor reprova"
+            )
+
+    if "--json" in sys.argv:
+        print(json.dumps({"ok": not falhas, "falhas": falhas, "provas": provas},
+                         indent=2, ensure_ascii=False))
+    else:
+        for chave, valor in provas.items():
+            print(f"  {chave}: {valor}")
+        if falhas:
+            print("\nREPROVADO:")
+            for f in falhas:
+                print(f"  - {f}")
+        else:
+            print("\nOK: DNS-AID publicado e cadeia DNSSEC fechada (DS confere com a DNSKEY, AD=true)")
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

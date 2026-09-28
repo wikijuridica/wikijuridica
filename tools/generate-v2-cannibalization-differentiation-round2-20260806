@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""generate-v2-cannibalization-differentiation-round2-20260806 — os dois pares que a publicação criou.
+
+Publicar 36 páginas destravadas (384f11cf) colocou no ar duas que passaram a
+disputar consulta com páginas já existentes:
+
+  /glossario/tomada-de-decisao-apoiada/ × /familia/tomada-decisao-apoiada/
+  /glossario/cobertura-parcial-temporaria/ × /saude/o-que-e-cpt/
+
+Os dois verbetes de glossário estão sob supersessão e não podem ser editados
+sem quebrar a cadeia autenticada — como se descobriu na primeira rodada. Então
+muda o lado LIVRE, que é o suficiente: para desfazer a disputa basta que um dos
+dois anuncie coisa diferente.
+
+O ângulo escolhido é o que cada página já entrega:
+
+  /familia/tomada-decisao-apoiada/ tem uma seção inteira sobre por que o
+  instituto é mais leve que a CURATELA — o verbete não tem. Vira esse o rótulo.
+
+  /saude/o-que-e-cpt/ trata do teto de 24 meses do art. 11 da Lei 9.656/1998 e
+  da declaração de saúde; o verbete trata do que a CPT suspende e da diferença
+  para o agravo.
+
+Nenhuma afirmação nova é acrescentada, então nenhuma fonte nova é exigida.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, CAS pelo sha256 da LINHA
+viva, CAS pelo valor atual de title e h1, escrita atômica com fsync,
+idempotente. NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-cannibalization-differentiation-round2-20260806 --dry-run
+    tools/generate-v2-cannibalization-differentiation-round2-20260806
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.cannibalization-differentiation-round2-20260806.lock"
+
+TITLE_MIN, TITLE_MAX = 20, 65
+
+# intent_id -> (shard, title atual, title novo, h1 atual, h1 novo)
+REPAROS: dict[str, tuple[str, str, str, str, str]] = {
+    'fam-tomada-decisao-apoiada': (
+        'data/editorial/v2_pages/familia-18.jsonl',
+        'Tomada de decisão apoiada: apoio sem perder a capacidade',
+        'Tomada de decisão apoiada ou curatela: qual cabe',
+        'Tomada de decisão apoiada: a própria pessoa continua decidindo',
+        'Tomada de decisão apoiada: mais leve do que a curatela'),
+    'saude-o-que-e-cpt': (
+        'data/editorial/v2_pages/saude-08.jsonl',
+        'O que é cobertura parcial temporária (CPT)',
+        'CPT: os 24 meses e a declaração de saúde',
+        'CPT: a restrição temporária por doença preexistente',
+        'CPT do plano: o teto de 24 meses e o que declarar'),
+}
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", (value or "").lower())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len(re.findall(r"[^\W_]+", folded, re.UNICODE))
+
+
+def word_count(record: dict) -> int:
+    """bodyWordCount, internal/v2ingest/validate.go:984.
+
+    title e h1 NÃO entram nessa conta, então o valor não deveria mudar. É
+    recalculado mesmo assim: se o declarado estivesse defasado por outro motivo,
+    gravar a linha sem revisar o número congelaria o defeito.
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def preflight() -> None:
+    """Valida ANTES de abrir o estoque: comprimento, unicidade e diferenciação."""
+    problemas: list[str] = []
+
+    titulos_novos: dict[str, str] = {}
+    h1_novos: dict[str, str] = {}
+    for intent, (_shard, title_atual, title_novo, h1_atual, h1_novo) in sorted(REPAROS.items()):
+        tamanho = len(title_novo)
+        if not TITLE_MIN <= tamanho <= TITLE_MAX:
+            problemas.append(f"{intent}: title tem {tamanho} caracteres, fora de {TITLE_MIN}-{TITLE_MAX}")
+        if title_novo == title_atual and h1_novo == h1_atual:
+            problemas.append(f"{intent}: nada muda")
+        chave_titulo = title_novo.strip().lower()
+        if chave_titulo in titulos_novos:
+            problemas.append(f"{intent}: title igual ao de {titulos_novos[chave_titulo]}")
+        titulos_novos[chave_titulo] = intent
+        chave_h1 = h1_novo.strip().lower()
+        if chave_h1 in h1_novos:
+            problemas.append(f"{intent}: h1 igual ao de {h1_novos[chave_h1]}")
+        h1_novos[chave_h1] = intent
+
+    # Unicidade contra TODO o acervo, não só entre os pares tratados.
+    for caminho in sorted((ROOT / "data/editorial/v2_pages").glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if not intent or intent in REPAROS:
+                    continue
+                titulo = (registro.get("title") or "").strip().lower()
+                if titulo in titulos_novos:
+                    problemas.append(
+                        f"{titulos_novos[titulo]}: title novo colide com {intent}")
+                h1 = (registro.get("h1") or "").strip().lower()
+                if h1 in h1_novos:
+                    problemas.append(f"{h1_novos[h1]}: h1 novo colide com {intent}")
+
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(REPAROS)} páginas, títulos únicos no acervo inteiro "
+          f"e dentro de {TITLE_MIN}-{TITLE_MAX} caracteres")
+
+
+def aplicar(shard_rel: str, alvos: dict, dry_run: bool) -> tuple[int, int]:
+    path = ROOT / shard_rel
+    linhas = path.read_bytes().decode("utf-8").split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    saida: list[str] = []
+    alterados = 0
+    ja_feitos = 0
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard_rel}: linha em branco {numero}")
+        registro = json.loads(raw)
+        intent = registro.get("intent_id")
+        if intent not in alvos:
+            saida.append(raw)
+            continue
+
+        title_atual, title_novo, h1_atual, h1_novo = alvos[intent]
+        if registro.get("title") == title_novo and registro.get("h1") == h1_novo:
+            ja_feitos += 1
+            saida.append(raw)
+            continue
+        if registro.get("title") != title_atual or registro.get("h1") != h1_atual:
+            raise SystemExit(
+                f"CAS FALHOU em {shard_rel}:{numero} ({intent}): o title/h1 vivo não é "
+                f"o esperado.\n  title vivo    : {registro.get('title')!r}\n"
+                f"  title esperado: {title_atual!r}\n"
+                f"  h1 vivo       : {registro.get('h1')!r}\n"
+                f"  h1 esperado   : {h1_atual!r}\n"
+                f"Reler o conteúdo vivo antes de reaplicar.")
+
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        registro["title"] = title_novo
+        registro["h1"] = h1_novo
+        registro["word_count"] = word_count(registro)
+        nova = json.dumps(registro, ensure_ascii=False, sort_keys=True)
+        atual = hashlib.sha256(
+            path.read_bytes().decode("utf-8").split("\n")[numero - 1].strip().encode("utf-8")
+        ).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {shard_rel}:{numero} ({intent}): "
+                f"outra frente tocou este registro durante a execução.")
+        saida.append(nova)
+        alterados += 1
+        print(f"  {intent}\n      title: {title_novo}\n      h1   : {h1_novo}")
+
+    if alterados and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(path, payload.encode("utf-8"))
+    return alterados, ja_feitos
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    preflight()
+
+    por_shard: dict[str, dict] = {}
+    for intent, (shard, title_atual, title_novo, h1_atual, h1_novo) in REPAROS.items():
+        por_shard.setdefault(shard, {})[intent] = (title_atual, title_novo, h1_atual, h1_novo)
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                total_alterados = 0
+                total_ja = 0
+                for shard in sorted(por_shard):
+                    alterados, ja = aplicar(shard, por_shard[shard], args.dry_run)
+                    total_alterados += alterados
+                    total_ja += ja
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print(f"\n--dry-run: {total_alterados} aplicável(is), {total_ja} já feita(s). Nada escrito.")
+        return 0
+    print(f"\n{total_alterados} diferenciada(s), {total_ja} já estava(m) diferenciada(s).")
+    if total_alterados:
+        print("Reingerir o estoque e republicar para o espelho refletir a mudança.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""generate-v2-planalto-anchor-repair-20260812 — a citação apontava para o topo da lei, não para o artigo.
+
+O DEFEITO. Boa parte das referências oficiais do acervo aponta para
+`URL#artigo` em documentos do Planalto que NÃO possuem aquela âncora. O caso
+mais comum é o arquivo com sufixo `compilado`/`compilada`/`cons`: ele é servido
+com o texto inteiro da norma, mas SEM os marcadores `<a name="artN">` que a
+versão sem sufixo carrega. Conferido por download em 2026-08-12:
+
+  https://www.planalto.gov.br/ccivil_03/leis/l8078compilado.htm  ->   2 âncoras
+  https://www.planalto.gov.br/ccivil_03/leis/l8078.htm           -> 590 âncoras
+
+O fragmento nunca chega ao servidor, então a URL responde 200 e nenhum
+verificador de link acusa. Quem clica em "art. 14 do CDC", porém, cai no topo de
+uma lei de 119 artigos. Numa página jurídica isso é falha de precisão: a
+citação promete o dispositivo e entrega a norma inteira.
+
+O CRITÉRIO (o trade-off, resolvido com evidência e não por regra de nome).
+A versão compilada é a que traz o texto consolidado; trocá-la por uma versão
+desatualizada seria piorar o dado para melhorar o link. Por isso a troca só
+acontece quando o documento alternativo é comprovadamente tão atual quanto o
+citado. Para cada par (documento citado, variante candidata) foram baixados os
+dois HTML e extraídos: o conjunto de âncoras e o conjunto de leis alteradoras
+citadas no corpo ("Redação dada pela Lei nº X, de ANO", "Incluído pela...").
+A decisão, por combinação:
+
+  ancora_existe      — nada a fazer.
+  troca_url          — a variante responde 200, TEM a âncora exata e não perde
+                       nenhuma norma alteradora do documento citado (conjunto
+                       superset). Troca-se a URL e o leitor passa a cair no
+                       artigo. Grava-se sempre a grafia REAL da âncora: o
+                       fragmento não casa sem diferenciar maiúscula, e o acervo
+                       citava "#art149A" onde o Planalto marcou "art149a".
+  remove_fragmento   — nenhuma variante satisfaz o teste acima. Mantém-se o
+                       documento atual (que é o correto) e retira-se o fragmento
+                       que prometia precisão inexistente. O leitor cai onde já
+                       caía; o dado deixa de mentir.
+  documento_inacessivel — não se mexe. Alterar referência sem conferir a fonte
+                       seria inventar verificação. Restaram três combinações
+                       assim, todas por URL que responde 404 (defeito de outra
+                       classe, registrado na conferência).
+
+Só o "Vide" e o "Vigência" ficam de fora do teste de atualidade: são remissão e
+data de vigor, aparecem numa versão e não na outra, e tomá-los por alteração
+recusava trocas boas — foi o que aconteceu com o art. 42 da Constituição.
+
+CORREÇÃO DE LÍNGUA NA MESMA PASSADA. Nomes de fonte no padrão "CTB — art. 165-A"
+viram "CTB, art. 165-A". Motivo: o índice público de fontes agrega por URL e
+remove o sufixo de artigo do rótulo; com o travessão, sobrava "CTB —" — um nome
+truncado com travessão pendurado, visível em /fontes/ e no `citation` do dado
+estruturado. Com a vírgula, o rótulo agregado fica "CTB", e a forma "CTB,
+art. 165-A" é a corrente em português jurídico.
+
+CONTRATO DE ESCRITA (o mesmo de generate-v2-atribuicao-dispositivo-repair-20260812):
+lease de época do estoque canônico, lock exclusivo próprio, CAS pelo sha256 da
+LINHA viva, forma de serialização preservada, demais linhas byte a byte,
+word_count reconferido pela fórmula do ingest, escrita atômica com fsync,
+idempotente. NÃO commita e NÃO republica.
+
+O acervo anterior está preservado em
+`.agents/runtime/backup-paginas-20260812-planalto-ancoras/v2_pages/`.
+
+Uso:
+    tools/generate-v2-planalto-anchor-repair-20260812 --dry-run
+    tools/generate-v2-planalto-anchor-repair-20260812
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+import urllib.parse
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.planalto-anchor-repair-20260812.lock"
+DADOS = Path(__file__).with_suffix(".data.json")
+PAGES = ROOT / "data/editorial/v2_pages"
+EVIDENCIA = ROOT / "data/editorial/v2_planalto_anchor_repair_evidence_20260812.jsonl"
+BACKUP = ".agents/runtime/backup-paginas-20260812-planalto-ancoras/v2_pages/"
+HOJE = "2026-08-12"
+
+# "CTB — art. 165-A" e "CDC - art. 6º" viram "CTB, art. 165-A" e "CDC, art. 6º".
+# O traço só é trocado quando o que vem depois é mesmo um dispositivo (com o
+# número logo à frente), nunca no meio de uma frase, e exige espaço dos dois
+# lados — assim "Decreto-Lei" e "165-A" ficam intactos.
+TRAVESSAO_ARTIGO = re.compile(
+    r"\s+[—–-]\s+(?=(?:arts?\.?|artigos?|incisos?|§§?)\s*\d)", re.I)
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def word_count(record: dict) -> int:
+    """Reproduz bodyWordCount de internal/v2ingest/validate.go."""
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def _token(valor: str) -> str:
+    """A forma exata com que o valor aparece na linha (ensure_ascii=False)."""
+    return json.dumps(valor, ensure_ascii=False)
+
+
+def reescrever_linha(linha_viva: str, original: dict, corrigido: dict,
+                     rel: str, numero: int) -> str:
+    """Aplica as correções NA LINHA, trocando só os tokens que mudaram.
+
+    Reemitir o registro inteiro com json.dumps reformataria a linha: o acervo
+    mistura a forma padrão e a compacta DENTRO da mesma linha (o objeto de topo
+    com espaço depois dos separadores, os objetos de `official_sources` sem),
+    herança de reparos anteriores. Um re-dump mudaria milhares de bytes que a
+    correção não pediu e apagaria essa herança.
+
+    Por isso a troca é textual e cirúrgica — `"url antiga"` vira `"url nova"` —,
+    e a garantia vem depois: a linha nova é reinterpretada e comparada, campo a
+    campo, com o registro corrigido em memória. Se divergir em um byte de
+    significado, aborta.
+    """
+    nova = linha_viva
+    pares: list[tuple[str, str]] = []
+    for antes, depois in zip(original.get("official_sources") or [],
+                             corrigido.get("official_sources") or []):
+        for chave in ("url", "name"):
+            if antes.get(chave) != depois.get(chave):
+                pares.append((_token(antes[chave]), _token(depois[chave])))
+    # Uma ocorrência por vez, na ordem das fontes. Trocar TODAS de uma vez
+    # quebra o caso em que a mesma URL aparece em duas fontes da mesma página e
+    # cada uma vai para um destino diferente — foi o que aconteceu ao devolver
+    # o `#page=N` de três citações do mesmo PDF numa página só.
+    for token_antes, token_depois in pares:
+        if token_antes not in nova:
+            raise SystemExit(
+                f"{rel}:{numero}: token {token_antes} não encontrado na linha viva")
+        nova = nova.replace(token_antes, token_depois, 1)
+    if json.loads(nova) != corrigido:
+        raise SystemExit(
+            f"{rel}:{numero}: a linha reescrita não reproduz o registro "
+            f"corrigido; substituição textual recusada")
+    return nova
+
+
+def carregar_dados() -> dict:
+    if not DADOS.is_file():
+        raise SystemExit(f"arquivo de dados ausente: {DADOS}")
+    with open(DADOS, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    if not dados.get("correcoes"):
+        raise SystemExit(f"{DADOS.name}: 'correcoes' vazio ou ausente")
+    return dados
+
+
+def preflight(dados: dict) -> dict[str, dict]:
+    """Valida o plano ANTES de tocar o acervo e devolve o mapa url->correção."""
+    problemas: list[str] = []
+    mapa: dict[str, dict] = {}
+    documentos = dados.get("documentos") or {}
+    for correcao in dados["correcoes"]:
+        antiga = correcao.get("url_antiga") or ""
+        nova = correcao.get("url_nova") or ""
+        classe = correcao.get("classe") or ""
+        rotulo = antiga or "(sem url)"
+        if not antiga or not nova:
+            problemas.append(f"{rotulo}: correção sem url_antiga/url_nova")
+            continue
+        if antiga == nova:
+            problemas.append(f"{rotulo}: url nova idêntica à atual")
+        if antiga in mapa:
+            problemas.append(f"{rotulo}: combinação repetida no arquivo de dados")
+        if classe not in ("troca_url", "remove_fragmento"):
+            problemas.append(f"{rotulo}: classe inesperada {classe!r}")
+        if not correcao.get("porque"):
+            problemas.append(f"{rotulo}: sem razão declarada")
+        base_nova = nova.split("#", 1)[0]
+        doc = documentos.get(base_nova)
+        if not doc:
+            problemas.append(f"{rotulo}: destino {base_nova} sem evidência de download")
+        else:
+            if doc.get("http_status") != 200:
+                problemas.append(f"{rotulo}: destino não respondeu 200")
+            if not doc.get("sha256"):
+                problemas.append(f"{rotulo}: destino sem sha256 do documento")
+            if classe == "troca_url":
+                frag = nova.split("#", 1)[1] if "#" in nova else ""
+                # O acervo cita tanto "#art14" quanto "#art37%C2%A76"; a âncora
+                # real do Planalto é literal ("art37§6"). Confere-se pelas duas
+                # formas — nunca por igualdade textual crua.
+                formas = {frag, urllib.parse.unquote(frag)}
+                if not (formas & set(doc.get("ancoras") or [])):
+                    problemas.append(
+                        f"{rotulo}: a âncora {frag!r} NÃO está no documento de "
+                        f"destino conferido — troca recusada")
+                if correcao.get("leis_perdidas"):
+                    problemas.append(
+                        f"{rotulo}: destino perde {len(correcao['leis_perdidas'])} "
+                        f"lei(s) alteradora(s) — troca recusada")
+            if classe == "remove_fragmento" and "#" in nova:
+                problemas.append(f"{rotulo}: remoção de fragmento com '#' na url nova")
+            # `#page=N` num PDF NÃO é âncora de HTML: é parâmetro de abertura do
+            # próprio formato (PDF Open Parameters), e o leitor de PDF do
+            # navegador o obedece. Medir esse fragmento com um extrator de
+            # id/name dá zero e sugere remoção — o que PIORA a citação. Aqui a
+            # remoção é recusada na porta de entrada.
+            if (classe == "remove_fragmento"
+                    and antiga.split("#", 1)[0].lower().endswith(".pdf")
+                    and antiga.split("#", 1)[1].startswith("page=")):
+                problemas.append(
+                    f"{rotulo}: #page=N em PDF é parâmetro de abertura válido, "
+                    f"não âncora de HTML — remoção recusada")
+        mapa[antiga] = correcao
+    if problemas:
+        for problema in problemas[:40]:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        print(f"({len(problemas)} problema(s))", file=sys.stderr)
+        raise SystemExit(1)
+    por_classe: dict[str, int] = {}
+    for correcao in mapa.values():
+        por_classe[correcao["classe"]] = por_classe.get(correcao["classe"], 0) + 1
+    print(f"preflight ok: {len(mapa)} combinação(ões) distintas "
+          f"({por_classe}); toda troca tem âncora conferida no destino e "
+          f"nenhuma perde lei alteradora")
+    return mapa
+
+
+def restaurar_fragmento_pdf(shard: Path, dry_run: bool,
+                            evidencia: list[dict]) -> int:
+    """Devolve o `#page=N` que a primeira leva tirou de citação em PDF.
+
+    A leva de 12/08 mediu o PDF com extrator de âncora de HTML, achou zero e
+    removeu o fragmento de três citações do CNJ. Estava errado: `#page=141` é
+    parâmetro de abertura do PDF e leva o leitor à página certa de um documento
+    de centenas de páginas. O texto anterior não foi descartado — está no
+    acervo preservado —, e é de lá que a URL volta, comparada índice a índice
+    com o registro vivo e regravada com o mesmo contrato de escrita.
+    """
+    preservado = ROOT / BACKUP / shard.name
+    if not preservado.is_file():
+        return 0
+    antigas = {}
+    for linha in preservado.read_text(encoding="utf-8").splitlines():
+        if linha.strip():
+            registro = json.loads(linha)
+            antigas[registro.get("intent_id")] = registro
+
+    bruto = shard.read_bytes().decode("utf-8")
+    linhas = bruto.split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+    saida: list[str] = []
+    restauradas = 0
+    for numero, raw in enumerate(linhas, 1):
+        registro = json.loads(raw)
+        anterior = antigas.get(registro.get("intent_id"))
+        if not anterior:
+            saida.append(raw)
+            continue
+        corrigido = json.loads(raw)
+        mudou = 0
+        for atual, velha in zip(corrigido.get("official_sources") or [],
+                                anterior.get("official_sources") or []):
+            url_velha = velha.get("url") or ""
+            base, _, frag = url_velha.partition("#")
+            if (frag.startswith("page=") and base.lower().endswith(".pdf")
+                    and atual.get("url") == base):
+                atual["url"] = url_velha
+                mudou += 1
+                evidencia.append({"intent_id": registro.get("intent_id"),
+                                  "shard": os.path.relpath(shard, ROOT),
+                                  "de": base, "para": url_velha,
+                                  "classe": "restaura_fragmento_pdf"})
+        if not mudou:
+            saida.append(raw)
+            continue
+        saida.append(reescrever_linha(raw, registro, corrigido,
+                                      os.path.relpath(shard, ROOT), numero))
+        restauradas += mudou
+    if restauradas and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(shard, payload.encode("utf-8"))
+    return restauradas
+
+
+def corrigir_registro(record: dict, mapa: dict[str, dict],
+                      renomear: bool) -> tuple[int, int, list[dict]]:
+    """Aplica no registro; devolve (urls trocadas, nomes corrigidos, detalhe)."""
+    urls = 0
+    nomes = 0
+    detalhe: list[dict] = []
+    for fonte in record.get("official_sources") or []:
+        url = fonte.get("url") or ""
+        correcao = mapa.get(url)
+        if correcao:
+            fonte["url"] = correcao["url_nova"]
+            urls += 1
+            detalhe.append({"de": url, "para": correcao["url_nova"],
+                            "classe": correcao["classe"]})
+        if renomear:
+            nome = fonte.get("name") or ""
+            novo = TRAVESSAO_ARTIGO.sub(", ", nome)
+            if novo != nome:
+                fonte["name"] = novo
+                nomes += 1
+                detalhe.append({"nome_de": nome, "nome_para": novo,
+                                "classe": "nome_travessao"})
+    return urls, nomes, detalhe
+
+
+def aplicar(shard: Path, mapa: dict[str, dict], renomear: bool,
+            dry_run: bool, evidencia: list[dict]) -> tuple[int, int, int]:
+    rel = os.path.relpath(shard, ROOT)
+    bruto = shard.read_bytes().decode("utf-8")
+    linhas = bruto.split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    saida: list[str] = []
+    paginas = 0
+    urls_total = 0
+    nomes_total = 0
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{rel}: linha em branco {numero}")
+        original = json.loads(raw)
+        registro = json.loads(raw)
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        wc_antes = word_count(original)
+        urls, nomes, detalhe = corrigir_registro(registro, mapa, renomear)
+        if not urls and not nomes:
+            saida.append(raw)
+            continue
+        # A correção não toca texto de corpo: a contagem de palavras do ingest
+        # tem que sair idêntica. O campo declarado NÃO é reescrito — divergência
+        # anterior entre declarado e recalculado é assunto de outro reparo, e
+        # corrigi-la aqui misturaria dois defeitos numa linha só.
+        if word_count(registro) != wc_antes:
+            raise SystemExit(
+                f"{rel}:{numero} ({registro.get('intent_id')}): a correção mudou "
+                f"a contagem de palavras ({wc_antes} -> {word_count(registro)}), "
+                f"o que significa que tocou texto de corpo. Abortado.")
+        nova = reescrever_linha(raw, original, registro, rel, numero)
+        atual = hashlib.sha256(
+            shard.read_bytes().decode("utf-8").split("\n")[numero - 1]
+            .strip().encode("utf-8")).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {rel}:{numero} "
+                f"({registro.get('intent_id')}): outra frente tocou este "
+                f"registro durante a execução.")
+        saida.append(nova)
+        paginas += 1
+        urls_total += urls
+        nomes_total += nomes
+        for item in detalhe:
+            evidencia.append({"intent_id": registro.get("intent_id"),
+                              "shard": rel, **item})
+
+    if paginas and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(shard, payload.encode("utf-8"))
+    return paginas, urls_total, nomes_total
+
+
+def escrever_evidencia(dados: dict, itens: list[dict],
+                       extras: list[str] | None = None) -> None:
+    """Uma linha por alteração, mais o cabeçalho de critério e documentos.
+
+    Reescrito por inteiro, ordenado, determinístico: reexecutar não duplica.
+    """
+    # A evidência de execuções anteriores é PRESERVADA: o gerador roda em
+    # levas (a primeira trocou o documento, a segunda acertou a grafia da
+    # âncora) e reescrever o arquivo do zero apagaria a prova do que já foi
+    # corrigido. Deduplica-se pelo registro inteiro, então reexecutar não
+    # duplica linha.
+    anteriores: dict[str, None] = {}
+    for origem in [EVIDENCIA] + [Path(p) for p in (extras or [])]:
+        if not origem.is_file():
+            continue
+        for linha in origem.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            # Critério e DECISÃO são reescritos a partir do plano vigente: uma
+            # decisão superada (foi o caso da remoção do `#page=N` em PDF, que
+            # o plano depois passou a recusar) não pode continuar na evidência
+            # como se valesse. Já a APLICAÇÃO é histórico do que entrou no
+            # acervo e nunca se apaga.
+            if (not linha or '"tipo": "criterio"' in linha
+                    or '"tipo": "decisao"' in linha):
+                continue
+            # As primeiras levas gravaram a aplicação sob o rótulo "correcao",
+            # antes de a evidência separar DECISÃO (o critério, por combinação)
+            # de APLICAÇÃO (onde entrou, por página). Renomear na leitura mantém
+            # um esquema só, sem perder nenhuma linha já gravada.
+            anteriores[linha.replace('"tipo": "correcao"',
+                                     '"tipo": "aplicacao"', 1)] = None
+
+    documentos = dados.get("documentos") or {}
+    linhas = [json.dumps({
+        "gerador": Path(__file__).name,
+        "gerado_em": HOJE,
+        "tipo": "criterio",
+        "criterio": dados.get("criterio", ""),
+        "documentos_conferidos": len(documentos),
+        "texto_anterior_preservado_em": BACKUP,
+    }, ensure_ascii=False)]
+    for url in sorted(documentos):
+        doc = documentos[url]
+        anteriores[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE,
+            "tipo": "documento_oficial", "url": url,
+            "consultado_em": doc.get("consultado_em", HOJE),
+            "http_status": doc.get("http_status"),
+            "sha256_documento": doc.get("sha256", ""),
+            "ancoras_no_documento": doc.get("n_ancoras"),
+            "ano_max_alteracao": doc.get("ano_max_alteracao"),
+        }, ensure_ascii=False)] = None
+    # A DECISÃO por combinação (com a razão escrita) e a APLICAÇÃO por página
+    # são registros diferentes e ambos precisam ficar. Sem o primeiro, a
+    # evidência mostra o que mudou mas não por quê; sem o segundo, mostra o
+    # critério mas não onde foi aplicado.
+    for correcao in dados["correcoes"]:
+        anteriores[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE,
+            "tipo": "decisao", "classe": correcao.get("classe", ""),
+            "url_antiga": correcao.get("url_antiga", ""),
+            "url_nova": correcao.get("url_nova", ""),
+            "ocorrencias": correcao.get("ocorrencias"),
+            "ancora_conferida": correcao.get("ancora_conferida", ""),
+            "porque": correcao.get("porque", ""),
+        }, ensure_ascii=False)] = None
+    for item in sorted(itens, key=lambda i: (i.get("intent_id") or "",
+                                             i.get("de") or i.get("nome_de") or "")):
+        anteriores[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE,
+            "tipo": "aplicacao", **item,
+        }, ensure_ascii=False)] = None
+    linhas.extend(sorted(anteriores))
+    atomic_write(EVIDENCIA, ("\n".join(linhas) + "\n").encode("utf-8"))
+    print(f"evidência: {len(linhas)} registro(s) em "
+          f"{os.path.relpath(EVIDENCIA, ROOT)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--sem-nomes", action="store_true",
+                        help="não corrige o travessão pendurado dos nomes")
+    parser.add_argument("--evidencia-anterior", action="append", default=[],
+                        metavar="ARQUIVO",
+                        help="evidência de leva anterior a preservar no merge")
+    parser.add_argument("--so-evidencia", action="store_true",
+                        help="reescreve só a evidência, sem tocar o acervo")
+    parser.add_argument("--restaurar-fragmento-pdf", action="store_true",
+                        help="devolve o #page=N que uma leva anterior removeu "
+                             "de citação em PDF, lendo o acervo preservado")
+    args = parser.parse_args()
+
+    dados = carregar_dados()
+    mapa = preflight(dados)
+    if not (ROOT / BACKUP).is_dir():
+        raise SystemExit(
+            f"backup ausente em {BACKUP}: página escrita nunca é descartada; "
+            f"copie o acervo antes de escrever")
+
+    evidencia: list[dict] = []
+    total_paginas = total_urls = total_nomes = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for shard in ([] if args.so_evidencia
+                              else sorted(PAGES.glob("*.jsonl"))):
+                    if args.restaurar_fragmento_pdf:
+                        voltaram = restaurar_fragmento_pdf(
+                            shard, args.dry_run, evidencia)
+                        if voltaram:
+                            print(f"{os.path.relpath(shard, ROOT)}: "
+                                  f"{voltaram} fragmento(s) de PDF restaurado(s)")
+                            total_paginas += voltaram
+                        continue
+                    paginas, urls, nomes = aplicar(
+                        shard, mapa, not args.sem_nomes, args.dry_run, evidencia)
+                    if paginas:
+                        print(f"{os.path.relpath(shard, ROOT)}: {paginas} página(s), "
+                              f"{urls} url(s), {nomes} nome(s)")
+                    total_paginas += paginas
+                    total_urls += urls
+                    total_nomes += nomes
+                if not args.dry_run and (total_paginas or args.so_evidencia):
+                    escrever_evidencia(dados, evidencia,
+                                       args.evidencia_anterior)
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    rotulo = "--dry-run: " if args.dry_run else ""
+    print(f"\n{rotulo}{total_paginas} página(s), {total_urls} referência(s) de "
+          f"URL, {total_nomes} nome(s) de fonte.")
+    if args.dry_run:
+        print("Nada escrito.")
+    elif total_paginas:
+        print("Reingerir o estoque e republicar para o espelho refletir a correção.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

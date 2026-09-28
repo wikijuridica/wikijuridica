@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""measure-borda-nao-confirmado-por-ip — quem, de verdade, mandou o tráfego que
+a borda NÃO CONFIRMOU.
+
+READ-ONLY. Não escreve arquivo nenhum, não commita, não altera a série. Emite
+duas consultas de LEITURA ao GraphQL da Cloudflare (a zona é nossa) e, quando
+pedido, resolve o PTR dos IPs — nada além disso sai daqui.
+
+POR QUE EXISTE. `data/ops/edge_bot_agents_daily.jsonl` guarda o VOLUME não
+confirmado por (dia, agente) e o país, mas **não guarda o `clientIP` nem o
+User-Agent exato de cada grupo** — a segunda consulta do produtor é consumida na
+hora e o que sobra na linha é o agregado. Sem isto, a pergunta que decide o
+veredito de `tools/check-perfil-por-bot` fica sem resposta reproduzível:
+
+    `requests_estimated_ip_range == 0` com faixa oficial carregada é
+    (i) impostor de fora da faixa, ou (ii) o coletor que não classificou?
+
+A resposta veio daqui em 2026-09-10, e as duas hipóteses foram testadas contra o
+dado vivo, não contra comentário. Ver a seção OBSERVADO abaixo.
+
+CUIDADO COM A JANELA. `httpRequestsAdaptiveGroups` retém **8 dias**. Uma medição
+de 2026-09-06 só é reproduzível até ~2026-09-14; depois disso a borda não
+reexpõe o passado e a única prova que resta é o que estiver escrito.
+
+O QUE ESTA FERRAMENTA MOSTRA E A SÉRIE NÃO:
+
+  * a partição da FASE 1 (Cloudflare / sonda-local-BR / sem verificação);
+  * os tokens que o produtor usaria no filtro `userAgent_like` da FASE 2 —
+    derivados das amostras REAIS, porque o LIKE da API é sensível a caixa;
+  * a FASE 2 aberta por `(User-Agent exato, clientIP, país, categoria)`, com
+    "dentro"/"fora" da faixa publicada pelo operador;
+  * o **agregado por User-Agent exato**, que é o que separa um agente colapsado
+    dentro de outro (BingPreview dentro de bingbot, por exemplo) de um impostor
+    usando a string canônica;
+  * opcionalmente (`--rdns`), o PTR de cada IP e se ele fecha FCrDNS contra o
+    sufixo que o operador documenta (`botagents.RDNS`).
+
+OBSERVADO EM 2026-09-10 (comando e saída no relatório da sessão):
+
+  * `bingbot@2026-09-06` — 842 amostradas não confirmadas, TODAS de
+    `132.196.1.195` (US), fora dos 28 prefixos de `bingbot.json` e sem PTR;
+    401 amostradas do MESMO dia, confirmadas pela Cloudflare, vieram de outros
+    IPs. A verificação que a Microsoft documenta é rDNS para `*.search.msn.com`.
+  * `perplexitybot@2026-09-08` — 169 amostradas movidas para faixa de IP
+    (18.97.9.96–103, os 8 prefixos oficiais) na MESMA execução do MESMO código.
+    É a prova de que a FASE 2 funciona: o zero do bingbot é resposta, não
+    silêncio.
+  * `claudebot@2026-09-08` e o bloco "SG" dos demais — um único host,
+    `34.158.60.234` (`bc.googleusercontent.com`), vestindo vários agentes.
+
+Uso:
+    ./tools/measure-borda-nao-confirmado-por-ip bingbot@2026-09-06
+    ./tools/measure-borda-nao-confirmado-por-ip perplexitybot@2026-09-08 --rdns
+    ./tools/measure-borda-nao-confirmado-por-ip bingbot@2026-09-06 --json
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import importlib.util
+import json
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS)
+import botagents  # noqa: E402
+import cloudflare_auth  # noqa: E402
+
+RAIZ = os.path.dirname(TOOLS)
+PRODUTOR = os.path.join(TOOLS, "generate-bot-agents-daily")
+
+
+def carregar_produtor():
+    """Importa `tools/generate-bot-agents-daily` como módulo.
+
+    O arquivo não tem extensão `.py` (é executável de linha de comando), e é o
+    mesmo padrão já usado por `tools/test_generate_cache_baseline.py` e por
+    `tools/test_apply_dynamic_redirect_rules.py`. Importar em vez de copiar a
+    lógica é o ponto: uma sonda que reimplementasse a FASE 2 mediria a SUA
+    versão dela, não a que roda em produção — e aí não provaria nada sobre o
+    coletor.
+    """
+    nome = "generate_bot_agents_daily"
+    spec = importlib.util.spec_from_loader(nome, SourceFileLoader(nome, PRODUTOR))
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+def janela_utc(dia: datetime.date) -> tuple[str, str]:
+    ini = datetime.datetime.combine(dia, datetime.time.min, datetime.timezone.utc)
+    fim = ini + datetime.timedelta(hours=23, minutes=59, seconds=59)
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    if fim > agora:
+        fim = agora
+    return (ini.strftime("%Y-%m-%dT%H:%M:%SZ"), fim.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def medir(gen, cabecalhos, zona, agente: str, dia: datetime.date, faixas: dict) -> dict:
+    """Uma medição (agente, dia). Devolve o documento; não imprime nada."""
+    ini_str, fim_str = janela_utc(dia)
+    resultado = {
+        "agent_key": agente,
+        "date": dia.isoformat(),
+        "window_start": ini_str,
+        "window_end": fim_str,
+        "erro": "",
+    }
+
+    zona_1, erro_1 = gen.graphql(cabecalhos, gen.CONSULTA, {
+        "zone": zona, "since": ini_str, "until": fim_str, "limite": gen.LIMITE_GRUPOS})
+    if erro_1:
+        resultado["erro"] = "fase 1: %s" % erro_1
+        return resultado
+    grupos_1 = zona_1.get("httpRequestsAdaptiveGroups", [])
+    resultado["fase1_grupos"] = len(grupos_1)
+    resultado["fase1_truncada"] = len(grupos_1) >= gen.LIMITE_GRUPOS
+    por_agente = gen._acumular_primario(grupos_1)
+    dados = por_agente.get(agente)
+    if dados is None:
+        resultado["erro"] = "agente ausente da consulta primaria neste dia"
+        return resultado
+    resultado["fase1"] = {
+        "cloudflare_verificado_amostrado": dados["requests_sampled"],
+        "sonda_local_br_amostrada": dados["requests_local_verification"],
+        "sem_verificacao_amostrado": dados["requests_sampled_unverified_ua"],
+        "amostras_de_ua_sem_verificacao": sorted(dados["user_agents_unverified"]),
+    }
+
+    tokens = gen._tokens_de_familia(agente, dados["user_agents_unverified"])
+    resultado["fase2_tokens_do_filtro"] = tokens
+    if not tokens:
+        resultado["fase2_estado"] = (
+            "NAO EXECUTADA — sem amostra de User-Agent para montar o filtro. "
+            "E exatamente o caminho em que o produtor imprime AVISO no stderr e "
+            "deixa o dia sem verificacao por IP."
+        )
+        return resultado
+
+    filtro = gen._filtro_or_userAgent(tokens)
+    resultado["fase2_filtro"] = filtro
+    zona_2, erro_2 = gen.graphql(cabecalhos, gen._consulta_secundaria(filtro), {
+        "zone": zona, "since": ini_str, "until": fim_str, "limite": gen.LIMITE_GRUPOS})
+    if erro_2:
+        resultado["fase2_estado"] = "FALHOU — %s" % erro_2
+        return resultado
+    grupos_2 = zona_2.get("httpRequestsAdaptiveGroups", [])
+    resultado["fase2_estado"] = "EXECUTADA"
+    resultado["fase2_grupos"] = len(grupos_2)
+    resultado["fase2_truncada"] = len(grupos_2) >= gen.LIMITE_GRUPOS
+
+    redes = faixas.get(agente, [])
+    resultado["faixa_prefixos_carregados"] = len(redes)
+    particao = {"dentro_da_faixa": 0, "fora_da_faixa": 0,
+                "ja_confirmado_pela_cloudflare": 0, "sonda_local_br": 0,
+                "outro_agente_no_filtro": 0}
+    detalhe: list = []
+    por_ua: dict = {}
+    for grupo in grupos_2:
+        dimensoes = grupo.get("dimensions") or {}
+        ua = dimensoes.get("userAgent") or ""
+        contagem = grupo.get("count", 0)
+        pais = (dimensoes.get("clientCountryName") or "").upper()
+        categoria = (dimensoes.get("verifiedBotCategory") or "").strip()
+        ip = dimensoes.get("clientIP") or ""
+        if botagents.agente_de(ua) != agente:
+            particao["outro_agente_no_filtro"] += contagem
+            classe = "outro_agente"
+        elif categoria:
+            particao["ja_confirmado_pela_cloudflare"] += contagem
+            classe = "cloudflare"
+        elif pais == "BR" and agente in gen.OPERADORES_SEMPRE_ESTRANGEIROS:
+            particao["sonda_local_br"] += contagem
+            classe = "sonda_local_br"
+        elif ip and botagents.em_faixa(ip, redes):
+            particao["dentro_da_faixa"] += contagem
+            classe = "dentro_da_faixa"
+        else:
+            particao["fora_da_faixa"] += contagem
+            classe = "fora_da_faixa"
+        detalhe.append({"user_agent": ua, "client_ip": ip, "country": pais,
+                        "verified_bot_category": categoria, "classe": classe,
+                        "count": contagem})
+        # O AGREGADO POR USER-AGENT EXATO é o que separa "agente colapsado
+        # dentro de outro" de "impostor usando a string canonica": a tabela de
+        # identidade casa por SUBSTRING (bingbot casa "bingbot" E "bingpreview"),
+        # entao dois agentes reais podem estar somados na mesma agent_key.
+        alvo = por_ua.setdefault(ua, dict.fromkeys(particao, 0))
+        alvo[classe] = alvo.get(classe, 0) + contagem
+    resultado["fase2_particao_amostrada"] = particao
+    resultado["fase2_por_user_agent"] = por_ua
+    resultado["fase2_grupos_detalhados"] = sorted(
+        detalhe, key=lambda linha: -linha["count"])
+    return resultado
+
+
+def resolver_rdns(documento: dict, agente: str) -> None:
+    """Acrescenta PTR + FCrDNS aos IPs medidos. Consulta DNS, nada mais."""
+    sufixos = botagents.RDNS.get(agente, ())
+    cache: dict = {}
+    for linha in documento.get("fase2_grupos_detalhados", []):
+        ip = linha.get("client_ip")
+        if not ip:
+            continue
+        if ip not in cache:
+            confirmado, nome = botagents.rdns_confirmado(ip, sufixos) if sufixos \
+                else (False, "")
+            if not nome:
+                try:
+                    import socket
+                    nome = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    nome = ""
+            cache[ip] = (confirmado, nome)
+        linha["ptr"] = cache[ip][1] or "(sem PTR)"
+        linha["fcrdns_confirma_o_operador"] = cache[ip][0]
+    documento["rdns_sufixos_do_operador"] = list(sufixos)
+
+
+def imprimir(documento: dict) -> None:
+    print("=" * 78)
+    print("%s @ %s   [%s .. %s]" % (documento["agent_key"], documento["date"],
+                                    documento.get("window_start", "?"),
+                                    documento.get("window_end", "?")))
+    print("=" * 78)
+    if documento["erro"]:
+        print("  ERRO: %s" % documento["erro"])
+        return
+    fase1 = documento.get("fase1", {})
+    print("  FASE 1: %d grupos (teto %s, truncada=%s)"
+          % (documento.get("fase1_grupos", 0), "5000",
+             documento.get("fase1_truncada")))
+    print("    confirmado pela Cloudflare (amostrado): %d" %
+          fase1.get("cloudflare_verificado_amostrado", 0))
+    print("    sonda local do BR (amostrada)         : %d" %
+          fase1.get("sonda_local_br_amostrada", 0))
+    print("    SEM verificacao (amostrado)           : %d" %
+          fase1.get("sem_verificacao_amostrado", 0))
+    for amostra in fase1.get("amostras_de_ua_sem_verificacao", []):
+        print("      UA sem verificacao: %s" % amostra)
+    print("  tokens do filtro (grafia REAL, LIKE e sensivel a caixa): %s"
+          % documento.get("fase2_tokens_do_filtro"))
+    print("  FASE 2: %s" % documento.get("fase2_estado", "?"))
+    if documento.get("fase2_estado") != "EXECUTADA":
+        return
+    print("    %d grupos, truncada=%s; faixa oficial carregada: %d prefixo(s)"
+          % (documento.get("fase2_grupos", 0), documento.get("fase2_truncada"),
+             documento.get("faixa_prefixos_carregados", 0)))
+    particao = documento.get("fase2_particao_amostrada", {})
+    for nome, valor in particao.items():
+        print("      %-30s %d" % (nome, valor))
+
+    print("\n    --- por User-Agent EXATO (separa agente colapsado de impostor) ---")
+    for ua, contas in sorted(documento.get("fase2_por_user_agent", {}).items(),
+                             key=lambda kv: -sum(kv[1].values())):
+        resumo = ", ".join("%s=%d" % (k, v) for k, v in contas.items() if v)
+        print("      %s\n        %s" % (ua, resumo or "(zero)"))
+
+    print("\n    --- grupos, do maior para o menor ---")
+    for linha in documento.get("fase2_grupos_detalhados", [])[:25]:
+        extra = ""
+        if "ptr" in linha:
+            extra = "  PTR=%s%s" % (linha["ptr"],
+                                    "  [FCrDNS OK]" if linha.get("fcrdns_confirma_o_operador")
+                                    else "")
+        print("      %-16s %-4s %-16s count=%-6d %s%s"
+              % (linha["client_ip"] or "(sem IP)", linha["country"],
+                 linha["classe"], linha["count"],
+                 (linha["verified_bot_category"] or "-"), extra))
+    if documento.get("rdns_sufixos_do_operador"):
+        print("\n    sufixo(s) que o operador documenta para rDNS: %s"
+              % ", ".join(documento["rdns_sufixos_do_operador"]))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Abre, por clientIP e User-Agent exato, o trafego que a borda "
+                    "nao confirmou. READ-ONLY.")
+    ap.add_argument("alvos", nargs="+", metavar="AGENTE@AAAA-MM-DD",
+                    help="ex.: bingbot@2026-09-06 (retencao do dataset: 8 dias)")
+    ap.add_argument("--rdns", action="store_true",
+                    help="resolver PTR e conferir FCrDNS contra o sufixo do operador")
+    ap.add_argument("--json", action="store_true", help="emitir JSON")
+    args = ap.parse_args()
+
+    gen = carregar_produtor()
+    ambiente = cloudflare_auth.ambiente(os.path.join(RAIZ, ".env.local"))
+    cabecalhos, _ = cloudflare_auth.cabecalhos("leitura", env=ambiente)
+    if not cabecalhos:
+        print("measure-borda-nao-confirmado-por-ip: sem credencial Cloudflare de leitura "
+              "em .env.local (CLOUDFLARE_ZONE_TOKEN ou CLOUDFLARE_EMAIL + "
+              "CLOUDFLARE_API_TOKEN)", file=sys.stderr)
+        return 2
+    with open(os.path.join(RAIZ, "content/site.json"), encoding="utf-8") as handle:
+        dominio = json.load(handle)["base_url"].rstrip("/").split("//", 1)[-1]
+    zona, erro = gen.resolver_zona(cabecalhos, dominio)
+    if erro:
+        print("measure-borda-nao-confirmado-por-ip: %s" % erro, file=sys.stderr)
+        return 2
+    faixas = botagents.ler_faixas(RAIZ)
+
+    documentos = []
+    for alvo in args.alvos:
+        if "@" not in alvo:
+            print("alvo invalido %r: use AGENTE@AAAA-MM-DD" % alvo, file=sys.stderr)
+            return 2
+        agente, dia_iso = alvo.split("@", 1)
+        try:
+            dia = datetime.date.fromisoformat(dia_iso)
+        except ValueError:
+            print("data invalida em %r" % alvo, file=sys.stderr)
+            return 2
+        documento = medir(gen, cabecalhos, zona, agente, dia, faixas)
+        if args.rdns:
+            resolver_rdns(documento, agente)
+        documentos.append(documento)
+
+    if args.json:
+        print(json.dumps(documentos, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for documento in documentos:
+            imprimir(documento)
+    # Medição não tem veredito: exit 0 sempre que mediu. Erro de consulta vira
+    # exit 1 porque "não mediu" não pode passar por "mediu e não achou nada".
+    return 1 if any(d["erro"] for d in documentos) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

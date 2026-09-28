@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""notify-owner — o canal unico pelo qual um vigia deste repo avisa o dono.
+
+POR QUE EXISTE: em 2026-08-19 mediu-se que NENHUM dos vigias do wikijuridica
+avisa o dono de nada. `check-tunnel-health` e `check-portal-health` gravam JSONL
+e tentam reparar; se o reparo falha, o veredito morre no journal e so e visto
+por quem for ler. O dono pediu, nesta ordem: "esse timer me avisar quando algo
+der errado para ele reiniciar ou se curar sozinho" — avisar e requisito, nao
+enfeite, e nao existia.
+
+CANAIS, todos locais (nenhum SaaS, nenhum servico de terceiro):
+  1. DESKTOP  — notify-send no barramento da sessao grafica do dono (uid 1000).
+                E o unico canal que o alcanca sem ele ir procurar.
+  2. JOURNAL  — logger com prioridade, tag `wikijuridica-alerta`. Fica no
+                journalctl junto do resto e sobrevive a reboot.
+  3. JSONL    — data/ops/owner_alerts.jsonl, no repo, versionavel. E a serie
+                que prova depois QUANDO o sistema avisou e do que.
+
+ANTI-RUIDO (por que a deduplicacao existe): um vigia que roda a cada 30 s e
+avisa a cada execucao degradada produz 120 notificacoes por hora e treina o
+dono a ignorar todas. Um alerta com a mesma chave so repete depois de
+`--cooldown` segundos (padrao 1800). O estado fica em
+data/ops/owner_alerts_state.json. Resolucao (`--resolvido`) sempre passa, e
+limpa a chave — o dono precisa saber que voltou ao normal.
+
+ANTI-FRAUDE: este notificador nao inventa evento. Ele transmite o que o vigia
+chamador mediu; o campo `evidencia` e obrigatorio em alerta de severidade
+critica ou alta, e a chamada falha sem ele.
+
+Uso:
+    tools/notify-owner --chave wifi-banda --severidade alta \
+        --titulo "WiFi em 2.4 GHz" --mensagem "72 Mbit/s" --evidencia "iw dev wlp2s0 link"
+    tools/notify-owner --chave wifi-banda --resolvido --titulo "WiFi normalizado" \
+        --mensagem "de volta a 5 GHz, 433 Mbit/s"
+"""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+HISTORICO = os.path.join(ROOT, "data/ops/owner_alerts.jsonl")
+ESTADO = os.path.join(ROOT, "data/ops/owner_alerts_state.json")
+TRAVA_ESTADO = ESTADO + ".lock"
+
+SCHEMA = "owner_alert_v1"
+UID_DONO = 1000
+BUS_DONO = f"unix:path=/run/user/{UID_DONO}/bus"
+
+# Severidade -> (urgencia do notify-send, prioridade do syslog).
+# "critica" usa urgencia critical, que no padrao freedesktop nao some sozinha:
+# a notificacao fica na tela ate o dono dispensar. E o que se quer quando o
+# portal esta fora do ar; e o que NAO se quer para um aviso informativo.
+# Peso relativo, usado so para decidir se um alerta AGRAVA o que ja estava
+# aberto na mesma chave. Nao e ordenacao estetica: e o que autoriza romper o
+# cooldown.
+ORDEM_SEVERIDADE = {"info": 0, "baixa": 1, "media": 2, "alta": 3, "critica": 4}
+POLITICA = os.path.join(ROOT, "ops/alert_policy.json")
+INCIDENTES = os.path.join(ROOT, "data/ops/incidents.jsonl")
+SCHEMA_INCIDENTE = "owner_incident_v1"
+POR_SEVERIDADE = {peso: nome for nome, peso in ORDEM_SEVERIDADE.items()}
+
+
+def politica_da_chave(chave):
+    """Limiares de escalada desta chave, com queda para o padrao.
+
+    Politica AUSENTE ou ilegivel nao trava alerta nenhum: devolve limiares
+    infinitos, e o comportamento vira o de antes de 2026-09-03 (notifica e
+    repete). Alerta e o canal que avisa que algo quebrou — ele nao pode ser o
+    proximo a quebrar por causa de um JSON malformado.
+    """
+    vazio = {"eleva_severidade_em": float("inf"), "abre_incidente_em": float("inf"),
+             "eleva_severidade_apos_h": float("inf"), "abre_incidente_apos_h": float("inf"),
+             "cooldown_maximo_s": None}
+    try:
+        with open(POLITICA, encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+    except (OSError, ValueError):
+        return vazio
+    if not isinstance(dados, dict):
+        return vazio
+    padrao = dados.get("padrao") if isinstance(dados.get("padrao"), dict) else {}
+    especifica = (dados.get("chaves") or {}).get(chave)
+    if not isinstance(especifica, dict):
+        especifica = {}
+    resultado = dict(vazio)
+    for campo in ("eleva_severidade_em", "abre_incidente_em",
+                  "eleva_severidade_apos_h", "abre_incidente_apos_h", "cooldown_maximo_s"):
+        valor = especifica.get(campo, padrao.get(campo))
+        if isinstance(valor, bool):
+            continue
+        if isinstance(valor, (int, float)) and valor > 0:
+            resultado[campo] = valor
+    return resultado
+
+
+# O RELOGIO DE TEMPO ABERTO SO VALE PARA `alta` E `critica`.
+#
+# Um cronico de severidade `media` que subisse sozinho depois de 24 h desfaria a
+# tolerancia que a politica compra de proposito para o enlace de rede
+# (`rede-banda`, `eleva_severidade_em: 8`, 679 linhas em 24 h). O que o dono pediu
+# e que ALTA e CRITICA nao fiquem caladas indefinidamente — e so essas duas.
+SEVERIDADES_COM_RELOGIO = ("alta", "critica")
+
+
+def horas_em_aberto(aberto_desde, instante):
+    """Ha quantas horas esta chave esta aberta. `0.0` quando nao da para saber.
+
+    Zero, e nao infinito, porque um `aberto_desde` ilegivel nao pode ESCALAR
+    nada por si: escalada exige idade provada. O lado seguro de uma leitura que
+    falhou e nao agir, e o alerta desta execucao sai do mesmo jeito.
+    """
+    if not aberto_desde:
+        return 0.0
+    try:
+        inicio = datetime.datetime.fromisoformat(aberto_desde)
+    except (TypeError, ValueError):
+        return 0.0
+    if inicio.tzinfo is None:
+        inicio = inicio.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (instante - inicio).total_seconds() / 3600.0)
+
+
+def severidade_escalada(severidade, ocorrencias, limiar, horas=0.0, limiar_horas=float("inf")):
+    """Sobe UM degrau ao cruzar QUALQUER dos dois relogios, e para em `critica`.
+
+    Um degrau, e nao um por ocorrencia: a escalada existe para dizer "isto nao
+    se resolveu sozinho", nao para inflar a fila. `critica` e teto porque acima
+    dela nao ha canal — o proximo passo e o incidente, que e outro campo.
+
+    ★ POR QUE DOIS RELOGIOS (2026-09-05)
+
+    `ocorrencias` conta ENVIOS NAO SILENCIADOS, e por isso ele anda no ritmo do
+    `--cooldown` que o produtor escolheu, nao no do problema. Medido: a chave
+    `bot-abandono` sai com `--cooldown 86400`, entao os 5 do
+    `eleva_severidade_em` dela sao CINCO DIAS — e a propria politica escreve que
+    "tres dias seguidos ja e sinal". O contador media uma coisa e o texto queria
+    outra. O relogio de TEMPO ABERTO mede o que o dono sente: ha quanto tempo
+    isto esta em pe sem se resolver. Ele vale so para alta/critica
+    (SEVERIDADES_COM_RELOGIO); para as demais `limiar_horas` chega infinito.
+    """
+    if ocorrencias < limiar and horas < limiar_horas:
+        return severidade, False
+    peso = min(ORDEM_SEVERIDADE.get(severidade, 0) + 1, ORDEM_SEVERIDADE["critica"])
+    escalada = POR_SEVERIDADE[peso]
+    return escalada, escalada != severidade
+
+
+def registrar_incidente(evento):
+    """Grava a abertura de incidente no ledger proprio, uma vez por abertura.
+
+    UMA VEZ, e a garantia e o campo `aberto_desde`: ele so muda quando o alerta
+    e resolvido e reabre, entao a linha do incidente e unica por ciclo de vida
+    do alerta. Sem isso, um alerta cronico de 2 em 2 minutos escreveria 30
+    incidentes por hora e o ledger que existe para destacar o grave viraria a
+    mesma parede de ruido que a fila de alertas ja era.
+    """
+    chave, aberto_desde = evento.get("chave"), evento.get("aberto_desde")
+    try:
+        with open(INCIDENTES, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                try:
+                    anterior = json.loads(linha)
+                except ValueError:
+                    continue
+                if anterior.get("chave") == chave and anterior.get("aberto_desde") == aberto_desde:
+                    return False
+    except OSError:
+        pass
+    linha = {
+        "schema_version": SCHEMA_INCIDENTE,
+        "aberto_em": agora(),
+        "chave": chave,
+        "aberto_desde": aberto_desde,
+        "ocorrencias": evento.get("ocorrencias"),
+        "severidade": evento.get("severidade"),
+        "titulo": evento.get("titulo"),
+        "evidencia": evento.get("evidencia"),
+        "origem": evento.get("origem"),
+    }
+    os.makedirs(os.path.dirname(INCIDENTES), exist_ok=True)
+    with open(INCIDENTES, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+    return True
+
+SEVERIDADES = {
+    "critica": ("critical", "crit"),
+    "alta": ("normal", "err"),
+    "media": ("normal", "warning"),
+    "baixa": ("low", "notice"),
+    "info": ("low", "info"),
+}
+
+
+def agora():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def travar_estado():
+    """Abre e tranca (bloqueante) o arquivo dedicado ao estado de alertas.
+
+    POR QUE precisa de trava, e por que ela cobre leitura+decisao+escrita e
+    nao so a gravacao final: este script e chamado por timers systemd de
+    30 s, 60 s e 2 min — execucoes concorrentes sao rotina, nao excecao. Sem
+    uma trava sobre o ciclo inteiro, dois processos podem ler o mesmo
+    `owner_alerts_state.json`, cada um decidir de forma independente se o
+    alerta esta em cooldown/deve escalar, e o que gravar por ultimo apaga a
+    decisao do outro — um alerta critico que deveria romper o cooldown pode
+    sumir porque um processo mais lento sobrescreveu o estado com a leitura
+    antiga (perda silenciosa de alerta, o proprio defeito que este notificador
+    existe para evitar). A trava e um ARQUIVO PROPRIO, nunca o ESTADO em si:
+    se fosse o mesmo inode, ela colidiria com a troca atomica via os.replace()
+    em gravar_estado(). E bloqueante (sem LOCK_NB): um timer esperar alguns
+    milissegundos pela trava e inofensivo; um alerta perdido nao e.
+    """
+    os.makedirs(os.path.dirname(TRAVA_ESTADO), exist_ok=True)
+    descritor = open(TRAVA_ESTADO, "w", encoding="utf-8")
+    fcntl.flock(descritor.fileno(), fcntl.LOCK_EX)
+    return descritor
+
+
+def ler_estado():
+    """Le o estado de alertas abertos.
+
+    POLITICA para JSON invalido (decidida aqui, nao no chamador): o defeito
+    antigo devolvia {} em silencio para qualquer falha de parse, o que faz um
+    arquivo corrompido (por exemplo, por uma gravacao truncada de uma corrida
+    antiga, ou por falha de disco) equivaler a "nenhum alerta aberto" — e essa
+    e exatamente a forma de um alerta real desaparecer sem ninguem notar. Em
+    vez disso: reporta em stderr (para journalctl do timer capturar), guarda
+    uma COPIA forense do arquivo corrompido ao lado (nunca sobrescreve a
+    evidencia com `{}`) e so entao segue em memoria com estado vazio, para que
+    o alerta desta execucao ainda seja enviado — nao silenciado por um estado
+    ilegivel. Chamada sempre com a trava de `travar_estado()` ja segurada.
+    """
+    try:
+        with open(ESTADO, encoding="utf-8") as arquivo:
+            conteudo = arquivo.read()
+    except OSError:
+        return {}
+    if not conteudo.strip():
+        return {}
+    try:
+        return json.loads(conteudo)
+    except ValueError as erro:
+        estampa = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        copia = f"{ESTADO}.corrompido-{estampa}"
+        try:
+            shutil.copy2(ESTADO, copia)
+            destino_msg = f"copia preservada em {copia}"
+        except OSError as erro_copia:
+            destino_msg = f"nao foi possivel preservar copia ({erro_copia})"
+        print(f"aviso: {ESTADO} contem JSON invalido ({erro}); {destino_msg}; "
+              "prosseguindo com estado vazio nesta execucao (nao silenciando o alerta atual)",
+              file=sys.stderr)
+        return {}
+
+
+def gravar_estado(estado):
+    """Grava o estado de forma atomica, com temporario de nome unico.
+
+    POR QUE nome unico por processo, e nao um `.tmp` fixo: mesmo com a trava
+    de `travar_estado()` cobrindo o ciclo, um nome fixo e fragil por natureza
+    (uma segunda instancia deste script chamada fora do fluxo normal — teste
+    manual, depuracao — truncaria o mesmo inode que outra estivesse
+    escrevendo). Com `tempfile.mkstemp` no MESMO diretorio do destino, cada
+    processo escreve em seu proprio arquivo e so o `os.replace` final (atomico
+    dentro do mesmo sistema de arquivos) troca o conteudo visivel — nunca dois
+    escritores truncando o mesmo arquivo ao mesmo tempo.
+    """
+    diretorio = os.path.dirname(ESTADO)
+    os.makedirs(diretorio, exist_ok=True)
+    descritor_fd, temporario = tempfile.mkstemp(
+        prefix=os.path.basename(ESTADO) + ".", suffix=".tmp", dir=diretorio)
+    try:
+        with os.fdopen(descritor_fd, "w", encoding="utf-8") as arquivo:
+            json.dump(estado, arquivo, ensure_ascii=False, sort_keys=True)
+        os.replace(temporario, ESTADO)
+    except BaseException:
+        try:
+            os.unlink(temporario)
+        except OSError:
+            pass
+        raise
+
+
+def registrar(evento):
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(evento, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def enviar_desktop(urgencia, titulo, corpo):
+    """Notificacao na sessao grafica do dono. Devolve o que de fato aconteceu.
+
+    Roda como o proprio uid 1000 quando o vigia ja e o rafael; quando o vigia
+    roda como root (timer de sistema), usa `sudo -u` para entrar no barramento
+    certo — enviar para o barramento do root nao alcanca ninguem.
+    """
+    if not os.path.exists(f"/run/user/{UID_DONO}/bus"):
+        return "sem sessao grafica"
+    ambiente = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=BUS_DONO)
+    envio = ["notify-send", "-u", urgencia, "-a", "WikiJuridica", titulo, corpo]
+    if os.geteuid() == UID_DONO:
+        comando = envio
+    else:
+        comando = ["sudo", "-n", "-u", f"#{UID_DONO}", "env",
+                   f"DBUS_SESSION_BUS_ADDRESS={BUS_DONO}"] + envio
+    try:
+        resultado = subprocess.run(comando, env=ambiente, capture_output=True,
+                                   text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as erro:
+        return f"falhou: {erro}"
+    if resultado.returncode != 0:
+        return f"falhou: rc={resultado.returncode} {resultado.stderr.strip()[:120]}"
+    return "enviado"
+
+
+def enviar_journal(prioridade, titulo, corpo):
+    try:
+        resultado = subprocess.run(
+            ["logger", "-t", "wikijuridica-alerta", "-p", f"daemon.{prioridade}",
+             f"{titulo} — {corpo}"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as erro:
+        return f"falhou: {erro}"
+    return "enviado" if resultado.returncode == 0 else "falhou"
+
+
+def main():
+    analisador = argparse.ArgumentParser(description=__doc__,
+                                         formatter_class=argparse.RawDescriptionHelpFormatter)
+    analisador.add_argument("--chave", required=True,
+                            help="identificador estavel do alerta; e a unidade de deduplicacao")
+    analisador.add_argument("--severidade", default="media", choices=sorted(SEVERIDADES))
+    analisador.add_argument("--titulo", required=True)
+    analisador.add_argument("--mensagem", required=True)
+    analisador.add_argument("--evidencia", default="",
+                            help="comando/medicao que sustenta o alerta; obrigatorio em critica/alta")
+    analisador.add_argument("--origem", default="", help="qual vigia disparou")
+    analisador.add_argument("--cooldown", type=int, default=1800,
+                            help="segundos ate repetir a mesma chave (padrao 1800)")
+    analisador.add_argument("--resolvido", action="store_true",
+                            help="avisa que a condicao normalizou e libera a chave")
+    analisador.add_argument("--json", action="store_true")
+    argumentos = analisador.parse_args()
+
+    if argumentos.severidade in ("critica", "alta") and not argumentos.evidencia \
+            and not argumentos.resolvido:
+        print("erro: alerta critico/alto exige --evidencia (contrato do dado real, R3)",
+              file=sys.stderr)
+        return 2
+
+    # Todo o ciclo ler->decidir(cooldown/escalada)->gravar roda sob uma unica
+    # trava exclusiva: e essa decisao (nao so a escrita final) que a corrida
+    # entre os timers de 30 s/60 s/2 min corrompe se ficar sem protecao.
+    trava = travar_estado()
+    try:
+        estado = ler_estado()
+        anterior = estado.get(argumentos.chave, {})
+        instante = datetime.datetime.now(datetime.timezone.utc)
+        limiares = politica_da_chave(argumentos.chave)
+        silenciado = False
+        # Valores do caminho `--resolvido`, que nao escala nem conta ocorrencia:
+        # a resolucao sempre passa e limpa a chave.
+        severidade_efetiva, houve_escalada = argumentos.severidade, False
+        ocorrencias_ate_agora = 0
+        horas_aberto = 0.0
+        cooldown_efetivo = argumentos.cooldown
+
+        if argumentos.resolvido:
+            # Se nunca houve alerta aberto nesta chave, nao ha o que resolver: avisar
+            # "normalizou" para quem nunca soube do problema e ruido.
+            if not anterior.get("aberto"):
+                silenciado = True
+            estado.pop(argumentos.chave, None)
+        else:
+            # TETO DE COOLDOWN PARA ALTA E CRITICA.
+            #
+            # `--cooldown` e escolhido pelo produtor e nao tinha limite nenhum:
+            # um vigia que passasse 604800 calaria uma CRITICA por uma semana, e
+            # `ocorrencias` — o contador de que a escalada depende — nem andava,
+            # porque so conta envio nao silenciado. Cooldown longo virava mordaca
+            # com escalada desligada junto. O teto vale so para alta/critica: o
+            # cronico de baixa severidade continua podendo se calar o quanto o
+            # produtor pedir, que e o anti-ruido de que este canal depende.
+            #
+            # Com o padrao de 86400 nada muda para quem ja esta abaixo dele
+            # (`bot-abandono` pede exatamente 86400; o padrao do proprio flag e
+            # 1800): o teto so morde quem tenta calar mais do que um dia.
+            cooldown_efetivo = argumentos.cooldown
+            if argumentos.severidade in SEVERIDADES_COM_RELOGIO and limiares["cooldown_maximo_s"]:
+                cooldown_efetivo = min(cooldown_efetivo, int(limiares["cooldown_maximo_s"]))
+            ultimo = anterior.get("ultimo_envio")
+            if ultimo:
+                try:
+                    decorrido = (instante - datetime.datetime.fromisoformat(ultimo)).total_seconds()
+                    if decorrido < cooldown_efetivo:
+                        silenciado = True
+                except ValueError:
+                    pass
+            # ESCALACAO — sem isto o anti-ruido vira mordaca.
+            #
+            # Medido em 2026-08-19: um alerta cronico de severidade "media" (banda
+            # divergente) manteve a chave `rede-degradada` em cooldown durante 18 de
+            # 21 entregas. Como a severidade nao era consultada, um 530 real, de
+            # severidade "critica", chegaria na MESMA chave e sairia silenciado por
+            # ate meia hora — justamente a janela que o vigia existe para cobrir.
+            # Agravar a situacao ROMPE o cooldown: o dono precisa saber que o que era
+            # incomodo virou incendio, mesmo que o incomodo tenha avisado ha pouco.
+            anterior_peso = ORDEM_SEVERIDADE.get(anterior.get("severidade", ""), 0)
+            atual_peso = ORDEM_SEVERIDADE.get(argumentos.severidade, 0)
+            if silenciado and atual_peso > anterior_peso:
+                silenciado = False
+            # `aberto_desde` e a PRIMEIRA ocorrencia nao resolvida — o campo que
+            # mede a idade real do incidente. Medido em 2026-09-02: uma critica
+            # aberta ha 15,7 h passou 24 vezes por "OK" no consumidor porque ele
+            # lia a idade de `alertado_em` da ULTIMA linha, regravada a cada 2 min
+            # mesmo silenciada. `ocorrencias` conta os envios nao silenciados
+            # desde a abertura: e o contador que a escalada usa, derivado do
+            # proprio fluxo e nao de um estado que se reseta.
+            aberto_desde = anterior.get("aberto_desde") or instante.isoformat()
+            horas_aberto = horas_em_aberto(aberto_desde, instante)
+
+            # A ESCALADA E DECIDIDA ANTES DE GRAVAR, e nao depois — senao a
+            # entrega que ela autoriza nao conta como entrega.
+            #
+            # ★ O DEFEITO QUE ISTO CORRIGE, MEDIDO NO PROPRIO LEDGER
+            # (2026-09-05, data/ops/owner_alerts.jsonl, 3.592 linhas)
+            #
+            # A ordem antiga era: decidir o silencio -> GRAVAR o estado ->
+            # escalar -> `silenciado = False`. Na volta silenciada, a gravacao
+            # tomava o ramo que NAO mexe em `ultimo_envio` nem em `ocorrencias`;
+            # a escalada entao rompia o silencio e a mensagem saia, mas o estado
+            # continuava com o `ultimo_envio` velho. Na chamada seguinte o
+            # cooldown estava vencido de novo, a escalada disparava de novo, e
+            # assim por diante: a chave `rede-banda` tem 152 eventos com
+            # `escalado: true` e OS 152 FORAM ENTREGUES ao desktop do dono. O
+            # comentario dizia "rompe o cooldown UMA vez" — o codigo rompia
+            # todas.
+            #
+            # Duas correcoes, e as duas sao necessarias: a entrega passa a ser
+            # contabilizada (ultimo_envio e ocorrencias andam), e o rompimento
+            # so vale quando a severidade escalada e MAIOR do que a que o estado
+            # ja registrou. Depois da primeira entrega escalada o estado guarda
+            # `critica`, e a comparacao para de ser verdadeira sozinha — que e o
+            # "UMA vez" que o texto sempre prometeu.
+            ocorrencias_projetadas = anterior.get("ocorrencias", 0) + (0 if silenciado else 1)
+            limiar_horas = (limiares["eleva_severidade_apos_h"]
+                            if argumentos.severidade in SEVERIDADES_COM_RELOGIO
+                            else float("inf"))
+            severidade_efetiva, houve_escalada = severidade_escalada(
+                argumentos.severidade, ocorrencias_projetadas,
+                limiares["eleva_severidade_em"], horas_aberto, limiar_horas)
+            ja_registrada = ORDEM_SEVERIDADE.get(
+                anterior.get("severidade") or argumentos.severidade, 0)
+            if silenciado and ORDEM_SEVERIDADE.get(severidade_efetiva, 0) > ja_registrada:
+                silenciado = False
+                ocorrencias_projetadas = anterior.get("ocorrencias", 0) + 1
+
+            if not silenciado:
+                estado[argumentos.chave] = {
+                    "aberto": True,
+                    "aberto_desde": aberto_desde,
+                    "ultimo_envio": instante.isoformat(),
+                    "severidade": severidade_efetiva,
+                    "repeticoes": anterior.get("repeticoes", 0) + 1,
+                    "ocorrencias": ocorrencias_projetadas,
+                }
+            else:
+                anterior["aberto"] = True
+                anterior["aberto_desde"] = aberto_desde
+                estado[argumentos.chave] = anterior
+            ocorrencias_ate_agora = ocorrencias_projetadas
+
+        urgencia, prioridade = SEVERIDADES[severidade_efetiva]
+        if argumentos.resolvido:
+            urgencia, prioridade = "low", "notice"
+        titulo = ("✅ " if argumentos.resolvido else "⚠️ ") + argumentos.titulo
+        corpo = argumentos.mensagem
+        if argumentos.evidencia:
+            corpo += f"\n[{argumentos.evidencia}]"
+
+        canais = {"desktop": "silenciado", "journal": "silenciado"}
+        if not silenciado:
+            canais["desktop"] = enviar_desktop(urgencia, titulo, corpo)
+            canais["journal"] = enviar_journal(prioridade, titulo, argumentos.mensagem)
+
+        atual = estado.get(argumentos.chave, {})
+        evento = {
+            "schema_version": SCHEMA,
+            "alertado_em": agora(),
+            "aberto_desde": None if argumentos.resolvido else atual.get("aberto_desde"),
+            "ocorrencias": 0 if argumentos.resolvido else atual.get("ocorrencias", 0),
+            "chave": argumentos.chave,
+            "severidade": severidade_efetiva,
+            "severidade_declarada": argumentos.severidade,
+            "escalado": houve_escalada,
+            "resolvido": argumentos.resolvido,
+            "titulo": argumentos.titulo,
+            "mensagem": argumentos.mensagem,
+            "evidencia": argumentos.evidencia,
+            "origem": argumentos.origem,
+            "silenciado_por_cooldown": silenciado,
+            # AUDITAVEL: sem estes dois nao da para reconstruir depois por que a
+            # entrega saiu ou nao saiu — e foi exatamente a falta desse rastro
+            # que deixou 152 entregas escaladas passarem por normais no ledger.
+            "cooldown_efetivo_s": cooldown_efetivo,
+            "horas_em_aberto": round(horas_aberto, 2),
+            "canais": canais,
+        }
+        # O INCIDENTE TAMBEM TEM OS DOIS RELOGIOS, pelo mesmo motivo da escalada:
+        # com `--cooldown 86400`, os 12 do `abre_incidente_em` do `bot-abandono`
+        # seriam DOZE DIAS de bot sem voltar antes de o ledger de incidentes ver
+        # o caso. `registrar_incidente` e idempotente por (chave, aberto_desde),
+        # entao o segundo relogio nao duplica linha.
+        limiar_incidente_h = (limiares["abre_incidente_apos_h"]
+                              if argumentos.severidade in SEVERIDADES_COM_RELOGIO
+                              else float("inf"))
+        if not argumentos.resolvido and (ocorrencias_ate_agora >= limiares["abre_incidente_em"]
+                                         or horas_aberto >= limiar_incidente_h):
+            evento["incidente_aberto"] = registrar_incidente(evento)
+        registrar(evento)
+        gravar_estado(estado)
+    finally:
+        trava.close()
+
+    if argumentos.json:
+        print(json.dumps(evento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        estampa = "silenciado (cooldown)" if silenciado else \
+            f"desktop={canais['desktop']} journal={canais['journal']}"
+        print(f"{argumentos.chave}: {estampa}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

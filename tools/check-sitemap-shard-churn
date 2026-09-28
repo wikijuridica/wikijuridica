@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Mede, ANTES de publicar, quantos shards de sitemap um lote de revisao renomeia.
+
+POR QUE ESTE CHECK EXISTE (2026-08-13)
+--------------------------------------
+A particao do sitemap agrupa paginas por (data de revisao, area) e numera os
+shards continuamente. O comentario de `internal/sitemap/shard_partition.go`
+afirmava que o ordinal era estavel porque "as coortes que somem sao sempre as
+MAIS NOVAS, na cauda". Isso vale para churn de paginas isoladas — e NAO vale
+para lote concentrado numa area, que e exatamente o que a fila de refinamento
+(`v2_rewrite_queue`) produz.
+
+Medido na distribuicao viva: `administrativo` (46 URLs) e `constitucional` (26)
+de 2026-08-06 estao abaixo de `minCohortURLs=50` e vivem fundidas em
+pages-0002.xml. Revisar as 46 de administrativo deixa a fundida com 26, ela e
+absorvida pela anfitria da data, **pages-0002 desaparece e os 29 shards seguintes
+deslocam -1**.
+
+Deslocar ordinal nao perde URL — o crawler indexa por <loc>, nao por nome de
+arquivo. Mas custa refetch do indice e de cada shard renomeado, e foi o que
+entregou 14 respostas 404 ao Bingbot na migracao de c1f7f407 (medido no access
+log de 08-12: 14 requisicoes de pages-0032..0045, 14 vezes 404).
+
+POR QUE MEDIR EM VEZ DE REPROJETAR
+----------------------------------
+A alternativa obvia — nomear o shard pela area, ignorando a data — foi avaliada e
+DESCARTADA por medicao: `ShardLastMod` e o MAXIMO das paginas do shard, entao
+misturar datas faz revisar UMA pagina marcar o shard inteiro (ate 959 URLs hoje).
+Isso destruiria o ganho de 468x que a particao por (data, area) existe para
+comprar. O esquema atual esta certo; o que faltava era enxergar o custo do lote
+antes de pagar por ele.
+
+Uso:
+    tools/check-sitemap-shard-churn --revisar-area administrativo
+    tools/check-sitemap-shard-churn --revisar-area saude --quantas 30
+    tools/check-sitemap-shard-churn --max-deslocamento 0    # reprova qualquer churn
+
+READ-ONLY: le os shards publicados e simula. Nao escreve nem publica.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import json
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+SHARDS = RAIZ / "public" / "sitemaps"
+PAGES_JSON = RAIZ / "content" / "pages.json"
+
+# Espelham as constantes Go. Divergir aqui torna a simulacao mentirosa, entao o
+# check confere o numero de shards previsto contra o numero real e avisa.
+MIN_COHORT_URLS = 50          # internal/sitemap/shard_partition.go: minCohortURLs
+MAX_URLS_PER_SHARD = 5000     # internal/sitemap/sitemap.go: PortalMaxURLsPerShard
+
+
+def rotas_editoriais():
+    """Os paths de content/pages.json — o complemento da navegacao sintetica.
+
+    Quem chama subtrai: `loc do sitemap` menos este conjunto = navegacao.
+    A derivacao e ESTRUTURAL, nunca por regex de path.
+
+    O Go discrimina por `PageType == "hub-area"`
+    (internal/sitemap/shard_partition.go: navigationPageType), campo que o shard
+    publicado nao carrega: o XML so tem <loc> e <lastmod>. O equivalente
+    ESTRUTURAL disponivel a um leitor read-only e a diferenca de conjuntos: a hub
+    e sintetica e por isso e mantida FORA de content/pages.json de proposito
+    (internal/build/build.go: "Elas NAO entram em repo.Pages"), enquanto toda
+    pagina editorial esta la. Logo `loc do sitemap` menos `path de pages.json` e
+    exatamente a navegacao.
+
+    Conferido no acervo vivo de 2026-08-27: a diferenca da 218 rotas e coincide
+    URL a URL com pages-0032.xml, o shard que o Go reservou para a navegacao.
+
+    Um casamento por formato de path ("/{area}/" ou contem "/pagina/") acertaria
+    hoje e erraria no dia em que uma rota editorial tivesse essa forma — e
+    erraria em silencio, que e o modo de falha caro.
+    """
+    try:
+        registros = json.loads(PAGES_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Sem pages.json nao ha como derivar: a simulacao volta ao comportamento
+        # anterior (navegacao dentro das coortes datadas) em vez de adivinhar.
+        return set()
+    return {p["path"] for p in registros if isinstance(p, dict) and p.get("path")}
+
+
+def le_coortes():
+    """(dia de revisao, area) -> lista de paths, a partir dos shards publicados.
+
+    O DIA, NUNCA O INSTANTE. O Go agrupa por `content.RevisionDay`
+    (internal/sitemap/shard_partition.go:120), que corta o carimbo nos 10
+    primeiros caracteres. Desde `b2d46a06` o <lastmod> pode sair como instante
+    ("2026-08-13T14:54:41Z") e o acervo carrega as DUAS formas ao mesmo tempo.
+
+    Agrupar pelo carimbo bruto partia uma coorte em duas. Medido em 2026-08-13:
+    as 32 URLs com instante e as 209 com data pura moram no MESMO pages-0031.xml,
+    e o simulador previa 32 shards contra 31 publicados — acusando "as constantes
+    espelhadas podem ter divergido do Go", que era o lugar errado. Detector que
+    aponta para a peca errada custa mais caro que detector nenhum, porque quem le
+    vai conferir a peca inocente.
+    """
+    editoriais = rotas_editoriais()
+    coortes = collections.defaultdict(list)
+    navegacao = []
+    for arq in sorted(glob.glob(str(SHARDS / "pages-*.xml"))):
+        texto = pathlib.Path(arq).read_text(encoding="utf-8")
+        # SHARD EM CARENCIA NAO E PLANO. Ele e a copia RETIRADA da publicacao
+        # anterior, mantida servivel para quem tem o indice antigo em cache
+        # (internal/sitemapgrace). As URLs dele ja vivem, no plano atual, sob
+        # outro ordinal — contar as duas copias inflava as coortes e fazia o
+        # simulador prever mais shards do que o Go planeja, disparando o aviso de
+        # "constantes divergiram" contra a peca inocente. Medido em 2026-08-27:
+        # 35 arquivos em disco para 32 shards no indice.
+        if "sitemap-shard-em-carencia" in texto:
+            continue
+        for loc, carimbo in re.findall(r"<url>\s*<loc>([^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>", texto):
+            caminho = loc.replace("https://wikijuridica.com.br", "")
+            # A NAVEGACAO SAIU DAS COORTES DATADAS em 2026-08-27 (coorte
+            # reservada na cabeca do plano, splitNavigationCohort no Go). Manter
+            # aqui a semantica antiga faria o simulador prever churn onde nao ha
+            # (as hubs re-datadas deixaram de deslocar ordinal) — e um check
+            # pre-publicacao que preve o custo errado e pior que nenhum.
+            if editoriais and caminho not in editoriais:
+                navegacao.append((caminho, carimbo))
+                continue
+            partes = caminho.strip("/").split("/")
+            area = partes[0] if partes and partes[0] else ""
+            coortes[(carimbo[:10], area)].append(caminho)
+    if len(navegacao) < MIN_COHORT_URLS:
+        # ABAIXO DO PISO a coorte reservada nao nasce e as rotas voltam para as
+        # coortes datadas — o mesmo caminho de volta que splitNavigationCohort
+        # toma no Go. Sem esta devolucao a simulacao perderia URLs.
+        for caminho, carimbo in navegacao:
+            partes = caminho.strip("/").split("/")
+            area = partes[0] if partes and partes[0] else ""
+            coortes[(carimbo[:10], area)].append(caminho)
+        navegacao = []
+    return coortes, [caminho for caminho, _ in navegacao]
+
+
+def planeja(coortes, navegacao=()):
+    """Reproduz a particao: coorte reservada na cabeca, coalesce miudas por data,
+    ordena por (data, area), numera.
+
+    A navegacao ocupa os PRIMEIROS ordinais e so quando alcanca MIN_COHORT_URLS —
+    o mesmo piso que o Go aplica em splitNavigationCohort, para que um punhado de
+    hubs nao gaste uma requisicao inteira do crawler.
+    """
+    grupos = {k: list(v) for k, v in coortes.items()}
+
+    # coalesceTinyCohorts: funde, dentro de cada data, as coortes abaixo do piso.
+    por_data = collections.defaultdict(list)
+    for (data, area) in list(grupos):
+        por_data[data].append(area)
+
+    fundido = {}
+    for data, areas in por_data.items():
+        miudas = [a for a in areas if len(grupos[(data, a)]) < MIN_COHORT_URLS]
+        if not miudas:
+            continue
+        paginas = []
+        for a in miudas:
+            paginas += grupos.pop((data, a))
+        grandes = sorted(a for a in areas if a not in miudas)
+        if len(paginas) < MIN_COHORT_URLS and grandes:
+            # absorvida pela ULTIMA coorte da data (ultimaCoorteDaData)
+            grupos[(data, grandes[-1])] += paginas
+        else:
+            # SOMA com a coorte de raiz, nunca substitui.
+            #
+            # A chave coalescida usa area "" — e `pageArea("/")` devolve "" tambem
+            # (shard_partition.go:298-307), entao a raiz e a fundida disputam a
+            # MESMA chave. O Go soma as duas explicitamente
+            # (coalesceTinyCohorts, shard_partition.go:245-248). Atribuir direto
+            # apagava da simulacao uma coorte de raiz que tivesse passado do piso.
+            # Hoje a raiz tem 1 URL e cai nas miudas, entao o bug e latente e nao
+            # mede errado — o que nao o torna menos bug: ele acorda no dia em que
+            # o portal ganhar 50 rotas de primeiro nivel.
+            fundido[(data, "")] = grupos.pop((data, ""), []) + paginas
+    grupos.update(fundido)
+
+    # Ordenacao: data crescente, depois area. "" ordena ANTES de area nomeada.
+    chaves = sorted(grupos, key=lambda k: (k[0], k[1]))
+    plano, ordinal = {}, 1
+    if len(navegacao) >= MIN_COHORT_URLS:
+        for _ in range(max(1, -(-len(navegacao) // MAX_URLS_PER_SHARD))):
+            plano[f"pages-{ordinal:04d}.xml"] = ("navegacao", "")
+            ordinal += 1
+    for chave in chaves:
+        n = len(grupos[chave])
+        for _ in range(max(1, -(-n // MAX_URLS_PER_SHARD))):
+            plano[f"pages-{ordinal:04d}.xml"] = chave
+            ordinal += 1
+    return plano
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--revisar-area", action="append", default=[],
+                    help="simula revisar paginas desta area (pode repetir)")
+    ap.add_argument("--quantas", type=int, default=0,
+                    help="quantas paginas da area revisar (0 = todas)")
+    ap.add_argument("--data-revisao", default="2026-12-31",
+                    help="data que as paginas revisadas passam a ter")
+    # 2 e o PISO INEVITAVEL, nao um numero escolhido: qualquer revisao real tira
+    # paginas do shard de origem (1) e as poe num shard de data nova (2). Teto
+    # menor reprovaria todo lote legitimo e o check viraria ruido que se aprende
+    # a ignorar — que e como um gate morre. O que ele existe para pegar e a
+    # ordem de grandeza acima disso: 30 shards por um lote de 46 paginas.
+    ap.add_argument("--max-deslocamento", type=int, default=2,
+                    help="quantos shards podem trocar de conteudo sem reprovar (default 2, o piso inevitavel)")
+    args = ap.parse_args()
+
+    coortes, navegacao = le_coortes()
+    if not coortes:
+        print(f"check-sitemap-shard-churn: FAIL\n  - nenhum shard lido de {SHARDS}")
+        return 1
+
+    antes = planeja(coortes, navegacao)
+    # Os REAIS a comparar sao os do PLANO, nao os arquivos em disco: os shards em
+    # carencia continuam servidos de proposito e nao pertencem ao plano.
+    reais = sorted(
+        pathlib.Path(p).name
+        for p in glob.glob(str(SHARDS / "pages-*.xml"))
+        if "sitemap-shard-em-carencia" not in pathlib.Path(p).read_text(encoding="utf-8")
+    )
+    if len(antes) != len(reais):
+        print(f"  AVISO: a simulacao previu {len(antes)} shards e ha {len(reais)} publicados — "
+              "as constantes espelhadas podem ter divergido do Go.")
+
+    if not args.revisar_area:
+        print(f"  coortes (data,area): {len(coortes)} | shards simulados: {len(antes)} | publicados: {len(reais)}")
+        pequenas = {k: len(v) for k, v in coortes.items() if len(v) < MIN_COHORT_URLS}
+        print(f"  coortes abaixo do piso de {MIN_COHORT_URLS} (fundidas): {len(pequenas)}")
+        print("  risco por area (quantas revisoes derrubam a coorte abaixo do piso):")
+        for (data, area), paginas in sorted(coortes.items(), key=lambda kv: len(kv[1])):
+            if len(paginas) < 250 and area:
+                falta = max(0, len(paginas) - MIN_COHORT_URLS + 1)
+                print(f"    {data} {area:<24} {len(paginas):>4} URLs -> {falta:>3} revisoes disparam realocacao")
+        print("check-sitemap-shard-churn: pass (levantamento, sem lote simulado)")
+        return 0
+
+    # Simula: mover N paginas das areas pedidas para uma data nova.
+    depois_coortes = {k: list(v) for k, v in coortes.items()}
+    movidas = 0
+    for area in args.revisar_area:
+        for (data, a) in sorted(depois_coortes):
+            if a != area:
+                continue
+            paginas = depois_coortes[(data, a)]
+            n = len(paginas) if args.quantas <= 0 else min(args.quantas, len(paginas))
+            escolhidas = paginas[:n]
+            depois_coortes[(data, a)] = paginas[n:]
+            if not depois_coortes[(data, a)]:
+                del depois_coortes[(data, a)]
+            depois_coortes.setdefault((args.data_revisao, a), []).extend(escolhidas)
+            movidas += n
+
+    depois = planeja(depois_coortes, navegacao)
+
+    mudaram = [nome for nome in sorted(set(antes) | set(depois)) if antes.get(nome) != depois.get(nome)]
+    sumiram = sorted(set(antes) - set(depois))
+    nasceram = sorted(set(depois) - set(antes))
+
+    print(f"  lote simulado: {movidas} pagina(s) de {args.revisar_area} -> data {args.data_revisao}")
+    print(f"  shards antes: {len(antes)} | depois: {len(depois)}")
+    print(f"  shards que TROCAM de conteudo: {len(mudaram)}")
+    if sumiram:
+        print(f"  shards que DESAPARECEM (viram 404 para quem os tem em cache): {sumiram}")
+    if nasceram:
+        print(f"  shards NOVOS: {nasceram[:6]}{' ...' if len(nasceram) > 6 else ''}")
+
+    if len(mudaram) > args.max_deslocamento:
+        print("check-sitemap-shard-churn: FAIL")
+        print(f"  - {len(mudaram)} shards trocam de conteudo, acima do teto de {args.max_deslocamento}.")
+        print("    Cada um custa refetch ao crawler, e os que desaparecem devolvem 404 —")
+        print("    foi assim que o Bingbot colheu 14 respostas 404 em 08-12.")
+        print("    Mitigacao: espalhe o lote entre areas em vez de concentra-lo numa so,")
+        print("    ou publique sabendo o custo (o 410 derivado cobre os ordinais extintos).")
+        return 1
+
+    print("check-sitemap-shard-churn: pass")
+    print(f"  o lote nao desloca ordinal alem do teto ({len(mudaram)} <= {args.max_deslocamento})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

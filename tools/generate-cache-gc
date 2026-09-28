@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""generate-cache-gc — coleta de lixo do `.cache/` por POLÍTICA, nunca por faxina manual.
+
+★ POR QUE EXISTE (2026-08-29, BUG-147 da caça aos bugs)
+
+`/` está a 80% e a projeção do `check-disk-headroom` — ainda a confirmar com 24 h
+de série — aponta para dias, não meses. Disco cheio no meio de uma publicação
+mata a transação, e a publicação é transacional justamente para não deixar o
+portal em estado híbrido.
+
+Medido hoje: `.cache/` tem **15 GB**, o maior consumidor do repositório à frente
+de `data/` (12 GB) e do próprio `.git` (9,9 GB). Dentro dele:
+
+    3,4 GB  go-cmd-bin            binários por comando, regeneráveis
+    2,2 GB  dead-tmp-quarantine   entradas de 2026-07-30, sem consumidor de código
+    1,8 GB  factorygraph-uid-1000
+    1,6 GB  gate-build
+
+★ POR QUE UM GERADOR COM POLÍTICA, E NÃO UM `rm` NO TERMINAL
+
+O contrato deste repositório proíbe deletar sem contexto completo, e por bom
+motivo: já se perdeu trabalho aqui apagando o que "parecia lixo" — o caso
+registrado é o `uta.json`, que parecia ruído e era o mapa de IPs do Google.
+
+Uma faxina manual não é auditável, não se repete e não protege ninguém na
+próxima vez que o disco encher. Uma política, sim:
+
+  - o alcance é **estritamente `.cache/`**, verificado por caminho absoluto
+    resolvido (nada de `..`, nada de symlink que escape);
+  - o critério é **idade**, medida no arquivo, com piso diferente por classe;
+  - o padrão é **ENSAIO**: sem `--aplicar`, nada é removido;
+  - toda remoção vira linha em `data/ops/cache_gc.jsonl`, com caminho, bytes e
+    idade — para que "sumiu" nunca seja um mistério.
+
+★ AS DUAS CLASSES, e por que os pisos diferem
+
+`go-cmd-bin` guarda o binário compilado de cada comando (`check` sozinho tem
+465 MB). Apagá-lo custa um rebuild de minutos na próxima invocação, então o piso
+é generoso: 14 dias sem uso. Usa-se `atime` quando o filesystem o mantém, com
+queda para `mtime` — e o gerador DECLARA qual usou, porque um piso de "último
+acesso" medido sobre `mtime` é mais agressivo do que parece.
+
+`dead-tmp-quarantine` é o depósito de `/tmp` morto que alguém pôs de lado para
+não perder. Sem consumidor em código (`grep` em `tools/`, `cmd/`, `internal/`,
+`ops/` devolve só uma menção em documento de plano) e com entradas de 30 dias,
+o piso é 21 dias — mas ainda é piso, e ainda é ensaio por padrão.
+
+Nenhuma outra pasta de `.cache/` é tocada sem ser nomeada em `--classe`: o
+gerador não varre o que não conhece.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import stat
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE = os.path.join(RAIZ, ".cache")
+LEDGER_REL = os.path.join("data", "ops", "cache_gc.jsonl")
+
+# Classe → (subdiretório, piso de idade em dias, o que a entrada é)
+CLASSES = {
+    "go-cmd-bin": ("go-cmd-bin", 14, "binário compilado por comando; apagar custa um rebuild"),
+    "quarentena": ("dead-tmp-quarantine", 21, "depósito de /tmp morto, sem consumidor em código"),
+}
+
+
+def dentro_do_cache(caminho: str) -> bool:
+    """Trava de alcance: o alvo TEM de estar sob .cache/, resolvido.
+
+    Resolve symlink e `..` antes de comparar, e exige o separador no fim do
+    prefixo — senão `.cache-outra-coisa/` passaria por estar sob `.cache`.
+    """
+    alvo = os.path.realpath(caminho)
+    raiz = os.path.realpath(CACHE)
+    return alvo == raiz or alvo.startswith(raiz + os.sep)
+
+
+def bytes_de(caminho: str) -> int:
+    if os.path.isfile(caminho) and not os.path.islink(caminho):
+        return os.path.getsize(caminho)
+    total = 0
+    for pasta, _, arquivos in os.walk(caminho, followlinks=False):
+        for nome in arquivos:
+            alvo = os.path.join(pasta, nome)
+            try:
+                if not os.path.islink(alvo):
+                    total += os.path.getsize(alvo)
+            except OSError:
+                continue
+    return total
+
+
+def idade_dias(caminho: str, usa_atime: bool) -> tuple[float, str]:
+    info = os.stat(caminho)
+    marca, nome = (info.st_atime, "atime") if usa_atime else (info.st_mtime, "mtime")
+    agora = dt.datetime.now(dt.timezone.utc).timestamp()
+    return (agora - marca) / 86400.0, nome
+
+
+def atime_confiavel(diretorio: str) -> bool:
+    """`relatime`/`noatime` fazem o atime mentir. Detecta comparando com o mtime.
+
+    Com `noatime`, o atime nunca é maior que o mtime; num diretório realmente
+    usado, alguma entrada tem atime > mtime. É heurística, e por isso o gerador
+    imprime qual marca usou em vez de decidir em silêncio.
+    """
+    for pasta, _, arquivos in os.walk(diretorio):
+        for nome in arquivos[:50]:
+            try:
+                info = os.stat(os.path.join(pasta, nome))
+            except OSError:
+                continue
+            if info.st_atime > info.st_mtime + 1:
+                return True
+        break
+    return False
+
+
+def libera_e_repete(funcao, caminho, info_do_erro):
+    """Reage ao read-only do cache de módulos Go, e só a ele.
+
+    Medido na primeira execução: `gomodcache` em quarentena tem 956 MB em modo
+    0444 — o `go mod download` marca tudo somente-leitura de propósito, para que
+    ninguém edite dependência baixada. `shutil.rmtree` para no primeiro arquivo
+    (`Permission denied: 'PATENTS'`) e deixa a árvore pela metade, o que é pior
+    que não ter começado: consome tempo, libera parte e some com o resto sem
+    registro.
+
+    A reação é mínima e verificada: só devolve permissão de escrita e repete a
+    MESMA operação, e só se o alvo continuar sob `.cache/` — a trava de alcance
+    vale aqui também, porque `onexc` recebe caminhos que a recursão montou.
+    """
+    # `onerror` (Python 3.11) entrega a tupla de sys.exc_info(); `onexc`, que só
+    # existe no 3.12+, entregaria a exceção. Este host roda 3.11 — usar o nome
+    # novo levantava TypeError na primeira remoção de diretório, e o gerador
+    # abortava com a árvore pela metade.
+    erro = info_do_erro[1] if isinstance(info_do_erro, tuple) else info_do_erro
+    if not dentro_do_cache(caminho):
+        raise erro
+    # O PERMISSO QUE FALTA É O DO DIRETÓRIO, NÃO O DO ARQUIVO.
+    #
+    # Medido: dar `+w` só no arquivo NÃO resolve — o `unlink` precisa de escrita
+    # no diretório que CONTÉM a entrada, e o `go mod download` marca as duas
+    # coisas somente-leitura (0444 nos arquivos, 0555 nos diretórios). A primeira
+    # versão desta função tratava só o arquivo e continuava batendo em
+    # `Permission denied: '…/golang.org/x/time@v0.15.0/PATENTS'`.
+    for alvo in (os.path.dirname(caminho), caminho):
+        if not alvo or not dentro_do_cache(alvo):
+            continue
+        try:
+            os.chmod(alvo, os.stat(alvo).st_mode | stat.S_IWUSR | stat.S_IXUSR)
+        except OSError:
+            pass
+    try:
+        funcao(caminho)
+    except OSError:
+        raise erro
+
+
+def grava(linhas: list[dict]) -> None:
+    destino = os.path.join(RAIZ, LEDGER_REL)
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    with open(destino, "a", encoding="utf-8") as arquivo:
+        for linha in linhas:
+            arquivo.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def main() -> int:
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--classe", action="append", choices=sorted(CLASSES),
+                            help="classe a coletar; repetível. Padrão: todas.")
+    analisador.add_argument("--dias", type=int, default=None,
+                            help="sobrepõe o piso da classe (nunca abaixo de 7)")
+    analisador.add_argument("--aplicar", action="store_true",
+                            help="remove de verdade; sem esta flag o comando é ENSAIO")
+    opcoes = analisador.parse_args()
+
+    if not os.path.isdir(CACHE):
+        print(f"generate-cache-gc: {CACHE} não existe — nada a coletar")
+        return 0
+
+    classes = opcoes.classe or sorted(CLASSES)
+    registros: list[dict] = []
+    total_bytes = 0
+    total_entradas = 0
+
+    for classe in classes:
+        sub, piso_padrao, descricao = CLASSES[classe]
+        piso = piso_padrao if opcoes.dias is None else max(7, opcoes.dias)
+        diretorio = os.path.join(CACHE, sub)
+        if not os.path.isdir(diretorio):
+            print(f"  {classe:<12} ausente ({sub})")
+            continue
+
+        usa_atime = classe == "go-cmd-bin" and atime_confiavel(diretorio)
+        marca_usada = "atime" if usa_atime else "mtime"
+        print(f"  {classe:<12} piso {piso}d · marca {marca_usada} · {descricao}")
+
+        for nome in sorted(os.listdir(diretorio)):
+            alvo = os.path.join(diretorio, nome)
+            if not dentro_do_cache(alvo):
+                print(f"    RECUSADO (fora de .cache/): {alvo}", file=sys.stderr)
+                return 2
+            try:
+                idade, marca = idade_dias(alvo, usa_atime)
+            except OSError as erro:
+                print(f"    ilegível: {nome}: {erro}", file=sys.stderr)
+                continue
+            if idade < piso:
+                continue
+            tamanho = bytes_de(alvo)
+            total_bytes += tamanho
+            total_entradas += 1
+            print(f"    {'REMOVE' if opcoes.aplicar else 'removeria'} {nome} "
+                  f"({tamanho / 1024 / 1024:.1f} MB, {idade:.1f}d por {marca})")
+            registro = {
+                "schema_version": "cache_gc_v1",
+                "medido_em": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "classe": classe,
+                "caminho": os.path.relpath(alvo, RAIZ),
+                "bytes": tamanho,
+                "idade_dias": round(idade, 2),
+                "marca": marca,
+                "piso_dias": piso,
+                "aplicado": bool(opcoes.aplicar),
+            }
+            if opcoes.aplicar:
+                try:
+                    if os.path.isdir(alvo) and not os.path.islink(alvo):
+                        shutil.rmtree(alvo, onerror=libera_e_repete)
+                    else:
+                        os.remove(alvo)
+                except OSError as erro:
+                    registro["erro"] = str(erro)
+                    print(f"    FALHOU: {nome}: {erro}", file=sys.stderr)
+            registros.append(registro)
+
+    print(f"generate-cache-gc: {total_entradas} entrada(s), "
+          f"{total_bytes / 1024 / 1024 / 1024:.2f} GiB "
+          f"{'liberados' if opcoes.aplicar else 'liberáveis (ENSAIO — use --aplicar)'}")
+    if registros and opcoes.aplicar:
+        grava(registros)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

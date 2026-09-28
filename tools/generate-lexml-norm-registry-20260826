@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""generate-lexml-norm-registry-20260826 — data oficial das normas que o
+extrator reconhece e nao consegue normalizar.
+
+POR QUE EXISTE. `internal/legalfacts` reconhece "Lei 8.112/1990" no corpo
+visivel, mas `internal/lexml` so consegue montar a URN LexML quando conhece a
+DATA do ato — e a tabela canonica do pacote tinha 11 entradas escritas a mao.
+Toda norma fora dela cai numa chave de fallback (`lei-ref:lei:8112:1990`), que
+nao passa pelo filtro `urn:lex:` de `buildLegislationNode`: a norma some do
+JSON-LD e do link inline SEM deixar rastro. Censo proprio de 2026-08-26 (render
+offline, `cmd/measure-graph-authority`): 1.001 normas distintas, 5.281
+ocorrencias de pagina.
+
+O QUE ELE FAZ. Le o censo, monta a URN candidata com ano (`urn:lex:br:federal:
+{tipo}:{ano};{numero}` — forma que a API aceita) e pergunta a data ao canal
+publico e sem credencial do LexML/Senado:
+
+    GET https://normas.leg.br/api/public/metadados/gerais?urn=<urn>
+
+A data usada e `legislationDate` — a data do ATO —, NUNCA `datePublished`, que e
+a data no Diario Oficial e costuma ser o dia seguinte. Conferido: o CDC responde
+`legislationDate=1990-09-11` e `datePublished=1990-09-12`, e a URN LexML do CDC
+e `...:1990-09-11;8078` — usar `datePublished` produziria URN errada para
+praticamente todo ato.
+
+O QUE ELE ESCREVE. (1) a evidencia por norma em
+`data/source-audit/lexml_norm_registry_20260826.jsonl` (urn, nome oficial, data,
+URL consultada, data da consulta e sha256 da resposta) e (2) a tabela em FONTE
+GO, `internal/lexml/norm_registry_generated.go` — fonte Go e nao `//go:embed`
+porque o grafo autenticado do fingerprint de ingestao so aceita `.go` no
+snapshot de codigo (mesmo motivo de `tools/generate-siteicon-source`).
+
+Nada aqui e adivinhado: norma cuja data a fonte oficial nao devolve, ou cuja
+resposta nao bate com o numero/ano citado, fica FORA da tabela e continua
+falhando fechado.
+
+Uso:
+    tools/generate-lexml-norm-registry-20260826               # coleta e grava
+    tools/generate-lexml-norm-registry-20260826 --so-tabela   # regenera o .go
+    tools/generate-lexml-norm-registry-20260826 --limite 20
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import http.client
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CENSO = ROOT / "data/source-audit/norm_citation_unresolved_census_20260826.json"
+EVIDENCIA = ROOT / "data/source-audit/lexml_norm_registry_20260826.jsonl"
+TABELA = ROOT / "internal/lexml/norm_registry_generated.go"
+API = "https://normas.leg.br/api/public/metadados/gerais"
+# Identidade canonica (CLAUDE.md secao 11). Medido em 2026-09-05 contra
+# normas.leg.br/api/public/metadados/gerais com este UA: 200, 5.133 bytes.
+UA = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+      "+https://wikijuridica.com.br/bot/; coleta-oficial)")
+CABECALHOS = {"User-Agent": UA, "Accept": "application/json",
+              "Accept-Encoding": "gzip"}
+REDE = (urllib.error.URLError, http.client.HTTPException, ValueError,
+        TimeoutError, OSError)
+
+# Especies que o extrator produz em chave de fallback. O slug e o MESMO que
+# internal/lexml usa na URN (tipoSlug), e o rotulo Go e o identificador do
+# TipoNorma correspondente — as duas pontas conferidas no teste do pacote.
+ESPECIES = {
+    "lei": "TipoLei",
+    "lei.complementar": "TipoLeiComplementar",
+    "decreto": "TipoDecreto",
+    "decreto.lei": "TipoDecretoLei",
+    "emenda.constitucional": "TipoEmendaConstitucional",
+    "medida.provisoria": "TipoMedidaProvisoria",
+}
+
+# O numero aceita o sufixo de REEDICAO ("2200-2"): medida provisoria reeditada
+# e um ato proprio, com data propria, e `(\d+)` a deixava fora do censo.
+CHAVE = re.compile(r"^lei-ref:([a-z.]+):(\d+(?:-\d{1,2})?):(\d{4})$")
+
+
+def buscar(url: str, timeout: float = 25.0) -> bytes:
+    pedido = urllib.request.Request(url, headers=CABECALHOS)
+    with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+        bruto = resposta.read()
+        if resposta.headers.get("Content-Encoding") == "gzip":
+            bruto = gzip.decompress(bruto)
+        return bruto
+
+
+def numero_do_nome(nome: str) -> str | None:
+    """Numero do ato como a fonte oficial o escreve no campo `name`.
+
+    O SUFIXO DE REEDICAO FAZ PARTE DO NUMERO (2026-08-29). A forma anterior era
+    `([\d.]+)`, que sobre "Medida Provisoria no 2.200-2 de 24/08/2001" devolvia
+    "2200" — e a conferencia entao RECUSAVA a propria resposta correta da fonte,
+    com "numero divergente: citado 2200-2, fonte 2200". Treze medidas
+    provisorias reeditadas ficaram de fora da tabela por esse motivo, entre elas
+    a 2.200-2 (ICP-Brasil, assinatura eletronica, 16 ocorrencias no acervo) e a
+    2.225-45. Era defeito do validador, nao da fonte."""
+    achado = re.search(r"n[ºo°]\s*([\d.]+(?:-\d{1,2})?)", nome)
+    if not achado:
+        return None
+    return achado.group(1).replace(".", "")
+
+
+def resolve(tipo: str, numero: str, ano: str, pausa: float):
+    """(registro, motivo). registro None quando a fonte nao comprova a data."""
+    urn_consulta = f"urn:lex:br:federal:{tipo}:{ano};{numero}"
+    alvo = API + "?urn=" + urllib.parse.quote(urn_consulta, safe=":;")
+    try:
+        bruto = buscar(alvo)
+    except REDE as erro:
+        time.sleep(pausa)
+        return None, f"rede: {erro}"
+    time.sleep(pausa)
+    try:
+        dados = json.loads(bruto.decode("utf-8", "replace"))
+    except ValueError:
+        return None, "resposta nao e JSON"
+    if not isinstance(dados, dict):
+        return None, "resposta nao e objeto"
+    nome = (dados.get("name") or "").strip()
+    data = (dados.get("legislationDate") or "").strip()
+    if not nome or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data):
+        return None, "sem legislationDate"
+    if not data.startswith(ano + "-"):
+        # O ano do ato tem de ser o ano citado; divergencia significa que a URN
+        # por ano pegou outro ato (ou que a citacao esta errada). Fica de fora.
+        return None, f"ano divergente: citado {ano}, fonte {data[:4]}"
+    conferido = numero_do_nome(nome)
+    if conferido is not None and conferido != numero:
+        return None, f"numero divergente: citado {numero}, fonte {conferido}"
+    return {
+        "chave_fallback": f"lei-ref:{tipo}:{numero}:{ano}",
+        "tipo": tipo,
+        "numero": numero,
+        "ano": int(ano),
+        "data": data,
+        "urn": f"urn:lex:br:federal:{tipo}:{data};{numero}",
+        "nome_oficial": nome,
+        "fonte": alvo,
+        "consultado_em": time.strftime("%Y-%m-%d"),
+        "sha256_resposta": hashlib.sha256(bruto).hexdigest(),
+    }, None
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporario = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporario, path)
+    finally:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+
+
+def ordem_numero(numero: str) -> tuple:
+    """Chave de ordenacao que aceita numero de REEDICAO ("2200-2").
+
+    int("2200-2") estoura, e era o que impedia a tabela de receber medida
+    provisoria reeditada. A reedicao ordena logo depois do ato base.
+    """
+    base, _, reedicao = numero.partition("-")
+    return (int(base) if base.isdigit() else 0,
+            int(reedicao) if reedicao.isdigit() else 0)
+
+
+def escreve_tabela(registros: list[dict]) -> None:
+    registros = sorted(registros, key=lambda r: (r["tipo"], ordem_numero(r["numero"]), r["data"]))
+    linhas = [
+        "// Code generated by tools/generate-lexml-norm-registry-20260826; DO NOT EDIT.",
+        "",
+        "package lexml",
+        "",
+        "// normasDatadas e a data oficial de cada norma federal que o acervo cita e",
+        "// que a tabela curada a mao (codigosCanonicos) nao conhecia. Sem a data, a",
+        "// URN LexML nao se monta e a norma some do JSON-LD e do link inline — falha",
+        "// silenciosa medida em 2026-08-26 sobre 1.001 normas distintas.",
+        "//",
+        "// Cada linha veio da API publica do LexML/Senado (normas.leg.br), campo",
+        "// legislationDate (a data do ATO, nunca datePublished, que e a data no DOU).",
+        "// A evidencia por norma — URL consultada, data da consulta e sha256 da",
+        "// resposta — esta em data/source-audit/lexml_norm_registry_20260826.jsonl, e",
+        "// TestNormasDatadasBateComEvidencia falha se as duas divergirem.",
+        "//",
+        "// Nenhuma entrada traz PlanaltoURL: a URL oficial so entra na tabela curada,",
+        "// onde ela foi conferida uma a uma. Aqui o que se afirma e a DATA.",
+        "var normasDatadas = []codigoCanonico{",
+    ]
+    for registro in registros:
+        rotulo = ESPECIES[registro["tipo"]]
+        linhas.append(
+            f'\t{{Tipo: {rotulo}, Numero: "{registro["numero"]}", '
+            f'Ano: {registro["ano"]}, Data: "{registro["data"]}"}},'
+        )
+    linhas.append("}")
+    linhas.append("")
+    atomic_write(TABELA, ("\n".join(linhas)).encode("utf-8"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limite", type=int, default=0)
+    parser.add_argument("--censo", default=str(CENSO),
+                        help="censo alternativo (mesmo schema); util quando o "
+                             "extrator passa a reconhecer formas novas")
+    parser.add_argument("--substituir", action="store_true",
+                        help="DESCARTA a evidencia ja gravada e regenera a tabela "
+                             "SO com o que este censo resolver. Perigoso e por isso "
+                             "explicito: com um censo parcial, apaga em silencio as "
+                             "normas datadas em execucoes anteriores. O padrao e UNIR.")
+    parser.add_argument("--pausa", type=float, default=1.1)
+    parser.add_argument("--so-tabela", action="store_true",
+                        help="regenera o .go a partir da evidencia ja coletada")
+    args = parser.parse_args()
+
+    if args.so_tabela:
+        registros = [json.loads(l) for l in EVIDENCIA.read_text(encoding="utf-8").splitlines() if l.strip()]
+        registros = [r for r in registros if r.get("tipo")]
+        escreve_tabela(registros)
+        print(f"tabela regenerada com {len(registros)} norma(s)")
+        return 0
+
+    censo = json.loads(Path(args.censo).read_text(encoding="utf-8"))
+    alvos = []
+    for item in censo["normas"]:
+        achado = CHAVE.match(item["chave_fallback"])
+        if not achado:
+            continue
+        tipo, numero, ano = achado.groups()
+        if tipo not in ESPECIES:
+            continue
+        # QUANTAS FONTES CITAM A NORMA. O censo original (2026-08-26) veio do
+        # render do acervo e chamou isso de `paginas`; o censo do corpus do STJ
+        # (2026-09-08) conta ACORDAOS, e gravar acordao sob a chave `paginas`
+        # seria a chave que engana a medicao — o mesmo defeito que este
+        # repositorio ja pagou. Entao aceitamos `ocorrencias` como forma
+        # neutra, e quem le o campo `paginas_que_citam` do registro sabe pelo
+        # `censo_origem` de qual populacao ele veio.
+        quantas = item.get("paginas")
+        if quantas is None:
+            quantas = item.get("ocorrencias")
+        if quantas is None:
+            raise SystemExit(
+                "censo sem `paginas` nem `ocorrencias` em " + item["chave_fallback"])
+        alvos.append((tipo, numero, ano, quantas))
+    if args.limite:
+        alvos = alvos[:args.limite]
+    print(f"consultando {len(alvos)} norma(s) na API publica do LexML/Senado")
+
+    resolvidos: list[dict] = []
+    recusados: list[dict] = []
+    for indice, (tipo, numero, ano, paginas) in enumerate(alvos, 1):
+        registro, motivo = resolve(tipo, numero, ano, args.pausa)
+        if registro:
+            registro["paginas_que_citam"] = paginas
+            resolvidos.append(registro)
+        else:
+            recusados.append({"chave_fallback": f"lei-ref:{tipo}:{numero}:{ano}",
+                              "paginas_que_citam": paginas, "motivo": motivo})
+        if indice % 25 == 0:
+            print(f"  [{indice}/{len(alvos)}] resolvidas={len(resolvidos)} "
+                  f"recusadas={len(recusados)}", flush=True)
+
+    if not args.substituir and EVIDENCIA.exists():
+        # UNIAO E O PADRAO, e a substituicao e que pede flag. A ordem inversa era
+        # uma armadilha: rodar com censo parcial regenerava a tabela so com o que
+        # o censo trouxe, apagando em silencio as normas ja datadas — e a falha e
+        # invisivel ate o JSON-LD perder a norma. Texto de --help nao e guarda.
+        # A chave da uniao e (tipo, numero, ano); o resultado NOVO vence, porque
+        # ele acabou de ser conferido na fonte.
+        novos = {(r["tipo"], r["numero"], r["ano"]) for r in resolvidos}
+        anteriores = []
+        for linha in EVIDENCIA.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            if not registro.get("tipo") or not registro.get("data"):
+                continue
+            if (registro["tipo"], registro["numero"], registro["ano"]) in novos:
+                continue
+            anteriores.append(registro)
+        # A RECUSA COM MOTIVO E EVIDENCIA (R9): "sem legislationDate" para a Lei
+        # 10.705/2000 registra que ela e ESTADUAL (ITCMD de Sao Paulo) e nao cabe
+        # na URN federal. Descartar essas linhas apagaria o unico registro do que
+        # a fonte NAO comprova, e o proximo agente reconsultaria tudo de novo.
+        reconsultadas = {r["chave_fallback"] for r in resolvidos}
+        reconsultadas |= {r["chave_fallback"] for r in recusados}
+        recusas_antigas = []
+        for linha in EVIDENCIA.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            if registro.get("tipo") or registro.get("data"):
+                continue
+            if registro.get("chave_fallback") in reconsultadas:
+                continue
+            recusas_antigas.append(registro)
+        print(f"uniao: {len(anteriores)} norma(s) datadas e "
+              f"{len(recusas_antigas)} recusa(s) anteriores preservadas")
+        resolvidos = anteriores + resolvidos
+        recusados = recusas_antigas + recusados
+
+    linhas = [json.dumps(r, ensure_ascii=False) for r in resolvidos]
+    linhas += [json.dumps({**r, "tipo": None}, ensure_ascii=False) for r in recusados]
+    atomic_write(EVIDENCIA, ("\n".join(linhas) + "\n").encode("utf-8"))
+    escreve_tabela(resolvidos)
+
+    cobertas = sum(r["paginas_que_citam"] for r in resolvidos)
+    perdidas = sum(r["paginas_que_citam"] for r in recusados)
+    print(f"\nresolvidas: {len(resolvidos)} norma(s), {cobertas} ocorrencia(s) de pagina")
+    print(f"recusadas:  {len(recusados)} norma(s), {perdidas} ocorrencia(s) de pagina")
+    print(f"evidencia:  {os.path.relpath(EVIDENCIA, ROOT)}")
+    print(f"tabela:     {os.path.relpath(TABELA, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

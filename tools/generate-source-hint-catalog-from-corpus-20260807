@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""generate-source-hint-catalog-from-corpus-20260807 — a lei já baixada vira entrada de catálogo.
+
+O DEFEITO. 2.008 intents de portfólio declaram `needs_source_research: false` —
+pesquisa concluída — e citam `source_hint` que NÃO existe em
+`data/editorial/v2_source_hint_catalog.json`. São 1.857 hints distintos. O
+produtor reprova a projeção de fontes desses lotes, e 394 lotes ficam fora da
+fila de escrita.
+
+O gate está certo: declarar pesquisa concluída sem a fonte resolvida é
+inconsistência.
+
+O QUE ESTA FERRAMENTA RESOLVE, e só isso: os hints que nomeiam um diploma que
+JÁ ESTÁ em `data/legal-corpus/` — baixado do Planalto, com URL oficial,
+`document_sha256` e `fetched_at`. "CC/2002 art. 1.210", "ECA art. 33", "Lei
+8.036/1990 art. 23". A fonte existe e está verificada; faltava a entrada.
+
+NÃO INVENTA NADA. A URL vem do corpus, não de palpite. O `anchor_claim` é o
+caput do artigo citado, do documento oficial — domínio público (Lei 9.610/1998,
+art. 8º, IV) — e, quando o hint não nomeia artigo, é a identificação do diploma.
+Hint cujo diploma não está no corpus fica INTACTO: entrada ausente é honesta,
+entrada inventada é fraude.
+
+DUAS ESCRITAS, UM LEASE. A chave do catálogo precisa ser kebab-slug
+(`ops/relaunch-writing.sh:199`) e o portfólio referencia em texto livre. Criar a
+entrada sem reescrever a referência não resolveria nada — o portfólio
+continuaria apontando para uma chave inexistente. Por isso as duas mudanças
+acontecem juntas.
+
+INTENTS PROTEGIDOS SÃO PULADOS. Os que estão em arquivo de supersessão ou têm
+requisito no contrato semântico não podem ter o registro alterado sem quebrar a
+cadeia autenticada — foi o que aconteceu com 5 deles em 2026-08-07. Eles ficam
+com o hint em texto livre e seguem excluídos individualmente, como já estavam.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, escrita atômica com fsync,
+idempotente. NÃO commita.
+
+Uso:
+    tools/generate-source-hint-catalog-from-corpus-20260807 --dry-run
+    tools/generate-source-hint-catalog-from-corpus-20260807
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.source-hint-catalog-from-corpus-20260807.lock"
+CATALOGO = ROOT / "data/editorial/v2_source_hint_catalog.json"
+PORTFOLIO = ROOT / "data/editorial/portfolio_v2"
+SUPERSEDED = ROOT / "data/editorial/v2_superseded"
+CONTRATO = ROOT / "data/editorial/v2_writing_semantic_contract.json"
+CORPUS = ROOT / "data/legal-corpus"
+
+SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+ANCHOR_MAX = 300
+
+# Número da lei -> slug do corpus. É o caminho sem ambiguidade: o número
+# identifica o diploma, o apelido não (há mais de um "Código").
+NUMERO_PARA_SLUG = {
+    "10406": "codigo_civil", "8078": "cdc", "13105": "cpc", "5452": "clt",
+    "2848": "codigo_penal", "3689": "cpp", "5172": "ctn", "9503": "ctb",
+    "8069": "eca", "12965": "marco_civil", "13709": "lgpd",
+    "8213": "lei_8213_1991", "8112": "lei_8112_1990", "6015": "lei_6015_1973",
+    "9656": "lei_9656_1998", "9099": "lei_9099_1995", "9279": "lei_9279_1996",
+    "8245": "lei_8245_1991", "4591": "lei_4591_1964", "6830": "lei_6830_1980",
+    "123": "lc_123_2006", "8036": "lei_8036_1990", "9784": "lei_9784_1999",
+    "14790": "lei_14790_2023", "15040": "lei_15040_2024",
+}
+# Apelido no início do hint -> slug. Só entra apelido que identifica UM diploma.
+APELIDO_PARA_SLUG = {
+    "cc": "codigo_civil", "codigo civil": "codigo_civil",
+    "cdc": "cdc", "cpc": "cpc", "clt": "clt",
+    "cp": "codigo_penal", "codigo penal": "codigo_penal",
+    "cpp": "cpp", "ctn": "ctn", "ctb": "ctb",
+    "cf": "constituicao", "constituicao": "constituicao",
+    "eca": "eca", "lgpd": "lgpd",
+}
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def slugify(valor: str) -> str:
+    dobrado = unicodedata.normalize("NFKD", valor)
+    dobrado = "".join(c for c in dobrado if not unicodedata.combining(c))
+    dobrado = re.sub(r"[^A-Za-z0-9]+", "-", dobrado).strip("-").lower()
+    return re.sub(r"-{2,}", "-", dobrado)
+
+
+def carregar_corpus() -> dict:
+    corpus = {}
+    for caminho in sorted(CORPUS.glob("*.json")):
+        with open(caminho, encoding="utf-8") as handle:
+            dados = json.load(handle)
+        if dados.get("source_url") and dados.get("nome"):
+            corpus[dados["slug"]] = dados
+    return corpus
+
+
+def protegidos() -> set:
+    alvo = set()
+    for caminho in sorted(SUPERSEDED.glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                intent = json.loads(linha).get("intent_id")
+                if intent:
+                    alvo.add(intent)
+    with open(CONTRATO, encoding="utf-8") as handle:
+        contrato = json.load(handle)
+    for chave in ("requirements", "forward_candidates",
+                  "adopt_existing_targets", "resolutions"):
+        for registro in contrato.get(chave, []):
+            if registro.get("intent_id"):
+                alvo.add(registro["intent_id"])
+    return alvo
+
+
+def diploma_do_hint(hint: str, corpus: dict) -> str | None:
+    """Slug do corpus que o hint nomeia, ou None. Número vence apelido.
+
+    O apelido é comparado SEM ACENTO. A primeira versão usava só `.lower()`, e
+    "Código Civil art. 951" não casava a entrada "codigo civil" — 1.007
+    referências ficaram na classe "fora do corpus" tendo a fonte disponível.
+    """
+    baixo = unicodedata.normalize("NFKD", hint.lower())
+    baixo = "".join(c for c in baixo if not unicodedata.combining(c))
+    for achado in re.finditer(r"\b(\d{2,6})(?:[./]\d{4})?\b", baixo):
+        numero = achado.group(1).replace(".", "")
+        if numero in NUMERO_PARA_SLUG and NUMERO_PARA_SLUG[numero] in corpus:
+            return NUMERO_PARA_SLUG[numero]
+    numero_pontuado = re.search(r"\b(\d{1,2}\.\d{3})\b", baixo)
+    if numero_pontuado:
+        numero = numero_pontuado.group(1).replace(".", "")
+        if numero in NUMERO_PARA_SLUG and NUMERO_PARA_SLUG[numero] in corpus:
+            return NUMERO_PARA_SLUG[numero]
+    for apelido, slug in APELIDO_PARA_SLUG.items():
+        if re.match(r"^%s\b" % re.escape(apelido), baixo) and slug in corpus:
+            return slug
+    return None
+
+
+def artigo_do_hint(hint: str) -> str | None:
+    achado = re.search(r"\bart(?:igo)?s?\.?\s*(\d{1,4}(?:\.\d{3})*(?:-[A-Za-z])?)",
+                       hint, re.IGNORECASE)
+    return achado.group(1) if achado else None
+
+
+def montar_entrada(hint: str, slug: str, corpus: dict) -> dict | None:
+    dados = corpus[slug]
+    artigo = artigo_do_hint(hint)
+    nome = dados["nome"]
+    claim = None
+    if artigo:
+        chave = artigo.replace(".", "").upper()
+        texto = " ".join((dados.get("articles", {}).get(chave) or "").split())
+        if texto:
+            caput = re.split(r"\s(?:§|Par[áa]grafo [úu]nico|I\s*-\s)", texto)[0]
+            if len(caput) > ANCHOR_MAX:
+                corte = caput.rfind(" ", 0, ANCHOR_MAX)
+                caput = caput[:corte if corte > 0 else ANCHOR_MAX].rstrip(" ,;") + "…"
+            claim = caput
+            nome = f"{dados['nome']}, art. {artigo}"
+    if not claim:
+        # Sem artigo nomeado (ou artigo fora do corpus): a âncora identifica o
+        # documento, sem afirmar conteúdo que não se conferiu.
+        claim = (f"texto oficial de {dados['nome']} no portal do Planalto, "
+                 f"coletado em {dados['fetched_at'][:10]}")
+    return {
+        "anchor_claim": claim,
+        "name": nome,
+        "source_kind": "legal_act",
+        "url": dados["source_url"],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    with open(CATALOGO, encoding="utf-8") as handle:
+        catalogo = json.load(handle)
+    hints = catalogo["source_hints"]
+    corpus = carregar_corpus()
+    bloqueados = protegidos()
+    print(f"corpus: {len(corpus)} diplomas | catálogo: {len(hints)} hints | "
+          f"intents protegidos: {len(bloqueados)}")
+
+    # 1. Levanta os hints ausentes citados por intent que declara pesquisa feita.
+    ausentes = collections.Counter()
+    for caminho in sorted(glob.glob(os.fspath(PORTFOLIO / "*.jsonl"))):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                registro = json.loads(linha)
+                if registro.get("needs_source_research"):
+                    continue
+                if registro.get("intent_id") in bloqueados:
+                    continue
+                for hint in registro.get("source_hints") or []:
+                    if hint not in hints:
+                        ausentes[hint] += 1
+
+    # 2. Resolve os que o corpus cobre.
+    plano = {}
+    for hint in ausentes:
+        slug = diploma_do_hint(hint, corpus)
+        if not slug:
+            continue
+        chave = slugify(hint)
+        if not SLUG_RE.fullmatch(chave):
+            continue
+        entrada = montar_entrada(hint, slug, corpus)
+        if entrada:
+            plano[hint] = (chave, entrada)
+
+    print(f"hints ausentes (fora dos protegidos): {len(ausentes)}")
+    print(f"resolvíveis pelo corpus legal        : {len(plano)} "
+          f"({sum(ausentes[h] for h in plano)} referências)")
+    if not plano:
+        print("nada a fazer.")
+        return 0
+
+    # 3. Preflight: chave nova não pode colidir com entrada existente de OUTRA URL.
+    problemas = []
+    for hint, (chave, entrada) in sorted(plano.items()):
+        if chave in hints and hints[chave].get("url") != entrada["url"]:
+            problemas.append(
+                f"{hint!r} -> {chave!r} colide com entrada existente de URL "
+                f"diferente ({hints[chave].get('url')} vs {entrada['url']})")
+        if not entrada["anchor_claim"] or not entrada["name"]:
+            problemas.append(f"{hint!r}: entrada sem anchor_claim ou name")
+    por_chave = collections.defaultdict(set)
+    for hint, (chave, entrada) in plano.items():
+        por_chave[chave].add(entrada["url"])
+    for chave, urls in sorted(por_chave.items()):
+        if len(urls) > 1:
+            problemas.append(f"{chave!r} receberia {len(urls)} URLs diferentes")
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(por_chave)} chaves novas, 0 conflito de URL")
+
+    renomeio = {hint: chave for hint, (chave, _) in plano.items()}
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for hint, (chave, entrada) in sorted(plano.items()):
+                    hints[chave] = entrada
+                catalogo["source_hints"] = dict(sorted(hints.items()))
+
+                referencias = 0
+                tocados = 0
+                for caminho in sorted(glob.glob(os.fspath(PORTFOLIO / "*.jsonl"))):
+                    linhas = Path(caminho).read_bytes().decode("utf-8").split("\n")
+                    fim_com_newline = bool(linhas) and linhas[-1] == ""
+                    if fim_com_newline:
+                        linhas = linhas[:-1]
+                    saida = []
+                    mudou = False
+                    for raw in linhas:
+                        if not raw.strip():
+                            saida.append(raw)
+                            continue
+                        registro = json.loads(raw)
+                        if registro.get("intent_id") in bloqueados:
+                            saida.append(raw)
+                            continue
+                        atuais = registro.get("source_hints") or []
+                        if not any(h in renomeio for h in atuais):
+                            saida.append(raw)
+                            continue
+                        vistos = []
+                        for h in atuais:
+                            destino = renomeio.get(h, h)
+                            if destino not in vistos:
+                                vistos.append(destino)
+                            if h in renomeio:
+                                referencias += 1
+                        registro["source_hints"] = vistos
+                        saida.append(json.dumps(registro, ensure_ascii=False,
+                                                sort_keys=True))
+                        mudou = True
+                    if mudou:
+                        tocados += 1
+                        if not args.dry_run:
+                            payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+                            atomic_write(Path(caminho), payload.encode("utf-8"))
+                print(f"  catálogo: +{len(por_chave)} entradas")
+                print(f"  portfólio: {referencias} referência(s) em {tocados} arquivo(s)")
+                if not args.dry_run:
+                    payload = json.dumps(catalogo, ensure_ascii=False, indent=1,
+                                         sort_keys=True) + "\n"
+                    atomic_write(CATALOGO, payload.encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    print("\n--dry-run: nada escrito." if args.dry_run
+          else "\nCatálogo populado. Rode ops/relaunch-writing.sh.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Revalida a evidência de vida das URLs de fonte oficial cujo TTL venceu.
+
+POR QUE ISTO EXISTE
+===================
+`data/source-registry/official_source_url_live_evidence.jsonl` guarda, por URL
+de fonte oficial, a prova de que ela estava viva numa data: status HTTP,
+content-type, redirecionamentos, duração. Cada registro tem um TTL
+(`freshness_ttl_days`, 60 por padrão e 365 no máximo, conforme
+`internal/officialsourceurlliveevidence/evidence.go`).
+
+Passado o TTL, o gate emite `official_source_url_live_evidence_checked_at_stale`
+e a URL entra em `blocking_reasons` — ou seja, **bloqueia publicação** de
+qualquer página que dependa dela.
+
+A entrada nesse estado é automática (o tempo passa). A saída não era: **não
+existia nenhum gerador que revalidasse essas URLs**, e nenhum timer o fazia.
+Medido em 2026-08-27: 15 dos 64 registros já venciam, o mais antigo com 67 dias,
+e a revalidação mais recente era de 30/06.
+
+É a mesma família do shard de sitemap em carência, corrigida no mesmo dia: algo
+que entra sozinho num estado e depende de um humano lembrar para sair dele.
+
+★ O QUE MUDOU EM 2026-09-05: O CAMINHO DE ESCRITA FOI APOSENTADO
+================================================================
+Até aqui este script sondava as URLs com `curl` e reescrevia os campos de
+medição **direto no arquivo derivado**. Esse caminho está aposentado, e o motivo
+é de desenho, não de estilo:
+
+`official_source_url_live_evidence.jsonl` é **derivado**. Quem manda é
+`official_source_url_live_metadata_attempts.jsonl`, e o agregado
+(`officialsourceurlliveevidence.GenerateAt`) **reconstrói o derivado inteiro** a
+partir do inventário + das tentativas, toda vez que roda. Com o timer
+`wikijuridica-official-source-url-inventory-refresh` (04:20) reconstruindo o
+derivado todo dia, tudo o que este script gravasse às 05:40 seria descartado na
+passada seguinte — trabalho de sonda contra fonte oficial, jogado fora em 22h.
+
+Pior: o detector que decidia o que revalidar lia `checked_at` do arquivo
+DERIVADO, e ali `checked_at` nem sempre é medição. Sem tentativa válida, o
+agregado grava `checked_at = run_date` (evidence.go:1370, `http_status_code=0`).
+Medido em 2026-09-05: 6.022 dos 6.421 registros estão nesse estado. Ou seja, com
+o refresco diário no ar, este script leria "0 vencidos" **todo dia, para
+sempre** — inclusive no dia em que a medição de verdade vencesse, porque às
+04:20 o carimbo já teria sido reescrito para hoje.
+
+O caminho certo já estava escrito no próprio dado, em `required_fixes`:
+`run_metadata_only_official_source_live_recheck`. Ele é a ferramenta de
+tentativas com `--live --metadata-only --no-content-copy`, que grava na FONTE.
+É isso que este script passa a orquestrar.
+
+NENHUMA CAPACIDADE SE PERDEU — inclusive a lição do WAF
+=======================================================
+HEAD NÃO BASTA para sondar fonte oficial, e ignorar isso produz falso negativo
+em massa. Medido em 2026-08-27, contra `https://www.gov.br/pt-br/temas/meu-inss`:
+
+    HEAD + UA próprio ......... 403
+    HEAD sem UA custom ........ 403
+    GET com range de 1 byte ... 206
+    GET + Accept: text/html ... 206
+
+O WAF do gov.br recusa o **método**, não o agente. A primeira versão deste
+gerador usou só HEAD e gravou 403 em nove URLs do gov.br perfeitamente vivas —
+trocar "não medi" por "está fora do ar" é a pior espécie de dado errado, porque
+parece medição.
+
+Essa lição **não se perde com a aposentadoria**: ela vive em Go, com teste, em
+`internal/sourcefetch.shouldFallbackToRangeGET` (sourcefetch.go:437), que faz o
+fallback HEAD→GET com `Range: 0-0` em 403, 405, 202, 500, 502, 503, 504, 501 e
+no erro 520 da Cloudflare — cobertura maior que a deste script, e ligada em
+`liveMetadataSourceFetchDoer` (`AllowRangeGetFallback = true`,
+internal/sourceliveevidence/evidence.go:979) com `AllowPlainGetFallback = false`,
+para que nenhum corpo seja lido.
+
+O antigo `--reparar-403` também virou comportamento automático: uma tentativa
+armazenada com 4xx/5xx não é `reusablePositiveMetadataAttempt`
+(internal/sourceliveevidence/evidence.go:648), então **toda** passada `--live` a
+sonda de novo, sem precisar de flag.
+
+ORDEM, E POR QUE ELA É OBRIGATÓRIA
+==================================
+Este job depende do refresco do inventário do MESMO DIA, por duas travas do Go:
+
+  * `LoadCurrentInventoryRecordsAt` (inventory.go:855) reprova com
+    `official_source_url_inventory_inputs_stale` se as entradas editoriais
+    mudaram depois do manifesto — e elas mudam todo dia;
+  * `GenerateAt` (evidence.go:244) exige `manifest.run_date == hoje (UTC)`.
+
+Por isso a checagem de pré-condição abaixo: sem inventário fresco, este script
+**falha alto** nomeando a unit que falta, em vez de sondar fonte oficial à toa e
+gravar um lote que o agregado recusaria.
+
+O QUE ELE NÃO FAZ
+=================
+Não decide sobre publicação, aprovação ou bloqueio: `blocks_publication`,
+`approval` e `record_status` pertencem aos gates. Não lê corpo
+(`use_policy: ..._metadata_only_no_body_no_text`, `response_body_read: false`).
+E não escreve em `data/` com as próprias mãos — quem escreve é o gerador Go, que
+valida antes de gravar.
+
+RITMO
+=====
+Fonte oficial não se martela: o cliente Go limita 1 requisição por segundo por
+host (`defaultRate`, internal/sourceliveevidence/evidence.go:63), com uma fila
+sequencial por host. É lento de propósito.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(RAIZ, "tools"))
+
+import officialsourcettlhorizon as horizonte_ttl  # noqa: E402
+
+MANIFESTO_DO_INVENTARIO = "data/source-registry/official_source_url_inventory_manifest.json"
+UNIT_DO_INVENTARIO = "wikijuridica-official-source-url-inventory-refresh.service"
+
+# Teto de sondas ao vivo por execução. Não é número redondo escolhido às cegas:
+# o cliente Go serializa 1 requisição por segundo POR HOST, e a fila real está
+# concentrada — medido em 2026-09-05, dos 4.152 registros ainda sem medição,
+# 3.226 são de www.planalto.gov.br. No pior caso (todas as N sondas no mesmo
+# host) uma execução leva N segundos de espera de ritmo; com N=600 isso dá 10
+# min de piso contra o TimeoutStartSec=30min da unit, ~3x de folga. Sem teto, a
+# primeira passada tentaria 4.152 URLs e o piso do Planalto sozinho já seria
+# 3.226s = 53,8 min — acima do timeout, ou seja, a unit se mataria no meio.
+# Com N=600 a fila drena em ceil(4152/600) = 7 noites, antes do primeiro
+# vencimento de TTL (2026-10-04, ver o horizonte abaixo).
+LIMITE_PADRAO_DE_SONDAS = 600
+
+
+def executa(comando: list[str]) -> int:
+    print("+ " + " ".join(comando), flush=True)
+    return subprocess.run(comando, cwd=RAIZ, check=False).returncode
+
+
+def inventario_fresco(hoje: datetime.date) -> tuple[bool, str]:
+    caminho = os.path.join(RAIZ, MANIFESTO_DO_INVENTARIO)
+    try:
+        with open(caminho, encoding="utf-8") as arquivo:
+            manifesto = json.load(arquivo)
+    except (OSError, json.JSONDecodeError) as erro:
+        return False, f"não consegui ler {MANIFESTO_DO_INVENTARIO}: {erro}"
+    run_date = str(manifesto.get("run_date") or "")
+    if run_date != hoje.isoformat():
+        return False, (f"o inventário está datado de {run_date or '(vazio)'} e hoje é {hoje.isoformat()}")
+    return True, run_date
+
+
+def relata_horizonte(hoje: datetime.date, rotulo: str) -> tuple[dict, dict]:
+    caminho = os.path.join(RAIZ, horizonte_ttl.CAMINHO_ATTEMPTS)
+    censo = horizonte_ttl.horizonte(horizonte_ttl.le_jsonl(caminho), hoje)
+    sondagem = horizonte_ttl.censo_de_sondagem(horizonte_ttl.le_jsonl(caminho), hoje)
+    print(f"{rotulo}: {censo['total']} registro(s) na fonte de verdade | "
+          f"{censo['medidos']} com medição | {censo['carimbos']} sem medição | "
+          f"{censo['vencidos_hoje']} vencido(s) hoje | "
+          f"primeiro vencimento: {censo['primeiro_vencimento'] or 'nenhum'}", flush=True)
+    print(f"{rotulo}: a sondar {sondagem['sondaveis']} "
+          f"({sondagem['vencidos']} vencido(s) + {sondagem['pendentes']} nunca medido(s) + "
+          f"{sondagem['negativos']} com medição negativa) | "
+          f"{sondagem['frescos_reaproveitados']} reaproveitado(s) sem rede | "
+          f"{sondagem['pulados_sem_match']} sem match seguro no registro (não são candidatos)", flush=True)
+    return censo, sondagem
+
+
+def main() -> int:
+    analisador = argparse.ArgumentParser(
+        description="Revalida a evidência de vida das fontes oficiais pela fonte de verdade (attempts.jsonl).")
+    analisador.add_argument("--seco", action="store_true",
+                            help="relata o que seria feito e imprime o comando, sem sondar nem gravar")
+    analisador.add_argument("--limite", type=int, default=LIMITE_PADRAO_DE_SONDAS,
+                            help=f"máximo de URLs sondadas ao vivo nesta execução (padrão: {LIMITE_PADRAO_DE_SONDAS}; "
+                                 f"0 = todas, ver o cálculo no cabeçalho)")
+    analisador.add_argument("--hoje", default="", help="data de referência YYYY-MM-DD (padrão: hoje em UTC)")
+    argumentos = analisador.parse_args()
+
+    if argumentos.limite < 0:
+        print("--limite não pode ser negativo", file=sys.stderr)
+        return 2
+
+    if argumentos.hoje:
+        try:
+            hoje = datetime.date.fromisoformat(argumentos.hoje)
+        except ValueError:
+            print(f"--hoje {argumentos.hoje!r} não é uma data YYYY-MM-DD", file=sys.stderr)
+            return 2
+    else:
+        hoje = horizonte_ttl.hoje_utc()
+
+    caminho_fonte = os.path.join(RAIZ, horizonte_ttl.CAMINHO_ATTEMPTS)
+    if not os.path.exists(caminho_fonte):
+        print(f"{horizonte_ttl.CAMINHO_ATTEMPTS} não existe — rode {UNIT_DO_INVENTARIO} antes", file=sys.stderr)
+        return 2
+
+    antes, sondagem = relata_horizonte(hoje, "antes")
+    if sondagem["sondaveis"] == 0:
+        print("nada vencido, nada pendente e nenhuma medição negativa: não há o que sondar hoje")
+        return 0
+
+    comando = [
+        "./tools/go-modern", "run", "-tags", "devcmds",
+        "./cmd/generate-official-source-url-live-metadata-attempts",
+        "--live", "--metadata-only", "--no-content-copy",
+    ]
+    if argumentos.limite > 0:
+        comando.append(f"--max-live-candidates={argumentos.limite}")
+    comando_do_agregado = [
+        "./tools/go-modern", "run", "-tags", "devcmds",
+        "./cmd/generate-official-source-url-live-evidence",
+    ]
+
+    print(f"teto desta execução: {argumentos.limite or 'sem teto'} sonda(s) sobre {sondagem['sondaveis']} candidata(s)",
+          flush=True)
+
+    if argumentos.seco:
+        print("--seco: nada foi sondado nem gravado. Os dois comandos do caminho autoritativo são:")
+        print("  " + " ".join(comando))
+        print("  " + " ".join(comando_do_agregado))
+        return 0
+
+    fresco, detalhe = inventario_fresco(hoje)
+    if not fresco:
+        print(f"\nABORTADO: {detalhe}.\n"
+              f"O gerador de tentativas reprova com official_source_url_inventory_inputs_stale e o agregado com "
+              f"official_source_url_live_evidence_inventory_run_date_mismatch enquanto o inventário for de outro dia.\n"
+              f"Rode {UNIT_DO_INVENTARIO} (ou ./tools/generate-official-source-url-inventory-refresh) ANTES deste job — "
+              f"a ordem está fixada por After= na unit .service.", file=sys.stderr)
+        return 1
+
+    codigo = executa(comando)
+    if codigo != 0:
+        print(f"\nFALHOU: o recheck de metadado saiu com {codigo}. "
+              f"O arquivo derivado NÃO foi regenerado — fonte e derivado continuam coerentes.", file=sys.stderr)
+        return codigo
+
+    # Sem este segundo passo a medição fica só na fonte, e os gates (que leem o
+    # derivado) só a enxergariam na passada das 04:20 do dia seguinte.
+    codigo = executa(comando_do_agregado)
+    if codigo != 0:
+        print(f"\nFALHOU: a agregação do derivado saiu com {codigo}. "
+              f"A medição está gravada na fonte de verdade e será propagada pela passada das 04:20; "
+              f"o derivado ficou um lote atrás até lá.", file=sys.stderr)
+        return codigo
+
+    depois, sondagem_depois = relata_horizonte(hoje, "depois")
+    print(f"\nmedições: {antes['medidos']} -> {depois['medidos']} | "
+          f"a sondar: {sondagem['sondaveis']} -> {sondagem_depois['sondaveis']} | "
+          f"primeiro vencimento: {depois['primeiro_vencimento'] or 'nenhum'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

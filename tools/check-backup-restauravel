@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# tools/check-backup-restauravel — READ-ONLY. O backup existe, esta fresco e
+# JA FOI RESTAURADO com sucesso?
+#
+# ★ POR QUE EXISTE (2026-08-29, BUG-146)
+#
+# Havia backup e ninguem sabia se ele valia. Duas lacunas mediram-se no mesmo
+# dia em que este gate nasceu:
+#
+#  1. `systemctl list-timers --all | grep backup` mostrava
+#     wikijuridica-backup.timer com a coluna LAST em "-": a unit estava
+#     enabled e active e NUNCA tinha disparado. As duas execucoes existentes no
+#     ledger tinham sido manuais. Um timer instalado que nunca rodou e
+#     indistinguivel de um timer que funciona, se ninguem olhar.
+#  2. O espelho passava em `git fsck` e ninguem nunca tinha restaurado nada
+#     dele. Integridade de objeto nao e restaurabilidade.
+#
+# Este gate fecha as duas: le o ledger do backup e o ledger do ensaio de
+# restauracao e reprova quando qualquer um dos dois envelhece ou reprovou.
+#
+# ★ OS PRAZOS SAO DERIVADOS DA CADENCIA DAS UNITS, NAO ESCOLHIDOS
+#
+#  - Backup: wikijuridica-backup.timer roda OnCalendar diario (02:20 UTC) com
+#    RandomizedDelaySec=15min. Um ciclo e 24 h; o limite e 36 h = 1,5 ciclos,
+#    que absorve um atraso ou um boot tardio sem gritar, mas nao absorve um
+#    dia inteiro perdido.
+#  - Ensaio: wikijuridica-backup-restore.timer roda semanal com
+#    RandomizedDelaySec=20min. Um ciclo e 7 dias; o limite e 10 dias, os mesmos
+#    1,5 ciclos arredondados para baixo ao dia inteiro.
+#
+# ★ O ATRASO DO ESPELHO E REPORTADO, NAO REPROVADO
+#
+# O espelho fica atras da origem entre um backup e o seguinte — isso e o RPO do
+# desenho, nao defeito. Medido em 2026-08-29: seis horas depois do backup a
+# origem estava 98 commits a frente. O gate IMPRIME esse atraso para o RPO ser
+# um numero visivel em vez de uma suposicao, e so reprova por idade.
+#
+# ★ E CONFERE QUE O BACKUP E DESTE REPOSITORIO
+#
+# O SHA restaurado no ultimo ensaio tem de ser alcancavel a partir do HEAD da
+# origem (`git merge-base --is-ancestor`). Backup fresco de OUTRA historia
+# passaria em fsck, passaria em idade, e nao restauraria este projeto.
+#
+# EXIT: 0 ok · 1 reprovado · 2 uso/ambiente.
+
+set -u -o pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DESTINO="${WIKI_BACKUP_DIR:-/mnt/hdd/backups/wiki}"
+LEDGER_BACKUP="$RAIZ/data/ops/backup_wiki.jsonl"
+LEDGER_ENSAIO="$RAIZ/data/ops/backup_restore_ensaio.jsonl"
+MAX_BACKUP_H="36"
+MAX_ENSAIO_D="10"
+ALERTAR="1"
+
+uso() {
+	echo "Uso: tools/check-backup-restauravel [--max-backup-horas N] [--max-ensaio-dias N] [--sem-alerta]" >&2
+	exit 2
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--max-backup-horas)
+		[ $# -ge 2 ] || uso
+		MAX_BACKUP_H="$2"
+		shift 2
+		;;
+	--max-ensaio-dias)
+		[ $# -ge 2 ] || uso
+		MAX_ENSAIO_D="$2"
+		shift 2
+		;;
+	--sem-alerta)
+		ALERTAR="0"
+		shift
+		;;
+	-h | --help) uso ;;
+	*)
+		echo "flag desconhecida: $1" >&2
+		uso
+		;;
+	esac
+done
+
+ESPELHO="$DESTINO/repo.git"
+HEAD_ORIGEM="$(git -C "$RAIZ" rev-parse HEAD 2>/dev/null || echo "")"
+HEAD_ESPELHO=""
+ATRASO_COMMITS=""
+if [ -d "$ESPELHO" ]; then
+	HEAD_ESPELHO="$(git --git-dir="$ESPELHO" rev-parse HEAD 2>/dev/null || echo "")"
+	if [ -n "$HEAD_ESPELHO" ] && [ -n "$HEAD_ORIGEM" ]; then
+		ATRASO_COMMITS="$(git -C "$RAIZ" rev-list --count "$HEAD_ESPELHO..$HEAD_ORIGEM" 2>/dev/null || echo "")"
+	fi
+fi
+
+# Quantos bancos sociais existem na ORIGEM. Este gate nao abre nenhum deles — quem
+# prova que a copia restaura e tools/check-backup-banco-social. O que se responde
+# aqui e mais simples e o ledger sozinho nao respondia: a ultima execucao de
+# backup chegou a copiar o dado de usuario?
+BANCOS_NA_ORIGEM=0
+for banco in "$RAIZ"/var/social/*.db; do
+	[ -f "$banco" ] && BANCOS_NA_ORIGEM=$((BANCOS_NA_ORIGEM + 1))
+done
+
+PROBLEMAS="$(
+	nice -n 19 python3 - \
+		"$LEDGER_BACKUP" "$LEDGER_ENSAIO" "$ESPELHO" "$HEAD_ESPELHO" "$ATRASO_COMMITS" \
+		"$MAX_BACKUP_H" "$MAX_ENSAIO_D" "$BANCOS_NA_ORIGEM" <<'PYEOF'
+import datetime
+import json
+import os
+import sys
+
+(ledger_backup, ledger_ensaio, espelho, head_espelho, atraso,
+ max_backup_h, max_ensaio_d, bancos_na_origem) = sys.argv[1:9]
+max_backup_h = float(max_backup_h)
+max_ensaio_d = float(max_ensaio_d)
+bancos_na_origem = int(bancos_na_origem)
+agora = datetime.datetime.now(datetime.timezone.utc)
+
+
+def carrega(caminho):
+    """JSONL tolerante a linha invalida — backup_wiki.jsonl tem uma, da
+    primeira execucao, quando a rede de seguranca do /mnt/hdd matou o `du` e o
+    campo saiu vazio ("tamanho_kb":,). A causa ja foi corrigida; a linha fica,
+    porque neste projeto nao se apaga dado."""
+    linhas = []
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    linhas.append(json.loads(ln))
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return linhas
+
+
+def quando(registro):
+    t = registro.get("checked_at")
+    if not t:
+        return None
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=datetime.timezone.utc)
+
+
+def ultimo_bom(linhas, chave_problema):
+    for registro in reversed(linhas):
+        problema = registro.get(chave_problema)
+        if isinstance(problema, list):
+            if problema:
+                continue
+        elif problema:
+            continue
+        if quando(registro) is not None:
+            return registro
+    return None
+
+
+problemas = []
+info = []
+sha_restaurado = None
+
+if not os.path.isdir(espelho):
+    problemas.append("espelho ausente em %s — nenhum backup existe" % espelho)
+
+backup = ultimo_bom(carrega(ledger_backup), "problema")
+if backup is None:
+    problemas.append(
+        "nenhuma execucao de backup sem problema em %s" % ledger_backup)
+else:
+    idade_h = (agora - quando(backup)).total_seconds() / 3600.0
+    info.append("ultimo backup OK ha %.1f h (%s), %s commits, %.2f GiB, untracked %s arquivo(s)" % (
+        idade_h, backup.get("checked_at"), backup.get("commits"),
+        (backup.get("tamanho_kb") or 0) * 1024 / 1073741824.0,
+        backup.get("untracked_arquivos", "?")))
+    if idade_h > max_backup_h:
+        problemas.append(
+            "ultimo backup bem-sucedido ha %.1f h, acima do limite de %.0f h (1,5 ciclo do timer diario)"
+            % (idade_h, max_backup_h))
+    # A cobertura de untracked passou a existir em 2026-08-29. Linha antiga nao
+    # tem a chave, e isso NAO e defeito retroativo; linha nova com zero e.
+    if "untracked_arquivos" in backup and not backup["untracked_arquivos"]:
+        problemas.append(
+            "backup mais recente copiou 0 arquivo untracked — a cobertura de sole-copy nao rodou")
+    # BANCO SOCIAL, pela mesma regra da linha acima: chave ausente e linha
+    # antiga (a cobertura nasceu em 2026-09-05), chave presente e vazia com
+    # banco na origem e defeito.
+    #
+    # O caso concreto: a linha de 2026-09-05T02:21:58Z gravou "problema":"" e o
+    # destino nao tinha /banco-social/ nenhum — a guarda `[ -d var/social ]` do
+    # gerador era falsa porque var/social/ so nasceu as 03:02:15Z. Backup verde,
+    # estado canonico de usuario sem copia, e nada dizia.
+    if "bancos_sociais" in backup:
+        bancos = backup["bancos_sociais"] or []
+        if bancos_na_origem and not bancos:
+            problemas.append(
+                "backup mais recente nao copiou nenhum banco social, e a origem ja tem %d "
+                "(var/social/*.db) — estado canonico de usuario sem copia" % bancos_na_origem)
+        else:
+            info.append("banco social no ultimo backup: %s" % (", ".join(
+                "%s %s bytes integrity=%s sal=%s" % (
+                    b.get("banco", "?"), b.get("bytes", "?"),
+                    b.get("integrity_check", "?"), b.get("sal", "?"))
+                for b in bancos) or "nenhum (nem a origem tem)"))
+
+ensaio = ultimo_bom(carrega(ledger_ensaio), "problemas")
+if ensaio is None:
+    problemas.append(
+        "NENHUM ensaio de restauracao bem-sucedido em %s — o backup nunca foi provado; "
+        "rode tools/generate-ensaio-restauracao" % ledger_ensaio)
+else:
+    idade_d = (agora - quando(ensaio)).total_seconds() / 86400.0
+    sha_restaurado = ensaio.get("sha_restaurado") or None
+    info.append("ultimo ensaio de restauracao OK ha %.1f dias (%s), %s arquivos e %.2f GiB conferidos byte a byte, sha %s" % (
+        idade_d, ensaio.get("checked_at"), ensaio.get("arquivos_verificados"),
+        (ensaio.get("bytes_verificados") or 0) / 1073741824.0,
+        (sha_restaurado or "?")[:12]))
+    if not sha_restaurado:
+        # Ensaio que passou mas nao diz QUE sha restaurou nao permite conferir
+        # linhagem. Reprova em vez de seguir: e justamente assim que um gate
+        # aprende a so saber passar.
+        problemas.append(
+            "ensaio de restauracao sem campo sha_restaurado — impossivel conferir a linhagem do backup")
+    if idade_d > max_ensaio_d:
+        problemas.append(
+            "ultimo ensaio de restauracao ha %.1f dias, acima do limite de %.0f dias (1,5 ciclo do timer semanal)"
+            % (idade_d, max_ensaio_d))
+
+if head_espelho:
+    info.append("espelho em %s" % head_espelho[:12])
+if atraso:
+    info.append("origem esta %s commit(s) a frente do espelho (RPO do desenho: ate 24 h)" % atraso)
+
+print(json.dumps({
+    "problemas": problemas,
+    "info": info,
+    # SHA COMPLETO E ESTRUTURADO. A primeira versao deste gate garimpava o sha
+    # de dentro da frase de exibicao (`rsplit("sha ", 1)`) e ainda por cima
+    # truncada em 12 caracteres: bastava alguem reformatar a linha para a
+    # conferencia de linhagem parar de rodar EM SILENCIO, passando verde.
+    "sha_restaurado": sha_restaurado,
+}, ensure_ascii=False))
+PYEOF
+)" || {
+	echo "check-backup-restauravel: avaliacao falhou" >&2
+	exit 2
+}
+
+# LINHAGEM: o backup restaura ESTE repositorio? Fora do Python porque quem
+# responde e o proprio git da origem.
+LINHAGEM=""
+SHA_ENSAIO="$(printf '%s' "$PROBLEMAS" | python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("sha_restaurado") or "")
+')" || {
+	echo "check-backup-restauravel: nao foi possivel ler o sha do ensaio" >&2
+	exit 2
+}
+if [ -n "$SHA_ENSAIO" ]; then
+	if [ -z "$HEAD_ORIGEM" ]; then
+		LINHAGEM="origem sem HEAD legivel — linhagem do backup nao pode ser conferida"
+	elif ! git -C "$RAIZ" merge-base --is-ancestor "$SHA_ENSAIO" "$HEAD_ORIGEM" 2>/dev/null; then
+		LINHAGEM="sha restaurado no ensaio ($SHA_ENSAIO) nao e ancestral do HEAD da origem — o backup pode ser de outra historia"
+	fi
+fi
+
+printf '%s' "$PROBLEMAS" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for i in d["info"]:
+    print("backup: %s" % i)
+for p in d["problemas"]:
+    print("REPROVA: %s" % p)
+'
+[ -n "$LINHAGEM" ] && echo "REPROVA: $LINHAGEM"
+
+LISTA="$(printf '%s' "$PROBLEMAS" | python3 -c '
+import json, sys
+print(" | ".join(json.load(sys.stdin)["problemas"]))')"
+[ -n "$LINHAGEM" ] && LISTA="${LISTA:+$LISTA | }$LINHAGEM"
+
+if [ -z "$LISTA" ]; then
+	# O VERDE RESOLVE A CHAVE. Gate que so abre alerta e nunca o fecha deixa o
+	# painel do dono vermelho depois de a causa sumir -- medido em 2026-09-16 em
+	# dois gates desta arvore, um deles com 263 HORAS de alerta aberto enquanto a
+	# propria evidencia dizia que estava tudo verde.
+	#
+	# Alerta que nunca fecha ensina o dono a ignorar o canal, e ai o proximo
+	# incidente de verdade chega no lugar onde ele parou de olhar.
+	if [ "$ALERTAR" = "1" ] && [ -x "$RAIZ/tools/notify-owner" ]; then
+		"$RAIZ/tools/notify-owner" \
+			--chave "backup-nao-restauravel" \
+			--resolvido \
+			--titulo "Backup do wiki com prova de restauracao" \
+			--mensagem "O ensaio de restauracao voltou a passar." \
+			--evidencia "tools/check-backup-restauravel" >/dev/null 2>&1
+		rc_resolve=$?
+		# Mesma disciplina do ramo de abertura: sem `|| true`. Falha na entrega do
+		# fechamento tambem cria sensacao errada -- ali de cobertura, aqui de
+		# resolucao.
+		if [ "$rc_resolve" -ne 0 ]; then
+			echo "check-backup-restauravel: AVISO — notify-owner saiu $rc_resolve; o alerta NAO foi fechado" >&2
+		fi
+	fi
+	exit 0
+fi
+
+if [ "$ALERTAR" = "1" ] && [ -x "$RAIZ/tools/notify-owner" ]; then
+	"$RAIZ/tools/notify-owner" \
+		--chave "backup-nao-restauravel" \
+		--severidade alta \
+		--titulo "Backup do wiki sem prova de restauracao" \
+		--mensagem "$LISTA" \
+		--evidencia "tools/check-backup-restauravel" >/dev/null 2>&1
+	rc_alerta=$?
+	# SEM `|| true`. Silenciar a entrega do alerta e o defeito do BUG-149 em
+	# miniatura: os dois canais registraram "silenciado" e ninguem soube. Alerta
+	# que nao chega e pior que alerta que nao existe, porque cria sensacao de
+	# cobertura. Se o notify-owner falhar, isso sai no stderr do gate — e o
+	# tools/check-gate-pode-reprovar, que apanhou este `|| true`, estava certo.
+	if [ "$rc_alerta" -ne 0 ]; then
+		echo "check-backup-restauravel: AVISO — notify-owner saiu $rc_alerta; o alerta NAO foi entregue" >&2
+	fi
+fi
+exit 1

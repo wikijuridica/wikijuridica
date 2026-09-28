@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Reprova corpo TRUNCADO servido com status 200 — o erro que o cliente nao consegue ver.
+
+POR QUE ESTE GATE EXISTE (2026-09-01)
+-------------------------------------
+Medido em producao, reproduzido duas vezes:
+
+    GET /api/v1/lote   BORDA : 172.407 bytes,  14 registros   <- HTTP 200
+                       ORIGEM: 604.090 bytes,  51 registros
+
+O corpo era cortado no meio de um campo e a conexao morria com
+`INTERNAL_ERROR` -- mas o status ja havia saido 200. **O consumidor nao tem como
+saber que recebeu 14 de 51.** Um agente de IA que consome esse endpoint ingere dado
+truncado achando que esta completo, e essa e a forma mais literal de "confundir
+bot" que este portal pode praticar.
+
+A CAUSA, fechada: `proxy_temp_path /opt/wiki/var/nginx/proxy`
+(ops/nginx/standalone/nginx.conf:79) apontava para um diretorio `nobody:rafael`
+0700 enquanto o nginx roda como `rafael`. Sem `proxy_buffers` declarados, o default
+e ~36 KB: toda resposta maior precisa derramar em disco quando o cliente e lento --
+e o caminho pela borda/tunel e lento. O nginx nao conseguia abrir o arquivo,
+abortava a leitura do upstream, e o que ja tinha sido enviado virava a resposta.
+Corrigido o dono dos cinco diretorios temporarios, borda e origem passaram a bater.
+
+ESTE GATE EXISTE PORQUE A CAUSA PODE VOLTAR por outro caminho: alguem recriar os
+diretorios, mudar o usuario da unit, aumentar uma resposta acima do buffer, ou
+trocar o proxy. O sintoma e sempre o mesmo -- 200 com corpo menor -- e nenhum
+health check o pega, porque status e latencia ficam perfeitos.
+
+COMO ELE MEDE, e por que assim
+------------------------------
+Compara BORDA contra ORIGEM na mesma rota, e compara o corpo DESCOMPRIMIDO: a
+borda serve brotli e comparar bytes crus faria o gate acusar diferenca a cada
+mudanca de compressao. Para rota NDJSON compara tambem a CONTAGEM DE LINHAS, que e
+o que denuncia truncamento sem depender de byte exato.
+
+READ-ONLY: so faz GET com o User-Agent proprio do portal e o header de aquecimento,
+para nao contaminar a metrica de audiencia.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+
+# Rotas de RISCO: as que devolvem corpo grande pelo processo Go atraves do proxy.
+# O acervo estatico nao entra -- ele sai do disco pelo nginx, sem proxy_pass, e
+# portanto sem buffer temporario.
+ROTAS = [
+    ("/api/v1/lote", "ndjson"),
+    ("/api/v1/novidades?limite=200", "json"),
+    ("/familia/index.md", "texto"),
+]
+
+AGENTE = "wikijuridica-superficie-probe/1.0"
+
+
+def busca(url: str) -> tuple[int, bytes, str]:
+    """GET com identidade propria. Nunca com UA de bot real: e fraude no contrato."""
+    proc = subprocess.run(
+        ["curl", "-sS", "--max-time", "90", "-A", AGENTE,
+         "-H", "X-Warming-Request: true",
+         "-H", "Accept-Encoding: identity",  # descomprimido dos dois lados
+         "-w", "\n%{http_code}", url],
+        capture_output=True, timeout=120)
+    saida = proc.stdout
+    corte = saida.rfind(b"\n")
+    if corte < 0:
+        return 0, b"", proc.stderr.decode("utf-8", "replace")[:200]
+    corpo = saida[:corte]
+    try:
+        status = int(saida[corte + 1:].decode().strip())
+    except ValueError:
+        status = 0
+    return status, corpo, ""
+
+
+def veredito(rota: str, forma: str, corpo_borda: bytes, corpo_origem: bytes,
+             tolerancia: int) -> list[str]:
+    """A regra de reprovacao, isolada da rede para poder ser exercitada sem ela.
+
+    Existe separada por um motivo pratico: um gate que so foi visto PASSANDO nao
+    provou nada. Com a regra isolada, `--autoteste` a exercita sobre os numeros
+    REAIS do defeito de 2026-09-01 e demonstra a reprovacao sem depender de
+    reintroduzir o defeito em producao para ve-lo acusar.
+    """
+    achados: list[str] = []
+    if forma == "ndjson":
+        lb = len([x for x in corpo_borda.split(b"\n") if x.strip()])
+        lo = len([x for x in corpo_origem.split(b"\n") if x.strip()])
+        if lb != lo:
+            achados.append(f"{rota}: borda entregou {lb} de {lo} registros com status 200")
+    falta = len(corpo_origem) - len(corpo_borda)
+    if abs(falta) > tolerancia and not achados:
+        achados.append(f"{rota}: faltam {falta} bytes na borda, com status 200 dos dois lados")
+    return achados
+
+
+def autoteste() -> int:
+    """Exercita a regra sobre o defeito medido em 2026-09-01, sem tocar a rede."""
+    print("autoteste da regra de veredito, sobre os numeros REAIS do defeito:")
+    # O corpo que a borda entregava: 14 registros, 172.407 bytes.
+    truncado = b"\n".join([b'{"x":1}' + b"." * 12300 for _ in range(14)])
+    # O que a origem entregava: 51 registros, 604.090 bytes.
+    inteiro = b"\n".join([b'{"x":1}' + b"." * 12300 for _ in range(51)])
+    achados = veredito("/api/v1/lote", "ndjson", truncado, inteiro, 0)
+    if not achados:
+        print("  FALHOU: a regra NAO acusou 14 registros contra 51 — o gate seria decorativo")
+        return 1
+    for a in achados:
+        print(f"  acusou: {a}")
+    iguais = veredito("/api/v1/lote", "ndjson", inteiro, inteiro, 0)
+    if iguais:
+        print(f"  FALHOU: acusou corpos IGUAIS ({iguais}) — falso positivo")
+        return 1
+    print("  e nao acusa quando os corpos batem")
+    print("\nautoteste: pass")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--borda", default="https://wikijuridica.com.br")
+    ap.add_argument("--origem", default="http://127.0.0.1:8088")
+    ap.add_argument("--tolerancia-bytes", type=int, default=0,
+                    help="diferenca aceita entre borda e origem (default 0). NAO afrouxe "
+                         "isto para o gate passar: a diferenca que este gate persegue e "
+                         "corpo faltando, e corpo faltando nao tem tolerancia legitima.")
+    ap.add_argument("--autoteste", action="store_true",
+                    help="exercita a regra de veredito sobre os numeros reais do defeito, sem rede")
+    args = ap.parse_args()
+
+    if args.autoteste:
+        return autoteste()
+
+    problemas: list[str] = []
+    for rota, forma in ROTAS:
+        st_b, corpo_b, erro_b = busca(args.borda + rota)
+        st_o, corpo_o, erro_o = busca(args.origem + rota)
+
+        if erro_o or st_o != 200:
+            # Origem fora nao e o defeito que este gate persegue, e reportar como
+            # se fosse ensinaria a ignorar o alarme.
+            print(f"  {rota}: origem indisponivel (status {st_o}) — INCONCLUSIVO, nao aprovado")
+            continue
+        if st_b != 200:
+            problemas.append(f"{rota}: borda respondeu {st_b} e a origem 200")
+            continue
+
+        linha = ""
+        if forma == "ndjson":
+            lb = len([x for x in corpo_b.split(b"\n") if x.strip()])
+            lo = len([x for x in corpo_o.split(b"\n") if x.strip()])
+            linha = f", registros {lb} contra {lo}"
+        print(f"  {rota}: borda {len(corpo_b)} bytes, origem {len(corpo_o)} bytes{linha}")
+        problemas.extend(veredito(rota, forma, corpo_b, corpo_o, args.tolerancia_bytes))
+
+    if problemas:
+        print("\ncheck-corpo-integro-na-borda: FAIL")
+        for p in problemas:
+            print(f"  - {p}")
+        print("  Corpo cortado com status 200 e o defeito que o consumidor NAO consegue detectar.")
+        print("  Confira o dono de /opt/wiki/var/nginx/{body,proxy,fastcgi,scgi,uwsgi} contra o")
+        print("  User= da unit do nginx, e se ha proxy_buffers declarados no conf standalone.")
+        return 1
+
+    print("\ncheck-corpo-integro-na-borda: pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

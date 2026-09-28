@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""Coleta o dado de BUSCA do Bing Webmaster Tools e o grava como serie propria.
+
+O QUE ISTO RESPONDE E NADA MAIS NO PROJETO RESPONDIA. Origem e borda medem quem
+CHEGOU; GA4 e Clarity medem o que a pessoa fez DEPOIS de chegar. Nenhum deles diz
+quantas vezes o acervo APARECEU numa busca, para qual consulta, em que posicao, e
+quantas paginas estao no indice. Sem isso, "o portal esta sendo encontrado?" era
+pergunta sem instrumento — e foi exatamente a duvida que motivou instalar medicao
+de audiencia em 2026-08-27.
+
+Primeira coleta (2026-08-29): 717 impressoes e 15 cliques em 17 dias, com o indice
+subindo de 403 para 1.211 paginas em cinco dias. O portal tem publico de busca, e
+agora ha numero para dizer isso.
+
+POR QUE O BING E NAO O GOOGLE: o Search Console exige OAuth com credencial de
+projeto Google; o Bing Webmaster autentica com uma chave que o dono ja tem, sem
+cadastro novo nem fluxo interativo. O contrato ja abre excecao para os canais de
+descoberta da Microsoft (IndexNow); este e o lado da leitura do mesmo canal.
+
+LEDGER APPEND-ONLY, e a razao: o Bing REVISA numeros de dias recentes. Reescrever
+o arquivo perderia o historico da revisao — que e informacao, nao ruido. Cada
+linha carrega `coletado_em`; quem consome pega a ultima por dia. Linha identica a
+que ja existe nao e regravada, entao o arquivo nao incha em coleta repetida.
+
+BLOCOS POR URL (2026-09-09). Os cinco blocos originais respondem sobre o SITE; o
+que faltava era o dado por PAGINA. `GetPageStats` e um topo capado (114 linhas em
+2026-09-09), nao o acervo: com 4.667 de 10.141 paginas no indice, "quais paginas o
+Bing nunca rastreou?" continuava sem instrumento. Tres blocos novos:
+
+  urlinfo          GetUrlInfo por URL do manifesto publicado — LastCrawledDate,
+                   DiscoveryDate, DocumentSize, HttpStatus. Uma janela de 200 URLs
+                   por dia UTC, escolhida por stride deterministico: as paginas sao
+                   ordenadas por sha256(path) e o inicio da janela e
+                   (ordinal_do_dia * 200) mod N. O acervo inteiro e coberto em ~51
+                   dias, sem sorteio e sem depender de estado gravado. URL que o
+                   Bing nunca rastreou vem com DateTime.MinValue
+                   (`/Date(-62135596800000)/`), e `normaliza` a converte em `null`
+                   — e esse `null` que `generate-bing-submit-batch` consulta.
+  consulta_pagina  GetQueryPageStats para as 50 consultas com mais impressoes em
+                   GetQueryStats (soma por consulta sobre o que a API devolveu).
+  pagina_consulta  GetPageQueryStats para as 50 paginas com mais impressoes em
+                   GetPageStats (que, na API, chama a URL de `Query`).
+
+RITMO, MEDIDO E NAO SUPOSTO (2026-09-09): a API aceita 10 requisicoes por
+janela de 60 s e devolve `HTTP 400 {"ErrorCode":5,"Message":"ERROR!!!
+ThrottleHost"}` da 11a em diante; a janela nao se estende com as chamadas
+recusadas, e a 10a aceita libera a proxima ~59 s depois da primeira. `Ritmo`
+segura o passo em 10 por 62 s ANTES de bater no teto, e um ThrottleHost que
+mesmo assim chegue (outra sessao dividindo a chave) recua a janela inteira e
+repete o item uma vez. O run cheio (~305 chamadas) leva ~31 min.
+
+TETOS por execucao: `--max-requisicoes` (padrao 400) e `--tempo-maximo` em
+segundos (padrao 100 — abaixo do `timeout 120` da unit de medicao externa, que
+roda este coletor sem argumentos). O que um teto corta fica registrado no
+cursor (`data/ops/bing_webmaster_state.json`) e o proximo run DO MESMO DIA UTC
+retoma de onde parou: a janela do `urlinfo` guarda `feitas`, e os blocos de
+enriquecimento guardam as chaves ja consultadas. Assim a unit das 03:10 UTC
+(`wikijuridica-bing-submit`, com `--tempo-maximo 2400`) faz o trabalho pesado e
+a das 06:10 encontra o dia concluido e gasta so as 5 chamadas do site.
+
+CODIGOS DE SAIDA: 0 tudo coletado; 1 ao menos um bloco falhou; 2 sem credencial
+ou API inteira fora (todos os blocos pedidos falharam).
+
+Uso:
+  ./tools/collect-bing-webmaster                          # tudo, ate 100 s
+  ./tools/collect-bing-webmaster --so trafego             # so um bloco
+  ./tools/collect-bing-webmaster --so urlinfo --max-requisicoes 20
+  ./tools/collect-bing-webmaster --tempo-maximo 2400      # o run cheio da unit noturna
+"""
+import argparse
+import collections
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+ENV_LOCAL = RAIZ / ".env.local"
+SITE = RAIZ / "content" / "site.json"
+SERIE = RAIZ / "data" / "ops" / "bing_webmaster_daily.jsonl"
+CURSOR = RAIZ / "data" / "ops" / "bing_webmaster_state.json"
+MANIFESTO = RAIZ / "data" / "editorial" / "published_manifest.jsonl"
+
+CHAVE = "WIKI_BING_WEBMASTER_APIKEY"
+BASE = "https://ssl.bing.com/webmaster/api.svc/json"
+# AO SAIR PARA A REDE, O PORTAL E O WikijuridicaBot (CLAUDE.md secao 11, ordem do
+# dono de 2026-09-05). Ate 2026-09-10 esta ferramenta nao definia User-Agent
+# nenhum: `urllib.request` mandava `Python-urllib/3.x` para ssl.bing.com em ~305
+# requisicoes por dia, desde a primeira coleta. O gate `tools/check-identidade-
+# de-saida` nao viu porque ele so avalia arquivo que DEFINE um UA
+# (`if not agentes: return [], False`) — ausencia de identidade escapava da
+# regua que existe para cobrar identidade.
+# A forma e' a mesma de `internal/wikijuridicabot.UserAgentComProposito`, com o
+# proposito que descreve o que esta coleta faz: ler metadado publico de demanda
+# (consulta, impressao, rastreio) do proprio site no Bing Webmaster.
+# Medido em 2026-09-10 com este UA: GetUrlSubmissionQuota, GetCrawlIssues e
+# GetUrlInfo responderam HTTP 200 — o Bing nao discrimina a identidade canonica.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; observacao-de-demanda)")
+SCHEMA = "bing_webmaster_v1"
+
+# Cada bloco de SITE: endpoint -> como a linha do ledger se chama. Sao uma
+# requisicao cada e respondem sobre o dominio inteiro.
+BLOCOS = {
+    "trafego": ("GetRankAndTrafficStats", "busca_diaria"),
+    "rastreio": ("GetCrawlStats", "rastreio_diario"),
+    "consultas": ("GetQueryStats", "consulta_diaria"),
+    "paginas": ("GetPageStats", "pagina_diaria"),
+    "problemas": ("GetCrawlIssues", "problema_de_rastreio"),
+}
+
+# Blocos por URL/consulta: uma requisicao POR ITEM, governados pelo teto.
+ENRIQUECIMENTO = {
+    "urlinfo": "url_info",
+    "consulta_pagina": "consulta_pagina",
+    "pagina_consulta": "pagina_consulta",
+}
+
+JANELA_URLINFO = 200
+TOPO = 50
+TETO_REQUISICOES = 400
+TEMPO_MAXIMO_S = 100
+# Limite medido da API (2026-09-09): 10 aceitas por 60 s. A janela propria e
+# 2 s mais larga que a medida para nao encostar no teto por deriva de relogio.
+RITMO_POR_JANELA = 10
+RITMO_JANELA_S = 62.0
+# Quantos bytes do corpo de um erro HTTP vao para o terminal e o cursor.
+CORPO_ERRO_MAX = 200
+# Depois de tantas falhas SEGUIDAS num laco por item, a API esta fora e insistir
+# so queima o teto: o laco para e o cursor nao avanca sobre o que falhou.
+FALHAS_SEGUIDAS_MAX = 3
+
+DATA_MS = re.compile(r"/Date\((-?\d+)([+-]\d+)?\)/")
+# DateTime.MinValue serializado pelo WCF: e como o Bing diz "nunca".
+NUNCA_MS = -62135596800000
+
+
+class OrcamentoEsgotado(Exception):
+    """O teto de requisicoes da execucao foi atingido."""
+
+
+class Orcamento:
+    """Conta as requisicoes da execucao contra o teto. Toda chamada a API passa
+    por `gasta()`; o teto vale para os blocos de site e os de enriquecimento
+    somados, na ordem em que rodam."""
+
+    def __init__(self, teto):
+        self.teto = int(teto)
+        self.usadas = 0
+
+    def cabe(self):
+        return self.usadas < self.teto
+
+    def gasta(self):
+        if not self.cabe():
+            raise OrcamentoEsgotado(f"teto de {self.teto} requisicoes atingido")
+        self.usadas += 1
+
+
+class Ritmo:
+    """Segura o passo em `por_janela` requisicoes por `janela_s` segundos.
+
+    Guarda o instante de cada requisicao aceita; quando a janela esta cheia,
+    espera ate a mais antiga sair dela. `relogio` e `espera` sao injetaveis
+    para o teste correr sem dormir."""
+
+    def __init__(self, por_janela=RITMO_POR_JANELA, janela_s=RITMO_JANELA_S,
+                 relogio=time.monotonic, espera=time.sleep):
+        self.por_janela = int(por_janela)
+        self.janela_s = float(janela_s)
+        self.relogio = relogio
+        self.espera = espera
+        self.marcas = collections.deque()
+        self.esperado_s = 0.0
+
+    def _poda(self, agora):
+        while self.marcas and agora - self.marcas[0] >= self.janela_s:
+            self.marcas.popleft()
+
+    def pausa_pendente(self):
+        """Quantos segundos a proxima requisicao teria de esperar."""
+        agora = self.relogio()
+        self._poda(agora)
+        if len(self.marcas) < self.por_janela:
+            return 0.0
+        return max(0.0, self.janela_s - (agora - self.marcas[0]))
+
+    def antes(self):
+        pausa = self.pausa_pendente()
+        if pausa > 0:
+            self.espera(pausa)
+            self.esperado_s += pausa
+            self._poda(self.relogio())
+        self.marcas.append(self.relogio())
+
+    def recua(self):
+        """Depois de um ThrottleHost: a janela inteira, e as marcas zeram —
+        o que a API contou nao e mais o que este processo contou."""
+        self.espera(self.janela_s)
+        self.esperado_s += self.janela_s
+        self.marcas.clear()
+
+
+def le_chave():
+    if os.environ.get(CHAVE):
+        return os.environ[CHAVE].strip()
+    try:
+        for linha in ENV_LOCAL.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if linha.startswith("#") or "=" not in linha:
+                continue
+            nome, valor = linha.split("=", 1)
+            if nome.strip() == CHAVE:
+                return valor.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def normaliza(valor):
+    """`/Date(1786345200000-0700)/` -> `2026-05-08`; DateTime.MinValue -> None.
+
+    O epoch vem em UTC e o sufixo e apenas o fuso em que o painel exibe — somar
+    o deslocamento moveria dias inteiros de lugar. A data fica em UTC, como o
+    resto das series de data/ops.
+
+    `/Date(-62135596800000)/` e o ano 0001: e o valor que GetUrlInfo devolve em
+    LastCrawledDate e DiscoveryDate para URL que o Bing nunca visitou. Gravar
+    "0001-01-01" faria o consumidor tratar "nunca" como "ha 2.025 anos"; `None`
+    diz o que e."""
+    if not isinstance(valor, str):
+        return valor
+    achado = DATA_MS.search(valor)
+    if not achado:
+        return valor
+    ms = int(achado.group(1))
+    if ms <= NUNCA_MS:
+        return None
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).date().isoformat()
+
+
+def limpa(registro):
+    return {k: normaliza(v) for k, v in registro.items() if k != "__type"}
+
+
+def monta_url(endpoint, chave, site, extra=None):
+    parametros = {"apikey": chave, "siteUrl": site}
+    if extra:
+        parametros.update(extra)
+    return f"{BASE}/{endpoint}?" + urllib.parse.urlencode(parametros)
+
+
+def busca_json(url):
+    """A unica funcao que toca a rede. Os testes injetam outra no lugar."""
+    requisicao = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+    with urllib.request.urlopen(requisicao, timeout=45) as resposta:
+        return json.loads(resposta.read().decode("utf-8"))
+
+
+def chama(endpoint, chave, site, busca=busca_json, orcamento=None, **extra):
+    if orcamento is not None:
+        orcamento.gasta()
+    corpo = busca(monta_url(endpoint, chave, site, extra or None))
+    dados = corpo.get("d", corpo) if isinstance(corpo, dict) else corpo
+    return dados if isinstance(dados, list) else [dados]
+
+
+def linhas_existentes(serie=None):
+    """Assinatura das linhas ja gravadas, para nao regravar o identico."""
+    serie = SERIE if serie is None else serie
+    vistas = set()
+    try:
+        for linha in serie.read_text(encoding="utf-8").splitlines():
+            try:
+                d = json.loads(linha)
+            except ValueError:
+                continue
+            vistas.add(json.dumps({k: v for k, v in d.items() if k != "coletado_em"},
+                                  sort_keys=True, ensure_ascii=False))
+    except OSError:
+        pass
+    return vistas
+
+
+def carrega_manifesto(caminho=None):
+    """Paginas publicadas, uma por `unique_intent_id`, ordenadas por sha256(path).
+
+    A ordem por hash e o que torna a janela diaria um stride: prefixo de
+    diretorio ou ordem de publicacao dariam janelas de uma area so."""
+    caminho = MANIFESTO if caminho is None else caminho
+    por_intencao = {}
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        registro = json.loads(linha)
+        if registro.get("page_status", "published") != "published":
+            continue
+        chave = registro.get("unique_intent_id") or registro["path"]
+        por_intencao.setdefault(chave, registro)
+    paginas = [(hashlib.sha256(r["path"].encode("utf-8")).hexdigest(), r["path"],
+                r.get("canonical_url"))
+               for r in por_intencao.values()]
+    paginas.sort()
+    return [(path, url) for _, path, url in paginas]
+
+
+def inicio_da_janela(total, dia, janela=JANELA_URLINFO):
+    """Onde a janela do dia comeca na lista ordenada por hash: deterministico
+    a partir da data, sem depender de estado gravado."""
+    if total <= 0:
+        return 0
+    return (dia.toordinal() * janela) % total
+
+
+def seleciona_urlinfo(paginas, dia, estado, janela=JANELA_URLINFO):
+    """Devolve (inicio, feitas, pendentes) para o dia.
+
+    `estado` e o sub-objeto `urlinfo` do cursor. Se ele e do mesmo dia UTC, do
+    mesmo inicio e do mesmo total de paginas, retoma de `feitas`; senao a
+    janela e nova — quando o acervo cresce no meio do dia (a onda diaria
+    publica centenas de paginas), o indice deixa de apontar para a mesma URL e
+    retomar por posicao pularia paginas. Com menos paginas que a janela, a
+    janela e o acervo inteiro."""
+    total = len(paginas)
+    tamanho = min(janela, total)
+    inicio = inicio_da_janela(total, dia, janela)
+    feitas = 0
+    if (isinstance(estado, dict) and estado.get("dia") == dia.isoformat()
+            and estado.get("inicio") == inicio and estado.get("total") == total):
+        feitas = max(0, min(int(estado.get("feitas", 0)), tamanho))
+    pendentes = [paginas[(inicio + i) % total] for i in range(feitas, tamanho)]
+    return inicio, feitas, pendentes
+
+
+def topo_por_impressoes(registros, campo="Query", topo=TOPO):
+    """As `topo` chaves com mais impressoes somadas; desempate pela chave, para a
+    lista ser a mesma em duas execucoes sobre a mesma resposta."""
+    soma = {}
+    for registro in registros:
+        chave = registro.get(campo)
+        if not isinstance(chave, str) or not chave:
+            continue
+        try:
+            impressoes = int(registro.get("Impressions") or 0)
+        except (TypeError, ValueError):
+            impressoes = 0
+        soma[chave] = soma.get(chave, 0) + impressoes
+    ordenadas = sorted(soma.items(), key=lambda par: (-par[1], par[0]))
+    return [chave for chave, _ in ordenadas[:topo]]
+
+
+def le_estado(caminho=None):
+    caminho = CURSOR if caminho is None else caminho
+    try:
+        estado = json.loads(caminho.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return estado if isinstance(estado, dict) else {}
+
+
+def grava_estado(estado, caminho=None):
+    caminho = CURSOR if caminho is None else caminho
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    tmp = caminho.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as saida:
+        json.dump(estado, saida, ensure_ascii=False, indent=2, sort_keys=True)
+        saida.write("\n")
+        saida.flush()
+        os.fsync(saida.fileno())
+    os.replace(tmp, caminho)
+
+
+def grava_linhas(novas, serie=None):
+    serie = SERIE if serie is None else serie
+    if not novas:
+        return
+    serie.parent.mkdir(parents=True, exist_ok=True)
+    with open(serie, "a", encoding="utf-8") as saida:
+        saida.write("\n".join(novas) + "\n")
+        saida.flush()
+        os.fsync(saida.fileno())
+
+
+def corpo_do_erro(erro):
+    """Le (uma vez) o corpo de um HTTPError; e onde o Bing escreve o motivo."""
+    try:
+        return erro.read().decode("utf-8", errors="replace")[:CORPO_ERRO_MAX]
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def e_throttle(erro, corpo):
+    return (isinstance(erro, urllib.error.HTTPError)
+            and (erro.code == 429 or (erro.code == 400 and "ThrottleHost" in corpo)))
+
+
+def descreve_erro(erro, corpo=""):
+    if isinstance(erro, urllib.error.HTTPError):
+        detalhe = {401: "chave invalida", 403: "chave sem permissao para este site",
+                   400: "parametros invalidos", 429: "teto de requisicoes da API"}.get(erro.code, "")
+        if e_throttle(erro, corpo):
+            detalhe = "ThrottleHost: teto de 10 requisicoes por 60 s"
+        texto = f"HTTP {erro.code} {detalhe}".rstrip()
+        if corpo and not e_throttle(erro, corpo):
+            texto += f" — {corpo}"
+        return texto, f"erro {erro.code}"
+    return str(erro), "rede"
+
+
+class Coleta:
+    """Uma execucao: acumula linhas novas, o resumo por bloco e o cursor."""
+
+    def __init__(self, chave, site, orcamento, busca, agora, vistas, ritmo=None,
+                 tempo_maximo_s=TEMPO_MAXIMO_S, relogio=time.monotonic):
+        self.chave = chave
+        self.site = site
+        self.orcamento = orcamento
+        self.busca = busca
+        self.agora = agora
+        self.vistas = vistas
+        self.ritmo = ritmo if ritmo is not None else Ritmo(relogio=relogio)
+        self.relogio = relogio
+        self.inicio = relogio()
+        self.tempo_maximo_s = float(tempo_maximo_s)
+        self.novas = []
+        self.gravadas = 0
+        self.resumo = {}
+        self.cache = {}
+
+    def descarrega(self, serie=None):
+        """Grava no ledger o que este bloco acumulou e zera o buffer.
+
+        Chamado ao fim de CADA bloco, e nao so no fim da execucao: o run cheio
+        leva ~31 min, e um SIGTERM do `timeout` externo (ou um `urlopen` preso)
+        no meio perderia tudo que ja tinha vindo da API. Devolve o total
+        gravado na execucao."""
+        grava_linhas(self.novas, serie)
+        self.gravadas += len(self.novas)
+        self.novas = []
+        return self.gravadas
+
+    def tempo_restante(self):
+        return self.tempo_maximo_s - (self.relogio() - self.inicio)
+
+    def endpoint(self, nome, **extra):
+        """Chama a API; respostas de site sao cacheadas na execucao, porque
+        `consulta_pagina` precisa de GetQueryStats e `pagina_consulta` de
+        GetPageStats, e o bloco de site pode ja te-los pedido."""
+        chave_cache = (nome, tuple(sorted(extra.items())))
+        if not extra and chave_cache in self.cache:
+            return self.cache[chave_cache]
+        if not self.orcamento.cabe():
+            raise OrcamentoEsgotado(f"teto de {self.orcamento.teto} requisicoes atingido")
+        self.ritmo.antes()
+        registros = chama(nome, self.chave, self.site, busca=self.busca,
+                          orcamento=self.orcamento, **extra)
+        if not extra:
+            self.cache[chave_cache] = registros
+        return registros
+
+    def acrescenta(self, tipo, registro, extras=None):
+        linha = {"schema": SCHEMA, "tipo": tipo, "site": self.site}
+        if extras:
+            linha.update(extras)
+        linha.update(limpa(registro))
+        assinatura = json.dumps(linha, sort_keys=True, ensure_ascii=False)
+        if assinatura in self.vistas:
+            return 0
+        self.vistas.add(assinatura)
+        linha["coletado_em"] = self.agora
+        self.novas.append(json.dumps(linha, ensure_ascii=False, sort_keys=True))
+        return 1
+
+    def bloco_de_site(self, nome):
+        endpoint, tipo = BLOCOS[nome]
+        try:
+            registros = self.endpoint(endpoint)
+        except OrcamentoEsgotado as erro:
+            print(f"  CORTADO {nome} ({endpoint}): {erro}")
+            self.resumo[nome] = "cortado pelo teto"
+            return
+        except (urllib.error.URLError, ValueError, OSError) as erro:
+            texto, classe = descreve_erro(erro, corpo_do_erro(erro))
+            print(f"  FALHA {nome} ({endpoint}): {texto}")
+            self.resumo[nome] = classe
+            return
+        acrescentadas = sum(self.acrescenta(tipo, r) for r in registros)
+        self.resumo[nome] = f"{len(registros)} lidos, {acrescentadas} novos"
+
+    def laco_por_item(self, nome, itens, executa):
+        """Roda `executa(item)` para cada item ate o teto de requisicoes, o
+        teto de tempo ou a API cair. ThrottleHost recua a janela e repete o
+        item UMA vez; nao conta como falha. Devolve (concluidos,
+        motivo_da_parada, erro_de_api)."""
+        concluidos, falhas_seguidas, erro_api = [], 0, ""
+        for item in itens:
+            if not self.orcamento.cabe():
+                return concluidos, "cortado pelo teto", erro_api
+            if self.tempo_restante() - self.ritmo.pausa_pendente() <= 0:
+                return concluidos, "cortado pelo tempo", erro_api
+            tentativas = 0
+            while True:
+                tentativas += 1
+                try:
+                    executa(item)
+                except (urllib.error.URLError, ValueError, OSError) as erro:
+                    corpo = corpo_do_erro(erro)
+                    texto, classe = descreve_erro(erro, corpo)
+                    if e_throttle(erro, corpo):
+                        print(f"  THROTTLE {nome} em {item!r}: {texto}")
+                        if tentativas >= 2:
+                            return concluidos, "API estrangulando mesmo apos recuo", f"erro {erro.code}"
+                        if self.tempo_restante() <= self.ritmo.janela_s:
+                            return concluidos, "cortado pelo tempo (throttle)", erro_api
+                        self.ritmo.recua()
+                        continue
+                    erro_api = classe
+                    falhas_seguidas += 1
+                    print(f"  FALHA {nome} em {item!r}: {texto}")
+                    if falhas_seguidas >= FALHAS_SEGUIDAS_MAX:
+                        return concluidos, f"{falhas_seguidas} falhas seguidas", erro_api
+                    break
+                falhas_seguidas = 0
+                concluidos.append(item)
+                break
+        return concluidos, "", erro_api
+
+    def bloco_urlinfo(self, paginas, dia, estado_anterior):
+        inicio, feitas, pendentes = seleciona_urlinfo(paginas, dia, estado_anterior)
+        tamanho = min(JANELA_URLINFO, len(paginas))
+        novas_antes = len(self.novas)
+
+        def consulta(pagina):
+            path, url = pagina
+            for registro in self.endpoint("GetUrlInfo", url=url):
+                self.acrescenta(ENRIQUECIMENTO["urlinfo"], registro)
+
+        concluidos, parada, erro_api = self.laco_por_item("urlinfo", pendentes, consulta)
+        feitas += len(concluidos)
+        estado = {"dia": dia.isoformat(), "inicio": inicio, "feitas": feitas,
+                  "janela": tamanho, "total": len(paginas),
+                  "concluida": feitas >= tamanho}
+        acrescentadas = len(self.novas) - novas_antes
+        texto = f"{len(concluidos)} consultadas, {acrescentadas} novas; janela {feitas}/{tamanho} do dia"
+        if parada:
+            texto += f" ({parada})"
+        self.resumo["urlinfo"] = erro_api if (erro_api and not concluidos) else texto
+        return estado
+
+    def bloco_relacionado(self, nome, dia, estado_anterior):
+        """`consulta_pagina` e `pagina_consulta`: topo do bloco de site e uma
+        chamada por chave. As chaves ja feitas hoje ficam no cursor e nao se
+        repetem no mesmo dia UTC."""
+        if nome == "consulta_pagina":
+            base, endpoint, parametro = "GetQueryStats", "GetQueryPageStats", "query"
+            rotulo_chave, rotulo_resposta = "Consulta", "Pagina"
+        else:
+            base, endpoint, parametro = "GetPageStats", "GetPageQueryStats", "page"
+            rotulo_chave, rotulo_resposta = "Pagina", "Consulta"
+        tipo = ENRIQUECIMENTO[nome]
+        try:
+            registros_base = self.endpoint(base)
+        except OrcamentoEsgotado as erro:
+            self.resumo[nome] = "cortado pelo teto"
+            print(f"  CORTADO {nome} ({base}): {erro}")
+            return estado_anterior if isinstance(estado_anterior, dict) else {}
+        except (urllib.error.URLError, ValueError, OSError) as erro:
+            texto, classe = descreve_erro(erro, corpo_do_erro(erro))
+            print(f"  FALHA {nome} ({base}): {texto}")
+            self.resumo[nome] = classe
+            return estado_anterior if isinstance(estado_anterior, dict) else {}
+
+        chaves = topo_por_impressoes(registros_base)
+        feitas = []
+        if isinstance(estado_anterior, dict) and estado_anterior.get("dia") == dia.isoformat():
+            feitas = [c for c in estado_anterior.get("feitas", []) if isinstance(c, str)]
+        pendentes = [c for c in chaves if c not in feitas]
+        novas_antes = len(self.novas)
+
+        def consulta(chave):
+            for registro in self.endpoint(endpoint, **{parametro: chave}):
+                extras = {rotulo_chave: chave, rotulo_resposta: registro.get("Query")}
+                self.acrescenta(tipo, registro, extras)
+
+        concluidos, parada, erro_api = self.laco_por_item(nome, pendentes, consulta)
+        feitas = feitas + concluidos
+        estado = {"dia": dia.isoformat(), "feitas": feitas, "topo": len(chaves),
+                  "concluido": len(feitas) >= len(chaves)}
+        acrescentadas = len(self.novas) - novas_antes
+        texto = f"{len(concluidos)} consultadas, {acrescentadas} novas; {len(feitas)}/{len(chaves)} do dia"
+        if parada:
+            texto += f" ({parada})"
+        self.resumo[nome] = erro_api if (erro_api and not concluidos) else texto
+        return estado
+
+
+def main(argv=None, busca=busca_json, agora=None, relogio=time.monotonic, espera=time.sleep):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--so", choices=sorted(BLOCOS) + sorted(ENRIQUECIMENTO),
+                        help="coletar so um bloco")
+    parser.add_argument("--max-requisicoes", type=int, default=TETO_REQUISICOES,
+                        help=f"teto de chamadas a API nesta execucao (padrao {TETO_REQUISICOES})")
+    parser.add_argument("--tempo-maximo", type=float, default=TEMPO_MAXIMO_S,
+                        help=f"segundos antes de cortar os blocos por item (padrao {TEMPO_MAXIMO_S}; "
+                             "a API aceita 10 chamadas por 60 s, entao 200 URLs levam ~20 min)")
+    args = parser.parse_args(argv)
+    if args.max_requisicoes < 1:
+        print("--max-requisicoes precisa ser >= 1")
+        return 1
+    if args.tempo_maximo <= 0:
+        print("--tempo-maximo precisa ser > 0")
+        return 1
+
+    chave = le_chave()
+    if not chave:
+        print("sem credencial do Bing Webmaster: nada coletado e nada gravado")
+        print(f"  a chave e lida de {CHAVE}, no ambiente ou em .env.local")
+        return 2
+
+    site = json.loads(SITE.read_text(encoding="utf-8"))["base_url"].rstrip("/") + "/"
+    if agora is None:
+        agora = dt.datetime.now(dt.timezone.utc)
+    dia = agora.date()
+    blocos_site = [args.so] if args.so in BLOCOS else ([] if args.so else list(BLOCOS))
+    enriquecimento = ([args.so] if args.so in ENRIQUECIMENTO
+                      else ([] if args.so else list(ENRIQUECIMENTO)))
+
+    estado = le_estado()
+    orcamento = Orcamento(args.max_requisicoes)
+    coleta = Coleta(chave, site, orcamento, busca, agora.isoformat(), linhas_existentes(),
+                    ritmo=Ritmo(relogio=relogio, espera=espera),
+                    tempo_maximo_s=args.tempo_maximo, relogio=relogio)
+
+    blocos_estado = estado.get("blocos") if isinstance(estado.get("blocos"), dict) else {}
+
+    def persiste():
+        """Ledger e cursor a cada bloco: o que ja veio da API nao se perde se
+        o processo morrer no bloco seguinte."""
+        coleta.descarrega()
+        blocos_estado.update(coleta.resumo)
+        estado.update({"ultima_coleta": agora.isoformat(), "site": site,
+                       "linhas_novas": coleta.gravadas, "blocos": blocos_estado,
+                       "requisicoes": {"teto": orcamento.teto, "usadas": orcamento.usadas,
+                                       "tempo_maximo_s": args.tempo_maximo,
+                                       "decorrido_s": round(relogio() - coleta.inicio, 1),
+                                       "esperado_pelo_ritmo_s": round(coleta.ritmo.esperado_s, 1)}})
+        grava_estado(estado)
+
+    for nome in blocos_site:
+        coleta.bloco_de_site(nome)
+    if blocos_site:
+        persiste()
+
+    if "urlinfo" in enriquecimento:
+        paginas = carrega_manifesto()
+        estado["urlinfo"] = coleta.bloco_urlinfo(paginas, dia, estado.get("urlinfo"))
+        persiste()
+    for nome in ("consulta_pagina", "pagina_consulta"):
+        if nome in enriquecimento:
+            estado.setdefault("enriquecimento", {})
+            estado["enriquecimento"][nome] = coleta.bloco_relacionado(
+                nome, dia, estado["enriquecimento"].get(nome))
+            persiste()
+    if not blocos_site and not enriquecimento:
+        persiste()
+
+    for nome, r in coleta.resumo.items():
+        print(f"  {nome:<16} {r}")
+    print(f"\n{coleta.gravadas} linha(s) nova(s) em {SERIE.relative_to(RAIZ) if SERIE.is_relative_to(RAIZ) else SERIE}"
+          f"; {orcamento.usadas}/{orcamento.teto} requisicoes em {relogio() - coleta.inicio:.0f} s"
+          f" ({coleta.ritmo.esperado_s:.0f} s segurando o ritmo)")
+
+    falhas = [n for n, r in coleta.resumo.items() if r.startswith("erro") or r == "rede"]
+    if falhas and len(falhas) == len(coleta.resumo):
+        return 2
+    return 1 if falhas else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

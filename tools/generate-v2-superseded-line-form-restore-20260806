@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""generate-v2-superseded-line-form-restore-20260806 — devolve a FORMA da linha, não o conteúdo.
+
+O QUE ACONTECEU. Depois de diferenciar 34 títulos e restaurar os 17 que estão
+sob supersessão, o pre-commit continuou abortando:
+
+  check-v2-supersession-integrity: authenticate writing-semantic successor
+  provenance: semantic resolution does not authenticate exact unique page:
+  gloss-dissolucao-parcial
+  fatal: ref updates aborted by hook
+
+E a comparação campo a campo dizia que **nenhum valor havia mudado**. A linha
+tinha exatamente o mesmo tamanho de antes — 5.471 bytes nos dois casos.
+
+A CAUSA é serialização, não conteúdo. Os geradores de reparo escrevem com
+`json.dumps(..., sort_keys=True)`; a linha gravada anteriormente tinha outra
+ordem de chaves. Para quem lê JSON os dois documentos são idênticos; para um
+hash SHA-256, não. E o gate de supersessão autentica por hash, como deve.
+
+O QUE ESTE GERADOR FAZ. Para cada página sob supersessão que este ciclo tocou,
+grava de volta a linha EXATA que está no último commit — byte a byte.
+
+A GUARDA QUE TORNA ISSO SEGURO: a linha só é substituída se
+`json.loads(linha_do_commit) == json.loads(linha_viva)`, isto é, se os dois
+documentos forem semanticamente idênticos. Se qualquer valor divergir, a página
+é PULADA e reportada. Assim, trabalho não commitado de outra frente nunca é
+descartado — que é a diferença entre isto e um `git checkout`, proibido neste
+repositório justamente por não fazer essa distinção.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, escrita atômica com fsync,
+demais linhas preservadas byte a byte, idempotente. NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-superseded-line-form-restore-20260806 --dry-run
+    tools/generate-v2-superseded-line-form-restore-20260806
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.superseded-line-form-restore-20260806.lock"
+SUPERSEDED = ROOT / "data/editorial/v2_superseded"
+SHARDS = ROOT / "data/editorial/v2_pages"
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def intents_sob_supersessao() -> set[str]:
+    protegidos: set[str] = set()
+    for caminho in sorted(SUPERSEDED.glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                intent = json.loads(linha).get("intent_id")
+                if intent:
+                    protegidos.add(intent)
+    return protegidos
+
+
+def linha_no_commit(shard_rel: str) -> dict[str, str]:
+    """intent_id -> linha exata do último commit, para este shard."""
+    resultado = subprocess.run(
+        ["git", "show", "HEAD:" + shard_rel],
+        capture_output=True, text=True, cwd=os.fspath(ROOT))
+    if resultado.returncode != 0:
+        return {}
+    por_intent: dict[str, str] = {}
+    for linha in resultado.stdout.split("\n"):
+        if not linha.strip():
+            continue
+        intent = json.loads(linha).get("intent_id")
+        if intent:
+            por_intent[intent] = linha.strip()
+    return por_intent
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    protegidos = intents_sob_supersessao()
+    print(f"intents sob supersessão: {len(protegidos)}")
+
+    restaurados = 0
+    ja_iguais = 0
+    pulados: list[tuple[str, str]] = []
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for caminho in sorted(glob.glob(os.fspath(SHARDS / "*.jsonl"))):
+                    shard_rel = os.path.relpath(caminho, ROOT)
+                    bruto = Path(caminho).read_bytes().decode("utf-8")
+                    linhas = bruto.split("\n")
+                    fim_com_newline = bool(linhas) and linhas[-1] == ""
+                    if fim_com_newline:
+                        linhas = linhas[:-1]
+
+                    do_commit: dict[str, str] | None = None
+                    saida: list[str] = []
+                    mudou = False
+                    for raw in linhas:
+                        if not raw.strip():
+                            saida.append(raw)
+                            continue
+                        registro = json.loads(raw)
+                        intent = registro.get("intent_id")
+                        if intent not in protegidos:
+                            saida.append(raw)
+                            continue
+                        if do_commit is None:
+                            do_commit = linha_no_commit(shard_rel)
+                        antiga = do_commit.get(intent)
+                        if antiga is None:
+                            saida.append(raw)
+                            continue
+                        if antiga == raw.strip():
+                            ja_iguais += 1
+                            saida.append(raw)
+                            continue
+                        # A GUARDA: só a FORMA pode diferir.
+                        if json.loads(antiga) != registro:
+                            pulados.append((intent, "valores diferem do commit — preservado"))
+                            saida.append(raw)
+                            continue
+                        saida.append(antiga)
+                        restaurados += 1
+                        mudou = True
+                        print(f"  forma restaurada: {intent} ({shard_rel})")
+
+                    if mudou and not args.dry_run:
+                        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+                        atomic_write(Path(caminho), payload.encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    print(f"\nlinhas com a forma restaurada : {restaurados}")
+    print(f"já idênticas ao commit        : {ja_iguais}")
+    if pulados:
+        print(f"PULADAS (têm valor novo, não são só forma): {len(pulados)}")
+        for intent, motivo in pulados[:20]:
+            print(f"  {intent}: {motivo}")
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

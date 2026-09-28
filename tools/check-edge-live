@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""check-edge-live — o mundo consegue chegar na origem, ou so no cache dela?
+
+POR QUE EXISTE, e por que os tres vigias anteriores nao respondem isto:
+
+  `check-portal-health` mede a ORIGEM em 127.0.0.1 e fica verde com o tunel
+  caido. `check-tunnel-health` le as metricas LOCAIS do cloudflared — melhor,
+  mas ainda de dentro. `check-network-health` mede o uplink e, por desenho,
+  nao toca no site publico. Nenhum dos tres olha o portal do lado de FORA.
+
+  E olhar de fora, ingenuamente, engana: sondar a home devolve 200 mesmo com os
+  vinte e cinco conectores mortos, porque a Cloudflare serve aquela pagina do
+  cache dela. Mediu-se a home com `cf-cache-status: HIT` e `age` de dezesseis
+  horas — ela responderia bonito durante um apagao completo da origem.
+
+  A saida e sondar uma rota que a Cache Rule EXCLUI. `/healthz` esta fora da
+  regra (verificado na expressao em ops/cloudflare/cache-rules.json) e volta
+  sempre com `cf-cache-status: DYNAMIC`: cada requisicao atravessa borda ->
+  tunel -> nginx -> Go. Se ela responde, o caminho inteiro esta de pe. Se ela
+  falha enquanto uma pagina do acervo continua servindo, o diagnostico e exato:
+  a origem caiu e o cache esta mascarando — que e precisamente o estado que
+  ninguem enxergava.
+
+ANTI-FRAUDE: as duas sondas saem com User-Agent proprio e cabecalho de warming,
+que o nginx ja separa do trafego de audiencia. Sao duas requisicoes por
+execucao. Vigia que se conta como visita e fraude de metrica.
+
+Serie em data/ops/edge_live.jsonl — no repo, versionavel, nunca em /tmp.
+
+Uso:
+    tools/check-edge-live
+    tools/check-edge-live --json
+"""
+import argparse
+import datetime
+import json
+import os
+import random
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+import wikiuniverso  # noqa: E402
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+HISTORICO = os.path.join(ROOT, "data/ops/edge_live.jsonl")
+NOTIFICADOR = os.path.join(ROOT, "tools/notify-owner")
+SCHEMA = "edge_live_v1"
+
+BASE = "https://wikijuridica.com.br"
+# Rota fora da Cache Rule: atravessa a borda e chega na origem toda vez.
+ROTA_ORIGEM = "/healthz"
+
+AGENTE = "wikijuridica-edge-audit/1.0"
+MARCA_WARMING = "X-Warming-Request: true"
+
+# Acima disto a borda esta lenta a ponto de doer no rastreio: o Googlebot reduz
+# a taxa de rastreio quando o tempo de resposta sobe, e o portal vive de ser
+# rastreado.
+LENTO_S = 3.0
+
+
+def agora():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def sondar(url, timeout=15):
+    """Devolve (http, segundos, estado_de_cache, erro)."""
+    comando = ["curl", "-sS", "-o", "/dev/null", "--max-time", str(timeout),
+               "-A", AGENTE, "-H", MARCA_WARMING,
+               "-w", "%{http_code} %{time_total} %{header_json}", url]
+    try:
+        resultado = subprocess.run(comando, capture_output=True, text=True,
+                                   timeout=timeout + 10)
+    except (subprocess.SubprocessError, OSError) as erro:
+        return None, None, None, str(erro)[:160]
+    saida = (resultado.stdout or "").strip()
+    if not saida:
+        return None, None, None, (resultado.stderr or "sem saida").strip()[:160]
+    partes = saida.split(" ", 2)
+    try:
+        http = int(partes[0])
+        segundos = round(float(partes[1]), 3)
+    except (ValueError, IndexError):
+        return None, None, None, saida[:160]
+    estado = None
+    if len(partes) > 2:
+        try:
+            cabecalhos = json.loads(partes[2])
+            valor = cabecalhos.get("cf-cache-status")
+            if isinstance(valor, list) and valor:
+                estado = str(valor[0]).upper()
+        except ValueError:
+            pass
+    return http, segundos, estado, None
+
+
+def uma_pagina_do_acervo():
+    """Uma URL real do acervo, sorteada. Serve para distinguir 'borda viva' de
+    'origem viva' — se ela responde e a rota de origem nao, o cache esta
+    mascarando um apagao."""
+    # O UNIVERSO VEM DO ÍNDICE, NÃO DO DIRETÓRIO.
+    #
+    # Este trecho globava public/sitemaps/*.xml, que é o DEPÓSITO: tem 62
+    # arquivos, dos quais só 34 estão anunciados no public/sitemap.xml. Os 28
+    # restantes são shards aposentados em carência — servidos por compatibilidade,
+    # fora do índice. Sortear uma URL dali pode devolver rota que o portal não
+    # anuncia mais, e um alerta de "borda caída" fundado nela seria falso.
+    try:
+        urls = [u for u in wikiuniverso.urls_publicas(ROOT) if u.startswith("https://wikijuridica")]
+    except wikiuniverso.UniversoIndisponivel:
+        return None
+    urls = [u for u in urls if u.rstrip("/").count("/") > 3]
+    if not urls:
+        return None
+    return random.Random(int(agora().strftime("%Y%m%d%H"))).choice(urls)
+
+
+def avisar(chave, severidade, titulo, mensagem, evidencia, resolvido=False):
+    comando = [NOTIFICADOR, "--chave", chave, "--titulo", titulo,
+               "--mensagem", mensagem, "--origem", "check-edge-live"]
+    if resolvido:
+        comando.append("--resolvido")
+    else:
+        comando += ["--severidade", severidade, "--evidencia", evidencia]
+    try:
+        subprocess.run(comando, capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def ler_estado_anterior():
+    try:
+        with open(HISTORICO, encoding="utf-8") as arquivo:
+            ultima = None
+            for linha in arquivo:
+                ultima = linha
+            return json.loads(ultima) if ultima else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def main():
+    analisador = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    analisador.add_argument("--json", action="store_true")
+    analisador.add_argument("--sem-alerta", action="store_true")
+    argumentos = analisador.parse_args()
+
+    instante = agora()
+    http_origem, tempo_origem, cache_origem, erro_origem = sondar(BASE + ROTA_ORIGEM)
+
+    pagina = uma_pagina_do_acervo()
+    http_pagina, tempo_pagina, cache_pagina, erro_pagina = (None, None, None, None)
+    if pagina:
+        http_pagina, tempo_pagina, cache_pagina, erro_pagina = sondar(pagina)
+
+    origem_ok = http_origem == 200
+    pagina_ok = http_pagina == 200
+
+    problemas = []
+    # 530 e o codigo da Cloudflare para "nao consegui falar com a origem" — o
+    # sintoma exato de tunel fora, e o que o visitante e o crawler recebem.
+    if http_origem in (521, 522, 523, 524, 530):
+        problemas.append("borda nao alcanca a origem (HTTP %d)" % http_origem)
+    elif not origem_ok:
+        problemas.append("rota de origem respondeu %s" % (http_origem or erro_origem))
+    if origem_ok and cache_origem and cache_origem not in ("DYNAMIC", "BYPASS", "EXPIRED"):
+        # Se a rota que DEVERIA sempre ir a origem vier de cache, esta sonda
+        # deixou de provar o que promete — e um defeito da regra de cache, nao
+        # do portal, mas invalida o vigia em silencio.
+        problemas.append("rota de origem veio de cache (%s): a sonda perdeu a "
+                         "validade" % cache_origem)
+    if origem_ok and tempo_origem and tempo_origem > LENTO_S:
+        problemas.append("origem respondeu em %.2fs pela borda" % tempo_origem)
+    if pagina and not pagina_ok:
+        problemas.append("pagina do acervo respondeu %s" % (http_pagina or erro_pagina))
+
+    # O diagnostico que so esta sonda consegue dar.
+    mascarado = bool(pagina_ok and not origem_ok)
+    if mascarado:
+        problemas.append("CACHE MASCARANDO: o acervo serve da borda enquanto a "
+                         "origem esta inalcancavel")
+
+    evento = {
+        "schema_version": SCHEMA,
+        "medido_em": instante.isoformat(),
+        "rota_origem": ROTA_ORIGEM,
+        "origem_http": http_origem,
+        "origem_segundos": tempo_origem,
+        "origem_cache_status": cache_origem,
+        "origem_erro": erro_origem,
+        "pagina_amostrada": pagina,
+        "pagina_http": http_pagina,
+        "pagina_segundos": tempo_pagina,
+        "pagina_cache_status": cache_pagina,
+        "origem_alcancavel": origem_ok,
+        "cache_mascarando_queda": mascarado,
+        "problemas": problemas,
+        "ok": not problemas,
+        # QUAL chave este ciclo alertaria. Gravada para que a NORMALIZACAO
+        # resolva a chave que foi de fato aberta -- ver o comentario no bloco de
+        # alerta abaixo. Sem este campo, `borda-lenta` nunca era resolvida.
+        "chave_alertada": (
+            "borda-origem" if (mascarado or not origem_ok)
+            else ("borda-lenta" if problemas else None)
+        ),
+    }
+
+    # LER O ANTERIOR ANTES DE GRAVAR O ATUAL (BUG-060 da caca, 2026-08-29).
+    #
+    # Ate aqui a ordem era a inversa: gravava-se o evento no HISTORICO e SO
+    # ENTAO se chamava ler_estado_anterior(), que le a ULTIMA LINHA DESSE MESMO
+    # ARQUIVO. O "anterior" era, portanto, o evento recem-gravado — o proprio
+    # estado atual. Com isso `anterior_ok` nunca discordava do agora, e o ramo
+    # de resolucao (`elif not anterior_ok`) so podia ser alcancado quando NAO ha
+    # problemas, isto e, quando o evento acabado de gravar tem ok=true. Era
+    # inalcancavel por construcao.
+    #
+    # O efeito, medido no ledger: 63 alertas emitidos, ZERO resolucoes em todo o
+    # historico. Uma condicao que se cura sozinha ficava aberta para sempre —
+    # `borda-origem`, severidade CRITICA, permaneceu 38 horas aberta com
+    # /healthz devolvendo 200 na borda e na origem, edge_live com seis `ok:true`
+    # seguidos e tunnel_health declarando `degradado: false`. Alerta critico
+    # falso e pior que alerta ausente: ele dessensibiliza para o verdadeiro.
+    #
+    # tools/check-portal-health ja faz na ordem certa (le em :225, grava em
+    # :254). Aqui so se alinha ao irmao.
+    anterior = ler_estado_anterior()
+    anterior_ok = anterior.get("ok", True)
+
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(evento, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if not argumentos.sem_alerta:
+        if mascarado or not origem_ok:
+            avisar("borda-origem", "critica",
+                   "Borda nao alcanca a origem do portal",
+                   "; ".join(problemas)[:400],
+                   "tools/check-edge-live -> %s%s devolveu %s"
+                   % (BASE, ROTA_ORIGEM, http_origem or erro_origem))
+        elif problemas:
+            avisar("borda-lenta", "media", "Borda degradada",
+                   "; ".join(problemas)[:400],
+                   "tools/check-edge-live -> %.2fs" % (tempo_origem or 0))
+        elif not anterior_ok:
+            # RESOLVER A CHAVE QUE FOI ALERTADA, e nao uma chave fixa.
+            #
+            # Ate 2026-08-26 esta linha resolvia SEMPRE `borda-origem`, enquanto
+            # o ramo de alerta acima escolhe entre `borda-origem` (critica) e
+            # `borda-lenta` (media). Consequencia medida no ledger:
+            # `borda-lenta` aberta ha 159 HORAS, sem que nada a fechasse -- toda
+            # normalizacao ia carimbar a outra chave. Era esse o mecanismo que
+            # fazia o canal de alerta parecer write-only: a resolucao existia e
+            # ia para o lugar errado.
+            #
+            # Evento antigo sem o campo cai em `borda-origem`, o comportamento
+            # anterior -- nenhuma regressao para quem ja estava em ciclo aberto.
+            chave_aberta = anterior.get("chave_alertada") or "borda-origem"
+            avisar(chave_aberta, "info", "Borda normalizada",
+                   "origem alcancavel pela borda em %.2fs" % (tempo_origem or 0),
+                   "", resolvido=True)
+
+    if argumentos.json:
+        print(json.dumps(evento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("[%s] %s | origem %s em %ss (%s) | acervo %s (%s)"
+              % (instante.strftime("%Y-%m-%d %H:%M:%SZ"),
+                 "OK" if not problemas else "DEGRADADO",
+                 http_origem, tempo_origem, cache_origem or "-",
+                 http_pagina, cache_pagina or "-"))
+        for problema in problemas:
+            print("  %s" % problema)
+    # SONDA QUE NAO COMPLETOU NAO E VEREDITO, e ate 2026-08-28 era contada como
+    # um. `sondar()` devolve erro no quarto campo quando o subprocess do curl
+    # falha (OSError, timeout do proprio subprocess, saida vazia), e esse erro
+    # entrava na mesma lista `problemas` de "a borda nao alcanca a origem" --
+    # que e diagnostico de INFRAESTRUTURA CAIDA. Rede instavel na maquina que
+    # SONDA virava alarme de portal degradado.
+    #
+    # Exit 2 e "nao medi", diferente de exit 1, "medi e esta degradado". A unit
+    # mascara o 1 (veredito) e nao mascara o 2, entao so assim o dono e avisado
+    # de que o instrumento parou de funcionar.
+    if (http_origem is None and erro_origem) or (pagina and http_pagina is None and erro_pagina):
+        print("NAO MEDIDO: a sonda nao completou (origem: %s | pagina: %s) — erro de "
+              "rede da sonda, nao veredito sobre o portal."
+              % (erro_origem or "ok", erro_pagina or "ok"), file=sys.stderr)
+        return 2
+    return 1 if problemas else 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

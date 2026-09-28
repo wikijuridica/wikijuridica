@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# tools/generate-ensaio-restauracao — a prova de que o backup RESTAURA.
+#
+# ★ POR QUE EXISTE (2026-08-29, BUG-146)
+#
+# `tools/generate-backup-wiki` passou a existir em 2026-08-29 e o espelho estava
+# integro — mas integridade de espelho NAO e restaurabilidade. `git fsck` prova
+# que os objetos batem com os proprios hashes; nao prova que alguem consegue
+# tirar dali uma arvore de trabalho igual a que se perdeu. Backup que ninguem
+# restaurou e esperanca, nao engenharia, e a hora de descobrir a diferenca nao e
+# a hora em que o NVMe morreu.
+#
+# ★ O QUE ESTE ENSAIO PROVA, E COMO
+#
+# 1. MATERIALIZA de verdade. `git archive` sobre o ESPELHO le e descomprime cada
+#    blob da arvore e escreve os 16.562 arquivos em disco. Nao e amostragem: e o
+#    caminho real da restauracao, exercido inteiro.
+#
+# 2. VERIFICA POR RECOMPUTACAO INDEPENDENTE. Para cada arquivo restaurado
+#    recalcula-se, em Python, o hash de objeto do git — sha1(b"blob <n>\0" +
+#    conteudo) — e compara-se com o blob id que a arvore do espelho declara.
+#    Nao se usa `git hash-object`: pedir ao git que confira o git deixa passar
+#    exatamente a classe de defeito em que o git e o errado. O bit a bit e
+#    valido aqui porque a arvore nao tem symlink nem submodulo (medido: 15.563
+#    modos 100644 e 997 modos 100755, nada mais) e porque o .gitattributes
+#    PROIBE `binary`, `-text`, `eol=`, `working-tree-encoding=` e `filter=` —
+#    ou seja, nada altera o conteudo no checkout.
+#
+# 3. COMPARA CONTRA O SHA DO ESPELHO, NUNCA CONTRA A WORKTREE. A origem anda
+#    durante o dia (medido em 2026-08-29: 98 commits a frente do espelho seis
+#    horas depois do backup). Comparar com a worktree reprovaria um backup
+#    perfeito — foi esse exato falso negativo que o cabecalho do
+#    generate-backup-wiki ja documenta ter acontecido na primeira execucao.
+#
+# 4. CONFERE O QUE O GIT NAO GUARDA. O espelho nao cobre untracked nem
+#    .env.local; o backup os copia a parte. O ensaio confirma que estao la e
+#    compara byte a byte, por sha256, os que ainda existem identicos na origem.
+#
+# ★ DIRETORIO REUTILIZADO, NADA APAGADO
+#
+# A arvore restaurada vive em $DESTINO/restaurado e e REESCRITA por cima a cada
+# ensaio (`tar --overwrite`), nunca removida. Tres razoes: (a) nao se apaga nada
+# neste projeto; (b) um ensaio que cria e destroi 2,7 GB por semana so gasta
+# disco; (c) mantida em disco, a arvore restaurada e ela propria uma segunda
+# linha de defesa — copia quente, pronta para uso, num disco fisico diferente do
+# NVMe. Arquivo que existia num commit antigo e sumiu depois permanece ali; isso
+# nao falseia o ensaio, que so verifica os caminhos que a arvore do SHA declara.
+#
+# ★ NAO USA git checkout/reset/clone-com-hardlink
+#
+# `checkout`/`reset` sao proibidos no projeto e nao ha por que abrir excecao:
+# `git archive | tar -x` materializa a arvore sem tocar em ref, index ou
+# worktree de ninguem. Clone com hardlink seria pior ainda — compartilharia os
+# objetos com o espelho e provaria menos do que parece provar.
+
+set -u -o pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DESTINO="${WIKI_BACKUP_DIR:-/mnt/hdd/backups/wiki}"
+ESPELHO="$DESTINO/repo.git"
+SEGREDOS="$DESTINO/segredos"
+UNTRACKED_DIR="$DESTINO/untracked"
+RESTAURADO="$DESTINO/restaurado"
+LEDGER="$RAIZ/data/ops/backup_restore_ensaio.jsonl"
+AGORA="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+falha() {
+	echo "ensaio-restauracao: $*" >&2
+	exit "${2:-1}"
+}
+
+[ -d "$DESTINO" ] || falha "destino ausente: $DESTINO (o disco de backup esta montado?)" 2
+[ -d "$ESPELHO" ] || falha "espelho ausente: $ESPELHO — rode tools/generate-backup-wiki antes" 2
+
+SHA="$(git --git-dir="$ESPELHO" rev-parse HEAD 2>/dev/null)" || falha "espelho sem HEAD legivel" 1
+
+# ESPACO ANTES DE COMECAR — POR PROXY BARATO, NUNCA POR `ls-tree -l`.
+#
+# A versao original media a arvore exata com `git ls-tree -r -l`. Custou caro e
+# ficou medido: `-l` obriga o git a abrir CADA um dos 16.562 blobs so para ler o
+# tamanho, o que num HDD com cache frio vira acesso aleatorio pelo pack de
+# 6,6 GB. O processo passou seis minutos em estado D sem sequer criar o
+# diretorio de destino. Lentidao em escala e bug P0 neste projeto, e o numero
+# exato nao valia esse preco: e so uma guarda de espaco.
+#
+# PROXY: o tamanho do proprio espelho, por `du --max-depth=0` (a unica forma de
+# `du` autorizada em /mnt/hdd pela rede de seguranca do sistema). Ele e um
+# limite SUPERIOR confortavel para a arvore de trabalho — medido em 2026-08-29,
+# espelho 6,64 GiB contra arvore de 2,69 GiB, razao 0,41 — porque o pack guarda
+# a historia inteira comprimida e a arvore e so um commit descomprimido. Exigir
+# o dobro do espelho da margem sem precisar abrir um blob sequer.
+espelho_kb=$(du --max-depth=0 -k "$ESPELHO" 2>/dev/null | awk '{print $1}')
+[ -n "${espelho_kb:-}" ] || espelho_kb=0
+precisa_b=$((espelho_kb * 1024 * 2))
+livre_b=$(df -B1 --output=avail "$DESTINO" | tail -1 | tr -d ' ')
+if [ "$livre_b" -lt "$precisa_b" ]; then
+	falha "espaco insuficiente em $DESTINO: livre=${livre_b}B, exigido=${precisa_b}B (2x o espelho de $((espelho_kb / 1024)) MB)" 2
+fi
+
+inicio=$(date +%s)
+mkdir -p "$RESTAURADO"
+
+echo "ensaio-restauracao: materializando $SHA a partir do espelho"
+if ! git --git-dir="$ESPELHO" archive --format=tar "$SHA" | tar -x --overwrite -C "$RESTAURADO"; then
+	falha "extracao da arvore falhou (git archive | tar)" 1
+fi
+
+echo "ensaio-restauracao: verificando por recomputacao independente do hash"
+# A LISTAGEM DA ARVORE VEM DE DENTRO DO PYTHON, nao por pipe.
+#
+# A primeira versao fazia `git ls-tree ... | python3 - args <<'PYEOF'`. Nao
+# funciona, e falha de um jeito traicoeiro: o heredoc e o pipe disputam o MESMO
+# stdin. O heredoc vence (o programa chega inteiro), o `sys.stdin` do python ja
+# nasce em EOF, o `git ls-tree` escreve para um cano que ninguem le, leva
+# SIGPIPE, e o `set -o pipefail` transforma isso em "verificacao nao pode ser
+# executada". Passar espelho e sha como argumento e deixar o python chamar o
+# git elimina a disputa.
+VERIFICACAO="$(
+	nice -n 19 python3 - "$RESTAURADO" "$UNTRACKED_DIR" "$SEGREDOS" "$RAIZ" "$ESPELHO" "$SHA" <<'PYEOF'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+restaurado, untracked_dir, segredos, raiz, espelho, sha = sys.argv[1:7]
+
+# -z, NAO a saida padrao. Sem -z o `git ls-tree` C-QUOTA todo caminho com byte
+# fora do ASCII imprimivel — vira "arquivo\303\251.txt", entre aspas. O
+# ensaio procuraria esse nome literal, nao acharia, e reprovaria um backup
+# perfeito por "arquivo nao restaurado". Medido em 2026-08-29: a arvore tem
+# ZERO caminho nao-ASCII hoje (`git ls-files | grep -P "[^\x20-\x7e]"` = 0),
+# mas isto e um portal em portugues e o dia em que aparecer um acento em nome
+# de arquivo nao pode ser o dia em que o alerta de backup vira falso positivo —
+# alerta que mente treina a ser ignorado, que e o defeito que este ensaio
+# existe para nao ter. Com -z o git nunca cita e os registros vem separados por
+# NUL.
+listagem = subprocess.run(
+    ["git", "--git-dir", espelho, "ls-tree", "-r", "-z", sha],
+    capture_output=True, check=True,
+).stdout.decode("utf-8", "surrogateescape").split("\0")
+
+
+def hash_objeto_git(caminho):
+    """sha1(b"blob <n>\\0" + conteudo) — a mesma conta que o git faz, feita aqui.
+
+    Recomputar em vez de chamar `git hash-object` e deliberado: a pergunta do
+    ensaio e se o arquivo em disco tem o conteudo certo, e usar o git para
+    responder isso confia justamente na peca sob suspeita.
+    """
+    tamanho = os.path.getsize(caminho)
+    h = hashlib.sha1()
+    h.update(b"blob %d\0" % tamanho)
+    with open(caminho, "rb") as fh:
+        while True:
+            bloco = fh.read(4 * 1024 * 1024)
+            if not bloco:
+                break
+            h.update(bloco)
+    return h.hexdigest(), tamanho
+
+
+arquivos = 0
+bytes_verificados = 0
+ausentes = []
+divergentes = []
+modos_inesperados = []
+
+for linha in listagem:
+    if not linha:
+        continue
+    meta, caminho = linha.split("\t", 1)
+    modo, tipo, blob = meta.split()
+    if tipo != "blob" or modo not in ("100644", "100755"):
+        # Symlink (120000) ou submodulo (160000) nao existem nesta arvore, mas
+        # se um dia existirem o ensaio tem de DENUNCIAR, nunca ignorar em
+        # silencio: para eles a comparacao byte a byte nao vale.
+        modos_inesperados.append({"caminho": caminho, "modo": modo, "tipo": tipo})
+        continue
+    alvo = os.path.join(restaurado, caminho)
+    if not os.path.isfile(alvo):
+        if len(ausentes) < 20:
+            ausentes.append(caminho)
+        continue
+    obtido, tamanho = hash_objeto_git(alvo)
+    arquivos += 1
+    bytes_verificados += tamanho
+    if obtido != blob:
+        if len(divergentes) < 20:
+            divergentes.append({"caminho": caminho, "esperado": blob, "obtido": obtido})
+
+# O que o espelho do git nao cobre: untracked e segredos, copiados a parte pelo
+# generate-backup-wiki. Aqui a regua e outra — a origem continua andando, entao
+# arquivo que mudou depois do backup NAO e defeito. So a AUSENCIA e.
+untracked_no_backup = 0
+untracked_bytes = 0
+untracked_iguais = 0
+untracked_mudados = 0
+if os.path.isdir(untracked_dir):
+    for base, _dirs, nomes in os.walk(untracked_dir):
+        for nome in nomes:
+            caminho = os.path.join(base, nome)
+            rel = os.path.relpath(caminho, untracked_dir)
+            untracked_no_backup += 1
+            untracked_bytes += os.path.getsize(caminho)
+            origem = os.path.join(raiz, rel)
+            if not os.path.isfile(origem):
+                continue
+            with open(caminho, "rb") as fh:
+                a = hashlib.sha256(fh.read()).hexdigest()
+            with open(origem, "rb") as fh:
+                b = hashlib.sha256(fh.read()).hexdigest()
+            if a == b:
+                untracked_iguais += 1
+            else:
+                untracked_mudados += 1
+
+segredos_no_backup = []
+if os.path.isdir(segredos):
+    segredos_no_backup = sorted(os.listdir(segredos))
+
+problemas = []
+if ausentes:
+    problemas.append("%d arquivo(s) da arvore nao foram restaurados" % len(ausentes))
+if divergentes:
+    problemas.append("%d arquivo(s) restaurados com conteudo divergente" % len(divergentes))
+if modos_inesperados:
+    problemas.append("%d entrada(s) de modo nao verificavel byte a byte" % len(modos_inesperados))
+if arquivos == 0:
+    problemas.append("nenhum arquivo verificado — arvore vazia")
+if untracked_no_backup == 0:
+    problemas.append("nenhum untracked no backup — generate-backup-wiki nao cobriu sole-copy")
+if not segredos_no_backup:
+    problemas.append("nenhum segredo no backup")
+
+print(json.dumps({
+    "arquivos_verificados": arquivos,
+    "bytes_verificados": bytes_verificados,
+    "ausentes": ausentes,
+    "divergentes": divergentes,
+    "modos_inesperados": modos_inesperados,
+    "untracked_no_backup": untracked_no_backup,
+    "untracked_bytes": untracked_bytes,
+    "untracked_iguais_a_origem": untracked_iguais,
+    "untracked_mudados_na_origem": untracked_mudados,
+    "segredos_no_backup": segredos_no_backup,
+    "problemas": problemas,
+}))
+PYEOF
+)" || falha "verificacao nao pode ser executada" 1
+
+fim=$(date +%s)
+
+LINHA="$(printf '%s' "$VERIFICACAO" | nice -n 19 python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+d["checked_at"] = sys.argv[1]
+d["sha_restaurado"] = sys.argv[2]
+d["destino"] = sys.argv[3]
+d["duracao_s"] = int(sys.argv[4])
+print(json.dumps(d, ensure_ascii=False, sort_keys=True))
+' "$AGORA" "$SHA" "$RESTAURADO" "$((fim - inicio))")" || falha "ledger nao pode ser montado" 1
+
+mkdir -p "$(dirname "$LEDGER")"
+printf '%s\n' "$LINHA" >>"$LEDGER"
+
+PROBLEMAS="$(printf '%s' "$LINHA" | python3 -c 'import json,sys; print(" | ".join(json.load(sys.stdin)["problemas"]))')"
+RESUMO="$(printf '%s' "$LINHA" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("%d arquivos / %.2f GB verificados byte a byte, %d untracked, segredos: %s" % (
+    d["arquivos_verificados"],
+    d["bytes_verificados"] / 1073741824.0,
+    d["untracked_no_backup"],
+    ", ".join(d["segredos_no_backup"]) or "nenhum",
+))')"
+
+if [ -n "$PROBLEMAS" ]; then
+	echo "ensaio-restauracao: REPROVOU — $PROBLEMAS" >&2
+	echo "ensaio-restauracao: $RESUMO" >&2
+	exit 1
+fi
+
+echo "ensaio-restauracao: OK — $RESUMO, em $((fim - inicio))s"
+echo "ensaio-restauracao: arvore restaurada disponivel em $RESTAURADO (sha $SHA)"
+exit 0

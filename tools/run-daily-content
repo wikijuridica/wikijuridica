@@ -1,0 +1,1788 @@
+#!/usr/bin/env bash
+# run-daily-content — a onda diária: coleta, gera, verifica, publica e prova.
+#
+# POR QUE ISTO EXISTE. O portal tinha 13 timers e NENHUM produzia conteúdo —
+# todos eram de telemetria, medindo um acervo parado. E acervo parado é
+# exatamente o diagnóstico medido em 2026-08-20: o Googlebot desistiu no meio da
+# varredura (72% de cobertura, descoberta em zero desde 12/08), o GPTBot fez uma
+# rajada e congelou, e o ClaudeBot lê o acervo em markdown a ~1 página/hora.
+# Nenhum deles tem motivo para voltar a um site que não muda.
+#
+# A ORDEM AQUI NÃO É ARBITRÁRIA, e cada passo depende do anterior:
+#
+#   1. coletar   — busca o delta do dia nas fontes oficiais, com ritmo humano
+#   2. gerar     — transforma em página no formato das duas camadas (DEC-032)
+#   3. preservar — PARA a onda se algum gerador apagou página redigida
+#   4. parear    — confere intenção 1:1 ANTES de tentar commit (evita o beco em
+#                  que 4 tentativas queimaram um pre-commit inteiro cada)
+#   5. commitar  — portfólio PRIMEIRO, página DEPOIS: a autoridade de
+#                  pertinência é o commit pai, por desenho do gate
+#   6. censo     — decide o que publica, por severidade
+#   7. publicar  — transação com manifesto ⊆ sitemap ⊆ public e SHA-256 batendo
+#   8. provar    — HTTP real, markdown real, borda × disco. Relatório não é
+#                  prova; a prova é a rota responder.
+#
+# DISCIPLINA DE RECURSO: flock contra concorrência (duas ondas sobre os mesmos
+# JSONL corrompem estado), nice para não disputar CPU com sessão viva, e teto de
+# tempo por etapa — comando pesado sem condição de parada é bug P0 neste repo.
+#
+# Uso:
+#   tools/run-daily-content --seco        # coleta e gera, não commita nem publica
+#   tools/run-daily-content               # onda completa
+set -uo pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$RAIZ" || exit 2
+
+SECO=0
+# ESCOPO_DA_PASSADA fica VAZIO enquanto a passada ainda pode publicar, e e'
+# preenchido quando ela termina num desfecho previsto que NAO publicou
+# (`quarentena`). Declarado aqui, antes de qualquer `exit`, porque quem o le e'
+# `gravaEvidencia`, que roda no `trap EXIT` -- e `set -u` derrubaria o trap se
+# a variavel so nascesse mais adiante.
+ESCOPO_DA_PASSADA=""
+
+# T6.9 — onde o diagnostico da coleta sobrevive ao reboot e a proxima execucao.
+LOGS_COLETA="$PWD/data/ops/daily_content_logs"
+mkdir -p "$LOGS_COLETA"
+LEDGER_COLETA="$PWD/data/ops/daily_content_collect.jsonl"
+
+# registra_coleta grava POR FONTE o exit code e a saida, para que "falhou" deixe
+# de ser a unica informacao disponivel no dia seguinte.
+# registra_aviso anota no ledger sem entrar na lista de falhas: o que ele marca
+# nao impede a onda de publicar, mas nao pode sumir do registro.
+registra_aviso() {
+	printf '  (aviso registrado: %s)\n' "$1" >&2
+}
+
+# ★ com_teto — TETO DE TEMPO NOS PONTOS QUE NÃO TINHAM NENHUM (2026-09-16, §P10 item 5)
+#
+# O cabeçalho deste arquivo já declarava, desde que ele nasceu, "teto de tempo
+# por etapa — comando pesado sem condição de parada é bug P0 neste repo". A
+# declaração era verdadeira só para os passos de coleta, geração e publicação.
+# Contados em 2026-09-16, sobravam **22 invocações NUAS**: os 3 `git add`, os 3
+# `git commit`, os 7 gates da onda (8 invocações, porque
+# `check-edge-discovery-freshness` é chamado duas vezes), o
+# `reload-wiki-server`, o `generate-brotli-static`, o
+# `listar-produtores-de-pagina` e as 5 gravações de ledger/alerta em `python3`.
+# (O plano dizia 19; o número que vale é o que se conta, e são 22.)
+#
+# O QUE UM PONTO NU CUSTA, MEDIDO. Um `git commit` sem teto fica preso ao
+# pre-commit, que compila o ÍNDICE: 77,6 s com um pacote grande sentado nele
+# contra 14,9 s com o índice limpo. Preso ali, a onda não termina, o `flock`
+# não é liberado, e a onda do dia seguinte não roda. Nada cai — e é exatamente
+# por isso que ninguém percebe.
+#
+# POR QUE ISTO NÃO É "AUMENTAR TETO", QUE O §4 DO CONTRATO PROÍBE. Não há teto
+# a aumentar: há teto a CRIAR onde não existia. E os valores abaixo são
+# deliberadamente FOLGADOS — de 8× a 20× o custo medido de cada passo —, porque
+# o defeito que eles fecham é "roda para sempre", não "roda devagar". Teto
+# apertado trocaria uma onda travada por uma onda mutilada.
+#
+# `timeout` SEM `--kill-after`, E ISSO É DECISIVO NO `git`. O SIGTERM deixa o
+# git rodar a própria limpeza e remover `.git/index.lock`; o SIGKILL do
+# `--kill-after` o mataria com o lock no disco, e um `index.lock` órfão trava
+# TODA a árvore — inclusive as outras sessões deste repositório, que
+# compartilham o índice. Trocar um passo travado por uma árvore travada é
+# regressão, e é o motivo de este wrapper não ter `-k`.
+#
+# 124 É "MORTO PELO RELÓGIO", e ele sai nomeado. `timeout` devolve 124 quando o
+# teto dispara; 137 quando alguém de fora mandou SIGKILL. Sem esta distinção,
+# o operador lê "falhou" e vai investigar conteúdo onde não há conteúdo a
+# investigar — o mesmo diagnóstico que `tools/deploy-publico:442` já separa
+# para o ingest. O código volta intacto para quem chamou: este wrapper não
+# decide nada, só limita e nomeia.
+com_teto() {
+	local segundos="$1" rotulo="$2"
+	shift 2
+	local rc=0
+	timeout "${segundos}s" "$@" || rc=$?
+	case "$rc" in
+	124)
+		printf '  TETO ESTOURADO: `%s` passou de %ss e recebeu SIGTERM. Isto NÃO é reprovação de conteúdo — não há o que investigar no acervo. Meça o passo isolado antes de mexer no número.\n' "$rotulo" "$segundos" >&2
+		;;
+	137)
+		printf '  MORTO POR SIGKILL: `%s` foi terminado de fora (exit 137) — teto de %ss, OOM killer ou `kill -9` de outra sessão.\n' "$rotulo" "$segundos" >&2
+		;;
+	esac
+	return "$rc"
+}
+
+registra_coleta() {
+	local fonte="$1" codigo="$2" saida="$3"
+	com_teto 120 "gravacao do ledger de coleta" python3 - "$fonte" "$codigo" "$saida" "$LEDGER_COLETA" <<'PYEOF' 2>/dev/null || true
+import json, sys, datetime
+fonte, codigo, saida, ledger = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(ledger, "a", encoding="utf-8") as f:
+    f.write(json.dumps({
+        "schema_version": "daily_content_collect_v1",
+        "medido_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "fonte": fonte,
+        "exit_code": int(codigo),
+        "ok": int(codigo) == 0,
+        "saida": saida,
+    }, ensure_ascii=False) + "\n")
+PYEOF
+}
+
+TRAVA=/tmp/wiki-daily-content.lock
+LEDGER="$RAIZ/data/ops/daily_content_runs.jsonl"
+HOJE="$(date +%F)"
+INICIO="$(date +%s)"
+
+# Uma onda por vez. Sem isto, duas execuções escrevem os mesmos shards e o
+# vencedor é o último a fechar o arquivo — perda silenciosa de trabalho pago.
+exec 9>"$TRAVA"
+if ! flock -n 9; then
+	echo "outra onda diária já está rodando (trava $TRAVA); saindo sem fazer nada."
+	exit 0
+fi
+
+GO="./tools/go-modern"
+
+# --somente-noticias (2026-09-09): a onda das 04:20 roda as cinco familias; esta
+# passada roda SO o canal de noticia, para publicar o que a coleta das 11:50
+# trouxe sem esperar a madrugada seguinte.
+#
+# POR QUE UMA SEGUNDA PASSADA, e nao mais coleta: a latencia coleta->publicacao
+# medida hoje e de ~15 h na mediana e 31 h no maximo, e ela nao cai por coletar
+# mais cedo — cai por publicar mais de uma vez ao dia. Com a publicacao das
+# 12:20 a mediana vai a ~7 h.
+#
+# O QUE ELA NAO MUDA: as etapas 3 a 9 rodam na integra (preservacao, pareamento,
+# commit, censo, publicacao transacional, prova em HTTP real e IndexNow), sob o
+# MESMO flock /tmp/wiki-daily-content.lock. Publicar por atalho seria a fraude
+# operacional que o parágrafo 5 do contrato proibe.
+# ★ A MESMA CADEIA, APONTADA PARA OUTRO CONJUNTO DE PRODUTORES (2026-09-16, §P6)
+#
+# O §P6 do plano do cerebro prescrevia um `tools/publicar-estoque` que rodaria
+# "as etapas 2.5->9 VERBATIM". VERBATIM e' o mesmo CODIGO, nao uma copia dele:
+# uma segunda escada de nove degraus envelheceria sozinha, e este repositorio ja
+# pagou tres vezes por regra duplicada (a comparacao do censo chegou a ter TRES
+# implementacoes, e `tools/publicar` passou a delegar ao check por causa disso).
+#
+# Entao a cadeia nao se copia — ela ganha PARA ONDE APONTAR:
+#
+#   --gatilho=<g>       qual conjunto de produtores de `ops/produtores-de-pagina.jsonl`
+#                       entra nesta passada. `onda-diaria` (o padrao, as cinco
+#                       familias das 04:20) ou `publicador-cerebro` (o motor de
+#                       acordaos, que NAO entra na onda e tem timer proprio).
+#                       O conjunto e' FECHADO e quem o valida e'
+#                       `tools/listar-produtores-de-pagina`, que ja o declara.
+#   --somente=<canal>   estreita a passada a UM canal do gatilho escolhido.
+#   --sem-coleta        nao vai a rede. O publicador do cerebro publica o que o
+#                       cerebro JA produziu; recoletar 200 itens de quatro feeds
+#                       oficiais a cada peca redigida seria requisicao a fonte
+#                       de terceiro disparada por evento interno nosso.
+#   --rotulo=<texto>    a identidade DESTA passada no ledger, no alerta e na
+#                       mensagem de commit. Sem ele, a falha do publicador
+#                       abriria (e o sucesso dele FECHARIA) o alerta da onda
+#                       diaria, e `check-onda-avanca` gravaria as duas sob o
+#                       mesmo nome.
+#   --minimo-novas=<N>  piso de rotas INEDITAS que a passada tem de publicar
+#                       para a etapa 8.6/9 considerar que ela avancou. 1 na
+#                       onda, que existe para trazer rota nova. Ver o comentario
+#                       da 8.6/9 para o caso em que 0 e' o numero CERTO, e nao
+#                       um afrouxamento.
+#   --commit-restrito   as tres etapas de commit (5/9, 6/9 e 8.05/9) passam por
+#                       `tools/cerebro-commitar`, a UNICA porta pela qual a
+#                       publicacao autonoma escreve historico: allowlist derivada
+#                       do registro de produtores, conferida por caminho canonico
+#                       resolvido; so arquivo regular; nunca diretorio, symlink,
+#                       `..` ou remocao; e nenhum subcomando destrutivo, porque
+#                       nao ha parametro que o expresse.
+#
+#                       SUPERSESSAO DATADA (2026-09-16). Ate esta manha a flag se
+#                       chamava `--sem-git` e a passada NAO commitava: a ordem do
+#                       dono era *"criar, fazer build, deploy, menos git,
+#                       historico e delecao de qualquer especie"*, e a vedacao
+#                       estava em `ReadOnlyPaths=/opt/wiki/.git` nas units (ela
+#                       funcionava: `touch` em `.git` falhava e `git show HEAD:`
+#                       nao). A politica mudou no MESMO dia -- *"o cerebro precisa
+#                       publicar acordao. Mude a engenharia, ele deve publicar.
+#                       (...) Se for seguro ele pode commitar."* Caiu a PROIBICAO;
+#                       ficou o criterio de SEGURANCA, que agora e' esta flag mais
+#                       o wrapper. A delecao continua vedada, e essa parte da ordem
+#                       NAO mudou.
+#
+#                       A REPROVACAO DO COMMIT NAO E' UM DESFECHO SO. O wrapper
+#                       classifica por CAUSA e devolve a classe no exit code:
+#                       1 PECA (quarentena, espera correcao), 3 AMBIENTE
+#                       (retomada, sem consumir tentativa da peca), 4 HOOK
+#                       (retomada + alerta do defeito do gate). Sem isso, a
+#                       contencao de compilacao medida nesta sessao -- "compile
+#                       closure excedeu 76.5s concedidos", que passou na
+#                       retentativa sem uma linha alterada -- mandaria a peca para
+#                       quarentena PARA SEMPRE por defeito que nao e' dela.
+#
+# --somente-noticias (2026-09-09): a onda das 04:20 roda as cinco familias; esta
+# passada roda SO o canal de noticia, para publicar o que a coleta das 11:50
+# trouxe sem esperar a madrugada seguinte. Continua valendo palavra por palavra
+# e e' hoje um APELIDO de `--somente=noticias` mais o filtro do coletor: a unit
+# das 12:20 a invoca por este nome, e renomear flag viva quebraria a unit que
+# funciona.
+#
+# POR QUE UMA SEGUNDA PASSADA, e nao mais coleta: a latencia coleta->publicacao
+# medida hoje e de ~15 h na mediana e 31 h no maximo, e ela nao cai por coletar
+# mais cedo — cai por publicar mais de uma vez ao dia. Com a publicacao das
+# 12:20 a mediana vai a ~7 h.
+#
+# O QUE ELA NAO MUDA: as etapas 3 a 9 rodam na integra (preservacao, pareamento,
+# commit, censo, publicacao transacional, prova em HTTP real e IndexNow), sob o
+# MESMO flock /tmp/wiki-daily-content.lock. Publicar por atalho seria a fraude
+# operacional que o parágrafo 5 do contrato proibe.
+SOMENTE_NOTICIAS=0
+GATILHO="onda-diaria"
+SOMENTE_CANAL=""
+SEM_COLETA=0
+COMMIT_RESTRITO=0
+ROTULO=""
+MINIMO_NOVAS=1
+# UNIT_DA_PASSADA e' o `%N` da unit que invoca este script -- o mesmo `%i` que
+# `wikijuridica-alerta@.service` usa para montar a chave `unit-falhou-%i`. Sem
+# ele, a passada do publicador RESOLVERIA o alerta de falha da unit da ONDA. As
+# units passam `--unit=%N`, que o systemd expande para o proprio nome; o default
+# preserva, palavra por palavra, a chave que a onda ja resolve desde 2026-08-26.
+UNIT_DA_PASSADA="wikijuridica-daily-content"
+for argumento in "$@"; do
+	case "$argumento" in
+	--seco) SECO=1 ;;
+	--somente-noticias) SOMENTE_NOTICIAS=1 ;;
+	--gatilho=*) GATILHO="${argumento#*=}" ;;
+	--somente=*) SOMENTE_CANAL="${argumento#*=}" ;;
+	--sem-coleta) SEM_COLETA=1 ;;
+	--commit-restrito) COMMIT_RESTRITO=1 ;;
+	--rotulo=*) ROTULO="${argumento#*=}" ;;
+	--minimo-novas=*) MINIMO_NOVAS="${argumento#*=}" ;;
+	--unit=*) UNIT_DA_PASSADA="${argumento#*=}" ;;
+	*)
+		echo "run-daily-content: argumento desconhecido: $argumento" >&2
+		echo "  uso: run-daily-content [--seco] [--somente-noticias] [--gatilho=G]" >&2
+		echo "       [--somente=CANAL] [--sem-coleta] [--commit-restrito] [--rotulo=TEXTO]" >&2
+		echo "       [--minimo-novas=N] [--unit=NOME]" >&2
+		exit 2
+		;;
+	esac
+done
+# O apelido e' resolvido AQUI, num lugar so: o resto do arquivo conhece apenas
+# SOMENTE_CANAL, e nao ha um segundo `if SOMENTE_NOTICIAS` decidindo geracao
+# mais adiante. (O filtro do COLETOR continua sendo dele, porque o mapa de
+# coletores nao esta no registro de produtores e canal != fonte.)
+if [ "$SOMENTE_NOTICIAS" = "1" ]; then
+	SOMENTE_CANAL="noticias"
+fi
+[ -n "$ROTULO" ] || ROTULO="$GATILHO"
+case "$MINIMO_NOVAS" in
+'' | *[!0-9]*)
+	echo "run-daily-content: --minimo-novas exige inteiro nao negativo, veio '$MINIMO_NOVAS'" >&2
+	exit 2
+	;;
+esac
+# ROTULO vai para `notify-owner --chave`, para `check-onda-avanca --rotulo` e
+# para a mensagem de commit. Espaco ou barra ali produziria chave de alerta que
+# nao casa com a que resolve, e mensagem de commit com quebra.
+case "$ROTULO" in
+*[!a-zA-Z0-9_-]*)
+	echo "run-daily-content: --rotulo aceita so letras, digitos, hifen e sublinhado; veio '$ROTULO'" >&2
+	exit 2
+	;;
+esac
+
+# ★ QUARENTENA — o destino unico da falha quando a passada nao escreve historico
+#
+# Ordem do dono, 2026-09-16: *"nao tem poder de excluir, somente quarentenar
+# para o Claude Code refinar depois (...) Se der erro, deve entrar em
+# quarentena."* Quarentena aqui NAO e' pasta para onde se move arquivo: mover
+# seria deslocar trabalho, e o que ha de mais proximo de apagar num repositorio
+# e' tirar o arquivo do lugar em que os consumidores o procuram. O estoque FICA
+# exatamente onde esta, na worktree, e o que se grava e' um REGISTRO datado do
+# que ficou esperando e por que — no mesmo desenho append-only de
+# `data/ops/refinement_queue.jsonl`.
+#
+# O ledger e' `data/ops/publicacao_quarentena.jsonl`. Ele responde, sem
+# adivinhacao, as tres perguntas que a proxima sessao faz: o que esta parado,
+# desde quando, e qual e' o ato que o destrava.
+QUARENTENA="$PWD/data/ops/publicacao_quarentena.jsonl"
+
+# ★ commita_restrito — a UNICA forma de esta cadeia escrever historico quando a
+# passada e' do publicador autonomo. Ela nunca invoca git de escrita: chama
+# `tools/cerebro-commitar`, que valida a allowlist e serializa no lock de commit.
+#
+# O VALOR DE RETORNO E' A CLASSE, e e' por isso que ele nao se resume a 0/1:
+#   0 commitou (ou nada havia)   1 PECA      3 AMBIENTE   4 HOOK   2 recusa da porta
+# Quem chama decide o destino com a classe na mao -- quarentena que espera
+# correcao, ou retomada que nao cobra tentativa da peca.
+CLASSE_DO_COMMIT=""
+commita_restrito() {
+	local tipo="$1"
+	shift
+	CLASSE_DO_COMMIT=""
+	com_teto 1200 "cerebro-commitar $tipo" ./tools/cerebro-commitar \
+		--tipo "$tipo" --rotulo "$ROTULO" -- "$@"
+	local codigo=$?
+	case "$codigo" in
+	0) CLASSE_DO_COMMIT="ok" ;;
+	1) CLASSE_DO_COMMIT="peca" ;;
+	3) CLASSE_DO_COMMIT="ambiente" ;;
+	4) CLASSE_DO_COMMIT="hook" ;;
+	2) CLASSE_DO_COMMIT="recusa_da_porta" ;;
+	*) CLASSE_DO_COMMIT="desconhecida_$codigo" ;;
+	esac
+	return "$codigo"
+}
+
+# destino_da_classe traduz a classe em ESCOPO da passada. `quarentena` diz que a
+# peca espera correcao; `retomada` diz que a proxima passada tenta de novo e que
+# a tentativa NAO se cobra dela (`tools/publicar-estoque` so cobra tentativa
+# quando o escopo da ultima linha do ledger e' `completa`).
+destino_da_classe() {
+	case "$1" in
+	peca) echo "quarentena" ;;
+	ambiente | hook) echo "retomada" ;;
+	*) echo "abortada" ;;
+	esac
+}
+quarentena() {
+	local motivo="$1" detalhe="$2" destrava="$3"
+	shift 3
+	printf '  QUARENTENA [%s]: %s\n' "$motivo" "$detalhe"
+	printf '    destrava: %s\n' "$destrava"
+	com_teto 120 "gravacao da quarentena" python3 - \
+		"$QUARENTENA" "$ROTULO" "$GATILHO" "$motivo" "$detalhe" "$destrava" "$@" <<'PYQUARENTENA' || true
+import datetime, json, sys
+ledger, rotulo, gatilho, motivo, detalhe, destrava, *caminhos = sys.argv[1:]
+with open(ledger, "a", encoding="utf-8") as saida:
+    saida.write(json.dumps({
+        "schema_version": "publicacao_quarentena_v1",
+        "quando": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "rotulo": rotulo,
+        "gatilho": gatilho,
+        "motivo": motivo,
+        "detalhe": detalhe,
+        "destrava": destrava,
+        "caminhos": [c for c in caminhos if c],
+    }, ensure_ascii=False) + "\n")
+PYQUARENTENA
+}
+falhas=()
+# ★ A ETAPA CORRENTE E O FIM VERDADEIRO SAO FATO, E O ESCOPO ERA PROXY (2026-09-16).
+#
+# Medido as 17:52: a passada parou na 4/9 (`registra "texto-repetido"; exit 1`) e
+# o ledger gravou `escopo: completa`, porque o trap grava `completa` sempre que
+# `ESCOPO_DA_PASSADA` esta vazio -- e o `exit 1` direto do gate nunca preenche
+# essa variavel. Quem leu o ledger (o publicador autonomo) imprimiu "cadeia
+# completou: sim" para uma cadeia que parou no meio. Campo-proxy nao e
+# campo-fato: agora a linha declara ONDE parou e SE o gerador do canal concluiu.
+ETAPA_ATUAL=""
+CHEGOU_AO_FIM=0
+GEROU=0
+etapa() {
+	ETAPA_ATUAL="$1"
+	printf '\n=== %s ===\n' "$1"
+}
+registra() {
+	falhas+=("$1")
+	printf '  FALHA: %s\n' "$1" >&2
+}
+
+# vereditoDe devolve a LINHA que diz o que o gate achou, nao o nome dele.
+#
+# POR QUE (medido em 2026-08-28): a onda reprovou em check-lastmod-causalidade e o
+# alerta que chegou ao desktop dizia "Falhou em: check-lastmod-causalidade". O que
+# o gate REALMENTE escreveu, no log que ninguem abre, era "REPROVADO: reviewed_at
+# avancou em 10102 rota(s) sem o conteudo mudar -- a pagina afirma revisao de
+# advogado que nao ocorreu". Nome de gate nao e achado: o dono leu o alerta e nao
+# tinha como saber que 10.102 paginas afirmavam revisao inexistente.
+#
+# Uma linha por gate, e no maximo 160 caracteres: notify-send trunca corpo longo,
+# e tres vereditos truncados nao valem mais que tres vereditos curtos.
+vereditoDe() {
+	local gate="$1" log="$LOGS_COLETA/$1.log" linha=''
+	[[ -r "$log" ]] || {
+		printf '%s (sem log)' "$gate"
+		return 0
+	}
+	linha=$(grep -m1 -E '^[[:space:]]*(REPROVADO|FALHA|ERRO)' "$log" 2>/dev/null || true)
+	[[ -n "$linha" ]] || linha=$(grep -m1 -E '\S' "$log" 2>/dev/null || true)
+	[[ -n "$linha" ]] || {
+		printf '%s (log vazio)' "$gate"
+		return 0
+	}
+	printf '%s: %.160s' "$gate" "$(printf '%s' "$linha" | sed 's/^[[:space:]]*//')"
+}
+
+# montaMensagemFalha diz o que aconteceu, e nao mente sobre o que nao aconteceu.
+#
+# A frase anterior era "As etapas seguintes nao rodaram" -- FALSA para a maioria
+# das falhas: os gates de 8.7/9 rodam DEPOIS da publicacao e o proprio bloco
+# declara que "nenhum deles PARA a onda". O dono lia "a onda parou" num dia em
+# que a onda publicou 10.111 paginas e apenas reprovou o resultado.
+montaMensagemFalha() {
+	local vereditos=() f
+	for f in "${falhas[@]}"; do
+		[[ -n "$f" ]] && vereditos+=("$(vereditoDe "$f")")
+	done
+	local corpo
+	corpo=$(printf '%s\n' "${vereditos[@]}")
+	printf '[%s] %d verificacao(oes) reprovaram:\n%s' "$HOJE" "${#vereditos[@]}" "$corpo"
+}
+
+# ---------------------------------------------------------------- EVIDÊNCIA
+# gravaEvidencia roda por TRAP, e não no fim do fluxo feliz. A diferença não é
+# estilo: três etapas desta onda (preservação, reparo quebrado, texto partido)
+# terminam com `exit 1` no meio do script, e o bloco de evidência ficava DEPOIS
+# delas. Quando uma dessas paradas acontecia não havia linha no ledger, não
+# havia alerta, e — porque a unit declara `SuccessExitStatus=0 1` — o systemd
+# registrava SUCESSO e o `OnFailure=wikijuridica-alerta@` não disparava.
+#
+# Ou seja: a onda parava de madrugada, nada era publicado, e o único rastro era
+# uma linha de stderr dentro do journal. O trap fecha isso para TODA saída — as
+# três atuais e qualquer outra que venha a existir.
+gravaEvidencia() {
+	local codigo=$?
+	trap - EXIT # dispara uma vez só: o `exit` daqui de dentro reentraria
+	local duracao=$(($(date +%s) - INICIO))
+	local resultado
+	resultado=$([[ ${#falhas[@]} -eq 0 ]] && echo ok || echo parcial)
+	mkdir -p "$(dirname "$LEDGER")"
+	# ★ A LINHA DECLARA SE A ONDA FOI COMPLETA (2026-08-29, achado do crítico
+	# adversarial sobre o BUG-018).
+	#
+	# `--seco` sai com exit 0 no passo 2/9, ANTES de preservação, commit e
+	# publicação — e o trap grava a linha do mesmo jeito, com `resultado: "ok"` e
+	# `falhas: []`. Sem um campo que os distinga, a linha de um ensaio é
+	# indistinguível da linha de uma onda inteira.
+	#
+	# A consequência é operacional e concreta: o reconciliador de alertas fecha a
+	# chave `onda-diaria` quando a última linha diz "ok" — então um `--seco`
+	# rodado por qualquer motivo FECHARIA o alerta de uma publicação que nunca
+	# aconteceu. Alerta que se fecha sozinho sem a condição ter sido curada é pior
+	# que alerta nenhum, porque ensina o dono a confiar no canal errado.
+	#
+	# `escopo` é aditivo: linha antiga sem o campo continua legível, e o
+	# reconciliador trata ausência como "não sei", nunca como "completa".
+	#
+	# ★ `quarentena` E' O TERCEIRO ESCOPO (2026-09-16), pelo MESMO argumento.
+	#
+	# A passada que para antes de publicar porque o estoque novo espera commit
+	# sai com exit 0 — desfecho previsto, nao falha — e portanto chegaria aqui
+	# com `resultado: ok` e `falhas: []`, indistinguivel de uma passada que
+	# publicou. O reconciliador de alertas fecha a chave quando a ultima linha
+	# diz "ok": uma passada quarentenada FECHARIA o alerta de uma publicacao que
+	# nao aconteceu.
+	#
+	# ★ `completa` SO COM O FIM VERDADEIRO (2026-09-16, medido as 17:52). Ver o
+	# comentario de `etapa()`: sem `CHEGOU_AO_FIM`, toda parada por `exit 1`
+	# direto de gate era gravada como `completa`. O escopo novo `parou_em_etapa`
+	# diz o que aconteceu, e o campo `parou_em` diz onde. Para o reconciliador de
+	# alertas isso cai no lado SEGURO: linha que nao e `completa` nao fecha alerta
+	# de publicacao nenhuma.
+	local escopo
+	if [[ ${SECO:-0} -eq 1 ]]; then
+		escopo=ensaio
+	elif [[ -n "${ESCOPO_DA_PASSADA:-}" ]]; then
+		escopo="$ESCOPO_DA_PASSADA"
+	elif [[ ${CHEGOU_AO_FIM:-0} -eq 1 ]]; then
+		escopo=completa
+	else
+		escopo=parou_em_etapa
+	fi
+	# TETO ATE AQUI, E ESTE E O MAIS IMPORTANTE DOS 22: esta funcao roda no
+	# `trap EXIT`. Um `python3` preso aqui — disco cheio, NFS travado, arquivo
+	# sob lock — impede a onda de TERMINAR, e o `flock` so e liberado quando o
+	# processo morre. A onda do dia seguinte nao roda, e nada cai para denunciar.
+	# ★ `rotulo`, `gatilho` e `canal` sao ADITIVOS (2026-09-16): linha antiga sem
+	# eles continua legivel, e quem soma o ledger deixa de misturar a onda das
+	# 04:20 com as passadas do publicador autonomo do cerebro. Sem esses tres
+	# campos, "a onda de hoje publicou N" viraria a soma de passadas diferentes
+	# sobre estoques diferentes -- serie que nao separa produtor nao mede
+	# produtor nenhum.
+	com_teto 120 "gravacao do ledger da onda" python3 - "$LEDGER" "$HOJE" "${paginas_geradas:-0}" "$duracao" "$resultado" "$escopo" "$ROTULO" "$GATILHO" "$SOMENTE_CANAL" "${GEROU:-0}" "${ETAPA_ATUAL:-}" "${falhas[@]:-}" <<'PYLEDGER'
+import json, sys
+(ledger, dia, geradas, duracao, resultado, escopo, rotulo, gatilho, canal,
+ gerou, etapa, *falhas) = sys.argv[1:]
+falhas = [f for f in falhas if f]
+linha = {
+    "data": dia, "paginas_geradas": int(geradas or 0),
+    "duracao_segundos": int(duracao), "resultado": resultado,
+    "escopo": escopo,
+    "rotulo": rotulo,
+    "gatilho": gatilho,
+    "canal": canal or "todos",
+    # `gerou` e' o FATO que decide se uma peca teve chance: o gerador do canal
+    # concluiu a etapa 2/9. Cobrar tentativa por "a cadeia chegou ao fim" seria
+    # errado nos dois sentidos -- gate global que para a cadeia em 4/9 congelaria
+    # a contagem para sempre, e a peca que o proprio gerador tentou e nao
+    # entregou nunca chegaria ao teto.
+    "gerou": gerou == "1",
+    "falhas": falhas,
+}
+if escopo != "completa" and etapa:
+    linha["parou_em"] = etapa
+with open(ledger, "a", encoding="utf-8") as saida:
+    saida.write(json.dumps(linha, ensure_ascii=False) + "\n")
+PYLEDGER
+
+	if [[ ${#falhas[@]} -gt 0 ]]; then
+		# notify-owner é o canal único do repo e alcança o dono no desktop; o
+		# journal não alcança ninguém. Severidade alta porque onda parada é dia sem
+		# publicação — o portal deixa de ser fonte viva justamente no dia em que a
+		# fonte oficial mudou.
+		# T6.10 — A CHAVE NÃO CARREGA MAIS A DATA, e a diferença é o alarme funcionar.
+		#
+		# Até 2026-08-26 a chave era `onda-diaria-$HOJE`. Com a data dentro, cada dia
+		# criava uma chave NOVA: seis dias da MESMA falha viraram seis alertas
+		# "novos", nenhum deles envelhecendo, nenhum escalando. Medido no ledger:
+		# SETE chaves `onda-diaria-*` abertas ao mesmo tempo, uma por dia, para UM
+		# defeito — e o consumidor de alertas teve de agrupá-las por prefixo para
+		# enxergar que era um só.
+		#
+		# Com chave estável, a reincidência vira o sinal: o ledger acumula na MESMA
+		# chave, a idade cresce, e `check-owner-alerts-abertos` escala por prazo.
+		# A data continua na mensagem, onde ela informa sem fragmentar o alarme.
+		# TETO: `notify-owner` FALA COM A REDE. No trap EXIT, sem teto, uma
+		# conexao pendurada segura a onda e o flock por tempo indefinido.
+		#
+		# ★ A CHAVE E' O ROTULO DA PASSADA (2026-09-16). Com a chave literal
+		# `onda-diaria`, a falha do publicador autonomo abriria — e o sucesso
+		# dele FECHARIA — o alerta da onda das 04:20. Duas series de trabalho
+		# diferentes sob um alarme so e' a mesma fragmentacao ao contrario: em
+		# vez de sete chaves para um defeito, uma chave para dois assuntos.
+		com_teto 120 "notify-owner (abre alerta)" python3 tools/notify-owner \
+			--chave "$ROTULO" \
+			--severidade alta \
+			--titulo "Passada $ROTULO de conteudo parou" \
+			--mensagem "$(montaMensagemFalha)" \
+			--evidencia "$LEDGER" \
+			--origem "tools/run-daily-content" >/dev/null 2>&1 ||
+			echo "  ATENÇÃO: notify-owner também falhou; o veredito está em $LEDGER" >&2
+	else
+		# ONDA QUE FECHA COMPLETA RESOLVE O PRÓPRIO ALERTA.
+		#
+		# Até 2026-08-26 esta função só ABRIA alerta. O ledger acumulava a chave
+		# aberta indefinidamente, e `check-owner-alerts-abertos` reprovava por uma
+		# falha que já tinha sido corrigida — medido: a chave
+		# `unit-falhou-wikijuridica-daily-content` estava aberta há 152 horas com a
+		# onda já rodando verde. Alerta que ninguém fecha deixa de ser sinal e vira
+		# ruído que se aprende a ignorar, que é o pior estado possível de um canal
+		# de alarme.
+		#
+		# Resolve as DUAS chaves porque a falha da onda chega ao ledger por dois
+		# caminhos: a que esta função abre (o rótulo da passada) e a que o
+		# supervisor da unit abre quando o processo sai != 0.
+		#
+		# ★ SO A PASSADA QUE PUBLICOU RESOLVE. Passada quarentenada sai com exit
+		# 0 e `falhas` vazia -- e fechar o alerta aqui seria alerta que se fecha
+		# sozinho sem a condicao ter sido curada, o pior estado de um canal.
+		if [[ -z "${ESCOPO_DA_PASSADA:-}" ]]; then
+			for chave in "$ROTULO" "unit-falhou-$UNIT_DA_PASSADA"; do
+				com_teto 120 "notify-owner (resolve $chave)" python3 tools/notify-owner --chave "$chave" --resolvido \
+					--titulo "Passada $ROTULO completou" \
+					--mensagem "[$HOJE] As 9 etapas passaram em ${duracao}s; ${paginas_geradas:-0} pagina(s) no estoque." \
+					--evidencia "$LEDGER" \
+					--origem "tools/run-daily-content" >/dev/null 2>&1 || true
+			done
+		fi
+	fi
+
+	echo
+	# ★ O ESCOPO VEM ANTES DO VEREDITO, e a ordem não é cosmética: a mensagem
+	# "o que passou está no ar" é FALSA numa passada que abortou antes da
+	# primeira etapa, e foi a frase equivalente ("as etapas seguintes não
+	# rodaram") que já fez o dono ler "a onda parou" num dia em que ela publicou
+	# 10.111 páginas. Passada que não publicou diz isso, e diz por quê.
+	if [[ -n "${ESCOPO_DA_PASSADA:-}" ]]; then
+		echo "PASSADA $ROTULO ${ESCOPO_DA_PASSADA^^} — nada publicado nesta execução, e o motivo está acima. Evidência em $LEDGER" >&2
+		if [[ ${#falhas[@]} -gt 0 ]]; then
+			echo "  registrado em: ${falhas[*]}" >&2
+		fi
+		if [[ $codigo -ge 2 ]]; then
+			echo "  (defeito de processo, não veredito: preservando exit $codigo para a unit alertar)" >&2
+			exit "$codigo"
+		fi
+		exit "$codigo"
+	fi
+	if [[ ${#falhas[@]} -eq 0 ]]; then
+		# MEDIDO AO EXERCITAR `--gatilho=nao-existe` (2026-09-16): o abort do
+		# mapa de produtores sai 2 ANTES de qualquer etapa, e como `falhas`
+		# estava vazia o trap imprimia "ONDA DIÁRIA OK — 0 página(s) no
+		# estoque" e gravava `resultado: ok`. Pior que a mensagem: o ramo de
+		# resolução acima FECHAVA o alerta da passada sem nada ter sido curado.
+		# O defeito é anterior a esta sessão (o abort por registro ilegível já
+		# existia) e ficou alcançável com mais frequência quando a cadeia ganhou
+		# flags — bug no caminho se conserta no caminho. Quem o fecha é o ramo
+		# do ESCOPO_DA_PASSADA, logo acima.
+		echo "ONDA DIÁRIA OK — ${paginas_geradas:-0} página(s) no estoque, ${duracao}s. Evidência em $LEDGER"
+		exit "$codigo"
+	fi
+	echo "ONDA DIÁRIA PARCIAL — falhou em: ${falhas[*]}" >&2
+	echo "  o que passou está no ar; a falha NÃO é motivo para reexecutar em laço." >&2
+	# CÓDIGO >= 2 SOBREVIVE AO TRAP, e sem isto a separação abaixo seria inútil.
+	#
+	# A onda distingue dois estados que a unit trata de forma oposta: exit 1 é
+	# VEREDITO MEDIDO (um gate reprovou o resultado — a unit mascara, porque
+	# alertar em veredito vira ruído) e exit >= 2 é DEFEITO DO PROCESSO (invocação
+	# inválida, publicação transacional falhada — a unit deve alertar).
+	#
+	# Só que este trap roda em EXIT e chamava `exit 1` incondicionalmente sempre
+	# que houvesse qualquer falha registrada. Um `exit 2` lá embaixo chegava aqui e
+	# virava 1 no caminho de saída, e o alarme continuava mudo pelo motivo mais
+	# difícil de enxergar: a correção estava escrita e era apagada dois passos
+	# depois. Auditoria de 2026-08-28.
+	if [[ $codigo -ge 2 ]]; then
+		echo "  (defeito de processo, não veredito: preservando exit $codigo para a unit alertar)" >&2
+		exit "$codigo"
+	fi
+	exit 1
+}
+trap gravaEvidencia EXIT
+
+# ------------------------------------------------------- 0. VALIDAR INVOCACOES
+# Conferir a flag ANTES de rodar custa milissegundos; descobrir em producao
+# custa um dia de publicacao. A lista de flags sai do proprio fonte do comando,
+# entao ela nao pode ficar defasada em relacao ao que o binario aceita.
+validaInvocacoes() {
+	local rotulo problemas=0
+	local -a palavras
+	for rotulo in "$@"; do
+		# Separacao em PALAVRAS, e nao regex sobre a string inteira. A primeira
+		# versao usava `grep -oE '-[a-z-]*' | tr -d '-'` e errava de dois jeitos:
+		# `tr -d '-'` apagava TODOS os hifens ("-com-texto" virava "comtexto") e o
+		# proprio nome do pacote entrava como flag ("collect-stf-informativo" ->
+		# "-stf-informativo"). Um validador que acusa falso e pior que nenhum: ele
+		# para a onda por engano.
+		read -r -a palavras <<<"$rotulo"
+		local pacote="${palavras[0]}"
+		if [[ ! -d "${pacote#./}" ]]; then
+			echo "  INVOCACAO INVALIDA: $pacote nao existe" >&2
+			problemas=1
+			continue
+		fi
+		local i
+		for ((i = 1; i < ${#palavras[@]}; i++)); do
+			local palavra="${palavras[$i]}"
+			[[ "$palavra" == -* ]] || continue # valor de flag, nao flag
+			local flag="${palavra#-}"          # tira SO o hifen da frente
+			flag="${flag#-}"                   # e o segundo, se for --flag
+			flag="${flag%%=*}"                 # e o "=valor", se houver
+			if ! grep -q "\"$flag\"" "${pacote#./}/main.go" 2>/dev/null; then
+				echo "  INVOCACAO INVALIDA: $pacote nao aceita -$flag" >&2
+				problemas=1
+			fi
+		done
+	done
+	return $problemas
+}
+
+# ---------------------------------------------------------------- 1. COLETAR
+# Tetos por fonte: ritmo humano e volume que os gates absorvem no mesmo dia.
+# Fonte que não responde NÃO derruba a onda — as outras seguem, e a falha é
+# registrada. Uma fonte fora do ar não pode custar o dia inteiro de publicação.
+# A lista guarda o comando INTEIRO e a expansão é sem aspas de propósito.
+# A primeira versão usava $GO run "./cmd/${COLETORES[$fonte]}" — com as aspas, o
+# shell não faz word splitting e o Go recebia UM argumento só:
+#   stat /opt/wiki/cmd/collect-stj-precedentes -limite 1500: directory not found
+# As quatro coletas e as três gerações falharam por isso, e o resto da onda
+# seguiu normalmente — que é o comportamento certo, mas produziu zero páginas.
+# AS FLAGS SAO CONFERIDAS ANTES DE RODAR — ver validaInvocacoes, abaixo.
+#
+# Na primeira simulacao desta onda, DUAS das cinco coletas falharam com "flag
+# provided but not defined: -limite": collect-stj-precedentes nao tem teto (le o
+# dataset inteiro) e collect-stf-informativo usa -desde-edicao. O erro so
+# aparecia em runtime, no meio da madrugada, e o unico sintoma seria uma linha
+# "falhou" num journal que ninguem le.
+declare -A COLETORES=(
+	["stj-precedentes"]="./cmd/collect-stj-precedentes"
+	["stf-informativo"]="./cmd/collect-stf-informativo"
+	# -com-texto 60: o texto integral da norma. Sem ele o canal gravava ementa e
+	# link, e o articulado ficava numa URL que ninguem buscava (0 de 60 registros
+	# com corpo, medido em 2026-08-29). Orcamento por host nesta execucao:
+	# 1 sitemap + 60 detalhes + 60 textos = 121 do teto diario de 200 do
+	# sourcecollect. Subir o -limite acima de ~99 estoura a cota e o coletor passa
+	# a falhar no fim da lista -- se subir, suba o TetoDiario junto.
+	["normas-federais"]="./cmd/collect-normas-federais -limite 60 -com-texto 60"
+	["diarios-municipais"]="./cmd/collect-diarios-municipais -limite 300 -com-texto 25"
+	["noticias-oficiais"]="./cmd/collect-noticias-oficiais -limite 200"
+)
+
+# Na passada --somente-noticias sobra UMA fonte e UM gerador. A filtragem e por
+# remocao explicita das chaves, e nao por um segundo mapa: dois mapas derivam
+# com o tempo e o dia em que derivarem a onda curta vai publicar outra coisa.
+if [ "$SOMENTE_NOTICIAS" = "1" ]; then
+	for chave in "${!COLETORES[@]}"; do
+		[ "$chave" = "noticias-oficiais" ] || unset "COLETORES[$chave]"
+	done
+fi
+# ★ --sem-coleta ZERA O MAPA, e o motivo e' de EDUCACAO NA REDE, nao de tempo.
+#
+# O publicador autonomo do cerebro e' disparado por evento INTERNO (o cerebro
+# acabou de redigir). Se ele recoletasse, cada peca redigida viraria uma rodada
+# de requisicoes a quatro feeds oficiais — e o portal ja mediu, em 2026-09-05
+# contra o planalto.gov.br, o que um WAF faz com trafego que ele classifica como
+# robo. A materia-prima que o publicador precisa JA esta no disco: quem coleta
+# e' a onda, no ritmo dela.
+#
+# `canal` (do registro de produtores) e `fonte` (do mapa de coletores) sao
+# eixos DIFERENTES — nao existe coluna de coletor no registro —, e por isso
+# `--somente=<canal>` NAO tenta adivinhar um coletor: quem nao quer rede diz
+# `--sem-coleta`, por extenso.
+if [ "$SEM_COLETA" = "1" ]; then
+	for chave in "${!COLETORES[@]}"; do
+		unset "COLETORES[$chave]"
+	done
+fi
+
+# O MAPA DOS GERADORES DERIVA DO REGISTRO, e nao de um `declare -A` literal.
+#
+# POR QUE MUDOU (2026-09-16). Ate esta data o mapa era literal, com cinco
+# entradas escritas aqui. Dois motores commitados e funcionais ficavam de fora e
+# nao rodavam em runner NENHUM: `cmd/generate-acordao-pages` (o shard
+# stj-acordao-derivado-01.jsonl nunca existiu -- ERRATA da mesma data, 17h: ele
+# passou a existir, e a familia ja tem 17 fatias, -01 a -17, re-shardadas por
+# outra frente pelo teto de 4 MiB por blob; a derivacao por familia
+# `<prefixo>-NN.jsonl` as enxerga sem tocar no registro, que declara o PRIMEIRO
+# ordinal) e `cmd/generate-lei-artigo-pages`
+# (rodou UMA vez a mao em 2026-09-10, 38 paginas, e nunca mais). As unicas
+# ocorrencias dos dois fora do proprio codigo eram os COMENTARIOS das linhas
+# 446-447 deste arquivo -- mencao que um `grep` confunde com invocacao.
+#
+# O custo maior nao e a pagina que deixou de nascer: e que CODIGO QUE NAO RODA
+# NAO APARECE EM INCIDENTE, e por isso nao e consertado. `grep -rln tetodelote
+# cmd/` devolvia os CINCO daqui e nenhum dos dois orfaos, que seguiram com o
+# teto de lote defeituoso que os irmaos corrigiram em 2026-09-09.
+#
+# Agora a fonte unica e `ops/produtores-de-pagina.jsonl`, e o gate
+# `produtor-orfao` (`go-modern run ./cmd/check produtor-orfao`) reprova, por
+# AST, todo `cmd/generate-*` que escreva em data/editorial/v2_pages/ com
+# internal/shardpreserve e nao tenha linha la.
+#
+# O LIMITE DE CADA GERADOR E' O DIARIO, e desde 2026-09-09 ele governa apenas o
+# que se ACRESCENTA (internal/tetodelote) -- pagina ja publicada nao consome
+# cota. Para drenar um estoque represado numa passada unica, sobe-se o limite
+# do canal por ambiente, sem editar e commitar o script:
+#
+#   WIKI_LIMITE_STJ_TEMA=900 ./tools/run-daily-content
+#
+# Env ausente = o `limite_padrao` da linha do registro. O nome da variavel e o
+# campo `limite_env`, e nao uma convencao derivada do canal: convencao implicita
+# e o que quebra quando alguem renomeia o canal.
+#
+# A LEITURA E POR ARRAY INDEXADO, nao por seis nomes de variavel, para que nao
+# sobre variavel lida e nao usada. A ordem das colunas e o contrato de
+# tools/listar-produtores-de-pagina:
+#
+#   0 canal   1 cmd   2 shard   3 portfolio   4 limite_env   5 limite_padrao
+#
+# E a chave do array vai entre ASPAS em toda atribuicao (`GERADORES["$canal"]`):
+# o shfmt v3.13.1 reescreve chave literal sem aspas com espacos ao redor do
+# hifen, e foi isso que cegou o canal diario por cinco dias (d4c942f2).
+declare -A GERADORES=()
+if ! PRODUTORES_DA_ONDA="$(com_teto 120 "listar-produtores-de-pagina" python3 "$RAIZ/tools/listar-produtores-de-pagina" --gatilho "$GATILHO")"; then
+	echo "run-daily-content: registro de produtores ilegivel -- A ONDA PAROU" >&2
+	echo "  ops/produtores-de-pagina.jsonl e a fonte unica do que a onda roda." >&2
+	echo "  Mapa PARCIAL seria canal publicando em silencio a menos: por isso aborta." >&2
+	echo "  (gatilho pedido: $GATILHO; o conjunto fechado e' o de tools/listar-produtores-de-pagina)" >&2
+	# ABORTO NAO E' "OK": sem estas duas linhas o trap grava `resultado: ok` e
+	# fecha o alerta de uma passada que nem chegou a rodar uma etapa.
+	ESCOPO_DA_PASSADA="abortada"
+	registra "registro:produtores"
+	exit 2
+fi
+while IFS=$'\t' read -r -a produtor; do
+	[ "${#produtor[@]}" -eq 6 ] || continue
+	canal_do_produtor="${produtor[0]}"
+	limite_do_produtor="${!produtor[4]:-${produtor[5]}}"
+	GERADORES["$canal_do_produtor"]="${produtor[1]} -limite $limite_do_produtor"
+done <<<"$PRODUTORES_DA_ONDA"
+unset canal_do_produtor limite_do_produtor produtor
+if [ "${#GERADORES[@]}" -eq 0 ]; then
+	echo "run-daily-content: nenhum gerador com gatilho $GATILHO -- A ONDA PAROU" >&2
+	ESCOPO_DA_PASSADA="abortada"
+	registra "registro:gatilho-sem-produtor"
+	exit 2
+fi
+
+# ★ O TETO POR EXECUCAO JA ESTA AQUI, e nao e' um numero novo (2026-09-16).
+#
+# `-limite $limite_do_produtor` acima E' o teto por execucao desta cadeia: ele
+# sai de `limite_env`/`limite_padrao` do registro, canal a canal, e desde
+# 2026-09-09 (internal/tetodelote) governa apenas o que se ACRESCENTA — pagina
+# ja publicada nao consome cota. Nenhum caminho deste script inventa um limite
+# fora do registro, e e' isso que faz a guarda existir em vez de ser promessa.
+#
+# NAO se usa aqui o `teto_por_execucao: 5` de `content/cerebro_publicacao.json`:
+# aquele numero e' o freio do COMENTARIO DE REDE SOCIAL (o unico leitor e'
+# `cmd/cerebro/comentarios.go:451`, que o declara "o unico freio duro contra
+# publicar em excesso numa execucao" no contexto do gate de habitualidade da
+# OAB). Aplica-lo a paginas capava a drenagem em cinco por execucao e
+# contrariaria tanto o §P6 ("o `-limite` abre em seguida, no mesmo turno")
+# quanto a Regra 18 — teto sem causa fisica externa medida e' atraso, nao
+# prudencia.
+if [ -n "$SOMENTE_CANAL" ]; then
+	for chave in "${!GERADORES[@]}"; do
+		[ "$chave" = "$SOMENTE_CANAL" ] || unset "GERADORES[$chave]"
+	done
+	if [ "${#GERADORES[@]}" -eq 0 ]; then
+		# CANAL QUE NAO EXISTE NO GATILHO NAO PODE VIRAR PASSADA VAZIA. Uma
+		# passada com zero geradores atravessaria censo, transacao e prova sem
+		# gerar nada e terminaria verde — o canal "publicando em silencio a
+		# menos" que o registro de produtores existe para impedir.
+		echo "run-daily-content: --somente=$SOMENTE_CANAL nao casa nenhum canal do gatilho $GATILHO -- A PASSADA PAROU" >&2
+		echo "  canais deste gatilho: $(python3 "$RAIZ/tools/listar-produtores-de-pagina" --gatilho "$GATILHO" | cut -f1 | tr '\n' ' ')" >&2
+		ESCOPO_DA_PASSADA="abortada"
+		registra "registro:canal-inexistente"
+		exit 2
+	fi
+	echo "run-daily-content: passada --somente=$SOMENTE_CANAL sobre o gatilho $GATILHO (${#COLETORES[@]} coleta(s), 1 gerador; etapas 3 a 9 inteiras)"
+fi
+if [ "$COMMIT_RESTRITO" = "1" ]; then
+	echo "run-daily-content: passada com COMMIT RESTRITO: os tres commits passam por tools/cerebro-commitar (allowlist do registro; nunca diretorio, symlink, .. nem remocao)"
+fi
+
+etapa "0/9 validacao das invocacoes"
+if ! validaInvocacoes "${COLETORES[@]}" "${GERADORES[@]}"; then
+	registra "invocacao"
+	echo "  A ONDA PAROU: comando invocado com flag que ele nao aceita falharia" >&2
+	echo "  em runtime, no meio da madrugada, e o unico sintoma seria uma linha" >&2
+	echo "  \"falhou\" num journal que ninguem le." >&2
+	# EXIT 2, nao 1: isto e DEFEITO DE PROCESSO, nao veredito de medicao. Nenhuma
+	# pagina foi avaliada -- o comando nem chegou a rodar. A unit mascara o 1 (para
+	# nao alertar em veredito) e nao mascara o 2, entao so assim o dono fica
+	# sabendo que a onda nem comecou.
+	exit 2
+fi
+echo "  ${#COLETORES[@]} coleta(s) e ${#GERADORES[@]} geracao(oes) com flags validas"
+
+etapa "1/9 coleta das fontes oficiais"
+
+for fonte in "${!COLETORES[@]}"; do
+	printf '  %-20s ' "$fonte"
+	# A DIRETIVA NAO PODE LEVAR TEXTO NA MESMA LINHA. Ate 2026-09-11 esta linha
+	# era `# shellcheck disable=SC2086 — a ausencia de aspas...`, e o shellcheck
+	# recusava a diretiva inteira com SC1125 ("Invalid key=value pair? Ignoring
+	# the rest of this directive"): ou seja, o SC2086 NUNCA esteve desligado aqui.
+	# O motivo fica no comentario seguinte, que e onde ele sempre deveria estar:
+	# a ausencia de aspas AQUI e o que faz o comando virar argumentos separados;
+	# com aspas, vira um caminho unico com espacos.
+	# shellcheck disable=SC2086
+	# T6.9 — O LOG DA COLETA NÃO MORRE MAIS EM /tmp.
+	#
+	# A coleta de diários municipais falhou em 3 das 6 ondas (22, 24 e 25/08) e a
+	# CAUSA foi destruída: o log ia para /tmp/wiki-daily-$fonte.log, sobrescrito a
+	# cada execução e varrido no reboot. O journal só imprimia "falhou". Seis dias
+	# de falha sem uma linha de diagnóstico recuperável.
+	#
+	# Isso viola a regra do dono de 2026-07-29 — produto não mora em /tmp — e é a
+	# razão de esta onda ter sido investigada por dedução em vez de por leitura.
+	#
+	# Agora: o log vai para data/ops/daily_content_logs/, e o ledger recebe exit
+	# code e a última linha de saída. `saida` continua em /tmp por ser buffer de
+	# execução; o que se preserva é o resultado.
+	if timeout 900 nice -n 10 $GO run ${COLETORES[$fonte]} >"$LOGS_COLETA/$fonte.log" 2>&1; then
+		printf 'ok  %s\n' "$(tail -1 "$LOGS_COLETA/$fonte.log" | cut -c1-90)"
+		registra_coleta "$fonte" 0 "$(tail -1 "$LOGS_COLETA/$fonte.log" | cut -c1-200)"
+	else
+		codigo=$?
+		printf 'falhou (exit %s)\n' "$codigo"
+		registra_coleta "$fonte" "$codigo" "$(tail -3 "$LOGS_COLETA/$fonte.log" | tr '\n' ' ' | cut -c1-300)"
+		registra "coleta:$fonte"
+	fi
+done
+
+# ------------------------------------- 1.5 PROMOVER O QUE O CÉREBRO EXTRAIU
+etapa "1.5/9 writeback do cérebro (o que ele extraiu vira insumo do gerador)"
+# PRODUTOR ÓRFÃO, medido em 2026-09-10. `cmd/generate-writeback-extracoes` existe
+# desde 09-09 e NINGUÉM o chamava: `grep -rn generate-writeback-extracoes tools/
+# ops/ .githooks/` devolvia vazio. Ele rodou UMA vez, às 06:11, e congelou em 214
+# promoções enquanto o cérebro seguia trabalhando — às 19:41 havia **981 extrações
+# sem promoção, 882 delas com pelo menos uma URN**, somando 1.355 vínculos de
+# súmula e 283 de norma/artigo parados no disco.
+#
+# O custo não é só o vínculo perdido. `cmd/cerebro extrair --so-sem` filtra por
+# `dispositivos_citados_urn` vazio, que é justamente o campo que a promoção
+# preenche: sem writeback o cérebro REAPRESENTA como candidato o que já resolveu,
+# e paga de novo 75 a 100 s por item de uma CPU que não tem folga. E os três
+# consumidores da sobreposição — `generate-lei-artigo-pages:461`,
+# `generate-acordao-pages:413` e `cmd/cerebro:676` — enxergavam 214 de 1.096.
+#
+# Aqui, e não depois da geração: a etapa 2/9 monta as páginas a partir do que a
+# sobreposição já expõe. Promover depois seria entregar ao gerador de amanhã o
+# trabalho que o cérebro fez ontem.
+#
+# Não trava a onda: writeback é enriquecimento. Falha entra no ledger e a onda
+# segue — o que ele deixa de promover hoje continua no disco para amanhã, que é
+# exatamente a propriedade que faz dele um passo seguro nesta posição.
+if timeout 600 nice -n 10 $GO run ./cmd/generate-writeback-extracoes -raiz "$RAIZ" \
+	>"$LOGS_COLETA/writeback-extracoes.log" 2>&1; then
+	printf '  %s\n' "$(tail -1 "$LOGS_COLETA/writeback-extracoes.log" | cut -c1-160)"
+else
+	printf '  falhou (exit %s) — enriquecimento, a onda segue\n' "$?"
+	registra "writeback:extracoes"
+fi
+
+# ------------------------------------------------ 1.9 O POCO DO MOTOR DE LEIS
+etapa "1.9/9 seleção do tier A (o poço que o gerador de leis consome)"
+# POR QUE ESTA ETAPA NASCEU (2026-09-16), com o numero que a justifica.
+#
+# tools/generate-motor-tier-a era ORFAO: nenhum runner, timer ou hook o
+# chamava. data/editorial/motor/tier_a_artigos.jsonl estava congelado em
+# 2026-09-10 com 255 candidatos, e cmd/generate-lei-artigo-pages consome APENAS
+# esse arquivo.
+#
+# Com ~18 paginas por passada, o poco secaria em ~12 ondas e o canal voltaria a
+# `novas: 0` -- a versao lenta do mesmo defeito que este plano existe para
+# matar: o canal para e o log continua verde.
+#
+# Medido ao regerar: 255 -> 749 candidatos (+494, quase 3x), todos acima do piso
+# de blocos (379 com 3 blocos, 345 com 4, 25 com 5). O gerador saiu de 18
+# acrescentadas para 30, que e o TETO da cota diaria -- ou seja, o poco deixou
+# de ser o gargalo.
+#
+# Roda ANTES da etapa 2 porque e o insumo dela. Falha NAO para a onda: o
+# arquivo anterior continua servindo, e canal com poco velho publica menos, nao
+# publica errado.
+if timeout 600 nice -n 10 python3 ./tools/generate-motor-tier-a \
+	>"$LOGS_COLETA/motor-tier-a.log" 2>&1; then
+	printf '  %s\n' "$(grep -m1 'tier A selecionado' "$LOGS_COLETA/motor-tier-a.log" | cut -c1-160)"
+else
+	printf '  falhou (exit %s) — o poço anterior segue servindo, a onda continua\n' "$?"
+	registra "motor:tier-a"
+fi
+
+# ---------------------------------------------------------------- 2. GERAR
+etapa "2/9 geração de páginas"
+paginas_geradas=0
+for gerador in "${!GERADORES[@]}"; do
+	printf '  %-20s ' "$gerador"
+	# Motivo na nota da coleta acima; a diretiva vai sozinha na linha (SC1125).
+	# shellcheck disable=SC2086
+	if timeout 900 nice -n 10 $GO run ${GERADORES[$gerador]} >"$LOGS_COLETA/gen-$gerador.log" 2>&1; then
+		linha="$(grep -o 'gravado: [^ ]* ([0-9]* páginas)' "$LOGS_COLETA/gen-$gerador.log" | head -1)"
+		printf 'ok  %s\n' "${linha:-sem páginas}"
+		n="$(grep -oP '\(\K[0-9]+(?= páginas\))' "$LOGS_COLETA/gen-$gerador.log" | head -1)"
+		paginas_geradas=$((paginas_geradas + ${n:-0}))
+	else
+		printf 'falhou\n'
+		registra "geracao:$gerador"
+	fi
+done
+echo "  total de páginas no estoque desta onda: $paginas_geradas"
+# ★ `GEROU=1` SO SE TODOS OS GERADORES DESTA PASSADA CONCLUIRAM.
+#
+# E este e' o fato que decide se uma peca teve CHANCE. Uma peca redigida que o
+# gerador processou e nao entregou merece a tentativa contada; uma peca cujo
+# gerador nem rodou, nao. Em passada `--somente=<canal>` o mapa tem um gerador
+# so, entao aqui o fato e' exatamente "o gerador daquele canal concluiu".
+if [[ ! " ${falhas[*]:-} " =~ " geracao:" ]]; then
+	GEROU=1
+fi
+
+if ((SECO == 1)); then
+	echo
+	echo "--seco: coleta e geração feitas; nada commitado nem publicado."
+	exit 0
+fi
+
+# --------------------------------------------- 2.5 BASELINE DO ACERVO
+etapa "2.5/9 baseline do acervo (antes de publicar)"
+# `paginas_geradas` acima conta o SHARD REMONTADO, que inclui tudo o que ja
+# estava no ar: em 2026-09-09 ele imprimiu 415 com ZERO paginas novas, e a
+# fabrica ficou 5 dias parada sem um unico vermelho. O unico numero que
+# responde "a onda acrescentou alguma coisa?" e a diferenca de CONJUNTO de
+# unique_intent_id do published_manifest, medida antes e depois.
+if ! com_teto 300 "check-onda-avanca --antes" ./tools/check-onda-avanca --antes --rotulo "$ROTULO"; then
+	registra "onda-avanca:baseline"
+fi
+
+# ------------------------------------------------------- 3. PRESERVAÇÃO
+etapa "3/9 preservação: nenhum gerador apagou página redigida"
+# ESTA ETAPA VEM ANTES DE TUDO O QUE COMMITA, e é a mais importante da onda.
+#
+# Em 2026-08-20 um gerador passou a ver as PRÓPRIAS páginas publicadas como rota
+# alheia e pulou 106 de 124: o shard caiu de 80 para 18 registros e 62 páginas
+# redigidas sumiram do estoque, sem erro nenhum. O texto estava no git e foi
+# recuperado — mas esta onda roda TODA MADRUGADA, sem ninguém olhando. Em uma
+# semana o estoque derretia, e o manifesto passaria a apontar para páginas sem
+# registro de origem.
+#
+# A onda PARA aqui. Nunca commita um estado que perdeu trabalho.
+# check-verified-repair vem junto: reparo cujo defeito voltou significa que a
+# pagina esta publicada sob uma justificativa que nao descreve mais a realidade.
+# Custa milissegundos e roda antes de qualquer commit, como a preservacao.
+if ! com_teto 300 "check-verified-repair" ./tools/check-verified-repair; then
+	registra "reparo-quebrado"
+	echo "  A ONDA PAROU: um defeito ja reparado voltou ao conteudo. A pagina esta" >&2
+	echo "  no ar sob um reparo obsoleto. Corrija pelo gerador datado do reparo, ou" >&2
+	echo "  tire-a do ar com ./tools/retirar-pagina-do-ar." >&2
+	exit 1
+fi
+
+if ! com_teto 600 "check-shard-preservation" ./tools/check-shard-preservation; then
+	registra "preservacao"
+	echo "  A ONDA PAROU: um gerador apagou página redigida deste estoque." >&2
+	echo "  O texto NÃO está perdido (git show HEAD:<shard>), mas commitar este" >&2
+	echo "  estado o tornaria a nova verdade. Corrija o gerador e regere." >&2
+	exit 1
+fi
+
+# ------------------------------------------------------- 3-bis. TEXTO INTEIRO
+# T6.3 — O GATE DE PRODUTO UNTRACKED EXISTIA E NAO ESTAVA LIGADO A NADA.
+#
+# tools/check-untracked-product-inventory reprova produto untracked alem de 24h
+# e diz o que fazer: "commitar por pathspec (checkpoint aditivo) ou classificar
+# como efemero no .gitignore; nunca deletar". Ele acusava 41 produtos untracked,
+# 30 deles stale -- entre os quais 21 arquivos e 15,7 MB de materia-prima paga
+# das cinco fontes, coletada de 21 a 26/08 e nunca commitada, porque a onda
+# morria na etapa 5/9 antes de chegar ao commit.
+#
+# Aqui ele AVISA sem parar a onda: produto untracked e desperdicio a corrigir,
+# nao corrupcao de dado. As guardas que PARAM a onda sao as de preservacao (3/9)
+# e integridade (4/9), porque essas protegem contra perda irreversivel.
+etapa "3.5/9 produto untracked (avisa, nao para)"
+if com_teto 300 "check-untracked-product-inventory" ./tools/check-untracked-product-inventory >/dev/null 2>&1; then
+	echo "  nenhum produto untracked alem do prazo"
+else
+	echo "  ATENCAO: ha produto untracked alem de 24h — rode"
+	echo "  ./tools/check-untracked-product-inventory para ver o que commitar"
+	registra_aviso "untracked" 2>/dev/null || true
+fi
+
+etapa "4/9 integridade do texto: nada publicado pela metade"
+# ESTA ETAPA EXISTE PORQUE ELA JÁ PEGOU ALGO REAL, no dia em que nasceu.
+#
+# Em 2026-08-20 o gate text-truncation, recém-criado, reprovou 341 páginas que
+# ESTA MESMA ONDA havia publicado: 241 h1 e 100 title terminando em reticências,
+# porque os geradores espremiam o texto da fonte no limite de 65 caracteres.
+#
+#   Súmula 560 do STJ: Cinge-se o debate trazido nos autos em saber se…
+#
+# Os geradores foram corrigidos (internal/titulojuridico), mas o defeito nasceu
+# de uma fonte que muda todo dia — e a onda roda de madrugada, sem ninguém
+# olhando. Sem esta etapa, a próxima variação da fonte volta a publicar texto
+# partido e o detector assiste.
+#
+# Custo medido: 14,5s de parede sobre 871 shards. A onda PARA — publicar texto
+# cortado com assinatura de advogado é pior que publicar menos.
+# Os dois gates medem dimensões diferentes do mesmo texto: um apanha o que
+# chegou PARTIDO, o outro o que chegou REPETIDO. Ambos nasceram de defeito real
+# publicado por esta onda.
+if ! timeout 300 nice -n 10 $GO run ./cmd/check derived-body-repetition; then
+	registra "texto-repetido"
+	echo "  A ONDA PAROU: página derivada diz a mesma coisa em dois blocos." >&2
+	echo "  A saída acima diz qual intent_id e quais blocos. Cite o texto oficial" >&2
+	echo "  UMA vez, no bloco que o apresenta, e remeta a ele nos demais." >&2
+	exit 1
+fi
+if ! timeout 300 nice -n 10 $GO run ./cmd/check text-truncation; then
+	registra "texto-truncado"
+	echo "  A ONDA PAROU: há texto partido no estoque (conectivo pendurado, frase" >&2
+	echo "  sem fim, palavra cortada no hífen ou mojibake de charset). A saída acima" >&2
+	echo "  diz qual intent_id, qual shard, qual linha e qual campo." >&2
+	echo "  Corrija pelo GERADOR — nunca editando o JSONL à mão." >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------- 4. PAREAR
+# ---------------------------------------------------------------- 4. COMMITAR
+etapa "5/9 commit da INTENÇÃO (ela precede a página, por desenho do gate)"
+#
+# A ORDEM AQUI ERA O DEADLOCK QUE PAROU A FÁBRICA POR SEIS DIAS.
+#
+# Até 2026-08-26 esta onda rodava `check-v2-portfolio-pairing` ANTES de commitar
+# o portfólio. O gate lê o portfólio do commit PAI, por desenho declarado — "a
+# candidate cannot add its own portfolio row and consume it in the same
+# transaction" — e a etapa 2/9 gera intenções novas TODA madrugada. Logo
+# `so_no_candidato` nunca era vazio, o gate sempre reprovava, e a onda morria
+# antes de publicar. Medido: 6 de 6 execuções "parcial", nenhuma alcançando as
+# etapas 8/9 (publicação) e 9/9 (IndexNow) — que é por que o IndexNow do portal
+# ficou mudo de 20/08 a 26/08.
+#
+# A própria saída do gate já imprimia a ordem certa: "PRÓXIMO COMANDO: git commit
+# -- data/editorial/portfolio_v2 / e SÓ DEPOIS: git commit -- data/editorial/v2_pages".
+# O `CLAUDE.md` registra 4 tentativas queimadas contra este mesmo gate.
+#
+# POR QUE COMMITAR O PORTFÓLIO ANTES É SEGURO AGORA, e não era quando o plano foi
+# escrito: a etapa 3/9 (`check-shard-preservation`) passou a cobrir TAMBÉM
+# `data/editorial/portfolio_v2`. Antes ela guardava só `v2_pages`, e um portfólio
+# truncado — como o que o gerador do STF produziu, 50 registros para 4 — seria
+# commitado por esta etapa e viraria a nova verdade. A onda PARA na 3/9 antes de
+# chegar aqui.
+# ---------------------------------------------------------------------------
+# alvos_do_registro <shard|portfolio> — os caminhos EXATOS que esta onda escreve.
+#
+# ★ POR QUE NAO SE VARRE O DIRETORIO (corrigido em 2026-09-16)
+#
+# As duas etapas abaixo adicionavam o DIRETORIO inteiro. Medido nesta data: 69 e
+# 879 arquivos em portfolio_v2 e v2_pages, contra SETE produtores no registro.
+# Tudo que qualquer outra frente tocasse ali entrava no commit da onda, sob a
+# mensagem da onda, sem revisao.
+#
+# Nao e hipotese: hoje uma frente deixou um `.go` de medicao em `cmd/` a caminho
+# das 12:20, e so nao foi varrido porque alguem olhou. O contrato de maquina ja
+# proibia adicionar diretorio — "ja varreu trabalho nao-commitado de outra sessao
+# tres vezes" —, e estas duas linhas eram a excecao que sobrava, justamente no
+# caminho que roda sozinho as 04:20.
+#
+# Os caminhos saem de `ops/produtores-de-pagina.jsonl`, o mesmo registro de onde
+# a etapa 1/9 deriva o mapa de geradores: quem escreve esta declarado, e quem nao
+# esta declarado nao e commitado por esta onda.
+#
+# ROTACAO: o gerador pode abrir `-02` quando o `-01` enche (teto de ~1.000
+# paginas). O glob cobre os irmaos da MESMA familia e nada alem dela.
+#
+# FALHA RUIDOSA: registro ilegivel NAO cai de volta no diretorio. Cair de volta
+# seria trocar um defeito conhecido por um silencioso, que e pior.
+alvos_do_registro() {
+	local qual=$1 shard portfolio base padrao arquivo tsv
+	local -a alvos=()
+	# GATILHO COM DEFAULT LITERAL, e a razao e' de bancada: esta funcao e'
+	# extraida por ancora (`sed -n '/^alvos_do_registro()/,/^}/p'`) e avaliada
+	# fora deste script por `tools/test_alvos_do_registro.sh`. Sob `set -u`, uma
+	# referencia nua a $GATILHO abortaria o teste — e o default e' o mesmo
+	# gatilho da onda, que e' o unico correto quando ninguem escolheu outro.
+	if ! tsv="$(./tools/listar-produtores-de-pagina --gatilho "${GATILHO:-onda-diaria}" 2>&1)"; then
+		echo "  registro de produtores ilegivel: $tsv" >&2
+		return 1
+	fi
+	[[ -n "$tsv" ]] || { echo "  registro de produtores vazio" >&2; return 1; }
+	while IFS=$'\t' read -r _ _ shard portfolio _ _; do
+		case "$qual" in
+		shard) base="$shard" ;;
+		portfolio) base="$portfolio" ;;
+		*) return 1 ;;
+		esac
+		[[ -n "$base" ]] || continue
+		padrao="${base%-[0-9][0-9].jsonl}"
+		for arquivo in "$padrao"-[0-9][0-9].jsonl; do
+			[[ -e "$arquivo" ]] && alvos+=("$arquivo")
+		done
+	done <<<"$tsv"
+	((${#alvos[@]})) || { echo "  registro nao produziu nenhum caminho existente" >&2; return 1; }
+	printf '%s\n' "${alvos[@]}" | sort -u
+}
+
+mapfile -t ALVOS_PORTFOLIO < <(alvos_do_registro portfolio) || true
+if ((${#ALVOS_PORTFOLIO[@]} == 0)); then
+	registra "registro:portfolio"
+	echo "  a onda PARA aqui: sem os caminhos do registro, a alternativa seria" >&2
+	echo "  varrer o diretório — que é o defeito que esta etapa deixou de ter." >&2
+	exit 1
+fi
+if ! git diff --quiet -- "${ALVOS_PORTFOLIO[@]}" ||
+	[[ -n "$(git ls-files --others --exclude-standard -- "${ALVOS_PORTFOLIO[@]}")" ]]; then
+	if [ "$COMMIT_RESTRITO" = "1" ]; then
+		# ★ A INTENCAO NOVA AGORA E' COMMITADA, E ESTA E' A ETAPA QUE DESTRAVA
+		# A ORDEM DO DONO DE 2026-09-16.
+		#
+		# `check-v2-portfolio-pairing` le o portfolio do commit PAI, por desenho
+		# declarado -- "a candidate cannot add its own portfolio row and consume
+		# it in the same transaction". Enquanto a passada nao podia commitar,
+		# rota nova NUNCA virava pagina publicada: era a assimetria que deixava
+		# 7.539 acordaos montados em quarentena permanente. Com a porta restrita
+		# a ordem se cumpre, e a ordem sancionada se preserva: portfolio PRIMEIRO
+		# (aqui), pagina DEPOIS (6/9).
+		if ! commita_restrito portfolio "${ALVOS_PORTFOLIO[@]}"; then
+			ESCOPO_DA_PASSADA="$(destino_da_classe "$CLASSE_DO_COMMIT")"
+			case "$CLASSE_DO_COMMIT" in
+			peca)
+				quarentena "commit_de_intencao_reprovado" \
+					"o pre-commit reprovou o portfolio por defeito do CONTEUDO; a peca espera correcao" \
+					"leia o log em .agents/runtime/cerebro-commitar/, conserte o produtor e relance" \
+					"${ALVOS_PORTFOLIO[@]}"
+				;;
+			ambiente | hook)
+				# NAO E' QUARENTENA, E A DIFERENCA E' O DONO NAO SER ACORDADO A
+				# TOA. Contencao de compilacao e gate quebrado nao sao defeito da
+				# peca: ela RETOMA na passada seguinte e nao consome tentativa.
+				# Medido nesta sessao: "compile closure excedeu 76.5s concedidos"
+				# reprovou um commit que passou na retentativa sem uma linha
+				# alterada.
+				quarentena "commit_adiado_por_${CLASSE_DO_COMMIT}" \
+					"o commit do portfolio nao passou por causa de ${CLASSE_DO_COMMIT}, nao por defeito da peca; ela RETOMA e nao consome tentativa" \
+					"nenhum ato humano e' necessario para a retomada. E O QUE ESTA LINHA NAO PROMETE: a classe ambiente/hook NAO consome tentativa, entao o teto por peca nunca para uma peca por causa de ambiente; contencao PERMANENTE reincide em silencio, e hoje quem a enxerga e' a contagem destas linhas neste ledger" \
+					"${ALVOS_PORTFOLIO[@]}"
+				;;
+			*)
+				# Recusa da porta e' defeito de PROCESSO (pathspec fora da
+				# allowlist, diretorio, symlink, remocao): nunca se retenta, e o
+				# dono tem de saber que a cadeia pediu o proibido.
+				registra "commit-restrito:portfolio:$CLASSE_DO_COMMIT"
+				;;
+			esac
+			echo "  a passada PARA aqui, sem publicar: publicar pagina cuja intencao nao esta" >&2
+			echo "  no commit pai e' exatamente o que o gate de pareamento recusa." >&2
+			exit 0
+		fi
+		echo "  intenções commitadas pela porta restrita"
+	else
+		# CAMINHO DA ONDA DIARIA, inalterado: ela roda como a sessao roda, com o
+		# git direto. A onda das 04:20 nao atravessa a porta restrita porque a
+		# allowlist dela e' a mesma (os dois derivam do registro de produtores) e
+		# uma indirecao a mais no caminho que ja funciona so acrescenta
+		# superficie a manter.
+		#
+		# TETO: o commit fica preso ao pre-commit, que compila o ÍNDICE (77,6 s
+		# medidos com um pacote grande sentado nele). 600 s é ~8× o pior caso, e
+		# sem `--kill-after` para que o git remova o próprio `.git/index.lock`.
+		com_teto 300 "git add portfolio_v2" git add -- "${ALVOS_PORTFOLIO[@]}"
+		com_teto 600 "git commit portfolio_v2" git commit -q -m "chore(portfolio): intencoes da passada $ROTULO de $HOJE" -- "${ALVOS_PORTFOLIO[@]}" &&
+			echo "  intenções commitadas" || registra "commit:portfolio"
+	fi
+else
+	echo "  portfólio sem novidade"
+fi
+
+etapa "6/9 pareamento intenção × página (agora o pai TEM as intenções)"
+if ! com_teto 300 "check-v2-portfolio-pairing" ./tools/check-v2-portfolio-pairing; then
+	# ★ O GATE E' GLOBAL, e por isso a passada nao pode cobrar isto da peca.
+	#
+	# Medido em 2026-09-16: uma passada de NOTICIAS reprovou aqui com "7539
+	# intencao(oes) existem no disco mas NAO no commit pai", e as 7.539 eram de
+	# ACORDAOS, de outra frente. `check-v2-portfolio-pairing` le
+	# `data/editorial/v2_pages` INTEIRO -- ele nao conhece canal nem gatilho.
+	#
+	# `retomada` (e nao `quarentena`) porque a peca nao tem defeito: assim que o
+	# portfolio alheio for commitado, a passada seguinte publica. E o escopo e'
+	# o que impede `tools/publicar-estoque` de cobrar tentativa -- ele so cobra
+	# quando a ultima linha do ledger diz `completa`.
+	if [ "$COMMIT_RESTRITO" = "1" ]; then
+		ESCOPO_DA_PASSADA="retomada"
+		quarentena "pareamento_global_pendente" \
+			"o gate de pareamento le o diretorio inteiro e reprovou por intencao de OUTRO canal ainda nao commitada; esta peca nao tem defeito e RETOMA" \
+			"commitar o portfolio pendente (a saida do gate acima o nomeia) destrava todas as passadas" \
+			"${ALVOS_PORTFOLIO[@]}"
+	fi
+	registra "pareamento"
+	echo "  a onda PARA aqui: commitar página sem intenção pareada só queima um" >&2
+	echo "  pre-commit inteiro para ser recusada pelo gate." >&2
+	exit 1
+fi
+
+mapfile -t ALVOS_PAGINAS < <(alvos_do_registro shard) || true
+if ((${#ALVOS_PAGINAS[@]} == 0)); then
+	registra "registro:paginas"
+	echo "  a onda PARA aqui: sem os caminhos do registro, a alternativa seria" >&2
+	echo "  varrer o diretório — 879 arquivos medidos contra 7 produtores." >&2
+	exit 1
+fi
+if ! git diff --quiet -- "${ALVOS_PAGINAS[@]}" ||
+	[[ -n "$(git ls-files --others --exclude-standard -- "${ALVOS_PAGINAS[@]}")" ]]; then
+	if [ "$COMMIT_RESTRITO" = "1" ]; then
+		# ★ PRESERVAR ANTES DE COMMITAR, e a copia NAO ficou obsoleta com a
+		# politica nova. Ela cobre a janela em que o commit pode REPROVAR: nesse
+		# caso o texto que a transacao vai publicar existe so na worktree, e se
+		# outra passada o reescrever a pagina publicada fica sem nenhuma copia do
+		# que foi ao ar. E' a mesma regra que o contrato ja manda aplicar antes de
+		# tocar em texto redigido, e nao apaga nada -- so acrescenta.
+		#
+		# O NOME LEVA HORA, e nao so a data: o publicador roda varias vezes ao
+		# dia, e `$HOJE-$ROTULO` faria a segunda passada SOBRESCREVER a copia da
+		# primeira -- preservacao que apaga o que preservou.
+		PRESERVADO="$PWD/.agents/runtime/publicador-cerebro/$(date -u +%Y%m%d-%H%M%S)-$ROTULO"
+		mkdir -p "$PRESERVADO"
+		for alvo_preservar in "${ALVOS_PAGINAS[@]}" "${ALVOS_PORTFOLIO[@]}"; do
+			[[ -e "$alvo_preservar" ]] || continue
+			cp -p "$alvo_preservar" "$PRESERVADO/$(basename "$alvo_preservar")" 2>/dev/null ||
+				registra "preservacao:$(basename "$alvo_preservar")"
+		done
+		if ! commita_restrito paginas "${ALVOS_PAGINAS[@]}"; then
+			# A PASSADA SEGUE AQUI, e a diferenca para a 5/9 e' de FATO: chegar
+			# nesta linha significa que o pareamento da 6/9 PASSOU, isto e', toda
+			# pagina do estoque tem intencao no commit pai. A transacao pode
+			# publicar; o que falta e' o lastro do texto no historico, e a copia
+			# datada acima o substitui ate a passada seguinte.
+			case "$CLASSE_DO_COMMIT" in
+			peca)
+				quarentena "commit_de_estoque_reprovado" \\
+					"o pre-commit reprovou o estoque por defeito do CONTEUDO; copia datada em ${PRESERVADO#"$PWD"/}" \\
+					"leia o log em .agents/runtime/cerebro-commitar/, conserte o produtor e relance" \\
+					"${ALVOS_PAGINAS[@]}"
+				;;
+			ambiente | hook)
+				quarentena "commit_adiado_por_${CLASSE_DO_COMMIT}" \\
+					"o commit do estoque nao passou por ${CLASSE_DO_COMMIT}, nao por defeito da peca; copia datada em ${PRESERVADO#"$PWD"/}" \\
+					"nenhum ato humano e' necessario: a passada seguinte commita" \\
+					"${ALVOS_PAGINAS[@]}"
+				;;
+			*)
+				registra "commit-restrito:paginas:$CLASSE_DO_COMMIT"
+				;;
+			esac
+			echo "  estoque NAO commitado ($CLASSE_DO_COMMIT) e preservado; a publicacao segue"
+		else
+			echo "  páginas commitadas pela porta restrita"
+		fi
+	else
+		com_teto 300 "git add v2_pages" git add -- "${ALVOS_PAGINAS[@]}"
+		com_teto 600 "git commit v2_pages" git commit -q -m "chore(paginas): estoque da passada $ROTULO de $HOJE" -- "${ALVOS_PAGINAS[@]}" &&
+			echo "  páginas commitadas" || registra "commit:paginas"
+	fi
+else
+	echo "  estoque sem novidade"
+fi
+
+# ---------------------------------------------------------------- 5. CENSO
+etapa "7/9 censo de severidade"
+if timeout 900 nice -n 19 python3 tools/generate-v2-publication-severity --write \
+	>"$LOGS_COLETA/censo.log" 2>&1; then
+	grep -E 'PUBLICAVEIS|colisoes de rota|lanes publicaveis' "$LOGS_COLETA/censo.log" | sed 's/^/  /'
+else
+	registra "censo"
+fi
+
+# ------------------------------------------------ 5.9 A DATA DE CADA PAGINA
+etapa "7.9/9 data de revisao: quem mudou ganha data nova"
+# POR QUE ESTA ETAPA NASCEU, e por que ela vem ANTES da publicacao.
+#
+# `tools/generate-page-content-revision` existe desde 2026-08-07 e resolve o
+# defeito da data unica. Mas so `tools/deploy-publico` o chamava -- e a
+# publicacao canonica desde a politica PUBLICAR E CORRIGIR e
+# `cmd/publish-v2-direct`, que NAO o chamava. Resultado medido em 2026-08-26: o
+# ledger nao era gravado desde 20/08, e 9.582 URLs anunciavam <lastmod>
+# 2026-08-06 enquanto 10.059 de 10.059 rotas tinham `html_sha256` diferente do
+# manifesto de 20/08. Cem por cento do acervo servindo bytes novos sob data de
+# vinte dias atras.
+#
+# O CUSTO DISSO NAO E COSMETICO. `lastmod` e o sinal que diz ao crawler se vale
+# a pena voltar. Acervo enriquecido que se declara parado convida o bot a nao
+# voltar exatamente onde houve novidade -- e o dono nomeou isso: pagina que
+# parece obsoleta desmotiva o robo.
+#
+# ANTES da publicacao, e nao depois: o gerador escreve `content_revised_at`, que
+# `cmd/publish-v2-direct` le para carimbar o HTML, o <lastmod> e o
+# Last-Modified. Rodando depois, a data nova so alcancaria o publico na onda
+# SEGUINTE -- um dia de defasagem num sinal cuja unica funcao e ser oportuno.
+#
+# NAO REPROVA A ONDA: data que nao avancou e defeito de sinal, nao de conteudo,
+# e parar a publicacao por causa dela deixaria o acervo sem as paginas do dia
+# para corrigir um carimbo. Registra e segue.
+if timeout 900 nice -n 19 ./tools/generate-page-content-revision \
+	>"$LOGS_COLETA/revisao.log" 2>&1; then
+	grep -E 'conteúdo mudou|novas|datas distintas' "$LOGS_COLETA/revisao.log" | head -4 | sed 's/^/  /'
+else
+	echo "  data de revisao: FALHOU (ver $LOGS_COLETA/revisao.log) — a onda segue, o carimbo fica velho"
+	registra "revisao-de-data"
+fi
+
+# ------------------------------------------------ 5.95 A DATA DE ESTREIA
+etapa "7.95/9 data de estreia: quem ja estreou nao estreia de novo"
+# POR QUE ESTA ETAPA NASCEU (P1b, 2026-09-16), e por que ela vem ANTES da
+# publicacao.
+#
+# `tools/generate-first-published-at` existe desde 2026-08-20 e resolve o
+# defeito da estreia que anda. Ele era ORFAO: nenhum runner, nenhum timer,
+# nenhum hook o chamava. Resultado medido em 2026-09-16 --
+# `data/editorial/first_published_at.json` congelado ha 18 dias, com 10.107
+# chaves contra 11.114 do manifesto, e 942 paginas SERVIDAS declarando
+# `datePublished` de hoje com `dateModified` de dias antes: cronologia
+# impossivel, no ar, re-datada a cada onda. /jurisprudencia/ 875, /leis/ 38,
+# /sumulas/ 29.
+#
+# ANTES da publicacao, e nao depois: `cmd/publish-v2-direct` LE este arquivo
+# para carimbar o `datePublished` do JSON-LD e o `approved_at` do manifesto.
+# Rodando depois, a data certa so alcancaria o publico na onda seguinte -- e ate
+# la a flag `-published-at "$HOJE"` teria carimbado a data de hoje outra vez.
+#
+# A FONTE DELE E O HISTORICO GIT DO MANIFESTO, que a etapa 8.05/9 passou a
+# gravar: o gerador percorre os commits do published_manifest e anota em qual
+# deles cada rota aparece pela PRIMEIRA vez. Logo, a passada de hoje enxerga o
+# manifesto que a onda de ONTEM commitou; a rota que estreia HOJE entra no
+# registro na onda seguinte, e nesse meio-tempo ela usa a data da passada, que
+# para rota nova e a data certa. Enquanto o manifesto nao era commitado, a fonte
+# que consertaria o dado era justamente a que a onda deixava de gravar.
+#
+# NAO REPROVA A ONDA: metadado que nao avancou e defeito de sinal, nao de
+# conteudo, e o publicador ja trata ausencia do arquivo caindo na data da
+# passada. Registra e segue -- mesma postura da 7.9/9.
+if timeout 900 nice -n 19 python3 ./tools/generate-first-published-at \
+	>"$LOGS_COLETA/estreia.log" 2>&1; then
+	grep -E 'intents com data recuperada|intents ja conhecidos|gravado' "$LOGS_COLETA/estreia.log" | sed 's/^/  /'
+else
+	echo "  data de estreia: FALHOU (ver $LOGS_COLETA/estreia.log) — a onda segue, a estreia fica congelada"
+	registra "estreia"
+fi
+
+# ---------------------------------------------------------------- 6. PUBLICAR
+etapa "8/9 publicação transacional"
+if timeout 1800 nice -n 10 $GO run ./cmd/publish-v2-direct \
+	-published-at "$HOJE" -reviewed-at "$HOJE" -allow-public-write \
+	>"$LOGS_COLETA/publica.log" 2>&1; then
+	grep -E 'manifesto \+ gate index|publishedmanifest.Validate|HTML escrito|recarga' \
+		"$LOGS_COLETA/publica.log" | sed 's/^/  /'
+else
+	registra "publicacao"
+	tail -5 "$LOGS_COLETA/publica.log" >&2
+	# A ONDA PARA AQUI, e a diferença é grande: até 2026-08-26 este ramo apenas
+	# registrava a falha e SEGUIA para as etapas 8.5/9 e 9/9 — e a 9/9 RECARREGA O
+	# SERVIDOR.
+	#
+	# Recarregar depois de uma publicação que falhou é o gatilho do pior modo de
+	# falha que este portal tem. A transação escreve sitemap e manifesto em
+	# momentos distintos; interrompida no meio, o disco fica com sitemap sem
+	# manifesto correspondente, e essa condição ABORTA O BOOT
+	# (published_manifest_sitemap_loc_without_manifest). Como a unit do servidor
+	# tem Restart=always, RestartSec=5 e StartLimitIntervalSec=0 — sem teto —, o
+	# resultado é laço infinito de reinício, provocado pela própria onda.
+	#
+	# E há dois danos menores no mesmo caminho: recomprimir brotli (8.5/9) sobre
+	# HTML de publicação parcial propaga o parcial para o canal que a Cloudflare
+	# consome, e anunciar ao IndexNow (9/9) URLs de uma transação que falhou é pior
+	# que não anunciar — o buscador vem buscar o que não está lá.
+	#
+	# As outras cinco paradas desta onda (flag inválida, reparo quebrado,
+	# preservação, texto repetido, texto partido) já seguiam este padrão: `registra`
+	# e `exit 1`. A publicação era a exceção, e era justamente a mais cara.
+	echo "  A ONDA PAROU: a publicacao transacional falhou, e recarregar o servidor" >&2
+	echo "  depois disso pode reinicia-lo contra sitemap sem manifesto -- condicao" >&2
+	echo "  que aborta o boot, com Restart=always e sem teto de tentativas." >&2
+	# EXIT 2, nao 1: publicacao transacional que falha e a coisa mais cara que
+	# acontece nesta onda -- e era indistinguivel, no codigo de saida, de "um gate
+	# reprovou uma pagina". A unit mascarava o 1 e o dono nunca era alertado do
+	# caso grave. Auditoria de 2026-08-28.
+	exit 2
+fi
+
+# --------------------------------------- 6.1 O QUE A TRANSACAO ACABOU DE GRAVAR
+etapa "8.05/9 commit do manifesto publicado e do registro de estreia"
+# DEFEITO N13, medido em 2026-09-16: a onda commitava portfolio (5/9) e paginas
+# (6/9) e NUNCA o `published_manifest.jsonl`. Ele estava modificado ha 6 dias no
+# worktree, com o ultimo commit em 2026-09-10.
+#
+# O CUSTO NAO E COSMETICO, e fecha um laco: o registro de estreia da etapa
+# 7.95/9 deriva a data do HISTORICO GIT deste manifesto. Sem o commit, a rota
+# publicada hoje nunca ganha evidencia datada, o publicador cai na flag
+# `-published-at "$HOJE"` amanha, e a data de estreia anda mais um dia -- todo
+# dia. A fonte que conserta o dado era a que a onda deixava de gravar.
+#
+# O `add` leva o CAMINHO EXATO, nunca o diretorio: o indice e compartilhado
+# entre sessoes e `data/editorial` inteiro varreria estoque, portfolio e censo
+# de quem estiver trabalhando ao lado. A mensagem vai por ARQUIVO, que e o
+# contrato deste repositorio, e as duas invocacoes ficam em linhas separadas
+# porque o pre-commit compila o INDICE e reprova se ele mudar no meio.
+#
+# DEPOIS da publicacao transacional, porque e ela quem escreve os dois arquivos,
+# e so no ramo de sucesso -- commitar manifesto de transacao que falhou gravaria
+# no historico um retrato que o disco nao tem.
+ESTREIA_PARA_COMMIT="data/editorial/first_published_at.json"
+MANIFESTO_PARA_COMMIT="data/editorial/published_manifest.jsonl"
+MENSAGEM_MANIFESTO="$LOGS_COLETA/commit-manifesto.msg"
+# ESTA ETAPA E LOAD-BEARING, E POR ISSO ELA NAO FALHA EM SILENCIO.
+#
+# Ela NAO interrompe a onda: a publicacao ja aconteceu e esta coerente, e parar
+# aqui deixaria `.br` velho ao lado de HTML novo (8.5/9) e o servidor sem recarga
+# (9/9) -- dois danos maiores que o que ela evita. Mas falhar sem alarme e o
+# padrao que produziu os tres elos deste defeito, entao a falha sai NOMEADA, com
+# a consequencia e o comando de recuperacao, e a falha ACUMULADA (manifesto sem
+# commit ha mais de um dia) entra no relatorio com chave propria.
+#
+# RECONCILIACAO, e ate onde ela vai: um commit perdido NAO perde a data. A etapa
+# 7.95/9 usa tambem o registro de revisao de conteudo como TETO, entao a rota
+# volta a ser datada no ciclo seguinte, com no maximo UM dia de atraso; e o
+# `datePublished` SERVIDO nao e afetado, porque `cmd/publish-v2-direct` toma o
+# minimo entre a data declarada, o registro e a revisao. O que o commit perdido
+# custa e precisao de um dia no registro -- nao a data.
+if [ "$COMMIT_RESTRITO" = "1" ]; then
+	# O MANIFESTO E O REGISTRO DE ESTREIA FECHAM UM LACO, e por isso eles estao
+	# na allowlist da porta restrita: `tools/generate-first-published-at` deriva
+	# a estreia do HISTORICO GIT deste manifesto. Sem este commit a rota
+	# publicada hoje nunca ganha evidencia datada, o publicador cai na flag
+	# `-published-at "$HOJE"` amanha, e a data de estreia anda mais um dia --
+	# todo dia. Foi assim que o manifesto passou seis dias sem commit e 999 rotas
+	# ficaram sem evidencia datada nenhuma.
+	#
+	# NAO INTERROMPE A PASSADA em nenhuma classe: a publicacao ja aconteceu e
+	# esta coerente, e parar aqui deixaria `.br` velho ao lado de HTML novo e o
+	# servidor sem recarga -- dois danos maiores que o que se evitaria. O custo
+	# de um commit perdido e' de UM dia de precisao no registro, e nunca na data
+	# SERVIDA: `cmd/publish-v2-direct` toma o minimo entre a data declarada, o
+	# registro e a revisao de conteudo.
+	if ! git diff --quiet -- "$MANIFESTO_PARA_COMMIT" "$ESTREIA_PARA_COMMIT"; then
+		if ! commita_restrito publicacao "$MANIFESTO_PARA_COMMIT" "$ESTREIA_PARA_COMMIT"; then
+			quarentena "commit_de_publicacao_adiado_${CLASSE_DO_COMMIT}" \
+				"o commit do manifesto e do registro de estreia nao passou ($CLASSE_DO_COMMIT); o custo e' de UM dia de precisao no registro de estreia, nunca na data servida" \
+				"a passada seguinte commita; se a classe for peca, leia o log em .agents/runtime/cerebro-commitar/" \
+				"$MANIFESTO_PARA_COMMIT" "$ESTREIA_PARA_COMMIT"
+		else
+			echo "  manifesto e estreia commitados pela porta restrita"
+		fi
+	else
+		echo "  manifesto e estreia sem novidade"
+	fi
+elif ! git diff --quiet -- "$MANIFESTO_PARA_COMMIT" "$ESTREIA_PARA_COMMIT"; then
+	printf '%s\n' "chore(publicacao): manifesto publicado e registro de estreia da passada $ROTULO de $HOJE" \
+		>"$MENSAGEM_MANIFESTO"
+	com_teto 300 "git add manifesto+estreia" git add "$MANIFESTO_PARA_COMMIT" "$ESTREIA_PARA_COMMIT"
+	if com_teto 600 "git commit manifesto+estreia" git commit -q -F "$MENSAGEM_MANIFESTO" -- "$MANIFESTO_PARA_COMMIT" "$ESTREIA_PARA_COMMIT"; then
+		echo "  manifesto e estreia commitados"
+	else
+		registra "commit:manifesto"
+		ULTIMO_COMMIT_DO_MANIFESTO="$(git log -1 --format=%cd --date=short -- "$MANIFESTO_PARA_COMMIT" 2>/dev/null || true)"
+		echo "  commit do manifesto FALHOU -- a onda segue, e o custo e precisao de UM dia" >&2
+		echo "  no registro de estreia (o servido nao muda: o publicador toma o minimo)." >&2
+		echo "  ultimo commit do manifesto: ${ULTIMO_COMMIT_DO_MANIFESTO:-nenhum} / hoje: $HOJE" >&2
+		echo "  recuperacao, em DOIS comandos separados (o pre-commit compila o indice):" >&2
+		echo "    git add $MANIFESTO_PARA_COMMIT $ESTREIA_PARA_COMMIT" >&2
+		echo "    git commit -F $MENSAGEM_MANIFESTO -- $MANIFESTO_PARA_COMMIT $ESTREIA_PARA_COMMIT" >&2
+		# INICIO DO DIAGNOSTICO ACUMULADO 8.05/9 -- ancora literal, nao decoracao:
+		# tools/test_onda_commit_do_manifesto.py extrai EXATAMENTE estas linhas e as
+		# executa com uma data forjada, porque o ramo so roda quando o commit falha.
+		if [[ -n "$ULTIMO_COMMIT_DO_MANIFESTO" ]]; then
+			DIAS_SEM_COMMIT=$((( $(date -d "$HOJE" +%s) - $(date -d "$ULTIMO_COMMIT_DO_MANIFESTO" +%s)) / 86400))
+			# DOIS DIAS E OUTRA COISA. Uma falha isolada custa um dia de precisao;
+			# duas seguidas significam que a causa nao e transitoria -- foi assim
+			# que o manifesto passou 6 dias sem commit e 999 rotas ficaram sem
+			# evidencia datada nenhuma. Chave propria para nao se confundir com a
+			# falha do dia no relatorio.
+			if ((DIAS_SEM_COMMIT >= 2)); then
+				registra "commit:manifesto-acumulado-${DIAS_SEM_COMMIT}d"
+				echo "  ACUMULADO: $DIAS_SEM_COMMIT dias sem commit do manifesto -- a causa nao e transitoria." >&2
+			fi
+		fi
+		# FIM DO DIAGNOSTICO ACUMULADO 8.05/9
+	fi
+else
+	echo "  manifesto e estreia sem novidade"
+fi
+
+# ------------------------------------------------- 8-bis. FILA DE REFINAMENTO
+# A política de 2026-08-06 é explícita: o que entra como MÉDIO "vira fila de
+# refinamento com causa nomeada" — publicar não encerra o defeito.
+#
+# O publicador JÁ detecta e imprime essas classes ("gate de qualidade: N
+# classe(s) de achado MÉDIO", seguido de uma linha por classe). O que faltava
+# era alguém guardar: a onda grepava só manifesto, HTML e recarga, então o aviso
+# morria em "$LOGS_COLETA/publica.log" — arquivo volátil que ninguém lê às
+# 04:28. Foi assim que 8 páginas de diário ficaram no ar com "edição" repetida
+# 47 vezes; o publicador avisou todos os dias e o aviso não tinha destinatário.
+#
+# A fila NÃO reprova a onda. Médio publica, por decisão do dono; o que muda é
+# que o defeito passa a ter registro datado, contagem e causa nomeada.
+FILA_REFINAMENTO="data/ops/refinement_queue.jsonl"
+if grep -q 'achado MÉDIO' "$LOGS_COLETA/publica.log" 2>/dev/null; then
+	# O ROTULO ENTRA COMO `origem` (2026-09-16): a deduplicacao abaixo e' por
+	# (data, origem), e com a origem literal `onda-diaria` a passada do
+	# publicador SUBSTITUIRIA a linha da onda do mesmo dia -- a divida de um
+	# produtor apagando a do outro, com a serie continuando a somar certo e
+	# medindo errado.
+	com_teto 300 "fila de refinamento" python3 - "$FILA_REFINAMENTO" "$HOJE" "$LOGS_COLETA/publica.log" "$ROTULO" <<'PYFILA'
+import json, re, sys
+fila, dia, log, origem = sys.argv[1:5]
+classes = {}
+dentro = False
+for linha in open(log, encoding="utf-8", errors="replace"):
+    if "achado MÉDIO" in linha:
+        dentro = True
+        continue
+    if not dentro:
+        continue
+    # As linhas da lista vêm indentadas: "  codigo    N ocorrência(s)".
+    casado = re.match(r"\s+([a-z0-9_]+)\s+(\d+) ocorr", linha)
+    if casado:
+        classes[casado.group(1)] = int(casado.group(2))
+    elif linha.strip() and not linha.startswith(" "):
+        break
+if classes:
+    # UMA LINHA POR DIA E ORIGEM, NAO UMA POR EXECUCAO.
+    #
+    # Isto era `open(fila, "a")` puro, e a onda roda mais de uma vez por dia
+    # quando alguem a relanca. Resultado medido em 2026-08-29: a data
+    # 2026-08-26 aparecia QUATRO vezes, com o mesmo conteudo, e qualquer soma
+    # sobre a fila multiplicava a divida por quatro. Serie que conta o mesmo
+    # dia varias vezes nao mede tendencia -- e tendencia e a unica pergunta
+    # que essa fila responde: a divida esta crescendo ou caindo?
+    registro = {
+        "data": dia,
+        "origem": origem,
+        "classes": classes,
+        "total": sum(classes.values()),
+    }
+    anteriores = []
+    try:
+        with open(fila, encoding="utf-8") as entrada:
+            for linha in entrada:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    antigo = json.loads(linha)
+                except json.JSONDecodeError:
+                    anteriores.append(linha)  # linha ilegivel se preserva
+                    continue
+                if antigo.get("data") == dia and antigo.get("origem") == origem:
+                    continue  # substituida pela execucao de agora
+                anteriores.append(json.dumps(antigo, ensure_ascii=False))
+    except FileNotFoundError:
+        pass
+    anteriores.append(json.dumps(registro, ensure_ascii=False))
+    with open(fila, "w", encoding="utf-8") as saida:
+        saida.write("\n".join(anteriores) + "\n")
+    for codigo, quantos in sorted(classes.items(), key=lambda par: -par[1]):
+        print(f"  fila de refinamento: {codigo} — {quantos} ocorrência(s)")
+PYFILA
+else
+	echo "  fila de refinamento: nenhum achado médio nesta onda"
+fi
+
+# ------------------------------------------------- 6.5 RECOMPRIMIR O QUE MUDOU
+etapa "8.5/9 brotli estatico das paginas reescritas"
+# ESTA ETAPA EXISTE PORQUE A ANTERIOR CRIA A BOMBA QUE ELA DESARMA.
+#
+# `brotli_static on` manda o nginx servir `$uri.br` quando o arquivo existe, e
+# ele NÃO compara frescor com o fonte. A etapa 8/9 reescreve `index.html`,
+# `feed.xml`, `rss.xml`, `sitemap.xml` e os shards — todos com gêmea `.br` desde
+# 2026-08-26. Sem recomprimir aqui, o disco fica com HTML novo ao lado de `.br`
+# velho, e quem pede `Accept-Encoding: br` recebe o velho.
+#
+# Quem pede br é justamente quem não pode receber errado: medido no access log,
+# a Cloudflare puxa a origem comprimida (os fetches batem BYTE A BYTE com o
+# `stat` dos `.br`). Ou seja, o corpo velho não ficaria num cliente isolado —
+# entraria no cache de borda e seria distribuído a TODOS, enquanto o IndexNow da
+# etapa seguinte anuncia essas mesmas URLs como recém-atualizadas.
+#
+# Roda ANTES da 9/9 de propósito: anunciar ao buscador uma URL cujo corpo servido
+# ainda é o de ontem é pior que não anunciar. E o gerador poda antes de comprimir,
+# então uma interrupção aqui deixa AUSÊNCIA de `.br` (que o nginx resolve
+# comprimindo em q5) e nunca conteúdo velho.
+# O exit vem de PIPESTATUS[0], nunca do pipeline: `cmd | sed` devolve o status do
+# SED, e um `if !` em cima disso jamais dispararia. É a mesma armadilha que a
+# etapa 9/9 comenta logo abaixo — ela morde duas vezes no mesmo arquivo.
+com_teto 1800 "generate-brotli-static" nice -n 19 ./tools/generate-brotli-static --jobs 4 2>&1 | sed 's/^/  /'
+if [[ ${PIPESTATUS[0]} -ne 0 ]]; then registra "brotli"; fi
+
+etapa "8.6/9 a onda avançou? (conjunto de intents, não contagem de shard)"
+# Vem DEPOIS da publicacao transacional e ANTES dos gates de resultado, porque
+# e' o veredito da onda: se o acervo nao ganhou nenhuma rota, tudo o que os
+# gates abaixo medirem sera' sobre o acervo de ontem. Nao interrompe a onda --
+# a publicacao ja aconteceu e esta' coerente --, mas entra em `registra` e o
+# relatorio do dia sai marcado.
+# ★ QUANDO 0 E' O PISO CERTO, e por que isso NAO e' afrouxar o gate (2026-09-16)
+#
+# `--minimo 1` existe porque a onda das 04:20 tem por FUNCAO trazer rota nova:
+# ela coleta a fonte oficial do dia e monta pagina do que chegou. Em 2026-09-09
+# ela imprimiu "415 paginas" com `novas: 0` e a fabrica ficou cinco dias parada
+# sem um unico vermelho — este piso e' a correcao daquilo, e na onda ele fica.
+#
+# A passada de ENRIQUECIMENTO do cerebro e' outra grandeza: o comentario autoral
+# entra numa pagina que JA existe e JA esta publicada, e o produto dela e' o
+# corpo da rota mudando, nao um `unique_intent_id` novo. `novas_publicadas` e'
+# ZERO POR CONSTRUCAO ali, e cobrar 1 seria reprovar a passada por ela ter
+# funcionado como foi desenhada.
+#
+# O piso NAO fica sem substituto: quem cobra o resultado dessa passada e'
+# `tools/publicar-estoque`, que mede, ANTES e DEPOIS, quantos comentarios
+# aprovados do cerebro ainda nao estao no estoque -- criterio POSITIVO e mais
+# estrito que "apareceu rota nova", porque nomeia exatamente quais pecas
+# faltavam e quais continuam faltando.
+#
+# E o que este gate protege de verdade continua valendo nos dois casos: ele
+# tambem conta `sumiram`, e rota que DESAPARECE do manifesto reprova
+# independentemente do piso.
+if ! com_teto 300 "check-onda-avanca --depois" ./tools/check-onda-avanca --depois --minimo "$MINIMO_NOVAS" --rotulo "$ROTULO"; then
+	registra "onda-avanca"
+fi
+
+etapa "8.7/9 gates da onda: o que a onda acabou de produzir esta correto?"
+# POR QUE ESTES TRES, E POR QUE AQUI (2026-08-27).
+#
+# Os tres nasceram nesta sessao e nenhum tinha gatilho — eram gates orfaos, a
+# mesma condicao de outros 98 no repositorio. Gate que existe e nao roda e igual
+# a gate que nao existe, e este e o unico ponto do dia em que a onda ja produziu
+# tudo o que eles medem.
+#
+# Rodam DEPOIS da publicacao e da compressao de proposito: os tres medem o
+# RESULTADO (o que ficou no ar, o que ficou no estoque), nao a intencao. E
+# nenhum deles PARA a onda: a publicacao ja aconteceu e esta coerente; o que eles
+# encontram e fila de correcao, registrada em `registra` para o relatorio do dia.
+for gate in check-frescor-canal-diario check-derived-authorial-floor check-public-sem-lixo check-edge-vary-contract check-lastmod-causalidade check-bot-telemetry-honesty-selftest check-served-vs-manifest check-cronologia-de-publicacao; do
+	if [[ -x "./tools/$gate" ]]; then
+		"./tools/$gate" >"$LOGS_COLETA/$gate.log" 2>&1
+		codigo=$?
+		if [[ $codigo -ne 0 ]]; then
+			echo "  $gate: reprovou (exit $codigo) — ver $LOGS_COLETA/$gate.log"
+			tail -3 "$LOGS_COLETA/$gate.log" | sed 's/^/    /'
+			registra "$gate"
+		else
+			echo "  $gate: ok"
+		fi
+	fi
+done
+
+etapa "8.8/9 fila de propostas de reescrita (o conteudo parado vira pauta)"
+# POR QUE ESTA ETAPA NASCEU (2026-09-16, P8), com o numero que a justifica.
+#
+# tools/generate-propostas-reescrita era ORFAO — nenhum runner, timer ou hook o
+# chamava — e, pior, NAO TERMINAVA sobre o corpus atual: ele buscava o acordao
+# candidato por NORMA INTEIRA, e o CPC sozinho reune dezenas de milhares de
+# acordaos, o que punha o cosseno TF-IDF na casa de 10^8 chamadas.
+# data/ai/propostas_reescrita.jsonl estava congelado no lote unico de
+# 2026-09-08, 100 propostas, zero aplicadas.
+#
+# Corrigido o indice para exigir DISPOSITIVO (artigo) em comum, medido em
+# 2026-09-16 sobre o grafo real: 467.479 pares avaliados, 124,5 s de parede,
+# 1,03 GB de pico, 5.998 candidatas (1.968 delas de precedente, contra 100 no
+# lote antigo). A mediana da similaridade dos precedentes subiu de 0,020 para
+# 0,195 — o laco por artigo nao e so mais rapido, e o unico que sustenta
+# atribuicao.
+#
+# POR QUE AQUI. Ele le content/pages.json, o censo de severidade (7/9) e
+# data/ops/eventos/, e os tres so estao frescos depois da publicacao (8/9) e do
+# commit do manifesto (8.05/9). Roda DEPOIS dos gates da onda porque nao decide
+# nada sobre o que foi publicado: produz PAUTA.
+#
+# NAO PARA A ONDA. A saida e proposta com evidencia, nunca pagina: falhar aqui
+# significa que a pauta do dia nao foi atualizada, e a do dia anterior continua
+# servindo. Entra em `registra` para o relatorio.
+if timeout 900 nice -n 19 python3 ./tools/generate-propostas-reescrita --dias 7 --limite 100 --timings \
+	>"$LOGS_COLETA/propostas-reescrita.log" 2>&1; then
+	printf '  %s\n' "$(grep -m1 'propostas (de' "$LOGS_COLETA/propostas-reescrita.log" | cut -c1-160)"
+else
+	printf '  falhou (exit %s) — a pauta anterior segue servindo, a onda continua\n' "$?"
+	registra "propostas:reescrita"
+fi
+
+# ---------------------------------------------------------------- 7. PROVAR
+etapa "9/9 prova em HTTP real"
+# Relatório do publicador não é prova. A prova é a rota responder, o markdown
+# existir e a borda servir o mesmo byte que o disco.
+# TETO: a recarga fala com o systemd e espera o socket voltar. Sem teto, um
+# `systemctl` preso numa transação do gerenciador segura a onda inteira — e a
+# onda segura o flock, e o dia seguinte não roda.
+if ! com_teto 180 "reload-wiki-server" ./tools/reload-wiki-server; then registra "recarga"; fi
+# A ONDA CORRIGE O QUE SABE CORRIGIR, em vez de so reportar.
+#
+# Ate 2026-08-26 esta linha era `if ! check; then registra; fi`: a onda terminava
+# PARCIAL toda vez que a borda ficasse com a versao anterior de um artefato, e
+# alguem precisava purgar a mao no dia seguinte. Purga de artefato de descoberta
+# e barata, idempotente e nao destroi nada -- exatamente o tipo de conserto que
+# nao precisa de gente.
+#
+# UMA TENTATIVA, e so uma: se a purga nao resolver, a causa NAO e cache (foi
+# assim que a injecao do Cloudflare Web Analytics ficou escondida por tras de
+# um "purgue" repetido em laco), e o gate agora nomeia a causa real. Repetir
+# purga contra injecao gastaria cota e mascararia o defeito.
+if ! com_teto 300 "check-edge-discovery-freshness" ./tools/check-edge-discovery-freshness; then
+	echo "  borda divergente — purgando os artefatos de descoberta e reconferindo (1 tentativa)"
+	if ./tools/purge-edge-cache --url / --url /sitemap.xml --url /feed.xml --url /rss.xml \
+		--url /robots.txt --url /llms.txt --url /llms-full.txt >/dev/null 2>&1; then
+		# A borda precisa de alguns segundos para propagar a purga antes da reconferencia.
+		timeout 20 tail -f /dev/null 2>/dev/null || true
+		if com_teto 300 "check-edge-discovery-freshness (reconferencia)" ./tools/check-edge-discovery-freshness; then
+			echo "  frescor-borda: resolvido pela purga automatica"
+		else
+			registra "frescor-borda"
+		fi
+	else
+		registra "frescor-borda"
+	fi
+fi
+# O exit REAL vem de PIPESTATUS[0]: "cmd | tail | sed" devolve o status do SED,
+# e um IndexNow que falhasse passaria por bem-sucedido. É a armadilha que este
+# repositório já catalogou — e ela estava aqui.
+timeout 600 python3 tools/generate-indexnow-incremental-submit 2>&1 | tail -4 | sed 's/^/  /'
+if [[ ${PIPESTATUS[0]} -ne 0 ]]; then registra "indexnow"; fi
+
+# ★ FIM VERDADEIRO. Ver `etapa()`: sem esta marca, toda parada por `exit 1`
+# direto de gate era gravada no ledger como `escopo: completa` -- e o publicador
+# autonomo, que le esse campo, imprimia "cadeia completou: sim" para uma cadeia
+# parada na 4/9. A marca fica na ULTIMA linha executavel, depois da 9/9.
+CHEGOU_AO_FIM=1

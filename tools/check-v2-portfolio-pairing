@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Confere o pareamento intencao <-> pagina ANTES de tentar o commit.
+
+POR QUE ESTA FERRAMENTA EXISTE (custo medido em 2026-08-20).
+
+O gate tools/check-v2-finalized-commit recusa commit de shard v2 cujo
+intent_id nao esteja no portfolio -- e a autoridade de pertinencia e o
+portfolio do commit PAI, nunca o do candidato. A regra e boa: ninguem fabrica
+a demanda e o conteudo no mesmo movimento atomico. Mas ela so estava escrita
+num comentario dentro do proprio gate, e o preco de descobri-la pela recusa e
+alto: cada tentativa dispara o pre-commit completo, com build Go de minutos.
+
+Nesta data um agente com o indice INTEGRO (280 paginas, 280 intencoes, 1:1
+verificado sobre o proprio git write-tree) tentou o mesmo commit QUATRO vezes
+antes de ler o codigo e entender que o problema nao era o conteudo, era a
+ORDEM. Esta ferramenta responde a pergunta em menos de um segundo, sem build,
+e diz exatamente qual e o proximo comando.
+
+Ela e READ-ONLY: le git e disco, nao escreve nada, nao commita.
+
+Uso:
+    ./tools/check-v2-portfolio-pairing            # confere o estado atual
+    ./tools/check-v2-portfolio-pairing --index    # confere o que esta staged
+
+Saida: exit 0 quando o commit das paginas pode ir; exit 1 com o que falta.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+PAGINAS = "data/editorial/v2_pages"
+PORTFOLIO = "data/editorial/portfolio_v2"
+
+
+def git(argumentos: list[str]) -> bytes:
+    resultado = subprocess.run(["git", "-C", str(RAIZ)] + argumentos,
+                               capture_output=True)
+    if resultado.returncode != 0:
+        return b""
+    return resultado.stdout
+
+
+def intents_de(payload: bytes, so_ativos: bool = False) -> list[str]:
+    """Extrai os intent_id de um JSONL.
+
+    Com so_ativos, ignora os TOMBSTONES (`skipped: true`). Isso ESPELHA a regra
+    do gate, que exige pertinencia 1:1 apenas para pagina ativa e tolera
+    tombstone sem linha de portfolio (check-v2-finalized-commit: a condicao e
+    `(not skipped and count != 1) or (skipped and count > 1)`).
+
+    Espelhar importa mais que ser rigoroso: um verificador MAIS severo que o
+    gate reprova trabalho que passaria, e manda o agente consertar o que nao
+    esta quebrado. Na primeira execucao esta ferramenta acusou 6 paginas de
+    /aereo/ "sem intencao" -- todas tombstones de orfao, com
+    skip_reason "orphan_no_portfolio_join_semantic_duplicate_of_active_canonical"
+    e sem corpo. O gate as aceita; o verificador precisava aceitar tambem.
+    """
+    encontrados = []
+    for linha in payload.decode("utf-8", errors="replace").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            registro = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        if so_ativos and registro.get("skipped") is True:
+            continue
+        intent = registro.get("intent_id")
+        if isinstance(intent, str) and intent:
+            encontrados.append(intent)
+    return encontrados
+
+
+def lista_arquivos(arvore: str, diretorio: str) -> list[str]:
+    saida = git(["ls-tree", "-r", "--name-only", arvore, "--", diretorio])
+    return [linha for linha in saida.decode().split("\n") if linha.strip()]
+
+
+def conteudo(arvore: str, caminho: str) -> bytes:
+    return git(["show", f"{arvore}:{caminho}"])
+
+
+def main() -> int:
+    usar_index = "--index" in sys.argv
+    if usar_index:
+        arvore = git(["write-tree"]).decode().strip()
+        if not arvore:
+            print("nao foi possivel materializar o indice", file=sys.stderr)
+            return 2
+        rotulo = "INDICE (staged)"
+    else:
+        arvore = "HEAD"
+        rotulo = "HEAD"
+
+    # A autoridade e sempre o PAI: o portfolio que JA esta commitado.
+    portfolio_pai: dict[str, int] = {}
+    for caminho in lista_arquivos("HEAD", PORTFOLIO):
+        for intent in intents_de(conteudo("HEAD", caminho)):
+            portfolio_pai[intent] = portfolio_pai.get(intent, 0) + 1
+
+    # E o portfolio ainda nao commitado, que precisa ir ANTES.
+    portfolio_pendente: dict[str, int] = {}
+    if usar_index:
+        for caminho in lista_arquivos(arvore, PORTFOLIO):
+            for intent in intents_de(conteudo(arvore, caminho)):
+                portfolio_pendente[intent] = portfolio_pendente.get(intent, 0) + 1
+    else:
+        for arquivo in sorted((RAIZ / PORTFOLIO).glob("*.jsonl")):
+            for intent in intents_de(arquivo.read_bytes()):
+                portfolio_pendente[intent] = portfolio_pendente.get(intent, 0) + 1
+
+    paginas: dict[str, list[str]] = {}
+    if usar_index:
+        for caminho in lista_arquivos(arvore, PAGINAS):
+            for intent in intents_de(conteudo(arvore, caminho), so_ativos=True):
+                paginas.setdefault(intent, []).append(caminho)
+    else:
+        for arquivo in sorted((RAIZ / PAGINAS).glob("*.jsonl")):
+            rel = str(arquivo.relative_to(RAIZ))
+            for intent in intents_de(arquivo.read_bytes(), so_ativos=True):
+                paginas.setdefault(intent, []).append(rel)
+
+    print(f"escopo lido: {rotulo}")
+    print(f"paginas   : {len(paginas)} intents ATIVOS em {PAGINAS} (tombstones fora)")
+    print(f"portfolio : {len(portfolio_pai)} intents ja COMMITADOS, "
+          f"{len(portfolio_pendente)} no estado atual")
+
+    ausentes = sorted(i for i in paginas if i not in portfolio_pendente)
+    ambiguos = sorted(i for i in paginas if portfolio_pendente.get(i, 0) > 1)
+    # O caso que custou as quatro tentativas: a intencao existe, mas ainda nao
+    # esta no PAI. O conteudo esta certo; falta um commit antes.
+    so_no_candidato = sorted(
+        i for i in paginas
+        if portfolio_pendente.get(i, 0) == 1 and i not in portfolio_pai)
+
+    if ausentes:
+        print(f"\nFALTA INTENCAO: {len(ausentes)} pagina(s) sem linha no portfolio")
+        for intent in ausentes[:10]:
+            print(f"   {intent}  ({paginas[intent][0]})")
+        print("   -> o gerador da pagina precisa emitir a intencao junto; "
+              "nao adianta commitar.")
+        return 1
+
+    if ambiguos:
+        print(f"\nINTENCAO DUPLICADA: {len(ambiguos)}")
+        for intent in ambiguos[:10]:
+            print(f"   {intent} aparece {portfolio_pendente[intent]}x")
+        print("   -> remova a linha repetida antes de commitar.")
+        return 1
+
+    if so_no_candidato:
+        print(f"\nORDEM DE COMMIT PENDENTE: {len(so_no_candidato)} intencao(oes) "
+              "existem no disco mas NAO no commit pai.")
+        print("   A autoridade de pertinencia e o commit PAI, por desenho: "
+              "portfolio e pagina nao entram na mesma transacao.")
+        print("   PROXIMO COMANDO:")
+        print(f"     git commit -F <msg> -- {PORTFOLIO}")
+        print("   e SO DEPOIS:")
+        print(f"     git commit -F <msg> -- {PAGINAS}")
+        return 1
+
+    print("\npareamento OK: toda pagina tem intencao 1:1 ja no commit pai.")
+    print(f"   pode commitar: git commit -F <msg> -- {PAGINAS}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

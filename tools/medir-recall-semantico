@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""medir-recall-semantico — recall@k e MRR da busca por vetor, com a lexical ao lado.
+
+POR QUE EXISTE: o mandato AI-first (docs/goal/PROMPT_AI_FIRST_OPUS5_20260908.md §13)
+pergunta "qual modelo de embedding da o melhor recall@10 em 200 consultas reais de
+busca_interna por tok/s". Medido em 2026-09-08: a busca interna real tem UMA consulta
+distinta em 113 mil linhas do access.log do nginx ("usucapiao", 406 vezes, um so
+cliente), e o evento busca_interna do GA4 nao e coletavel sem credencial da Data API,
+que o contrato proibe pedir. Nao ha 200 consultas reais de usuario para medir.
+
+O CONJUNTO DE AVALIACAO, entao, e o que existe de verdade no acervo: as perguntas de
+FAQ. Cada uma foi escrita para um leitor humano e a pagina que a contem e a resposta
+certa (relevancia 1:1, sem anotador). E avaliacao PERGUNTA -> PAGINA, nao consulta de
+usuario, e o registro de saida diz isso no campo `conjunto`. Quando houver consultas
+reais em volume, elas entram como segundo conjunto no mesmo arquivo.
+
+O QUE MEDE: para N paginas do indice (amostra por passo deterministico sobre os
+caminhos ordenados, so paginas com FAQ), embute a primeira pergunta de FAQ no MESMO
+modelo do indice (Ollama local, /api/embed em lotes), calcula cosseno contra todos os
+vetores e registra a posicao da pagina verdadeira: recall@1, @5, @10 e MRR. Faz o
+mesmo pela busca lexical do portal (/api/v1/search, bleve), que e a linha de base.
+So conta paginas JA embutidas: com o indice parcial, mede a qualidade do que existe,
+nao inventa cobertura.
+
+SAIDA: uma linha JSON em data/ops/recall_semantico_daily.jsonl (schema
+recall_semantico_v1), com modelo, dimensao, tamanho do indice, N, k, os quatro
+numeros de cada lado, tokens e tok/s do embedding das perguntas. Nunca escreve em
+public/, content/ ou data/editorial/.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+import numpy as np
+
+SCHEMA = "recall_semantico_v1"
+SAIDA_PADRAO = "data/ops/recall_semantico_daily.jsonl"
+UA_SONDA = "wikijuridica-superficie-probe/1.0"
+
+
+def carrega_indice(dir_indice):
+    """Le indice.jsonl (ultimo registro por caminho vence) e vetores.f32 normalizados."""
+    registros = {}
+    with open(os.path.join(dir_indice, "indice.jsonl"), encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            r = json.loads(linha)
+            registros[r["path"]] = r
+    if not registros:
+        raise SystemExit(f"indice vazio em {dir_indice}")
+    todos = np.fromfile(os.path.join(dir_indice, "vetores.f32"), dtype="<f4")
+    caminhos = sorted(registros)
+    dim = registros[caminhos[0]]["dim"]
+    modelo = registros[caminhos[0]]["modelo"]
+    matriz = np.empty((len(caminhos), dim), dtype=np.float32)
+    for i, caminho in enumerate(caminhos):
+        r = registros[caminho]
+        ini = int(r["offset"])
+        if ini + dim > todos.size:
+            raise SystemExit(f"registro de {caminho} aponta alem de vetores.f32 (offset {ini}, floats {todos.size})")
+        matriz[i] = todos[ini:ini + dim]
+    normas = np.linalg.norm(matriz, axis=1, keepdims=True)
+    normas[normas == 0] = 1
+    return caminhos, matriz / normas, dim, modelo
+
+
+def carrega_faq(root, caminhos_indexados):
+    """Devolve {path: primeira pergunta de FAQ} so para paginas que estao no indice."""
+    with open(os.path.join(root, "content", "pages.json"), encoding="utf-8") as f:
+        paginas = json.load(f)
+    if isinstance(paginas, dict):
+        paginas = paginas.get("pages") or paginas.get("items") or []
+    no_indice = set(caminhos_indexados)
+    perguntas = {}
+    for p in paginas:
+        caminho = p.get("path")
+        if caminho not in no_indice:
+            continue
+        for item in p.get("faq") or []:
+            q = (item.get("question") or "").strip()
+            if len(q) >= 8:
+                perguntas[caminho] = q
+                break
+    return perguntas
+
+
+def amostra_por_passo(chaves, n, semente):
+    chaves = sorted(chaves)
+    if n >= len(chaves):
+        return chaves
+    passo = len(chaves) / n
+    deslocamento = semente % max(1, int(passo))
+    return [chaves[min(len(chaves) - 1, int(i * passo) + deslocamento)] for i in range(n)]
+
+
+def embute(url_ollama, modelo, textos, lote=16):
+    vetores, tokens, parede = [], 0, 0.0
+    for i in range(0, len(textos), lote):
+        corpo = json.dumps({"model": modelo, "input": textos[i:i + lote], "keep_alive": "5m", "truncate": True}).encode()
+        req = urllib.request.Request(url_ollama.rstrip("/") + "/api/embed", data=corpo, headers={"Content-Type": "application/json"})
+        t = time.time()
+        with urllib.request.urlopen(req, timeout=3600) as resp:
+            r = json.load(resp)
+        parede += time.time() - t
+        if "error" in r:
+            raise SystemExit(f"ollama: {r['error']}")
+        vetores.extend(r["embeddings"])
+        tokens += int(r.get("prompt_eval_count") or 0)
+    return np.asarray(vetores, dtype=np.float32), tokens, parede
+
+
+def posicoes_semanticas(matriz, caminhos, consultas, verdadeiros, k):
+    normas = np.linalg.norm(consultas, axis=1, keepdims=True)
+    normas[normas == 0] = 1
+    scores = (consultas / normas) @ matriz.T
+    posicoes = []
+    for i, verdadeiro in enumerate(verdadeiros):
+        ordem = np.argsort(-scores[i])[:max(k, 10)]
+        pos = None
+        for rank, j in enumerate(ordem, start=1):
+            if caminhos[j] == verdadeiro:
+                pos = rank
+                break
+        posicoes.append(pos)
+    return posicoes
+
+
+def posicoes_lexicas(base_url, host, perguntas, verdadeiros, k):
+    posicoes = []
+    for pergunta, verdadeiro in zip(perguntas, verdadeiros):
+        url = base_url.rstrip("/") + "/api/v1/search?" + urllib.parse.urlencode({"q": pergunta, "limit": max(k, 10)})
+        req = urllib.request.Request(url, headers={"User-Agent": UA_SONDA, "X-Warming-Request": "true", "Host": host, "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                r = json.load(resp)
+        except Exception as e:  # noqa: BLE001 — registra a causa, nao mascara
+            posicoes.append(("erro", repr(e)[:120]))
+            continue
+        acertos = r.get("hits") or r.get("resultados") or r.get("paginas") or []
+        pos = None
+        for rank, h in enumerate(acertos, start=1):
+            if (h.get("caminho") or h.get("path")) == verdadeiro:
+                pos = rank
+                break
+        posicoes.append(pos)
+    return posicoes
+
+
+def metricas(posicoes, k):
+    validas = [p for p in posicoes if not isinstance(p, tuple)]
+    n = len(validas)
+    if n == 0:
+        return {"consultas": 0}
+    def recall(m):
+        return round(sum(1 for p in validas if p is not None and p <= m) / n, 4)
+    mrr = round(sum(1.0 / p for p in validas if p is not None) / n, 4)
+    return {"consultas": n, "recall_at_1": recall(1), "recall_at_5": recall(5), f"recall_at_{k}": recall(k), "mrr": mrr,
+            "erros": len(posicoes) - n}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--root", default=".")
+    ap.add_argument("--indice-dir", default="", help="diretorio com indice.jsonl e vetores.f32 (padrao: o de ativo.json ou o do --modelo)")
+    ap.add_argument("--modelo", default="qwen3-embedding:0.6b")
+    ap.add_argument("--consultas", type=int, default=200)
+    ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--semente", type=int, default=20260908)
+    ap.add_argument("--ollama", default=os.environ.get("WIKI_OLLAMA_URL", "http://127.0.0.1:11434"))
+    ap.add_argument("--portal", default="http://127.0.0.1:8088", help="origem do portal para a busca lexical (0 = nao medir)")
+    ap.add_argument("--host", default="wikijuridica.com.br")
+    ap.add_argument("--saida", default=SAIDA_PADRAO)
+    ap.add_argument("--timings", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    root = os.path.abspath(args.root)
+    base = os.environ.get("WIKI_AI_EMBEDDINGS_DIR") or os.path.join(root, "data", "ai", "embeddings")
+    dir_indice = args.indice_dir
+    if not dir_indice:
+        try:
+            with open(os.path.join(base, "ativo.json"), encoding="utf-8") as f:
+                dir_indice = os.path.join(base, json.load(f)["dir"])
+        except FileNotFoundError:
+            dir_indice = os.path.join(base, args.modelo.replace(":", "-").replace("/", "-"))
+    t0 = time.time()
+    caminhos, matriz, dim, modelo = carrega_indice(dir_indice)
+    perguntas = carrega_faq(root, caminhos)
+    amostra = amostra_por_passo(perguntas.keys(), args.consultas, args.semente)
+    textos = [perguntas[c] for c in amostra]
+    if not textos:
+        raise SystemExit("nenhuma pagina do indice tem FAQ; nada a medir")
+    t1 = time.time()
+    consultas, tokens, parede_embed = embute(args.ollama, modelo, textos)
+    pos_sem = posicoes_semanticas(matriz, caminhos, consultas, amostra, args.k)
+    t2 = time.time()
+    pos_lex = posicoes_lexicas(args.portal, args.host, textos, amostra, args.k) if args.portal != "0" else []
+    t3 = time.time()
+    registro = {
+        "schema_version": SCHEMA,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "date": time.strftime("%Y-%m-%d", time.gmtime()),
+        "modelo": modelo, "dim": dim, "indexadas": len(caminhos), "com_faq_no_indice": len(perguntas),
+        "conjunto": "faq_do_acervo",
+        "conjunto_nota": "pergunta de FAQ da propria pagina como consulta; pagina = unica relevante. Nao e consulta real de usuario: o access.log tem 1 consulta distinta (usucapiao) e o GA4 nao e coletavel sem credencial.",
+        "consultas": len(textos), "k": args.k, "semente": args.semente,
+        "semantico": metricas(pos_sem, args.k),
+        "lexico": metricas(pos_lex, args.k) if pos_lex else {"consultas": 0, "nota": "nao medido (--portal 0)"},
+        "embed": {"prompt_tokens": tokens, "parede_s": round(parede_embed, 2), "tok_s": round(tokens / parede_embed, 1) if parede_embed else 0},
+        "timings_s": {"carga": round(t1 - t0, 2), "semantico": round(t2 - t1, 2), "lexico": round(t3 - t2, 2)},
+    }
+    linha = json.dumps(registro, ensure_ascii=False)
+    print(linha)
+    if not args.dry_run:
+        caminho = os.path.join(root, args.saida) if not os.path.isabs(args.saida) else args.saida
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        with open(caminho, "a", encoding="utf-8") as f:
+            f.write(linha + "\n")
+    if args.timings:
+        print(f"timings: carga={t1 - t0:.2f}s embed+semantico={t2 - t1:.2f}s lexico={t3 - t2:.2f}s", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

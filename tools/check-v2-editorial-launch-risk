@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""check-v2-editorial-launch-risk — diagnóstico READ-ONLY de risco editorial do
+estoque canônico v2 antes da primeira indexação pública.
+
+Mede, em streaming sobre data/editorial/v2_pages/*.jsonl (nada é carregado
+inteiro em memória além de chaves curtas por página), as classes de defeito que
+ficam CARAS depois que o Google indexa a URL:
+
+  seo_length        title/meta fora das faixas do projeto
+                    (internal/seo/seo.go:15-19 = 20-65 e 70-160 medidos em
+                    CLUSTERS DE GRAFEMA por ptbrdisplaybudget.CharacterCount;
+                    internal/v2ingest/validate.go:597-604 mede os MESMOS
+                    limites em RUNAS — as duas contagens são reportadas)
+  h1_equals_title   internal/v2ingest/validate.go:606
+  thin              corpo abaixo da banda de page_type
+                    (internal/v2ingest/validate.go:56-61 + tolerância ±10% da
+                    linha 622-627); corpo contado como bodyWordCount
+                    (validate.go:962-973: opening + heading + text + FAQ q/a,
+                    tokenizado após fold PT-BR)
+  wc_drift          word_count declarado divergindo >10% do real
+                    (validate.go:632-638)
+  cannibal          DUAS páginas disputando a MESMA intenção de busca
+                    (long_tail_query normalizada idêntica ou Jaccard alto no
+                    mesmo practice_area). Classe que os gates de corpo
+                    (check-v2-body-near-duplicates / -semantic-duplicates) NÃO
+                    pegam por construção: corpos distintos, SERP igual.
+  oab_ethics        promessa de resultado / captação / preço como chamariz
+                    (Provimento OAB 205/2021)
+  vocab_leak        vocabulário interno vazando para texto público
+  source_gap        página ativa sem fonte, com fonte não-200 ou marcada
+                    needs_source_research
+  citation_range    artigo citado ACIMA do último artigo real da norma citada
+                    (número que não existe / atribuído ao diploma errado)
+  stale_value       valor monetário-âncora desatualizado (salário mínimo de
+                    ano anterior apresentado como vigente)
+  encoding          mojibake, NFD, entidade HTML crua em texto público
+
+Uso:
+  tools/check-v2-editorial-launch-risk            # resumo humano
+  tools/check-v2-editorial-launch-risk --json     # relatório completo (stdout)
+  tools/check-v2-editorial-launch-risk --worst 20 # nº de piores casos por classe
+
+READ-ONLY: não escreve nada. Para guardar o relatório, redirecione o --json.
+
+VEREDITO (adicionado em 2026-08-27 — até então este script só diagnosticava e
+SEMPRE devolvia exit 0, inclusive com promessa de resultado ou colisão de URL
+no acervo; um gate chamado "risco de lançamento" incapaz de barrar lançamento
+nenhum). A lógica de detecção acima já é boa; faltava só o corte.
+
+CRÍTICO (exit 1) — classes que a política PUBLICAR E CORRIGIR do dono
+(2026-08-06, ver CLAUDE.md) já trata como bloqueadoras de publicação em
+qualquer lugar do pipeline, e que aqui são exclusivas desta ferramenta (não
+duplicadas por tools/generate-v2-publication-severity, que não sabe detectar
+ética OAB por frase, encoding, colisão de rota derivada, citação de artigo
+inexistente ou vazamento de vocabulário confirmado):
+
+    oab_promessa_resultado, oab_captacao_indevida, oab_preco_chamariz
+        (Provimento OAB 205/2021 — promessa NA VOZ DO PORTAL, já filtrada de
+        negação/citação/terceiro por first_unexculpated)
+    mojibake, html_entity, nfd_text            (defeito de encoding)
+    colisao_public_path                        (rota colidente)
+    vocab_interno_confirmado                   (vocabulário interno vazando,
+        já descontado o uso jurídico legítimo de "rascunho")
+    citation_range                             (artigo citado que NÃO EXISTE
+        no diploma — é inventar conteúdo jurídico, proibido sem exceção)
+    json_invalid                               (linha corrompida — falha de
+        medição, não dá para saber se a página é boa)
+
+Calibração medida em 2026-08-27 sobre 10.102 páginas ativas (10.221 registros,
+119 tombstones): as sete classes acima somam ZERO ocorrências hoje — o corte é
+"qualquer ocorrência reprova", sem margem, porque a margem correta destas
+classes é zero (não existe "um pouco" de promessa de resultado ou de artigo
+inventado que se deva tolerar). Isso NÃO torna o gate broken-by-design: as
+classes com alta incidência real (fonte_http_nao_200: 513, wc_drift: 287,
+h1_equals_title: 270, cannibal_query_jaccard: 37, thin: 12, etc.) ficam de
+propósito FORA do veredito — são "médio" na taxonomia do dono (fonte
+insuficiente, banda de palavras, similaridade) e continuam só reportadas.
+
+stale_min_wage foi MEDIDO e EXCLUÍDO do veredito de propósito: o detector é
+co-ocorrência de valor+contexto na página inteira, não frase-a-frase com
+exculpação como o de ética OAB, e uma frase histórica legítima ("em 2024, o
+salário mínimo era R$ 1.412") o aciona — o mesmo tipo de falso positivo que já
+custou 46 páginas neste repositório. Corrigir o detector está fora do escopo
+desta tarefa (é reescrever a lógica, não dar o veredito); ele continua
+reportado, nunca bloqueia.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+from collections import Counter, defaultdict
+from datetime import date
+
+try:
+    import regex as _regex  # grapheme clusters (\X) — equivalente a uniseg
+except ImportError:  # pragma: no cover - dependência presente no host
+    _regex = None
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Overridáveis só para o teste de falso-positivo/defeito sintético desta
+# ferramenta (tools/test_check_v2_editorial_launch_risk.py); em uso normal
+# apontam sempre para o estoque real.
+PAGES_DIR = os.environ.get(
+    "WIKI_LAUNCH_RISK_PAGES_DIR",
+    os.path.join(ROOT, "data", "editorial", "v2_pages"))
+PORTFOLIO_DIR = os.environ.get(
+    "WIKI_LAUNCH_RISK_PORTFOLIO_DIR",
+    os.path.join(ROOT, "data", "editorial", "portfolio_v2"))
+
+# Classes CRÍTICAS — qualquer ocorrência (>0) reprova. Ver racional completo
+# no docstring do módulo ("VEREDITO").
+CRITICAL_CLASSES = (
+    "oab_promessa_resultado", "oab_captacao_indevida", "oab_preco_chamariz",
+    "mojibake", "html_entity", "nfd_text",
+    "colisao_public_path", "vocab_interno_confirmado",
+    "citation_range", "json_invalid",
+)
+
+# internal/seo/seo.go:15-19
+TITLE_MIN, TITLE_MAX = 20, 65
+META_MIN, META_MAX = 70, 160
+
+# internal/v2ingest/validate.go:56-61
+WORD_BANDS = {
+    "verbete": (350, 700),
+    "pergunta": (400, 800),
+    "guia_problema": (700, 1400),
+    "procedimento": (500, 1000),
+}
+
+# internal/v2ingest/validate.go:70 (allowedSourceHostSuffixes)
+ALLOWED_HOST_SUFFIXES = ("gov.br", "jus.br", "leg.br", "mp.br")
+
+# internal/v2ingest/validate.go:73-92 (allowedSourceExactHosts) — fontes oficiais
+# estrangeiras que o gate aceita por host exato.
+ALLOWED_HOST_EXACT = {
+    "sistemas.cfm.org.br", "site.cfp.org.br", "www.icao.int", "europa.eu",
+    "www.govinfo.gov", "publications.europa.eu", "oeil.europarl.europa.eu",
+    "www.subtel.gob.cl", "dre.pt", "diariodarepublica.pt", "www.boe.es",
+    "www.normattiva.it", "www.gazzettaufficiale.it",
+    "www.gesetze-im-internet.de", "isap.sejm.gov.pl", "www.esteri.it",
+    "eur-lex.europa.eu", "portaldascomunidades.mne.gov.pt",
+}
+
+# internal/v2ingest/validate.go:96-104 (forbiddenInternalTokens) — a lista
+# sancionada de vocabulário interno, aplicada sobre tokens já foldados
+# (validate.go:743-752).
+FORBIDDEN_INTERNAL_TOKENS = {
+    "rascunho", "rascunhos", "seed", "seeds", "gate", "gates",
+    "cta", "ctas", "release", "releases", "noindex", "doorway", "doorways",
+}
+
+_GRAPHEME = _regex.compile(r"\X") if _regex else None
+
+
+def grapheme_count(value: str) -> int:
+    """Réplica de ptbrdisplaybudget.CharacterCount (uniseg.GraphemeClusterCount)."""
+    if _GRAPHEME is None:
+        return len(unicodedata.normalize("NFC", value))
+    return len(_GRAPHEME.findall(value))
+
+
+def rune_count(value: str) -> int:
+    """Réplica de utf8.RuneCountInString usada por v2ingest/validate.go:597."""
+    return len(value)
+
+
+_MN = "Mn"
+
+
+def fold(value: str) -> str:
+    """Réplica de ptbrtext.FoldTokenForCompare: NFC -> lower -> NFD -> drop Mn."""
+    value = unicodedata.normalize("NFC", value.strip()).lower()
+    decomposed = unicodedata.normalize("NFD", value)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != _MN)
+
+
+_TOKEN_SPLIT = re.compile(r"[^0-9a-z]+")
+
+
+def words(value: str) -> list[str]:
+    """Réplica de v2ingest.normalizedWords."""
+    return [t for t in _TOKEN_SPLIT.split(fold(value)) if t]
+
+
+def body_word_count(page: dict) -> int:
+    """Réplica de v2ingest.bodyWordCount (validate.go:962-973)."""
+    total = len(words(page.get("opening") or ""))
+    for section in page.get("sections") or []:
+        total += len(words(section.get("heading") or ""))
+        total += len(words(section.get("text") or ""))
+    for item in page.get("faq") or []:
+        total += len(words(item.get("q") or ""))
+        total += len(words(item.get("a") or ""))
+    return total
+
+
+def public_text(page: dict) -> str:
+    """Todo o texto que o leitor/Googlebot enxerga."""
+    parts = [
+        page.get("title") or "",
+        page.get("meta_description") or "",
+        page.get("h1") or "",
+        page.get("opening") or "",
+    ]
+    for section in page.get("sections") or []:
+        parts.append(section.get("heading") or "")
+        parts.append(section.get("text") or "")
+    for item in page.get("faq") or []:
+        parts.append(item.get("q") or "")
+        parts.append(item.get("a") or "")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Ética OAB (Provimento 205/2021): promessa de resultado, captação, preço.
+#
+# O risco ético é a promessa FEITA PELO PORTAL, na voz do portal. Descrever a
+# promessa de um terceiro ("a clínica anunciou resultado garantido"), negá-la
+# ("não existe resultado garantido") ou citá-la entre aspas é prosa técnica
+# CORRETA — e foi o que 100% dos primeiros 183 hits deste arquivo mostraram na
+# leitura manual de 2026-08-04. Por isso a detecção é por FRASE, com descarte
+# explícito de negação, citação e sujeito de terceiro; o número reportado é o
+# de casos que sobrevivem a esses filtros.
+# ---------------------------------------------------------------------------
+#
+# A detecção final ficou restrita à VOZ DO PORTAL porque a leitura manual de
+# 2026-08-04 mostrou que qualquer padrão mais largo é ruído puro neste acervo:
+#   - "resultado garantido"/"indenização certa" aparecem 36x, SEMPRE como
+#     ressalva ("não existe resultado garantido") ou descrição da fraude alheia;
+#   - "consulta gratuita" aparece 73x significando o DIREITO do consumidor de
+#     consultar Registrato/Cadastro Positivo/CPF de graça, nunca oferta de
+#     consulta jurídica grátis;
+#   - "último dia" é prazo processual, não escassez comercial.
+# Essas expressões continuam contadas como `mencao_*` para revisão humana, mas
+# não são violação. Violação é o portal prometer na primeira pessoa.
+#
+OAB_PATTERNS = [
+    ("promessa_resultado", re.compile(
+        r"\b(garantimos|asseguramos|conseguimos\s+sempre|prometemos)\b"
+        r"|\b100%\s+de\s+(chance|êxito|exito|sucesso|aprovação|aprovacao)\b"
+        r"|\b(você|voce)\s+(vai|irá|ira)\s+(ganhar|receber|conseguir)\s+"
+        r"(a\s+)?(indenização|indenizacao|causa|processo|ação|acao)\b",
+        re.IGNORECASE)),
+    ("captacao_indevida", re.compile(
+        r"\b(consulta|avaliação|avaliacao|análise|analise)\s+"
+        r"(jurídica|juridica|do\s+caso|com\s+advogad\w+)\s+"
+        r"(grátis|gratis|gratuita)\b"
+        r"|\b(fale|chame|clique)\s+(agora|já|ja)\b.{0,40}\b(receb|garant|ganh)"
+        r"|\bnão\s+perca\s+(essa\s+)?(chance|oportunidade)\b"
+        r"|\búltimas\s+vagas\b", re.IGNORECASE)),
+    ("preco_chamariz", re.compile(
+        r"\b(honorários?|honorarios?)\s+(a\s+partir\s+de|só|apenas|somente|por)\s*R?\$"
+        r"|\b(consulta|atendimento|contrato)\s+por\s+R\$\s?\d"
+        r"|\bR\$\s?\d[\d.,]*\s*(de\s+desconto|de\s+entrada\s+e)", re.IGNORECASE)),
+]
+
+# Expressões que NÃO são violação neste acervo, mas cuja frequência vale
+# acompanhar: se um lote futuro passar a usá-las em sentido afirmativo, o
+# número sobe antes de virar passivo.
+OAB_WATCH = [
+    ("mencao_resultado_garantido", re.compile(
+        r"\b(resultado|ganho|êxito|exito|indenização|indenizacao)\s+"
+        r"(garantid[oa]|cert[oa])\b", re.IGNORECASE)),
+    ("mencao_consulta_gratuita", re.compile(
+        r"\bconsulta\s+(grátis|gratis|gratuita)\b", re.IGNORECASE)),
+]
+
+# Uma frase com qualquer destes sinais NÃO é promessa do portal: ela nega,
+# ressalva, ou atribui a promessa a um terceiro descrito na página.
+OAB_EXCULPATORY = re.compile(
+    r"\b(não|nao|nem|sem|nunca|jamais|nenhum|nenhuma|evite|evitar|cuidado|desconfie|"
+    r"dificilmente|raramente|inexiste|inexistente|ilusão|ilusao|"
+    r"seria|configuraria|desinformar|enganos[ao]|abusiv[ao]|irregular|"
+    r"propaganda|publicidade|anúncio|anuncio|anunciou|anuncia|anunciando|"
+    r"prometeu|prometendo|promessa|alegou|alega|oferece|ofereceu|"
+    r"clínica|clinica|loja|empresa|plataforma|fornecedor|grupo|curso|"
+    r"bootcamp|mentoria|corretora|banco|seguradora|golpe|fraude)\b",
+    re.IGNORECASE)
+QUOTED = re.compile(r"[“\"'‘][^”\"'’]{0,120}$")
+
+# "rascunho" é vocabulário interno quando a página fala de SI MESMA ("este
+# rascunho"), e é português jurídico correto quando descreve a minuta de um
+# documento do leitor ("rascunho do testamento", "cópia simples, rascunho ou
+# minuta"). O gate Go (validate.go:747) usa token cru e por isso reprova os 3
+# únicos usos do acervo, todos legítimos.
+LEGITIMATE_LEGAL_DRAFT = re.compile(
+    r"rascunhos?\s+(d[oae]s?|ou\s+minuta)\s+\w+"
+    r"|(cópia|copia|minuta|versão|versao)\s*,?\s*(simples\s*,?\s*)?rascunhos?"
+    r"|rascunhos?\s+d[ao]\s+(protocolo|vontade|testamento|contrato|acordo|"
+    r"petição|peticao|escritura|estatuto|minuta)", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Vocabulário interno de pipeline vazando para texto público.
+# Cada padrão exige o SENTIDO interno (não a palavra em uso jurídico legítimo:
+# "rascunho da petição" é prosa válida, "este rascunho" não).
+# ---------------------------------------------------------------------------
+# "XXX" foi removido de propósito: em texto jurídico PT-BR ele é o algarismo
+# romano 30 ("art. 5º, XXX") e produziu 4/4 falsos positivos na leitura manual
+# de 2026-08-04.
+VOCAB_PATTERNS = [
+    ("lorem_ipsum", re.compile(r"\blorem\s+ipsum\b", re.IGNORECASE)),
+    ("placeholder", re.compile(r"\bplaceholder\b|\bTODO\b|\bFIXME\b")),
+    ("template_slot", re.compile(r"\{\{|\}\}|<[A-Z_]{3,}>|%s\b|\$\{")),
+    ("pipeline_jargon", re.compile(
+        r"\b(intent_id|word_count|meta_description|long_tail|page_type|"
+        r"practice_area|internal_link|official_sources|release\s+gate|"
+        r"paid[- ]intent|jsonl|noindex)\b", re.IGNORECASE)),
+    ("exemplo_fake", re.compile(
+        r"\b(fulano\s+de\s+tal|beltrano|sicrano|exemplo\.com|teste123)\b", re.IGNORECASE)),
+]
+
+# ---------------------------------------------------------------------------
+# Último artigo REAL de normas frequentes. Artigo acima do teto = artigo que não
+# existe naquele diploma (ou citação atribuída ao diploma errado).
+# ---------------------------------------------------------------------------
+NORM_LAST_ARTICLE = {
+    "cdc": 119, "lei 8.078": 119,
+    "clt": 922,
+    "codigo civil": 2046, "cc": 2046, "lei 10.406": 2046,
+    "cpc": 1072, "lei 13.105": 1072,
+    "codigo penal": 361, "cp": 361,
+    "cpp": 811,
+    "ctb": 341, "lei 9.503": 341,
+    "ctn": 218, "lei 5.172": 218,
+    "constituicao": 250, "cf": 250,
+    "lei 8.213": 156,
+    "lei 8.212": 104,
+    "lei 9.099": 97,
+    "lei 11.340": 46,
+    "lgpd": 65, "lei 13.709": 65,
+    "lei 8.069": 267, "eca": 267,
+    "lei 10.741": 118,
+    "lei 8.245": 90,
+    "lei 11.101": 201,
+    "lei 13.146": 127,
+    "lei 9.784": 68,
+    "lei 12.965": 32,
+    "lei 14.133": 194,
+    "lei 8.666": 126,
+    "lei 9.610": 115,
+    "lei 9.279": 244,
+    "lei 8.429": 25,
+    "lei 6.015": 300,
+    "lei 10.257": 58,
+}
+
+# "art. 927 do Código Civil", "art. 6º, § 2º, do CDC", "artigo 482 da CLT".
+#
+# A norma tem de vir ADJACENTE ao número do artigo (só decoração de §/inciso/
+# alínea entre eles). A primeira versão deste padrão aceitava 60 caracteres
+# livres no meio e capturou a norma ERRADA em 11/11 casos ("art. 306 do Código
+# de Processo Penal e a Constituição" virava "art. 306 da Constituição").
+# Alternação ordenada do nome mais longo para o mais curto.
+CITATION_RE = re.compile(
+    r"\bart(?:\.|igo)?\s*(\d{1,4})\s*[ºo°]?"
+    r"(?:\s*[,-]?\s*(?:§+\s*\d+[ºo°]?|inciso\s+[IVXLC]+|al[íi]nea\s+\w|"
+    r"par[áa]grafo\s+[\wúùôó]+|caput|[IVXLC]{1,6})\b)*"
+    r"\s*,?\s*d[oa]\s+"
+    r"(Código\s+de\s+Processo\s+Civil|Codigo\s+de\s+Processo\s+Civil|"
+    r"Código\s+de\s+Processo\s+Penal|Codigo\s+de\s+Processo\s+Penal|"
+    r"Código\s+de\s+Trânsito|Codigo\s+de\s+Transito|"
+    r"Código\s+Tributário\s+Nacional|Codigo\s+Tributario\s+Nacional|"
+    r"Código\s+Civil|Codigo\s+Civil|Código\s+Penal|Codigo\s+Penal|"
+    r"Constituição\s+Federal|Constituicao\s+Federal|Constituição|Constituicao|"
+    r"CDC|CLT|CPC|CPP|CTB|CTN|LGPD|ECA|"
+    r"Lei\s+n?[º°.]?\s*[\d][\d.]*)",
+    re.IGNORECASE)
+
+NORM_ALIASES = {
+    "cdc": "cdc", "clt": "clt", "cpc": "cpc", "cpp": "cpp", "ctb": "ctb",
+    "ctn": "ctn", "lgpd": "lgpd", "eca": "eca",
+    "codigo civil": "codigo civil", "codigo penal": "codigo penal",
+    "codigo de processo civil": "cpc", "codigo de processo penal": "cpp",
+    "codigo de transito": "ctb", "codigo tributario nacional": "ctn",
+    "constituicao": "constituicao", "constituicao federal": "constituicao",
+}
+
+# Salário mínimo por ano (fonte: decretos anuais). Valor de ano ANTERIOR
+# apresentado como vigente vira erro factual assim que a página é indexada.
+MIN_WAGE_BY_YEAR = {
+    2021: "1.100", 2022: "1.212", 2023: "1.320", 2024: "1.412", 2025: "1.518",
+}
+CURRENT_YEAR = date.today().year
+STALE_WAGE_RE = re.compile(
+    r"R\$\s?(" + "|".join(re.escape(v) for y, v in MIN_WAGE_BY_YEAR.items()
+                          if y < CURRENT_YEAR) + r")\b")
+WAGE_CONTEXT_RE = re.compile(
+    r"sal[áa]rio[- ]m[íi]nimo|piso\s+nacional|BPC|LOAS|benef[íi]cio\s+de\s+presta",
+    re.IGNORECASE)
+
+MOJIBAKE_RE = re.compile(r"Ã[\x80-\xbf©¡£§ª±µº]|Â[\xa0-\xbf]|â€|ï»¿")
+HTML_ENTITY_RE = re.compile(r"&(?:amp|nbsp|quot|lt|gt|#\d{2,5});")
+
+STOPWORDS = {
+    "a", "o", "e", "de", "do", "da", "dos", "das", "em", "no", "na", "nos",
+    "nas", "para", "por", "com", "que", "se", "ao", "aos", "as", "os", "um",
+    "uma", "quando", "como", "qual", "quais", "meu", "minha", "sem", "sobre",
+}
+
+
+def load_portfolio() -> dict:
+    portfolio = {}
+    for name in sorted(os.listdir(PORTFOLIO_DIR)):
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(PORTFOLIO_DIR, name)
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                intent = record.get("intent_id")
+                if intent:
+                    portfolio[intent] = record
+    return portfolio
+
+
+def slug(*parts: str) -> str:
+    """Réplica de publicpath.Slug (publicpath.go:25-37): só [a-z0-9], '-' entre
+    tokens. NÃO remove acento — 'ç' e 'ã' viram separador, igual ao Go."""
+    tokens = []
+    for part in parts:
+        token = ""
+        for char in part.lower():
+            if ("a" <= char <= "z") or ("0" <= char <= "9"):
+                token += char
+            elif token:
+                tokens.append(token)
+                token = ""
+        if token:
+            tokens.append(token)
+    return "-".join(tokens)
+
+
+def seed_term_id(intent_id: str) -> str:
+    """Réplica de v2ingest.seedTermIDFromIntentID (validate.go:766-772)."""
+    separator = intent_id.find("-")
+    if separator <= 0 or separator == len(intent_id) - 1:
+        return ""
+    return intent_id[separator + 1:]
+
+
+def public_page_path(practice_area: str, intent_id: str) -> str:
+    """Réplica de publicpath.PublicPagePath com a tripla DEC-008 usada pelo
+    v2ingest (validate.go:584-596): scenario_id e context_id vazios."""
+    seed = seed_term_id(intent_id)
+    if not seed or not practice_area:
+        return ""
+    return "/" + slug(practice_area) + "/" + slug(seed) + "/"
+
+
+def query_key(value: str) -> str:
+    return " ".join(words(value))
+
+
+def query_tokens(value: str) -> frozenset:
+    # Token numérico NUNCA é descartado por tamanho: "súmula 12" vs "súmula 13"
+    # e "art 25" vs "art 26" só se distinguem pelo número, e a primeira versão
+    # deste filtro (len > 2) apagava exatamente esse discriminador, gerando
+    # Jaccard 1.0 entre páginas distintas.
+    return frozenset(t for t in words(value)
+                     if t not in STOPWORDS and (len(t) > 2 or t.isdigit()))
+
+
+def analyse(worst: int) -> dict:
+    portfolio = load_portfolio()
+    findings = defaultdict(list)
+    counts = Counter()
+    totals = Counter()
+    wc_histogram = Counter()
+    verified_years = Counter()
+    status_counts = Counter()
+    citation_pairs = Counter()
+    query_index = defaultdict(list)      # chave normalizada -> [intent_id]
+    title_index = defaultdict(list)
+    path_index = defaultdict(list)       # path público canônico -> [intent_id]
+    token_index = defaultdict(list)      # (area) -> [(intent, tokens, query)]
+
+    for name in sorted(os.listdir(PAGES_DIR)):
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(PAGES_DIR, name)
+        rel = os.path.join("data/editorial/v2_pages", name)
+        with open(path, encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    page = json.loads(line)
+                except json.JSONDecodeError:
+                    counts["json_invalid"] += 1
+                    findings["json_invalid"].append(
+                        {"file": rel, "line": lineno, "intent_id": "?"})
+                    continue
+                totals["records"] += 1
+                if page.get("skipped"):
+                    totals["tombstones"] += 1
+                    continue
+                intent = page.get("intent_id") or ""
+                record = portfolio.get(intent)
+                if record is None:
+                    totals["sem_join_portfolio"] += 1
+                    counts["sem_join_portfolio"] += 1
+                    findings["sem_join_portfolio"].append(
+                        {"file": rel, "line": lineno, "intent_id": intent})
+                    continue
+                totals["ativas"] += 1
+                where = {"file": rel, "line": lineno, "intent_id": intent}
+
+                title = (page.get("title") or "").strip()
+                meta = (page.get("meta_description") or "").strip()
+                h1 = (page.get("h1") or "").strip()
+
+                t_graph, t_rune = grapheme_count(title), rune_count(title)
+                m_graph, m_rune = grapheme_count(meta), rune_count(meta)
+                if t_graph < TITLE_MIN or t_graph > TITLE_MAX:
+                    counts["title_len"] += 1
+                    findings["title_len"].append(
+                        dict(where, graphemes=t_graph, runes=t_rune, title=title))
+                if m_graph < META_MIN or m_graph > META_MAX:
+                    counts["meta_len"] += 1
+                    findings["meta_len"].append(
+                        dict(where, graphemes=m_graph, runes=m_rune, meta=meta[:90]))
+                if t_graph != t_rune or m_graph != m_rune:
+                    counts["grapheme_rune_divergence"] += 1
+                    findings["grapheme_rune_divergence"].append(
+                        dict(where, title_graphemes=t_graph, title_runes=t_rune,
+                             meta_graphemes=m_graph, meta_runes=m_rune))
+                if h1 and h1 == title:
+                    counts["h1_equals_title"] += 1
+                    findings["h1_equals_title"].append(dict(where, title=title))
+
+                page_type = page.get("page_type") or record.get("page_type") or ""
+                actual = body_word_count(page)
+                declared = int(page.get("word_count") or 0)
+                wc_histogram[min(actual // 100 * 100, 2000)] += 1
+                band = WORD_BANDS.get(page_type)
+                if band:
+                    lo, hi = band[0] * 9 // 10, band[1] * 11 // 10
+                    if actual < lo:
+                        counts["thin"] += 1
+                        findings["thin"].append(
+                            dict(where, page_type=page_type, words=actual,
+                                 min_allowed=lo))
+                    elif actual > hi:
+                        counts["verbose"] += 1
+                        findings["verbose"].append(
+                            dict(where, page_type=page_type, words=actual,
+                                 max_allowed=hi))
+                else:
+                    counts["page_type_sem_banda"] += 1
+                if declared <= 0:
+                    counts["wc_missing"] += 1
+                    findings["wc_missing"].append(dict(where, declared=declared))
+                elif actual > 0 and abs(declared - actual) * 10 > actual:
+                    counts["wc_drift"] += 1
+                    findings["wc_drift"].append(
+                        dict(where, declared=declared, actual=actual))
+
+                text = public_text(page)
+                for code, pattern in OAB_PATTERNS:
+                    hit = first_unexculpated(text, pattern)
+                    if hit is None:
+                        continue
+                    counts["oab_" + code] += 1
+                    findings["oab_" + code].append(dict(where, frase=hit))
+                for code, pattern in OAB_WATCH:
+                    if pattern.search(text):
+                        counts[code] += 1
+                for code, pattern in VOCAB_PATTERNS:
+                    match = pattern.search(text)
+                    if match:
+                        counts["vocab_" + code] += 1
+                        findings["vocab_" + code].append(
+                            dict(where, trecho=context(text, match)))
+                # Lista sancionada de vocabulário interno (validate.go:96-104),
+                # aplicada sobre os MESMOS tokens foldados do gate Go.
+                leaked = sorted(set(words(text)) & FORBIDDEN_INTERNAL_TOKENS)
+                if leaked:
+                    counts["vocab_interno_sancionado"] += 1
+                    findings["vocab_interno_sancionado"].append(
+                        dict(where, tokens=leaked))
+                    confirmed = [t for t in leaked
+                                 if not LEGITIMATE_LEGAL_DRAFT.search(text)
+                                 or t not in ("rascunho", "rascunhos")]
+                    if confirmed:
+                        counts["vocab_interno_confirmado"] += 1
+                        findings["vocab_interno_confirmado"].append(
+                            dict(where, tokens=confirmed))
+
+                if MOJIBAKE_RE.search(text):
+                    counts["mojibake"] += 1
+                    findings["mojibake"].append(
+                        dict(where, trecho=context(text, MOJIBAKE_RE.search(text))))
+                if HTML_ENTITY_RE.search(text):
+                    counts["html_entity"] += 1
+                    findings["html_entity"].append(
+                        dict(where, trecho=context(text, HTML_ENTITY_RE.search(text))))
+                if unicodedata.normalize("NFC", text) != text:
+                    counts["nfd_text"] += 1
+                    findings["nfd_text"].append(dict(where))
+
+                wage = STALE_WAGE_RE.search(text)
+                if wage and WAGE_CONTEXT_RE.search(text):
+                    counts["stale_min_wage"] += 1
+                    findings["stale_min_wage"].append(
+                        dict(where, valor=wage.group(1), trecho=context(text, wage)))
+
+                for match in CITATION_RE.finditer(text):
+                    article = int(match.group(1))
+                    norm = normalize_norm(match.group(2))
+                    if not norm:
+                        continue
+                    citation_pairs[(norm, article)] += 1
+                    limit = NORM_LAST_ARTICLE.get(norm)
+                    if limit and article > limit:
+                        counts["citation_range"] += 1
+                        findings["citation_range"].append(
+                            dict(where, norma=norm, artigo=article,
+                                 ultimo_artigo_real=limit,
+                                 trecho=context(text, match)))
+
+                sources = page.get("official_sources") or []
+                if not sources:
+                    counts["sem_fonte"] += 1
+                    findings["sem_fonte"].append(dict(where))
+                page_sem_prova = False
+                for source in sources:
+                    status = source.get("http_status")
+                    status_counts[str(status)] += 1
+                    if status is not None and status != 200:
+                        counts["fonte_http_nao_200"] += 1
+                        findings["fonte_http_nao_200"].append(
+                            dict(where, url=source.get("url", "")[:120], status=status))
+                    verified = str(source.get("verified_at") or "")[:4]
+                    if verified.isdigit():
+                        verified_years[verified] += 1
+                    if status is None or not verified.isdigit():
+                        page_sem_prova = True
+                    host = host_of(source.get("url") or "")
+                    if host and host not in ALLOWED_HOST_EXACT and not any(
+                            host.endswith(s) for s in ALLOWED_HOST_SUFFIXES):
+                        counts["fonte_host_fora_allowlist"] += 1
+                        findings["fonte_host_fora_allowlist"].append(
+                            dict(where, host=host))
+                if sources and page_sem_prova:
+                    counts["fonte_sem_prova_de_verificacao"] += 1
+                    findings["fonte_sem_prova_de_verificacao"].append(
+                        dict(where, fontes=len(sources)))
+                if page.get("needs_source_research"):
+                    counts["needs_source_research"] += 1
+                    findings["needs_source_research"].append(dict(where))
+
+                if not (page.get("internal_link_topics") or []):
+                    counts["sem_internal_link_topics"] += 1
+                    findings["sem_internal_link_topics"].append(dict(where))
+
+                query = record.get("long_tail_query") or ""
+                area = record.get("practice_area") or ""
+
+                path = public_page_path(area, intent)
+                if not path:
+                    counts["public_path_inderivavel"] += 1
+                    findings["public_path_inderivavel"].append(dict(where))
+                else:
+                    path_index[path].append((intent, rel, lineno))
+                if query:
+                    query_index[query_key(query)].append((intent, rel, lineno, area))
+                    token_index[area].append((intent, query_tokens(query), query, rel, lineno))
+                if title:
+                    title_index[query_key(title)].append((intent, rel, lineno))
+
+    # --- colisão de URL pública -------------------------------------------
+    # Duas páginas ativas que derivam o MESMO path só podem existir como uma
+    # URL: a segunda sobrescreve ou derruba a transação. Hoje esse defeito faz
+    # o diagnóstico canônico tools/check-v2-internal-link-graph abortar antes
+    # de contar órfãs.
+    for path, group in path_index.items():
+        if len(group) > 1:
+            counts["colisao_public_path"] += len(group)
+            findings["colisao_public_path"].append(
+                {"public_path": path,
+                 "paginas": [{"intent_id": i, "file": f, "line": l} for i, f, l in group]})
+
+    # --- canibalização -----------------------------------------------------
+    for key, group in query_index.items():
+        if len(group) > 1:
+            counts["cannibal_query_exata"] += len(group)
+            findings["cannibal_query_exata"].append(
+                {"long_tail_query_normalizada": key,
+                 "paginas": [{"intent_id": i, "file": f, "line": l} for i, f, l, _ in group]})
+    for key, group in title_index.items():
+        if len(group) > 1:
+            counts["cannibal_title_exato"] += len(group)
+            findings["cannibal_title_exato"].append(
+                {"title_normalizado": key,
+                 "paginas": [{"intent_id": i, "file": f, "line": l} for i, f, l in group]})
+
+    for area, entries in token_index.items():
+        by_token = defaultdict(list)
+        for index, (intent, tokens, query, rel, lineno) in enumerate(entries):
+            for token in tokens:
+                by_token[token].append(index)
+        seen_pairs = set()
+        for token, indexes in by_token.items():
+            if len(indexes) > 120:      # token genérico da área: não discrimina
+                continue
+            for position, left in enumerate(indexes):
+                for right in indexes[position + 1:]:
+                    pair = (left, right)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    a_tokens, b_tokens = entries[left][1], entries[right][1]
+                    if not a_tokens or not b_tokens:
+                        continue
+                    inter = len(a_tokens & b_tokens)
+                    union = len(a_tokens | b_tokens)
+                    jaccard = inter / union if union else 0.0
+                    if jaccard >= 0.75 and query_key(entries[left][2]) != query_key(entries[right][2]):
+                        counts["cannibal_query_jaccard"] += 1
+                        findings["cannibal_query_jaccard"].append({
+                            "practice_area": area,
+                            "jaccard": round(jaccard, 3),
+                            "a": {"intent_id": entries[left][0], "query": entries[left][2],
+                                  "file": entries[left][3], "line": entries[left][4]},
+                            "b": {"intent_id": entries[right][0], "query": entries[right][2],
+                                  "file": entries[right][3], "line": entries[right][4]},
+                        })
+
+    for key in findings:
+        findings[key] = findings[key][:worst]
+
+    return {
+        "denominador": dict(totals),
+        "contagem_por_defeito": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+        "distribuicao_palavras_corpo": dict(sorted(wc_histogram.items())),
+        "fonte_verified_at_por_ano": dict(sorted(verified_years.items())),
+        "fonte_http_status": dict(sorted(status_counts.items(),
+                                         key=lambda kv: -kv[1])),
+        "citacoes_norma_artigo_distintas": len(citation_pairs),
+        "citacoes_mais_frequentes": [
+            {"norma": n, "artigo": a, "ocorrencias": c}
+            for (n, a), c in citation_pairs.most_common(15)],
+        "piores_casos": {k: v for k, v in findings.items() if v},
+    }
+
+
+def normalize_norm(raw: str) -> str:
+    folded = " ".join(fold(raw).split())
+    folded = re.sub(r"\bn[o°º]?\s*", "", folded).strip()
+    if folded in NORM_ALIASES:
+        return NORM_ALIASES[folded]
+    match = re.match(r"lei\s+([\d.]+)", folded)
+    if match:
+        number = match.group(1).rstrip(".")
+        if "." not in number and len(number) > 3:
+            number = number[:-3] + "." + number[-3:]
+        return "lei " + number
+    return folded if folded in NORM_LAST_ARTICLE else ""
+
+
+def host_of(url: str) -> str:
+    match = re.match(r"https?://([^/]+)", url)
+    return match.group(1).lower() if match else ""
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def first_unexculpated(text: str, pattern: re.Pattern) -> str | None:
+    """Devolve a primeira FRASE em que o padrão casa sem sinal de negação,
+    ressalva, citação ou atribuição a terceiro. None quando todos os casamentos
+    do texto são prosa técnica correta."""
+    for sentence in _SENTENCE_SPLIT.split(text):
+        match = pattern.search(sentence)
+        if not match:
+            continue
+        if OAB_EXCULPATORY.search(sentence):
+            continue
+        if QUOTED.search(sentence[:match.start()]):
+            continue
+        return " ".join(sentence.split())[:300]
+    return None
+
+
+def context(text: str, match: re.Match, span: int = 70) -> str:
+    start = max(0, match.start() - span)
+    end = min(len(text), match.end() + span)
+    return " ".join(text[start:end].split())
+
+
+def veredito(report: dict) -> tuple[bool, dict]:
+    """(aprovado, criticos_encontrados) a partir do relatório de analyse().
+    Função pura e isolada para o teste de falso-positivo poder chamá-la sem
+    duplicar o corte critério-a-critério."""
+    defeitos = report["contagem_por_defeito"]
+    criticos = {code: defeitos[code] for code in CRITICAL_CLASSES
+                if defeitos.get(code, 0) > 0}
+    return not criticos, criticos
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--json", action="store_true", help="relatório completo em JSON")
+    parser.add_argument("--worst", type=int, default=12,
+                        help="quantos piores casos guardar por classe (default 12)")
+    args = parser.parse_args()
+
+    report = analyse(args.worst)
+    aprovado, criticos = veredito(report)
+    report["veredito"] = {
+        "aprovado": aprovado,
+        "classes_criticas_monitoradas": list(CRITICAL_CLASSES),
+        "criticos_encontrados": criticos,
+    }
+
+    if args.json:
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0 if aprovado else 1
+
+    totals = report["denominador"]
+    print("estoque v2 — risco editorial pré-indexação")
+    print(f"  registros lidos ........ {totals.get('records', 0)}")
+    print(f"  tombstones (skipped) ... {totals.get('tombstones', 0)}")
+    print(f"  ativas com join ........ {totals.get('ativas', 0)}")
+    print(f"  ativas sem join ........ {totals.get('sem_join_portfolio', 0)}")
+    print()
+    print("defeitos (páginas afetadas):")
+    for code, value in report["contagem_por_defeito"].items():
+        marca = " <<< CRÍTICO" if code in criticos else ""
+        print(f"  {code:32s} {value}{marca}")
+    print()
+    print("distribuição de palavras do corpo (faixa de 100):")
+    for bucket, value in report["distribuicao_palavras_corpo"].items():
+        print(f"  {bucket:5d}+ {'#' * min(60, value // 40)} {value}")
+    print()
+    if aprovado:
+        print("VEREDITO: aprovado — nenhuma classe crítica com ocorrência > 0.")
+    else:
+        print("VEREDITO: REPROVADO — classes críticas com ocorrência:")
+        for code, value in criticos.items():
+            print(f"  {code:32s} {value}")
+    return 0 if aprovado else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

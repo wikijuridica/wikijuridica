@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""check-crawl-coverage-stall — a cobertura de rastreio nao pode congelar em silencio.
+
+POR QUE EXISTE (2026-08-13, achado de auditoria de descoberta): a serie
+`data/ops/crawl_coverage_daily.jsonl` — o indicador PRINCIPAL do projeto, quanto
+do acervo o crawler ja pediu — ficou CONGELADA em 7.147/9.873 URLs do Googlebot
+por dois dias seguidos (08-12: new_sitemap_urls_that_day=0; 08-13: idem, medido
+as 12h51 UTC), com 2.726 URLs jamais pedidas
+(data/ops/crawl_coverage_never_requested.json). Nenhum check acusava, porque o
+unico vigia existente — tools/check-bot-telemetry-liveness — so confere se a
+COLETA continua rodando (idade do arquivo em horas), nunca se o NUMERO que ela
+produz parou de crescer. A coleta pode estar perfeitamente viva, tocando o
+arquivo todo dia, e mesmo assim relatar zero URL nova por dias seguidos — foi
+exatamente esse buraco que deixou o colapso de 5xx de 08-10/08-11 se converter
+em estagnacao de descoberta sem que ninguem visse por dias.
+
+A DIFERENCA PARA check-bot-telemetry-liveness: aquele mede LIVENESS do
+PRODUTOR (o arquivo esta sendo escrito?); este mede LIVENESS DA DESCOBERTA (o
+que o produtor escreve esta avancando?). As duas perguntas sao independentes —
+um timer vivo pode registrar legitimamente "zero URL nova" por semanas se o
+acervo ja foi 100% descoberto, e e por isso que este check so acusa abaixo do
+teto de cobertura declarado (COBERTURA_TETO): perto de 100%, zero novo por dia
+e SAUDE, nao estagnacao.
+
+O QUE ESTE CHECK COBRA, por crawler, olhando as ULTIMAS N linhas da serie
+(default N=2 dias corridos — o span real do problema medido em 08-12/08-13):
+  - `new_sitemap_urls_that_day` foi 0 em TODOS os dias da janela, E
+  - `cumulative_coverage_pct` ficou abaixo do teto de cobertura saudavel, E
+  - `cumulative_sitemap_coverage` nao se moveu UM byte entre a primeira e a
+    ultima leitura da janela (o congelamento em si, nao so o sintoma diario).
+
+READ-ONLY.
+
+Uso:
+    tools/check-crawl-coverage-stall
+    tools/check-crawl-coverage-stall --dias 3 --teto-cobertura 95
+    tools/check-crawl-coverage-stall --json
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SERIE = os.path.join(ROOT, "data", "ops", "crawl_coverage_daily.jsonl")
+
+DIAS_PADRAO = 2
+# Acima deste percentual, dias sem URL nova sao o comportamento ESPERADO (o
+# acervo ja foi descoberto) — nao ha o que reprovar.
+TETO_COBERTURA_PADRAO = 95.0
+# Crawlers cuja cobertura e o indicador principal do projeto (identidade
+# verificada pela Cloudflare, ver check-bot-telemetry-liveness). Os demais
+# entram no relatorio mas nao reprovam sozinhos — a serie deles e mais nova e
+# ainda nao tem historico suficiente para separar "estagnado" de "ainda
+# semeando".
+CRAWLERS_PRINCIPAIS = {"googlebot", "bingbot"}
+
+
+def ler_serie(caminho: str) -> dict[str, list[dict]]:
+    """crawler -> lista de registros, na ordem em que aparecem no arquivo
+    (que ja e cronologica: o produtor so faz append)."""
+    por_crawler: dict[str, list[dict]] = {}
+    if not os.path.isfile(caminho):
+        return por_crawler
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            crawler = registro.get("crawler")
+            if not crawler:
+                continue
+            por_crawler.setdefault(crawler, []).append(registro)
+    return por_crawler
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dias", type=int, default=DIAS_PADRAO,
+                        help="janela de dias corridos mais recentes a examinar (padrao: %(default)s)")
+    parser.add_argument("--teto-cobertura", type=float, default=TETO_COBERTURA_PADRAO,
+                        help="acima deste %% de cobertura, zero URL nova nao reprova (padrao: %(default)s)")
+    parser.add_argument("--horizonte-dias", type=int, default=90,
+                        help="em quantos dias a cobertura restante deve fechar (default 90). "
+                             "NAO afrouxe para o gate passar: o numero e a promessa de rastreio "
+                             "que o portal faz a si mesmo, e trocar a medicao pelo conforto e o "
+                             "defeito que este arquivo ja carregou.")
+    parser.add_argument("--json", action="store_true")
+    # --serie existe para o TESTE, e o teste existe porque este gate ja teve dois
+    # defeitos que so aparecem com serie controlada: fatiava LINHAS em vez de
+    # DATAS (e por isso AFROUXAVA quando a janela alargava) e incluia o dia
+    # corrente, que e uma janela de ~4h10. Sem poder apontar para um ledger
+    # sintetico, nao ha como provar que o gate detecta estagnacao de verdade --
+    # e gate que ninguem consegue testar e gate em que ninguem pode confiar.
+    parser.add_argument("--serie", default=SERIE,
+                        help="caminho do ledger (default: data/ops/crawl_coverage_daily.jsonl)")
+    args = parser.parse_args()
+
+    por_crawler = ler_serie(args.serie)
+    if not por_crawler:
+        print("check-crawl-coverage-stall: FAIL", file=sys.stderr)
+        print(f"  serie ausente ou vazia: {args.serie}", file=sys.stderr)
+        return 1
+
+    problemas = []
+    relatorio = []
+    for crawler in sorted(por_crawler):
+        # POR DATA, e nao por LINHA -- e excluindo o dia corrente.
+        #
+        # DOIS DEFEITOS NUM SO PONTO, medidos em 2026-08-28:
+        #
+        # 1. `[-args.dias:]` fatiava as ultimas N LINHAS. Como cada execucao
+        #    do produtor acrescenta ~8 linhas por crawler (ele reprocessa a
+        #    janela de 8 dias), a "janela de 7 dias" era o replay de UM run. Pior:
+        #    ALARGAR a janela AFROUXAVA o gate -- `--dias 2` reprovava e
+        #    `--dias 10` passava, porque ao cruzar a fronteira do run entravam
+        #    duplicatas fora de ordem e `cobertura_inicial != cobertura_atual`
+        #    ficava falso. Gate que fica mais verde quanto mais dado recebe nao
+        #    e gate.
+        #
+        # 2. A linha do dia CORRENTE e uma janela de ~4h10, nao um dia: o timer
+        #    roda 04:10 UTC e `measure-crawl-coverage` grampeia `fim=agora`. As
+        #    chegadas do Googlebot comecam depois disso. Incluir esse ponto faz
+        #    a serie parecer estagnada num dia em que ela nao foi medida ate o
+        #    fim.
+        hoje_utc = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        por_data = {}
+        for registro in por_crawler[crawler]:
+            data = registro.get("date")
+            if not data:
+                continue
+            # `window_complete` vence quando existe: e o produtor declarando se
+            # aquela linha cobre o dia inteiro ou so a fatia ate o momento da
+            # coleta. A exclusao por data continua como retaguarda, porque as
+            # linhas gravadas antes de 2026-08-28 nao trazem o campo -- e
+            # correcao so vale para frente, o historico nao se reescreve.
+            completa = registro.get("window_complete")
+            if completa is False:
+                continue
+            if completa is None and data >= hoje_utc:
+                continue
+            por_data[data] = registro  # ultima linha de cada data vence
+        registros = [por_data[d] for d in sorted(por_data)][-args.dias:]
+        if len(registros) < args.dias:
+            # Serie curta demais para julgar estagnacao (crawler novo na
+            # coleta) — reporta, nao reprova.
+            relatorio.append({"crawler": crawler, "status": "serie_curta", "dias_disponiveis": len(registros)})
+            continue
+
+        todos_zero = all(r.get("new_sitemap_urls_that_day", -1) == 0 for r in registros)
+        cobertura_inicial = registros[0].get("cumulative_sitemap_coverage")
+        cobertura_atual = registros[-1].get("cumulative_sitemap_coverage")
+        congelada = cobertura_inicial is not None and cobertura_inicial == cobertura_atual
+
+        # CAMPO AUSENTE NAO E APROVACAO.
+        #
+        # Ate 2026-08-28 esta parte lia so `cumulative_coverage_pct`. Quando o
+        # campo faltava -- schema antigo, linha truncada, produtor mudando de
+        # versao -- `cobertura_final` virava None, `abaixo_do_teto` virava False
+        # e `estagnado` virava False. O gate PASSAVA. Pior: ele imprimia
+        # "None%" na propria linha de saida e concluia OK ao lado. Mostrar que
+        # nao sabe e aprovar mesmo assim e a forma mais cara de gate verde.
+        #
+        # Agora o pct e DERIVADO quando ausente, dos dois campos que sempre
+        # existem; e se nem eles existirem, o crawler entra como INCONCLUSIVO --
+        # que nao reprova a onda, mas tambem nao conta como aprovado.
+        cobertura_final = registros[-1].get("cumulative_coverage_pct")
+        total = registros[-1].get("sitemap_total")
+        if cobertura_final is None and cobertura_atual is not None and total:
+            cobertura_final = round(100.0 * cobertura_atual / total, 2)
+        if cobertura_final is None:
+            relatorio.append({"crawler": crawler, "status": "inconclusivo",
+                              "motivo": "sem cumulative_coverage_pct e sem como derivar",
+                              "dias_janela": [r.get("date") for r in registros]})
+            print("  %-12s %-11s sem cobertura mensuravel na janela — NAO e aprovacao"
+                  % ("INCONCLUSIVO", crawler))
+            continue
+        abaixo_do_teto = cobertura_final < args.teto_cobertura
+
+        estagnado = todos_zero and congelada and abaixo_do_teto
+
+        # ★ RITMO, e nao so PARADA. Este gate detectava congelamento e NADA MAIS,
+        #   e por isso passou verde durante o episodio inteiro que ele existe para
+        #   pegar.
+        #
+        #   `todos_zero` exige `new_sitemap_urls_that_day == 0` em TODOS os dias da
+        #   janela. Medido em 2026-09-01: o Googlebot acha de 2 a 5 URLs novas por
+        #   dia, entao `todos_zero` e falso e o gate APROVA -- com o acervo a 747
+        #   dias de uma unica passada, 13,9 paginas/dia sobre 10.351 URLs e 3.057
+        #   paginas que ele NUNCA pediu. Detectar parada e necessario; nao e
+        #   suficiente. Rastreio lentissimo nao e rastreio.
+        #
+        #   O criterio novo e derivado, nao arbitrado: o que falta de cobertura
+        #   dividido por um HORIZONTE declarado da o ritmo minimo exigido. Hoje sao
+        #   (10.351 - 7.294) / 90 = 34 paginas/dia contra 13,9 medidas.
+        #
+        #   ★ E ELE VAI FICAR VERMELHO POR SEMANAS, DE PROPOSITO. Afrouxar o
+        #   horizonte para o gate passar e proibido: seria trocar a medicao pelo
+        #   conforto, que e exatamente o defeito que este arquivo ja carregou.
+        ritmo_medido = None
+        ritmo_exigido = None
+        lento = False
+        if cobertura_atual is not None and total and len(registros) >= 2:
+            dias_janela = max(len(registros) - 1, 1)
+            avanco = cobertura_atual - (cobertura_inicial or 0)
+            ritmo_medido = round(avanco / dias_janela, 2)
+            faltam = max(total - cobertura_atual, 0)
+            ritmo_exigido = round(faltam / max(args.horizonte_dias, 1), 2)
+            # QUEM JA COBRIU O ACERVO NAO TEM RITMO A EXIGIR, e isto nao e
+            # afrouxamento: e escopo. Na primeira execucao o criterio novo marcou
+            # o yandexbot como LENTO com 99,56% de cobertura, porque as 45 URLs
+            # que faltam divididas por 90 dias dao 0,50/dia e ele fez 0,00 na
+            # janela. Cobrar ritmo de quem terminou transforma o gate em ruido, e
+            # gate ruidoso e gate que todo mundo aprende a ignorar -- que e como
+            # os quatro vigias deste repositorio ficaram cegos.
+            #
+            # O corte e o MESMO teto de cobertura que ja governa `estagnado`
+            # (95%), entao nao ha regua nova nem numero inventado aqui.
+            lento = faltam > 0 and ritmo_medido < ritmo_exigido and abaixo_do_teto
+
+        status = "estagnado" if estagnado else ("lento" if lento else "ok")
+        relatorio.append({
+            "crawler": crawler,
+            "status": status,
+            "dias_janela": [r.get("date") for r in registros],
+            "new_sitemap_urls_that_day": [r.get("new_sitemap_urls_that_day") for r in registros],
+            "cumulative_sitemap_coverage": cobertura_atual,
+            "cumulative_coverage_pct": cobertura_final,
+            "sitemap_total": registros[-1].get("sitemap_total"),
+            "paginas_por_dia_medidas": ritmo_medido,
+            "paginas_por_dia_necessarias": ritmo_exigido,
+            "horizonte_dias": args.horizonte_dias,
+        })
+        ritmo_texto = ""
+        if ritmo_medido is not None:
+            ritmo_texto = " — ritmo %.2f/dia contra %.2f exigidas (horizonte %dd)" % (
+                ritmo_medido, ritmo_exigido, args.horizonte_dias)
+        print("  %-9s %-11s %s%% (%s/%s URLs)%s"
+              % (status.upper(), crawler, cobertura_final, cobertura_atual,
+                 registros[-1].get("sitemap_total"), ritmo_texto))
+
+        if lento and not estagnado and crawler in CRAWLERS_PRINCIPAIS:
+            problemas.append(
+                "%s_ritmo_insuficiente:%.2f pagina(s)/dia medidas contra %.2f necessarias para "
+                "fechar %s URL(s) restante(s) em %d dias — no ritmo atual seriam %d dia(s)"
+                % (crawler, ritmo_medido, ritmo_exigido,
+                   (total or 0) - (cobertura_atual or 0), args.horizonte_dias,
+                   int(((total or 0) - (cobertura_atual or 0)) / ritmo_medido) if ritmo_medido else -1))
+
+        if estagnado and crawler in CRAWLERS_PRINCIPAIS:
+            problemas.append(
+                "%s_cobertura_estagnada:%d dia(s) seguidos com 0 URL nova, cobertura presa em "
+                "%s/%s (%s%%) — abaixo do teto de %s%%"
+                % (crawler, args.dias, cobertura_atual, registros[-1].get("sitemap_total"),
+                   cobertura_final, args.teto_cobertura))
+
+    if args.json:
+        print(json.dumps({"problemas": problemas, "crawlers": relatorio}, ensure_ascii=False, sort_keys=True))
+
+    if problemas:
+        print("\ncheck-crawl-coverage-stall: FAIL", file=sys.stderr)
+        for problema in problemas:
+            print("  - %s" % problema, file=sys.stderr)
+        print("\n  Cobertura congelada com o acervo incompleto e o mesmo apagao de descoberta que",
+              file=sys.stderr)
+        print("  ja aconteceu em 08-10/08-11 (5xx nosso ao Googlebot). Investigar: sitemap acessivel,",
+              file=sys.stderr)
+        print("  robots.txt sem erro de sintaxe, orfas de link interno, canal IndexNow/WebSub.",
+              file=sys.stderr)
+        return 1
+
+    print("\ncheck-crawl-coverage-stall: pass")
+    print("  nenhum crawler principal com cobertura estagnada abaixo do teto")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

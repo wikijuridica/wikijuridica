@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Reprova se o firewall do host bloquear qualquer faixa de crawler legitimo.
+
+POR QUE ESTE CHECK EXISTE (2026-08-13)
+--------------------------------------
+O host tem um set nftables `botnet_block` com acao `drop`, criado para barrar
+scanner. Um dos IPs nele, `20.214.137.177`, pertence a **Microsoft Corporation**
+(whois: NetName MSFT) — e as faixas oficiais do Bingbot sao justamente Azure
+(`13.x`, `20.x`, `40.77.x`, `52.x`). Hoje esse IP nao esta em nenhuma faixa
+declarada de crawler, entao nao ha bloqueio ativo de bot valioso.
+
+O risco nao e o presente, e o futuro: provedor de nuvem RECICLA IP. Um endereco
+que hoje hospeda um scanner pode amanha hospedar infraestrutura de crawler, e o
+`drop` e SILENCIOSO — nao gera log de aplicacao, nao aparece em metrica de
+borda, nao dispara alarme. O sintoma seria exatamente o que ja custou dias de
+investigacao: "o bot parou de vir e ninguem sabe por que".
+
+Dai a regra: bloqueio por IP fixo e sempre uma aposta de que o dono do endereco
+nao muda. Este check re-verifica a aposta a cada ciclo, contra a lista de faixas
+que o proprio projeto mantem atualizada por timer (`generate-bot-ip-ranges`).
+
+COBERTURA
+---------
+Cruza as DUAS familias de endereco. O levantamento manual que precedeu este
+check cobriu so IPv4 (1.650 faixas) e deixou de fora **809 faixas IPv6** — um
+ponto cego de um terco do total, exatamente na familia que cresce.
+
+Lugar certo de barrar scanner e a BORDA (a zona ja tem regra de caminho de
+credencial), nao um set estatico no host: a borda ve o pedido, sabe classificar,
+e erra de forma visivel.
+
+Uso:
+    tools/check-firewall-bot-safety
+    tools/check-firewall-bot-safety --simular-bloqueio 66.249.64.1   # prova que reprova
+
+READ-ONLY: nunca altera regra de firewall.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import ipaddress
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+FAIXAS_DIR = RAIZ / "data" / "ops" / "bot_ip_ranges"
+NFT_CONF = pathlib.Path("/etc/nftables.conf")
+
+CIDR_RE = re.compile(
+    r"\b("
+    r"\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?"      # IPv4 com ou sem prefixo
+    r"|[0-9a-fA-F:]{2,}:[0-9a-fA-F:]*(?:/\d{1,3})?"  # IPv6
+    r")\b"
+)
+
+
+def carrega_faixas_crawler() -> tuple[list, dict]:
+    """Todas as faixas declaradas dos crawlers valiosos, IPv4 e IPv6."""
+    redes, origem = [], {}
+    for arq in sorted(glob.glob(str(FAIXAS_DIR / "*.json"))):
+        nome = pathlib.Path(arq).stem
+        try:
+            bruto = json.loads(pathlib.Path(arq).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        # O esquema varia por operador (prefixes[], creationTime+prefixes[],
+        # ipv4Prefix/ipv6Prefix). Em vez de um parser por formato — que quebra
+        # calado quando o upstream muda —, extrai-se todo CIDR do texto e
+        # valida-se cada um. Falso positivo aqui e inofensivo: no maximo
+        # protege-se um endereco a mais.
+        for achado in CIDR_RE.findall(json.dumps(bruto)):
+            try:
+                rede = ipaddress.ip_network(achado, strict=False)
+            except ValueError:
+                continue
+            redes.append(rede)
+            origem.setdefault(str(rede), nome)
+    return redes, origem
+
+
+def le_set_nftables() -> tuple[list, str]:
+    """Elementos do set botnet_block. Tenta o estado VIVO antes do arquivo."""
+    fonte, texto = "", ""
+    saida = subprocess.run(
+        ["sudo", "-n", "nft", "list", "ruleset"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if saida.returncode == 0 and saida.stdout.strip():
+        texto, fonte = saida.stdout, "nftables vivo (nft list ruleset)"
+    elif NFT_CONF.is_file():
+        try:
+            texto, fonte = NFT_CONF.read_text(encoding="utf-8"), str(NFT_CONF)
+        except OSError:
+            pass
+    if not texto:
+        return [], ""
+
+    # Recorta so os elementos do set: um CIDR solto em outra chain nao e bloqueio.
+    #
+    # ARMADILHA JA PISADA: `set botnet_block \{(.*?)\}` non-greedy para no
+    # PRIMEIRO `}` — que e o fecho de `elements = { ... }`, nao o do set. O
+    # `elements` seguinte entao nao encontrava chave de fechamento e o check
+    # anunciava "0 enderecos bloqueados" com quatro no firewall: falso-verde
+    # exatamente do tipo que este arquivo existe para impedir. A ancora agora e
+    # o proprio `elements` DEPOIS do nome do set.
+    inicio = texto.find("botnet_block")
+    if inicio < 0:
+        return [], fonte
+    elementos = re.search(r"elements\s*=\s*\{([^}]*)\}", texto[inicio:], re.S)
+    if not elementos:
+        return [], fonte
+
+    redes = []
+    for achado in CIDR_RE.findall(elementos.group(1)):
+        try:
+            redes.append(ipaddress.ip_network(achado, strict=False))
+        except ValueError:
+            continue
+    return redes, fonte
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument(
+        "--simular-bloqueio", metavar="IP_OU_CIDR", action="append", default=[],
+        help="acrescenta um endereco ao conjunto bloqueado, sem tocar no firewall. "
+             "Serve para provar que o check REPROVA quando deve — gate que so sabe passar nao e gate.",
+    )
+    args = ap.parse_args()
+
+    redes_crawler, origem = carrega_faixas_crawler()
+    if not redes_crawler:
+        print("check-firewall-bot-safety: FAIL")
+        print(f"  - nenhuma faixa de crawler carregada de {FAIXAS_DIR}. Sem a lista, o check aprovaria qualquer bloqueio.")
+        return 1
+
+    v4 = sum(1 for r in redes_crawler if r.version == 4)
+    v6 = sum(1 for r in redes_crawler if r.version == 6)
+
+    bloqueadas, fonte = le_set_nftables()
+    simuladas = []
+    for bruto in args.simular_bloqueio:
+        try:
+            simuladas.append(ipaddress.ip_network(bruto, strict=False))
+        except ValueError:
+            print(f"check-firewall-bot-safety: FAIL\n  - --simular-bloqueio {bruto!r} nao e IP nem CIDR valido")
+            return 1
+    bloqueadas = bloqueadas + simuladas
+
+    if not fonte and not simuladas:
+        # Sem leitura do firewall, o check nao pode afirmar nada. Dizer "pass"
+        # aqui seria o falso-verde que este arquivo inteiro existe para evitar.
+        print("check-firewall-bot-safety: FAIL")
+        print("  - nao foi possivel ler o ruleset (sem sudo nao-interativo e sem /etc/nftables.conf legivel).")
+        print("    Silencio nao e aprovacao: sem enxergar a regra, nao ha como garantir que bot legitimo passa.")
+        return 1
+
+    colisoes = []
+    for bloqueada in bloqueadas:
+        for crawler in redes_crawler:
+            if bloqueada.version != crawler.version:
+                continue
+            if bloqueada.overlaps(crawler):
+                colisoes.append((bloqueada, crawler, origem.get(str(crawler), "?")))
+
+    print(f"  faixas de crawler carregadas: {len(redes_crawler)} ({v4} IPv4 + {v6} IPv6)")
+    print(f"  enderecos bloqueados no firewall: {len(bloqueadas)}" + (f" (fonte: {fonte})" if fonte else ""))
+    if simuladas:
+        print(f"  incluindo {len(simuladas)} simulado(s): {', '.join(str(s) for s in simuladas)}")
+
+    if colisoes:
+        print("check-firewall-bot-safety: FAIL")
+        for bloqueada, crawler, quem in colisoes:
+            print(f"  - {bloqueada} bloqueado no firewall INTERSECTA {crawler} ({quem})")
+            print("    O drop e silencioso: o crawler simplesmente para de vir, sem log nem alarme.")
+        print("  Barre scanner na BORDA, que ve o pedido e erra de forma visivel — nao num set estatico no host.")
+        return 1
+
+    print("check-firewall-bot-safety: pass")
+    print("  nenhum endereco bloqueado intersecta faixa declarada de crawler valioso (IPv4 e IPv6 conferidos)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""apply-cache-rules — poe no ar a Cache Rule que o repositorio declara.
+
+ESCREVE na zona Cloudflare. Idempotente: le antes, compara, e nao faz nada se
+ja estiver igual.
+
+POR QUE ESTA FERRAMENTA PRECISA EXISTIR. Ate 2026-08-26 NENHUMA ferramenta deste
+repositorio escrevia a Cache Rule -- `grep -rl http_request_cache_settings
+tools/ cmd/ internal/` devolvia apenas um gate que LE e um comentario. Toda a
+configuracao de borda era feita por PAINEL, e o resultado esta medido: entre 21
+e 22/08 a regra versionada foi substituida por templates genericos do painel e
+depois zerada, em tres edicoes que somaram NOVE SEGUNDOS (v12 -> v13 -> v14). O
+audit log da conta mostra `interface: "UI"`.
+
+Configuracao que so existe no painel nao tem revisao, nao tem historico legivel
+no repositorio e nao pode ser restaurada por ninguem que nao esteja logado. Esta
+ferramenta fecha isso: o corpo canonico vive em ops/cloudflare/cache-rules.json,
+versionado, e o que vai para a zona sai dali.
+
+LEITURA ANTES DA ESCRITA, sempre: o estado anterior inteiro e gravado no ledger
+data/ops/edge_rule_apply.jsonl ANTES do PUT. Se a aplicacao piorar alguma coisa,
+o que estava la e recuperavel sem depender de memoria de ninguem.
+
+Uso:
+    tools/apply-cache-rules --dry-run     # mostra o diff, nao escreve
+    tools/apply-cache-rules               # aplica
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CANONICO = os.path.join(RAIZ, "ops/cloudflare/cache-rules.json")
+LEDGER = os.path.join(RAIZ, "data/ops/edge_rule_apply.jsonl")
+ENV = os.path.join(RAIZ, ".env.local")
+FASE = "http_request_cache_settings"
+API = "https://api.cloudflare.com/client/v4"
+
+
+def ambiente():
+    return cloudflare_auth.ambiente(ENV)
+
+
+# CREDENCIAL CENTRALIZADA em tools/cloudflare_auth.py desde 2026-09-03 (a
+# explicacao completa de "duas formas de credencial" mora na docstring do
+# modulo). Esta funcao continua aqui, com este NOME e esta ASSINATURA, de
+# proposito: check-cache-rule-viva importa ESTE arquivo por SourceFileLoader e
+# chama `ambiente()`, `_credenciais(env, precisa_escrever=...)` e `chamar()`
+# nele -- a suite de teste dele confere, no proprio texto-fonte, que a chamada
+# de leitura usa literalmente `_credenciais(env, precisa_escrever=False)`.
+#
+# O `if precisa_escrever` espelha o controle de fluxo original: tenta a Global
+# API Key (unica com escopo de escrita); se ela nao existir, cai para
+# `cabecalhos("leitura", ...)`, que tenta o Bearer de zona antes da Global Key
+# -- nunca None so porque a operacao pretendia escrever mas so o token de
+# zona existe (esse caso vira 403 limpo no PUT, nao uma excecao aqui).
+def _credenciais(env, precisa_escrever=False):
+    """Devolve (cabecalhos, rotulo). Bearer de zona para leitura; Global API Key
+    quando a operacao escreve, porque o Bearer de zona nao tem esse escopo."""
+    if precisa_escrever:
+        cab, rotulo = cloudflare_auth.cabecalhos("escrita", env=env)
+        if cab is not None:
+            return cab, rotulo
+    return cloudflare_auth.cabecalhos("leitura", env=env)
+
+
+def chamar(url, cabecalhos, metodo="GET", corpo=None):
+    dados = json.dumps(corpo).encode("utf-8") if corpo is not None else None
+    req = urllib.request.Request(url, data=dados, method=metodo, headers=cabecalhos)
+    with urllib.request.urlopen(req, timeout=45) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def normaliza(regra):
+    return {
+        "action": regra.get("action"),
+        "expression": " ".join((regra.get("expression") or "").split()),
+        "enabled": regra.get("enabled", True),
+        "action_parameters": regra.get("action_parameters") or {},
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    env = ambiente()
+    zona = env.get("CLOUDFLARE_ZONE_ID", "b2e1366a94c5dcac97f2fc264f18928f")
+    leitura, rotulo_leitura = _credenciais(env, precisa_escrever=False)
+    escrita, rotulo_escrita = _credenciais(env, precisa_escrever=True)
+    if leitura is None:
+        print("sem credencial Cloudflare em .env.local", file=sys.stderr)
+        return 2
+
+    with open(CANONICO, encoding="utf-8") as f:
+        canonico = json.load(f)
+    regras_novas = canonico.get("rules") or []
+    if not regras_novas:
+        print(f"{CANONICO} nao declara regra nenhuma — nada a aplicar", file=sys.stderr)
+        return 2
+
+    url = f"{API}/zones/{zona}/rulesets/phases/{FASE}/entrypoint"
+    try:
+        antes = chamar(url, leitura)["result"]
+    except urllib.error.HTTPError as e:
+        print(f"nao consegui LER o ruleset ({e.code} {e.reason}) — nao escrevo as cegas",
+              file=sys.stderr)
+        return 1
+
+    regras_antes = antes.get("rules") or []
+    print(f"zona    : {zona}")
+    print(f"credencial: leitura={rotulo_leitura} escrita={rotulo_escrita}")
+    print(f"ruleset : {antes.get('name')} (version {antes.get('version')})")
+    print(f"no ar   : {len(regras_antes)} regra(s) | versionado: {len(regras_novas)} regra(s)")
+
+    if [normaliza(r) for r in regras_antes] == [normaliza(r) for r in regras_novas]:
+        print("ja esta identico ao versionado — nada a fazer (idempotente)")
+        return 0
+
+    for r in regras_novas:
+        print(f"  vai aplicar: {(r.get('description') or '')[:110]}")
+        ap_ = r.get("action_parameters") or {}
+        ttl = (ap_.get("edge_ttl") or {})
+        print(f"    edge_ttl.mode = {ttl.get('mode')!r}"
+              + (f" default={ttl.get('default')}" if ttl.get("default") else ""))
+        print(f"    vary.accept   = {bool((ap_.get('vary') or {}).get('headers', {}).get('accept'))}")
+
+    if args.dry_run:
+        print("\n--dry-run: nada escrito na zona")
+        return 0
+
+    # O ESTADO ANTERIOR INTEIRO vai para o ledger ANTES do PUT.
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "schema_version": "edge_rule_apply_v1",
+            "aplicado_em": datetime.now(timezone.utc).isoformat(),
+            "zona": zona,
+            "fase": FASE,
+            "version_antes": antes.get("version"),
+            "regras_antes": regras_antes,
+            "regras_depois_pretendidas": regras_novas,
+            "origem": os.path.relpath(CANONICO, RAIZ),
+        }, ensure_ascii=False) + "\n")
+
+    try:
+        depois = chamar(url, escrita, "PUT", {"rules": regras_novas})["result"]
+    except urllib.error.HTTPError as e:
+        detalhe = ""
+        try:
+            detalhe = e.read().decode("utf-8")[:600]
+        except Exception:
+            pass
+        print(f"PUT falhou: {e.code} {e.reason}\n{detalhe}", file=sys.stderr)
+        print("O estado anterior esta gravado no ledger, nada foi perdido.", file=sys.stderr)
+        return 1
+
+    print(f"\nAPLICADO. version {antes.get('version')} -> {depois.get('version')} | "
+          f"{len(depois.get('rules') or [])} regra(s) no ar")
+    print(f"estado anterior preservado em {os.path.relpath(LEDGER, RAIZ)}")
+    print("\nConfira com: tools/check-edge-rule-drift")
+    print("E MEÇA a cobertura antes de concluir: restaurar a regra NAO garante HIT --")
+    print("na era em que ela estava viva a cobertura oscilou entre 0,0% e 17,5%.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

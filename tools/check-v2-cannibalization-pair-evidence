@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""check-v2-cannibalization-pair-evidence — READ-ONLY.
+
+Para cada par de canibalizacao apontado por `tools/check-v2-editorial-launch-risk`
+(duas paginas ativas disputando a MESMA intencao de busca declarada), mede a
+evidencia que decide o tratamento editorial correto:
+
+  * sobreposicao textual real dos corpos (Jaccard de shingles de 4 tokens, e
+    containment do menor no maior) — a mesma medida usada para o par
+    /imobiliario/direito-de-superficie/;
+  * practice_area e URL publica derivada de cada pagina
+    (internal/publicpath/publicpath.go:41 + seed = intent_id sem o primeiro
+    segmento, internal/v2ingest/validate.go:788-794);
+  * page_type e tamanho real do corpo.
+
+POR QUE ISSO IMPORTA: "mesma query declarada" nao implica "pagina redundante".
+Duas paginas em URLs distintas (`/glossario/x/` e `/administrativo/x/`) com
+corpos textualmente disjuntos sao um VERBETE e um GUIA — pecas legitimamente
+diferentes cuja declaracao de query e que esta errada. Ja duas paginas com
+corpo sobreposto sao redundancia real: uma delas tem de ser aposentada. Aplicar
+o mesmo tratamento aos dois casos destroi conteudo bom ou mantem canibalizacao
+real; por isso a decisao e por evidencia, par a par.
+
+Criterio emitido em `tratamento`:
+  supersede      containment >= 0.35  (corpo do menor majoritariamente contido)
+  diferenciar    containment <  0.35  e URLs publicas distintas
+  colisao_url    URLs publicas identicas (nao e canibalizacao: e colisao, que
+                 se resolve por tombstone, nao por query)
+
+Nao escreve nada. Saida em texto ou --json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PAGES_GLOB = "data/editorial/v2_pages/*.jsonl"
+PORTFOLIO_GLOB = "data/editorial/portfolio_v2/*.jsonl"
+SHINGLE = 4
+SUPERSEDE_CONTAINMENT = 0.35
+
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def fold(text: str) -> list[str]:
+    decomposed = unicodedata.normalize("NFD", text.lower())
+    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+    return _WORD.findall(stripped)
+
+
+def shingles(tokens: list[str], size: int = SHINGLE) -> set[tuple[str, ...]]:
+    if len(tokens) < size:
+        return {tuple(tokens)} if tokens else set()
+    return {tuple(tokens[i:i + size]) for i in range(len(tokens) - size + 1)}
+
+
+def body_text(record: dict) -> str:
+    parts = [record.get("opening") or ""]
+    for section in record.get("sections") or []:
+        if isinstance(section, dict):
+            parts.append(section.get("heading") or "")
+            parts.append(section.get("text") or "")
+    for item in record.get("faq") or []:
+        if isinstance(item, dict):
+            parts.append(item.get("q") or "")
+            parts.append(item.get("a") or "")
+    return " ".join(parts)
+
+
+def query_key(value: str) -> str:
+    return " ".join(fold(value or ""))
+
+
+def slug(*parts: str) -> str:
+    tokens: list[str] = []
+    for part in parts:
+        tokens.extend(_WORD.findall(unicodedata.normalize("NFD", (part or "").lower())))
+    return "-".join(tokens)
+
+
+def seed_from_intent(intent_id: str) -> str:
+    separator = intent_id.find("-")
+    if separator <= 0 or separator == len(intent_id) - 1:
+        return ""
+    return intent_id[separator + 1:]
+
+
+def public_path(practice_area: str, intent_id: str) -> str:
+    seed = seed_from_intent(intent_id)
+    if not practice_area or not seed:
+        return ""
+    return "/" + slug(practice_area) + "/" + slug(seed) + "/"
+
+
+def load_portfolio(root: Path) -> dict[str, dict]:
+    rows: dict[str, dict] = {}
+    for path in sorted(glob.glob(os.fspath(root / PORTFOLIO_GLOB))):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                intent = record.get("intent_id")
+                if isinstance(intent, str) and intent:
+                    rows[intent] = record
+    return rows
+
+
+def load_pages(root: Path) -> dict[str, dict]:
+    pages: dict[str, dict] = {}
+    for path in sorted(glob.glob(os.fspath(root / PAGES_GLOB))):
+        rel = os.path.relpath(path, os.fspath(root))
+        with open(path, encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("skipped") is True:
+                    continue
+                intent = record.get("intent_id")
+                if not isinstance(intent, str) or not intent:
+                    continue
+                record["_file"] = rel
+                record["_line"] = number
+                pages[intent] = record
+    return pages
+
+
+def build_pairs(portfolio: dict[str, dict], pages: dict[str, dict]) -> list[tuple[str, list[str]]]:
+    by_query: dict[str, list[str]] = {}
+    for intent, row in portfolio.items():
+        if intent not in pages:
+            continue
+        key = query_key(row.get("long_tail_query") or "")
+        if not key:
+            continue
+        by_query.setdefault(key, []).append(intent)
+    pairs = [(key, sorted(group)) for key, group in by_query.items() if len(group) > 1]
+    pairs.sort()
+    return pairs
+
+
+def evaluate(root: Path) -> dict:
+    portfolio = load_portfolio(root)
+    pages = load_pages(root)
+    results = []
+    for key, group in build_pairs(portfolio, pages):
+        members = []
+        token_sets = {}
+        for intent in group:
+            page = pages[intent]
+            row = portfolio.get(intent, {})
+            tokens = fold(body_text(page))
+            token_sets[intent] = shingles(tokens)
+            members.append({
+                "intent_id": intent,
+                "file": page["_file"],
+                "line": page["_line"],
+                "practice_area": row.get("practice_area") or "",
+                "page_type": row.get("page_type") or "",
+                "public_path": public_path(row.get("practice_area") or "", intent),
+                "body_words": len(tokens),
+                "long_tail_query": row.get("long_tail_query") or "",
+            })
+        left, right = group[0], group[1]
+        a, b = token_sets[left], token_sets[right]
+        union = len(a | b)
+        inter = len(a & b)
+        smaller = min(len(a), len(b)) or 1
+        jaccard = inter / union if union else 0.0
+        containment = inter / smaller
+        paths = {member["public_path"] for member in members if member["public_path"]}
+        if len(paths) == 1 and len(members) > 1:
+            treatment = "colisao_url"
+        elif containment >= SUPERSEDE_CONTAINMENT:
+            treatment = "supersede"
+        else:
+            treatment = "diferenciar"
+        results.append({
+            "long_tail_query_normalizada": key,
+            "shingle4_jaccard": round(jaccard, 4),
+            "shingle4_containment": round(containment, 4),
+            "tratamento": treatment,
+            "paginas": members,
+        })
+    results.sort(key=lambda item: (-item["shingle4_containment"], item["long_tail_query_normalizada"]))
+    counts: dict[str, int] = {}
+    for item in results:
+        counts[item["tratamento"]] = counts.get(item["tratamento"], 0) + 1
+    return {
+        "pares": len(results),
+        "paginas_envolvidas": sum(len(item["paginas"]) for item in results),
+        "tratamento_por_par": counts,
+        "criterio_supersede_containment": SUPERSEDE_CONTAINMENT,
+        "resultados": results,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="check-v2-cannibalization-pair-evidence")
+    parser.add_argument("--json", action="store_true", help="saída JSON completa")
+    parser.add_argument("--root", default=os.fspath(ROOT), help="raiz do projeto")
+    arguments = parser.parse_args()
+
+    report = evaluate(Path(arguments.root))
+    if arguments.json:
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    print(f"pares={report['pares']} paginas={report['paginas_envolvidas']} "
+          f"tratamento={report['tratamento_por_par']}")
+    for item in report["resultados"]:
+        print(f"\n[{item['tratamento']}] jaccard4={item['shingle4_jaccard']} "
+              f"containment={item['shingle4_containment']}  \"{item['long_tail_query_normalizada']}\"")
+        for member in item["paginas"]:
+            print(f"    {member['intent_id']:48s} {member['public_path']:46s} "
+                  f"{member['page_type']:14s} {member['body_words']:4d}p  "
+                  f"{member['file']}:{member['line']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

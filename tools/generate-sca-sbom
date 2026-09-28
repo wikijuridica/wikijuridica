@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(
+	unset CDPATH
+	cd -- "$(dirname -- "$0")/.." && pwd
+)"
+PATH="$ROOT/tools:$PATH"
+export PATH
+cd "$ROOT"
+export GOCACHE="${GOCACHE:-$HOME/.cache/go-build}"
+
+# Guarda de argumento (2026-09-23). Em 2026-06-30 `--help` virou OUTPUT, o
+# `dirname --help` imprimiu a ajuda e o `mkdir -p` criou na raiz do repo 19
+# diretorios aninhados com o texto dela. Fica ACIMA do reexec: uso errado nao
+# toma o lock do SBOM. -h/--help sai 0, como na maioria dos tools/generate-* e
+# check-* (que imprimem o uso no stdout); aqui o uso vai ao stderr, como no
+# `flag` do Go. Outra flag sai 2; o `exit 64` do escopo desconhecido, abaixo,
+# e outro caso e fica. Teste: tools/test_generate_sca_sbom_help.py
+uso() {
+	cat >&2 <<'EOF'
+Uso: tools/generate-sca-sbom                     gera o SBOM de cada módulo Go rastreado
+     tools/generate-sca-sbom --scope=<nome>      só o módulo <nome> (root = módulo raiz)
+     tools/generate-sca-sbom --<nome>-only       o mesmo que --scope=<nome>
+     tools/generate-sca-sbom <caminho-de-saida>  SBOM do módulo raiz gravado nesse caminho
+EOF
+}
+# >>> guarda-de-flag (o teste apaga este bloco para montar o mutante)
+case "${1:-}" in
+--scope=* | *-only) ;;
+-h | --help)
+	uso
+	exit 0
+	;;
+-*)
+	printf 'generate-sca-sbom: flag desconhecida: %q\n' "$1" >&2
+	uso
+	exit 2
+	;;
+esac
+# <<< guarda-de-flag
+
+# Auto-supervisao: sao ate 6 subprocessos `cyclonedx-gomod` SEQUENCIAIS. Sem
+# teto, uma trava em qualquer um deles pendurava o agente sem budget, sem lock
+# de escopo e sem mensagem de budget-exceeded para se reorientar. Reexecuta este
+# mesmo script sob run-heavy-throttled na primeira entrada.
+#
+# run-generate-supervised NAO serve aqui: ele so aceita ./cmd/generate-* (sai
+# 64 para qualquer outra coisa) e este script nao e um cmd Go. O guard usa
+# WIKI_RUN_GO_CMD_CACHED_UNDER_HEAVY, o marcador que o proprio
+# run-heavy-throttled ja exporta ao filho, de modo que a invocacao ja
+# documentada `./tools/run-heavy-throttled ./tools/generate-sca-sbom --root-only`
+# (ADR 2026-07-28) nao aninhe wrapper nem espere o proprio lock.
+if [[ "${WIKI_RUN_GO_CMD_CACHED_UNDER_HEAVY:-}" != "1" ]]; then
+	export WIKI_HEAVY_LOCK_SCOPE="${WIKI_HEAVY_LOCK_SCOPE:-generate:sca-sbom:gocache:$GOCACHE}"
+	export WIKI_HEAVY_BUDGET_MS="${WIKI_HEAVY_BUDGET_MS:-900000}"
+	# ★ O TIMEOUT DO COMANDO PRECISA ACOMPANHAR A DURACAO DECLARADA.
+	#
+	# Sem esta linha o run-heavy-throttled cai no default de 540s
+	# (run-heavy-throttled:105) e RECUSA a execucao antes de comecar:
+	# "expected duration must not exceed effective command timeout (540000ms)",
+	# exit 2. Ou seja, depois que a duracao esperada subiu para 780000ms — a
+	# correcao, correta, do bloco logo abaixo — o gerador ficou IMPOSSIVEL de
+	# rodar, e o BOM parou de vez em 2026-07-02. Medido em 2026-08-29 (BUG-067).
+	#
+	# Isto NAO e afrouxar teto para esconder lentidao: nada estava estourando o
+	# tempo; duas declaracoes do MESMO arquivo e que se contradiziam (budget de
+	# 900s, duracao esperada de 780s, timeout implicito de 540s). O numero aqui
+	# e o proprio budget, para que o teto de custo continue sendo um so.
+	export WIKI_HEAVY_TIMEOUT_SECONDS="${WIKI_HEAVY_TIMEOUT_SECONDS:-900}"
+	export WIKI_HEAVY_STOP_CONDITION="${WIKI_HEAVY_STOP_CONDITION:-command_exits_or_timeout_or_lock_release}"
+	# Budget + expected_duration + stop_condition + throughput sao os QUATRO que
+	# ligam o progress monitor do run-heavy-throttled (validate_heavy_project_
+	# command_contract). Sem os quatro ele reporta "progress_monitor=off
+	# reason=no_explicit_heavy_contract" e um cyclonedx-gomod travado passa mudo.
+	# DURACAO DECLARADA REALISTA, medida em 2026-08-26.
+	#
+	# Estava em 300000 (5 min) e o trabalho passa disso: o cyclonedx-gomod roda
+	# `-licenses` sobre os 504 pacotes do modulo, que e CPU-bound e nao escreve
+	# UM BYTE ate terminar. O progress_monitor do run-heavy-throttled cruzou
+	# "duracao declarada excedida" com "io_write_bytes_delta=0" e concluiu
+	# io_without_progress_risk, matando o processo aos 516s -- com 100% de CPU e
+	# progredindo. O BOM ficou parado em 2026-07-02 por causa disso.
+	#
+	# O monitor nao estava errado sobre o que mediu; a DECLARACAO e que estava.
+	# Duracao esperada abaixo da real transforma trabalho normal em alarme, e o
+	# alarme aqui nao avisa: mata. 780000 deixa margem sobre o pior caso
+	# observado sem ultrapassar o budget de 900000.
+	export WIKI_HEAVY_EXPECTED_DURATION_MS="${WIKI_HEAVY_EXPECTED_DURATION_MS:-780000}"
+	export WIKI_HEAVY_THROUGHPUT_EXPECTED="${WIKI_HEAVY_THROUGHPUT_EXPECTED:-items_per_second=0.02}"
+	export WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER="${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/generate-sca-sbom}"
+	export WIKI_HEAVY_ARTIFACT_CLAIM_PATH="${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-data/ops/sca_cyclonedx_bom.json}"
+	exec "$ROOT/tools/run-heavy-throttled" "$ROOT/tools/generate-sca-sbom" "$@"
+fi
+
+# Descoberta dos modulos, nao lista escrita a mao.
+#
+# Ate 2026-08-26 este gerador tinha CINCO alvos literais e nunca gerou SBOM de
+# `/tools/perf` nem de `/tools/duckdbolap` -- os dois modulos que carregavam as
+# vulnerabilidades fechadas na primeira onda da Fase 9 (x/mod GO-2026-6179 e
+# GO-2026-6180, x/image GO-2026-6222). A mesma doenca estava no gate `sca-sbom`
+# e no gate do Dependabot. A regra agora e: modulo Go RASTREADO pelo git tem
+# SBOM; nao rastreado (snapshots de `var/`, toolchains em `.toolchains/`, ambos
+# no .gitignore) nao e alvo de scanner hospedado e nao entra.
+#
+# `git ls-files` e o instrumento, e nao o caminhador de diretorios: `find` e
+# `./...` esbarram em var/nginx/body (dono `nobody`, modo 0700) nesta maquina.
+sbom_module_directories() {
+	git -C "$ROOT" ls-files -- 'go.mod' '*/go.mod' | while IFS= read -r gomod; do
+		dir="${gomod%/go.mod}"
+		if [[ "$dir" == "go.mod" ]]; then
+			printf '.\n'
+		else
+			printf './%s\n' "$dir"
+		fi
+	done | LC_ALL=C sort
+}
+
+# A falha da descoberta nao pode sumir (2026-09-23). Os lacos liam a lista por
+# `< <(sbom_module_directories)`, e ali o rc do git se perdia: numa raiz sem
+# repositorio o gerador saia 0 sem SBOM nenhum (falso verde) e o `--scope=`
+# saia 128 dizendo "escopo desconhecido". Agora a lista e capturada ANTES do
+# laco; git que falha ou lista vazia saem 75 (infra, a convencao de
+# tools/run-check) com a causa no stderr. Teste: tools/test_generate_sca_sbom_help.py
+#
+# Roda dentro de $(...): o stdout do git sai pelo fd 3 para quem captura a
+# lista, e o stderr fica em $erro para entrar na mensagem numa linha so.
+sbom_module_directories_checked() {
+	local erro rc=0
+	{ erro="$(sbom_module_directories 2>&1 >&3 3>&-)" || rc=$?; } 3>&1
+	if ((rc != 0)); then
+		printf 'generate-sca-sbom: git ls-files falhou (rc=%d) em %s: %s; sem a lista de módulos Go não há SBOM a gerar\n' "$rc" "$ROOT" "${erro:-sem mensagem do git}" >&2
+		return 75
+	fi
+	if [[ -n "$erro" ]]; then
+		printf '%s\n' "$erro" >&2
+	fi
+}
+
+# Preenche SBOM_MODULOS; sai 75 se a descoberta falhar ou vier vazia.
+sbom_discover_modules() {
+	local listagem rc=0
+	listagem="$(sbom_module_directories_checked)" || rc=$?
+	# >>> guarda-de-descoberta (o teste apaga este bloco para montar o mutante)
+	if ((rc != 0)); then
+		exit 75
+	fi
+	if [[ -z "$listagem" ]]; then
+		printf 'generate-sca-sbom: git ls-files não listou nenhum go.mod rastreado em %s; sem módulo Go não há SBOM a gerar\n' "$ROOT" >&2
+		exit 75
+	fi
+	# <<< guarda-de-descoberta
+	mapfile -t SBOM_MODULOS < <(printf '%s' "$listagem")
+}
+
+# sbom_slug espelha scaSBOMSlug em internal/checks/checks.go. As duas excecoes
+# (raiz sem segmento; ./tools/sca chamado "tools") existem para NAO renomear
+# artefato ja versionado.
+sbom_slug() {
+	case "$1" in
+	.) printf '' ;;
+	./tools/sca) printf 'tools' ;;
+	*) printf '%s' "${1##*/}" ;;
+	esac
+}
+
+sbom_output_path() {
+	local slug
+	slug="$(sbom_slug "$1")"
+	if [[ -z "$slug" ]]; then
+		printf 'data/ops/sca_cyclonedx_bom.json'
+	else
+		printf 'data/ops/sca_%s_cyclonedx_bom.json' "$slug"
+	fi
+}
+
+generate_module_sbom() {
+	local pattern="$1"
+	local output
+	output="$(sbom_output_path "$pattern")"
+	mkdir -p data/ops
+	go-modern tool -modfile=tools/sca/go.mod cyclonedx-gomod mod -test -json -licenses -output "$output" "$pattern"
+}
+
+if [[ $# -gt 0 ]]; then
+	if [[ "$1" == --scope=* || "$1" == *-only ]]; then
+		requested="${1#--scope=}"
+		requested="${requested#--}"
+		requested="${requested%-only}"
+		sbom_discover_modules
+		found=""
+		for pattern in "${SBOM_MODULOS[@]}"; do
+			if [[ "$(sbom_slug "$pattern")" == "$requested" ]] || { [[ "$requested" == "root" ]] && [[ "$pattern" == "." ]]; }; then
+				found="$pattern"
+			fi
+		done
+		if [[ -z "$found" ]]; then
+			printf 'generate-sca-sbom: escopo desconhecido %q; modulos descobertos:\n' "$requested" >&2
+			printf '%s\n' "${SBOM_MODULOS[@]}" >&2
+			exit 64
+		fi
+		if [[ "$found" == "./tools/sca" ]]; then
+			mkdir -p data/ops
+			go-modern list -modfile=tools/sca/go.mod -m all >data/ops/sca_tools_module_inventory.txt
+		fi
+		generate_module_sbom "$found"
+		exit 0
+	fi
+	OUTPUT="$1"
+	# `--` nos dois: a guarda acima ja barra "-*", e isto fecha a mesma classe
+	# se ela um dia sair (2026-06-30: a ajuda do `dirname` virou nome de diretorio).
+	mkdir -p -- "$(dirname -- "$OUTPUT")"
+	exec go-modern tool -modfile=tools/sca/go.mod cyclonedx-gomod mod -test -json -licenses -output "$OUTPUT" .
+fi
+sbom_discover_modules
+mkdir -p data/ops
+go-modern list -modfile=tools/sca/go.mod -m all >data/ops/sca_tools_module_inventory.txt
+for pattern in "${SBOM_MODULOS[@]}"; do
+	generate_module_sbom "$pattern"
+done

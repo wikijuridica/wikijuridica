@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Compara o que a BORDA entrega com o que a ORIGEM produz, pelo caminho publico real.
+
+POR QUE ESTE CHECK EXISTE (2026-08-13)
+--------------------------------------
+Toda verificacao de bot deste repositorio saia de dentro do servidor:
+`check-what-bots-see` bate em `127.0.0.1`. Isso mede o render, nunca o caminho —
+e o caminho tem cinco camadas que podem divergir do disco: DNS, POP da
+Cloudflare, Cache Rule, tunel e nginx. Foi essa lacuna que impediu de responder
+"o Bing enxerga a pagina?" sem inferencia, durante a investigacao do colapso de
+rastreio.
+
+Este check percorre o caminho INTEIRO e compara com a origem, byte a byte no
+corpo e campo a campo nos cabecalhos que decidem indexacao.
+
+PROIBIDO USAR USER-AGENT DE BOT REAL
+------------------------------------
+A tentacao obvia seria mandar `Googlebot/2.1` para ver "o que ele veria". Seria
+fraude de metrica, e o repositorio ja viveu isso: 2.053 de 2.061 linhas
+"Googlebot" no levantamento de cobertura eram simulacao propria. A borda NAO le
+`X-Bot-Simulation` (so a origem le), e `measure-crawl-coverage` conta cobertura
+por User-Agent no GraphQL da Cloudflare — uma sonda com UA de bot inflaria
+exatamente a metrica que serve de criterio de sucesso do plano.
+
+O UA daqui e proprio e declarado. O que se verifica e se a RESPOSTA difere por
+caminho, nao por identidade.
+
+CONFIRMADO EM 2026-09-03: revisado linha a linha contra a mesma regra que
+corrigiu tools/check-what-bots-see --borda (esse sim mandava UA de bot real
+contra o dominio publico). Este arquivo nunca teve tabela de UA por classe de
+bot -- `busca()` usa SEMPRE a constante UA acima, para BORDA e para ORIGEM.
+Nada a corrigir aqui alem de extrair `montar_comando()` para dar ao teste algo
+puro para conferir (ver tools/test_check_ua_por_camada.py).
+
+LIMITACAO, DECLARADA E NAO ESCONDIDA
+------------------------------------
+O IP de saida e o do proprio servidor. A requisicao percorre DNS -> POP -> tunel
+-> nginx de verdade, mas nao exercita a verificacao de bot da Cloudflare, que
+depende do IP de origem. Cobrir esse ultimo trecho exigiria um ponto de saida
+externo. Este check NAO afirma o que nao mede.
+
+Uso:
+    tools/check-what-bots-see-externo
+    tools/check-what-bots-see-externo --rotas /previdenciario/bpc-sem-contribuicao/ /familia/
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+INGRESS_ENV = RAIZ / "ops" / "ingress.env"
+PUBLICO = "https://wikijuridica.com.br"
+HOST = "wikijuridica.com.br"
+
+UA = "wikijuridica-sonda-externa/1.0 (+interno; comparacao borda-origem; nao-indexar)"
+ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+# Cabecalhos que decidem indexacao. Divergir em qualquer um deles significa que
+# o crawler recebe uma instrucao diferente da que a origem quis dar.
+HEADERS_QUE_IMPORTAM = ("content-type", "x-robots-tag", "link", "vary", "last-modified")
+
+ROTAS_PADRAO = ("/", "/robots.txt", "/sitemap.xml", "/previdenciario/bpc-sem-contribuicao/")
+
+
+def porta_origem() -> int:
+    if INGRESS_ENV.is_file():
+        achado = re.search(r"^WIKI_ORIGIN_PORT=(\d+)$", INGRESS_ENV.read_text(encoding="utf-8"), re.M)
+        if achado:
+            return int(achado.group(1))
+    return 8088
+
+
+def montar_comando(url: str, host: str | None = None, timeout: int = 30) -> list[str]:
+    """Monta o argv do curl. Pura (sem rede), extraida de `busca` em
+    2026-09-03 para o teste conferir sem duvida que o UA e SEMPRE o proprio
+    (`UA` acima), nunca de bot real, qualquer que seja o alvo -- borda
+    publica ou origem local. Este arquivo nunca simulou classe de bot (so
+    compara BORDA vs ORIGEM na MESMA rota, com a MESMA identidade); quem
+    precisa variar UA por perfil e alvo e tools/check-what-bots-see."""
+    cmd = [
+        "curl", "-sS", "--max-time", str(timeout), "-o", "-", "-D", "/dev/stderr",
+        "-A", UA, "-H", f"Accept: {ACCEPT}", "-H", "X-Bot-Simulation: true",
+        "--compressed", url,
+    ]
+    if host:
+        cmd[-1:-1] = ["-H", f"Host: {host}"]
+    return cmd
+
+
+def busca(url: str, host: str | None = None, timeout: int = 30):
+    """curl com UA proprio. Devolve (status, headers, sha256 do corpo, tamanho)."""
+    cmd = montar_comando(url, host, timeout)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+    except (subprocess.SubprocessError, OSError) as erro:
+        return None, {}, "", 0, str(erro)[:160]
+
+    corpo = r.stdout
+    cabecalho = r.stderr.decode("utf-8", "replace")
+    status = None
+    m = re.search(r"^HTTP/[\d.]+ (\d{3})", cabecalho, re.M)
+    if m:
+        status = int(m.group(1))
+    headers = {}
+    for linha in cabecalho.splitlines():
+        if ":" in linha and not linha.startswith("HTTP/"):
+            nome, _, valor = linha.partition(":")
+            headers[nome.strip().lower()] = valor.strip()
+    return status, headers, hashlib.sha256(corpo).hexdigest(), len(corpo), None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rotas", nargs="*", default=list(ROTAS_PADRAO))
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    porta = porta_origem()
+    falhas, avisos, registros = [], [], []
+
+    for rota in args.rotas:
+        st_b, hd_b, sha_b, tam_b, err_b = busca(PUBLICO + rota)
+        st_o, hd_o, sha_o, tam_o, err_o = busca(f"http://127.0.0.1:{porta}{rota}", host=HOST)
+
+        reg = {
+            "rota": rota,
+            "borda": {"status": st_b, "sha256": sha_b[:16], "bytes": tam_b,
+                      "cache": hd_b.get("cf-cache-status"), "age": hd_b.get("age")},
+            "origem": {"status": st_o, "sha256": sha_o[:16], "bytes": tam_o},
+        }
+        registros.append(reg)
+
+        if err_b:
+            falhas.append(f"{rota}: borda inacessivel ({err_b})")
+            continue
+        if err_o:
+            falhas.append(f"{rota}: origem inacessivel na porta {porta} ({err_o})")
+            continue
+        if st_b != st_o:
+            falhas.append(f"{rota}: status DIVERGE — borda {st_b}, origem {st_o}")
+
+        if sha_b != sha_o:
+            # Divergencia com HIT e cache velho: real, porem esperado e
+            # corrigivel por purga. Com MISS, a borda foi a origem AGORA e ainda
+            # assim entregou outra coisa — isso e defeito de caminho.
+            cache = (hd_b.get("cf-cache-status") or "").upper()
+            if cache in ("HIT", "REVALIDATED", "UPDATING", "STALE"):
+                avisos.append(
+                    f"{rota}: corpo diverge, mas a borda serviu {cache} (age={hd_b.get('age')}). "
+                    "Cache desatualizado — purga resolve; nao e divergencia de caminho."
+                )
+            else:
+                falhas.append(
+                    f"{rota}: corpo DIVERGE com cache={cache or '?'} — a borda foi a origem e entregou outra coisa. "
+                    f"borda {tam_b} B sha {sha_b[:16]}, origem {tam_o} B sha {sha_o[:16]}"
+                )
+
+        for h in HEADERS_QUE_IMPORTAM:
+            vb, vo = hd_b.get(h), hd_o.get(h)
+            if vb != vo:
+                # `vary` e `link` sao reescritos por camada de borda em alguns
+                # casos legitimos; reporta-se como aviso para nao criar ruido,
+                # mas x-robots-tag e content-type sao instrucao de indexacao.
+                destino = falhas if h in ("x-robots-tag", "content-type") else avisos
+                destino.append(f"{rota}: header {h!r} diverge — borda {vb!r}, origem {vo!r}")
+
+    if args.json:
+        print(json.dumps({"registros": registros, "falhas": falhas, "avisos": avisos},
+                         ensure_ascii=False, indent=2))
+    else:
+        for reg in registros:
+            b, o = reg["borda"], reg["origem"]
+            print(f"  {reg['rota']:<46} borda={b['status']} {b['bytes']:>7}B cache={b['cache']} "
+                  f"| origem={o['status']} {o['bytes']:>7}B | corpo={'IGUAL' if b['sha256']==o['sha256'] else 'DIFERE'}")
+        for a in avisos:
+            print(f"  aviso: {a}")
+
+    print(f"  (UA proprio: {UA.split()[0]} — jamais UA de bot real, que inflaria a metrica de cobertura)")
+    print(f"  (limitacao declarada: IP de saida e o do servidor; a verificacao de bot da Cloudflare nao e exercitada)")
+
+    if falhas:
+        print("check-what-bots-see-externo: FAIL")
+        for f in falhas:
+            print(f"  - {f}")
+        return 1
+    print("check-what-bots-see-externo: pass")
+    print("  a borda entrega o mesmo que a origem produz, nas rotas conferidas")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

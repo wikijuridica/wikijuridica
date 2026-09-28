@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# check-producao-saudavel -- a bateria que responde "producao esta saudavel?"
+# nas TRES audiencias que este portal serve, e nao em uma so.
+#
+# POR QUE ELA EXISTE, e por que compor em vez de reescrever. O repositorio ja
+# tinha os verificadores; o que nao tinha era o comando que os roda JUNTOS e
+# devolve um veredito. Na pratica isso fazia cada sessao montar a propria lista
+# no /tmp -- lista que some no reboot, que varia de sessao para sessao e que,
+# por variar, nunca cobre a mesma coisa duas vezes. Aqui a lista e versionada,
+# e crescer a cobertura passa a ser um diff que alguem le.
+#
+# AS TRES AUDIENCIAS, e o que se perde ao medir so uma:
+#
+#   HUMANO   -- a pagina responde 200, com estilo e sem erro. O gate de CSP
+#               passa verde com a folha bloqueada pelo navegador: e' preciso
+#               conferir que a URL servida e' a que a CSP autoriza.
+#   MAQUINA  -- gemea Markdown, /api/v1/*, descritores e openapi. Eles saem do
+#               processo Go, e ha 13 minutos registrados em que o Go respondia e
+#               o proxy nao -- por isso a sonda vai pelo nginx (8088), nunca
+#               direto no 8089.
+#   BOT      -- robots.txt, sitemaps e a cadeia de descoberta. Sem forjar
+#               User-Agent de bot, que e' fraude e e' barrado por hook: a sonda
+#               usa identidade propria com X-Warming-Request, e a paridade de
+#               conteudo com o Googlebot e' provada em memoria pelos testes Go,
+#               nunca por requisicao disfarcada saindo desta maquina.
+#
+# READ-ONLY. Nao escreve artefato, nao purga, nao publica, nao aquece.
+# Exit 0 = todas as verificacoes passaram; 1 = ao menos uma reprovou.
+#
+# Uso:  ./tools/check-producao-saudavel [--rapido]
+#       --rapido pula os gates caros (varredura de 10k arquivos), para quando se
+#       quer so o pulso das tres superficies.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+
+RAPIDO=0
+[ "${1:-}" = "--rapido" ] && RAPIDO=1
+
+# JANELA DE MANUTENCAO (2026-09-11). Durante um deploy o :8091 fica fora DE
+# PROPOSITO e o acervo e reescrito no disco: sondar producao nessa janela mede a
+# transacao, nao a saude, e devolveria vermelho por desenho.
+#
+# A regua e a MESMA de tools/check-portal-health:431-441 e de
+# internal/checks/http_smoke_redesocial.go:60-66 -- mesmo arquivo de lock, mesmo
+# teto de 30 min --, e nao uma terceira copia com numero proprio: dois gates
+# irmaos com janelas diferentes produziriam vereditos opostos sobre o mesmo
+# minuto. Lock mais velho que isso e ORFAO, e a vigilancia volta ao normal com o
+# aviso impresso, para que um deploy que falhou nao desligue a bateria para
+# sempre.
+#
+# A LINHA DIZ QUAL DOS DOIS CASOS OCORREU, porque exit 0 silencioso aqui seria
+# indistinguivel de "tudo verde" -- a mesma disciplina que check-http-smoke
+# aplica ao imprimir `redesocial=nao_sondada motivo=deploy_em_curso`.
+LOCK_DE_DEPLOY="data/ops/.deploy-em-curso.lock"
+JANELA_DE_DEPLOY=1800
+if [ -f "$LOCK_DE_DEPLOY" ]; then
+	idade_do_lock=$(($(date +%s) - $(stat -c %Y "$LOCK_DE_DEPLOY" 2>/dev/null || echo 0)))
+	if [ "$idade_do_lock" -lt "$JANELA_DE_DEPLOY" ]; then
+		printf 'check-producao-saudavel: nao_sondada motivo=deploy_em_curso idade_do_lock=%ss\n' "$idade_do_lock"
+		printf '  producao esta sendo reescrita agora; sondar aqui mediria a transacao, nao a saude.\n'
+		exit 0
+	fi
+	printf 'check-producao-saudavel: lock de deploy ORFAO ha %s min — vigilancia normal retomada\n' \
+		"$((idade_do_lock / 60))" >&2
+fi
+
+ORIGEM="http://127.0.0.1:8088"
+# A IDENTIDADE DA SONDA, e as duas metades importam. O UA proprio impede que
+# esta bateria apareca na medicao como visitante; o X-Warming-Request e' o que
+# tira a requisicao da contagem de trafego real. Sem ele o portal mede o proprio
+# eco -- e uma bateria que roda a cada deploy inflaria a serie sozinha.
+UA='wikijuridica-superficie-probe/1.0'
+# SEM `-f`, E ISSO E DIAGNOSTICO, NAO ESTILO. Com --fail o curl sai !=0 em
+# qualquer 4xx/5xx, e o `|| codigo=000` de baixo apagaria o status real: 404,
+# 500 e "nao conectou" virariam a mesma linha, e quem le a saida perderia
+# justamente a informacao que separa rota ausente de servico caido. Sem -f, o
+# status verdadeiro e impresso e o 000 volta a significar so o que ele significa
+# -- conexao que nao completou.
+CURL=(curl -sS --max-time 20 -o /dev/null -w '%{http_code}'
+	-A "$UA" -H 'X-Warming-Request: true')
+
+verdes=0
+vermelhos=0
+declare -a FALHAS=()
+
+secao() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
+
+# ok NOME COMANDO... -- roda, guarda o exit REAL e relata. Nunca `| tail`: em
+# pipeline o exit do ultimo comando esconde o do primeiro, e "completed" passa a
+# significar coisa nenhuma.
+ok() {
+	local nome="$1"
+	shift
+	local saida rc
+	saida="$("$@" 2>&1)"
+	rc=$?
+	if [ $rc -eq 0 ]; then
+		verdes=$((verdes + 1))
+		printf '  \033[32mok\033[0m   %s\n' "$nome"
+	else
+		vermelhos=$((vermelhos + 1))
+		FALHAS+=("$nome (rc=$rc)")
+		printf '  \033[31mFALHA\033[0m %s (rc=%d)\n' "$nome" "$rc"
+		printf '%s\n' "$saida" | sed -n '1,6p' | sed 's/^/         /'
+	fi
+}
+
+# rota CAMINHO ESPERADO -- confere o status HTTP de uma rota pelo nginx.
+rota() {
+	local caminho="$1" esperado="${2:-200}" codigo
+	codigo="$("${CURL[@]}" "$ORIGEM$caminho" 2>/dev/null)" || codigo="000"
+	if [ "$codigo" = "$esperado" ]; then
+		verdes=$((verdes + 1))
+		printf '  \033[32mok\033[0m   %-46s %s\n' "$caminho" "$codigo"
+	else
+		vermelhos=$((vermelhos + 1))
+		FALHAS+=("$caminho -> $codigo (esperado $esperado)")
+		printf '  \033[31mFALHA\033[0m %-46s %s (esperado %s)\n' "$caminho" "$codigo" "$esperado"
+	fi
+}
+
+secao "HUMANO -- as paginas que uma pessoa abre"
+rota "/" 200
+rota "/familia/" 200
+rota "/redesocial/" 200
+rota "/redesocial/perguntas/" 200
+rota "/redesocial/antes-de-perguntar/" 200
+rota "/redesocial/transparencia/" 200
+rota "/redesocial/cobertura/" 200
+rota "/redesocial/conta/entrar/" 200
+# A TELA DE ENTRADA E "/redesocial/conta/entrar/", nao "/redesocial/entrar/".
+# O erro de expectativa custou uma linha vermelha na primeira execucao desta
+# bateria, e a licao vale para toda rota daqui: o caminho se descobre na
+# constante do codigo (cmd/social/conta.go), nunca por analogia com o nome da
+# tela. "/redesocial/conta/" sozinho e o PREFIXO, e responde 404 -- prefixo de
+# constante nao e rota.
+rota "/redesocial/consulta/" 200
+rota "/redesocial/confere/" 200
+rota "/redesocial/tese/" 200
+# 303 E A RESPOSTA CERTA, e por isso ela e cobrada como 303 e nao como 200:
+# a caixa de entrada exige sessao, e para anonimo ela redireciona. Cobrar 200
+# aqui aprovaria justamente o defeito de servir conteudo autenticado a quem
+# nao tem sessao.
+rota "/redesocial/notificacoes/" 303
+rota "/buscar/?q=divorcio" 200
+
+# A FOLHA DE ESTILO, e por que ela e' verificacao de saude e nao detalhe. A CSP
+# das 10 mil paginas estaticas e' emitida pelo nginx; se a URL ali nao for byte a
+# byte a que o HTML pede, o navegador bloqueia a folha e NENHUMA pagina tem
+# estilo -- sem erro no log, sem 5xx, sem gate vermelho.
+folha_no_html="$(curl -fsS --max-time 20 -A "$UA" -H 'X-Warming-Request: true' "$ORIGEM/" 2>/dev/null |
+	grep -oE '/assets/wj-[a-f0-9]+\.css' | head -1)"
+if [ -n "$folha_no_html" ]; then
+	rota "$folha_no_html" 200
+	if curl -fsS --max-time 10 -D - -o /dev/null -A "$UA" -H 'X-Warming-Request: true' "$ORIGEM/" 2>/dev/null |
+		grep -i '^content-security-policy:' | grep -qF "$folha_no_html"; then
+		verdes=$((verdes + 1))
+		printf '  \033[32mok\033[0m   CSP autoriza a folha servida (%s)\n' "$folha_no_html"
+	else
+		vermelhos=$((vermelhos + 1))
+		FALHAS+=("CSP nao autoriza $folha_no_html: o navegador bloqueia a folha e o acervo fica sem estilo")
+		printf '  \033[31mFALHA\033[0m CSP nao autoriza a folha servida (%s)\n' "$folha_no_html"
+	fi
+else
+	vermelhos=$((vermelhos + 1))
+	FALHAS+=("nenhuma folha de estilo no HTML da home")
+	printf '  \033[31mFALHA\033[0m nenhuma folha de estilo no HTML da home\n'
+fi
+
+secao "MAQUINA -- o canal que agente e crawler consomem"
+rota "/index.md" 200
+rota "/familia/index.md" 200
+rota "/redesocial/index.md" 200
+# O DESCRITOR MORA NA RAIZ ("/openapi.json"), e nao sob "/api/v1/". Quem chuta
+# o caminho por simetria com as rotas de dados mede um 404 e o chama de queda.
+rota "/openapi.json" 200
+rota "/.well-known/ai-catalog.json" 200
+# O LOTE DA REDE SOCIAL entra aqui porque foi ele que expos a classe inteira:
+# anunciado nos descritores, respondia 200 no Go e 404 pelo nginx, por colisao
+# de location. Sonda-lo pelo 8088 e o unico jeito de a bateria ver isso.
+rota "/api/v1/redesocial/lote" 200
+rota "/api/v1/lote" 200
+rota "/.well-known/agent-card.json" 200
+rota "/llms.txt" 200
+
+secao "BOT -- descoberta, sem forjar identidade de ninguem"
+rota "/robots.txt" 200
+rota "/sitemap.xml" 200
+rota "/redesocial/sitemap.xml" 200
+rota "/redesocial/feed.xml" 200
+# A SEGUNDA DIRETIVA Sitemap: e' o unico caminho pelo qual um crawler descobre o
+# sitemap social -- ele nao esta no indice do acervo, de proposito.
+if curl -fsS --max-time 10 -A "$UA" -H 'X-Warming-Request: true' "$ORIGEM/robots.txt" 2>/dev/null |
+	grep -qi 'Sitemap:.*redesocial/sitemap.xml'; then
+	verdes=$((verdes + 1))
+	printf '  \033[32mok\033[0m   robots.txt anuncia o sitemap social\n'
+else
+	vermelhos=$((vermelhos + 1))
+	FALHAS+=("robots.txt nao anuncia /redesocial/sitemap.xml: o sitemap existe e nenhum crawler tem como descobri-lo")
+	printf '  \033[31mFALHA\033[0m robots.txt nao anuncia o sitemap social\n'
+fi
+
+secao "INTEGRIDADE -- os gates que medem o artefato servido"
+ok "smoke HTTP do acervo" ./tools/check-http-smoke
+ok "smoke HTTP da rede social" ./tools/check-social-http-smoke
+ok "saude do portal" ./tools/check-portal-health
+ok "ancora da rede social" ./tools/check-ancora-redesocial
+ok "CSP da rede social" ./tools/go-modern run ./cmd/check social-csp
+ok "cache da rede social" ./tools/go-modern run ./cmd/check social-cache
+ok "sem CORS aberto" ./tools/go-modern run ./cmd/check social-sem-cors
+ok "sem chave no ambiente" ./tools/go-modern run ./cmd/check social-sem-chave-no-ambiente
+ok "isolamento acervo x social" ./tools/go-modern run ./cmd/check social-isolation
+ok "politica da rede social" ./tools/go-modern run ./cmd/check social-policy
+ok "bypass de rate limit" ./tools/go-modern run ./cmd/check social-rate-bypass
+ok "units habilitadas" ./tools/go-modern run ./cmd/check social-units-enabled
+
+if [ $RAPIDO -eq 0 ]; then
+	secao "INTEGRIDADE PROFUNDA -- varreduras sobre as ~10 mil rotas"
+	ok "hash servido invariante" ./tools/check-served-hash-invariance
+	ok "servido bate com o manifesto" ./tools/check-served-vs-manifest
+	ok "bloco de links internos" ./tools/check-internal-link-block
+	ok "arquitetura fiel" ./tools/check-arquitetura-fiel
+	ok "contrato do dado real" ./tools/go-modern run ./cmd/check contrato-dado-real
+	ok "indexabilidade social" ./tools/go-modern run ./cmd/check social-indexavel
+fi
+
+secao "VEREDITO"
+printf '  verificacoes verdes: %d\n  verificacoes vermelhas: %d\n' "$verdes" "$vermelhos"
+if [ ${#FALHAS[@]} -gt 0 ]; then
+	printf '\n  o que reprovou:\n'
+	for f in "${FALHAS[@]}"; do printf '    - %s\n' "$f"; done
+	printf '\nREPROVADO: producao NAO esta saudavel nas %d verificacoes acima.\n' "$vermelhos"
+	exit 1
+fi
+printf '\nAPROVADO: humano, maquina e bot atendidos; %d verificacoes verdes.\n' "$verdes"

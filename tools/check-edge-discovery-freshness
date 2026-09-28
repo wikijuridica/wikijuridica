@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""check-edge-discovery-freshness — a borda serve o mesmo que o disco?
+
+POR QUE ESTE CHECK EXISTE, e por que ele NAO confia na lista de purga.
+
+A transacao de publicacao purga a borda com a lista EXATA de artefatos que
+reescreveu. Isso e o certo -- purgar tudo joga fora o cache quente de ~10 mil
+paginas. Mas uma lista mantida a mao tem um modo de falha proprio: quem
+acrescenta um artefato de descoberta novo esquece de registra-lo, e o
+esquecimento nao produz erro nenhum. Foi exatamente o que aconteceu.
+
+Medido em 2026-08-20, minutos depois de publicar 280 paginas:
+
+    /sitemap.xml   disco 20ac4ed3f1b0   borda df5140ad097c   DIVERGE
+    /feed.xml      disco 63572f3013d0   borda 973803c484e3   DIVERGE
+    /llms.txt      disco b2f20e9c1383   borda b2f20e9c1383   igual
+    /robots.txt    disco bcb50750c9ef   borda bcb50750c9ef   igual
+
+A lista cobria os llms.txt (o achado de 19/08) e mais nada. O indice de sitemap
+-- que o ClaudeBot consulta 12 vezes por dia e por onde o Googlebot descobre URL
+nova -- ficava com a versao ANTERIOR na borda pelo Edge TTL de sete dias. As 280
+paginas respondiam 200 em HTML e estavam invisiveis no canal de descoberta.
+
+Este check nao le a lista de purga nem o codigo do publicador. Ele PERGUNTA aos
+dois lados e compara o hash. Por isso apanha o artefato que ninguem lembrou de
+registrar -- inclusive um que ainda nem existe.
+
+O que ele NAO ve, escrito porque verde daqui nao e prova de descoberta:
+  - se a URL foi de fato RASTREADA (isso e crawl_coverage, outro instrumento);
+  - conteudo de pagina do acervo -- so os artefatos de descoberta;
+  - divergencia que a propria borda resolva depois, ja que o TTL expira sozinho:
+    o defeito e a JANELA de ate sete dias servindo o velho, nao a eternidade.
+
+Uso:
+    tools/check-edge-discovery-freshness
+    tools/check-edge-discovery-freshness --json
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+PUBLIC = RAIZ / "public"
+
+# Artefatos de descoberta: o que um robo le para SABER que existe conteudo, em
+# oposicao ao conteudo em si. Descobrir um novo? Acrescente aqui -- e este check
+# passa a cobri-lo mesmo que o publicador esqueca de purga-lo.
+ARTEFATOS = [
+    # A home e o artefato MAIS rastreado do portal e a porta pela qual o crawler
+    # chega as areas. Ela nao carrega Cache-Tag, entao a purga por tag jamais a
+    # alcanca -- e foi assim que, depois de publicar /jurisprudencia/, o disco
+    # tinha o link novo e a borda servia a home anterior.
+    "/",
+    "/sitemap.xml",
+    "/feed.xml",
+    # RSS 2.0, publicado a partir de 2026-08-20. Ele sai do MESMO Document que o
+    # Atom, entao divergirem e impossivel por construcao -- mas a borda pode
+    # servir versao velha de um e nao do outro, e e isso que este check ve.
+    "/rss.xml",
+    "/robots.txt",
+    "/llms.txt",
+    "/llms-full.txt",
+    "/.well-known/security.txt",
+]
+
+
+def base_publica() -> str:
+    config = json.loads((RAIZ / "content/site.json").read_text(encoding="utf-8"))
+    url = config.get("base_url") or config.get("site_url") or ""
+    return url.rstrip("/") or "https://wikijuridica.com.br"
+
+
+def hash_disco(rota: str) -> str | None:
+    # "/" mora em public/index.html; sem este mapeamento a rota cairia no
+    # diretorio public/ e seria tratada como ausente.
+    caminho = PUBLIC / "index.html" if rota == "/" else PUBLIC / rota.lstrip("/")
+    if not caminho.is_file():
+        return None
+    return hashlib.sha256(caminho.read_bytes()).hexdigest()
+
+
+# O corpo fica guardado para que a divergencia possa ser DIAGNOSTICADA, e nao
+# apenas contada. Sem ele, a unica saida seria repetir "purgue".
+CORPOS_DA_BORDA: dict[str, bytes] = {}
+
+
+def hash_borda(url: str, timeout: float = 30.0) -> tuple[str | None, int]:
+    pedido = urllib.request.Request(
+        url, headers={
+            "User-Agent": "wikijuridica-edge-freshness/1.0 "
+                          "(+https://wikijuridica.com.br/sobre/)",
+            # O Accept DE NAVEGADOR e obrigatorio aqui, e nao e detalhe: a
+            # injecao da borda so acontece para `text/html`. Sondar com o `*/*`
+            # padrao devolve a pagina limpa e o gate concluiria que esta tudo
+            # bem enquanto o visitante real e o Googlebot recebem outra coisa.
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            corpo = resposta.read()
+            CORPOS_DA_BORDA[url] = corpo
+            return hashlib.sha256(corpo).hexdigest(), resposta.status
+    except urllib.error.HTTPError as erro:
+        return None, erro.code
+    except Exception:
+        return None, 0
+
+
+# INJECAO DA BORDA NAO E CACHE VELHO, e confundir os dois manda purgar para sempre.
+#
+# Medido em 2026-08-26: este gate acusou `/` como divergente e mandou purgar.
+# Purgamos -- inclusive a zona inteira, com `cf-cache-status: MISS` confirmado --
+# e a divergencia continuou, porque a causa nao era cache: o Cloudflare Web
+# Analytics estava com auto-install ligado e INJETAVA na resposta um
+# `<script src="https://static.cloudflareinsights.com/beacon.min.js/...">`.
+#
+# O QUE TORNAVA ISSO INVISIVEL: a injecao so acontece quando a requisicao manda
+# `Accept: text/html` -- que e o que navegador e Googlebot mandam, e o que curl
+# NAO manda por padrao (`*/*`). Toda sonda com curl via a pagina limpa; o
+# visitante real recebia 359 bytes de script de host externo que a CSP do portal
+# (`script-src 'sha256-...'`) bloqueia, e que portanto nem executava.
+#
+# Diagnostico errado custa caro aqui: "purgue" e uma instrucao que o operador
+# executa em laco sem nunca resolver, e o gate fica vermelho para sempre
+# parecendo problema de TTL.
+MARCADORES_DE_INJECAO = (
+    "static.cloudflareinsights.com",
+    "/cdn-cgi/challenge-platform/",
+    "email-decode.min.js",
+    "rocket-loader.min.js",
+)
+
+
+def diagnostica_divergencia(corpo_borda: bytes, corpo_disco: bytes) -> str:
+    """Diz a CAUSA provavel da divergencia, e nao so que ela existe."""
+    try:
+        texto = corpo_borda.decode("utf-8", "replace")
+    except Exception:
+        return ""
+    achados = [m for m in MARCADORES_DE_INJECAO if m in texto]
+    if not achados:
+        return ""
+    delta = len(corpo_borda) - len(corpo_disco)
+    return ("a borda INJETOU conteudo que nao existe no disco (%s), %+d bytes. "
+            "Isto NAO se resolve com purga: e um recurso da zona reescrevendo a "
+            "resposta. Desligue o recurso na Cloudflare (Web Analytics/RUM, "
+            "Rocket Loader, Email Obfuscation) e so entao purgue."
+            % (", ".join(achados), delta))
+
+
+def main() -> int:
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--json", action="store_true")
+    argumentos = analisador.parse_args()
+
+    base = base_publica()
+    linhas, divergentes, ausentes = [], [], []
+    for rota in ARTEFATOS:
+        disco = hash_disco(rota)
+        if disco is None:
+            # Artefato que nao existe no disco nao e defeito por si: parte deles
+            # e opcional. Fica registrado, nunca reprova sozinho.
+            ausentes.append(rota)
+            continue
+        borda, status = hash_borda(base + rota)
+        igual = borda is not None and borda == disco
+        if not igual:
+            divergentes.append(rota)
+        linhas.append({"rota": rota, "disco": disco[:12],
+                       "borda": (borda or "")[:12], "http": status,
+                       "igual": igual})
+
+    if argumentos.json:
+        print(json.dumps({"base": base, "artefatos": linhas,
+                          "divergentes": divergentes, "ausentes": ausentes},
+                         ensure_ascii=False, indent=1))
+    else:
+        for linha in linhas:
+            marca = "igual" if linha["igual"] else ">>> DIVERGE"
+            print(f"  {linha['rota']:<28} disco {linha['disco']}  "
+                  f"borda {linha['borda'] or '(sem resposta)'}  "
+                  f"HTTP {linha['http']}  {marca}")
+        for rota in ausentes:
+            print(f"  {rota:<28} (ausente no disco — não avaliado)")
+
+    if divergentes:
+        print(f"\nDIVERGENTE: {len(divergentes)} artefato(s) de descoberta em que a "
+              "borda serve conteúdo diferente do disco.")
+        injetados = []
+        for rota in divergentes:
+            corpo = CORPOS_DA_BORDA.get(base_publica().rstrip("/") + rota)
+            caminho_disco = RAIZ / "public" / rota.lstrip("/")
+            if rota.endswith("/"):
+                caminho_disco = caminho_disco / "index.html"
+            try:
+                disco_bytes = caminho_disco.read_bytes()
+            except OSError:
+                disco_bytes = b""
+            causa = diagnostica_divergencia(corpo or b"", disco_bytes)
+            if causa:
+                injetados.append(rota)
+                print(f"   {rota}: {causa}")
+        restantes = [r for r in divergentes if r not in injetados]
+        if restantes:
+            print("   O robô lê a borda, não o disco: enquanto durar o Edge TTL, o "
+                  "conteúdo novo é invisível no canal de descoberta.")
+            print("   Corrija com: ./tools/purge-edge-cache " +
+                  " ".join(f"--url {rota}" for rota in restantes))
+        return 1
+
+    print("\nOK: a borda serve a mesma versão do disco em todos os artefatos "
+          "de descoberta avaliados.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

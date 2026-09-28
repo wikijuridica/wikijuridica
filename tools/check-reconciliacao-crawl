@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""check-reconciliacao-crawl — as três medições de rastreio dizem a mesma coisa?
+
+READ-ONLY. Não escreve ledger, não guarda estado, não toca a borda.
+
+★ O DEFEITO QUE ESTA FERRAMENTA EXISTE PARA APANHAR
+
+Em 2026-08-28, três fontes deste mesmo repositório deram três números para as
+requisições do Googlebot no dia, e nenhuma delas reconciliava com as outras:
+
+    data/ops/crawl_coverage_daily.jsonl  ->  0   (no_groups_returned: true)
+    log de origem, com IP conferido      -> 13
+    Cloudflare GraphQL, dia UTC inteiro  -> 31
+
+Nenhum dos três estava "errado": eles medem POPULAÇÕES DIFERENTES, e ninguém
+tinha escrito isso em lugar nenhum.
+
+  • O 0 vem de `tools/measure-crawl-coverage`. O timer
+    (ops/systemd/wikijuridica-crawl-coverage.timer) roda `OnCalendar 04:10 UTC`,
+    e `coletar_dia` (measure-crawl-coverage:287-289) monta a janela do dia e
+    então GRAMPEIA `fim = agora`. Para o dia CORRENTE a janela real é
+    00:00–04:10 UTC, quatro horas e dez minutos. As chegadas do Googlebot
+    naquele dia começaram 06:04 UTC — depois da medição. O 0 é verdade sobre
+    00:00–04:10 e mentira sobre o dia; a linha do ledger não distingue as duas
+    coisas.
+  • O 13 é o log de origem, que só enxerga o que ERRA o cache da borda.
+  • O 31 é a borda no dia UTC inteiro, cache incluído.
+
+Comparar qualquer par desses sem dizer qual é qual produz conclusão errada
+sobre o crawler — e foi exatamente por conclusão errada sobre o crawler que
+esta frente nasceu.
+
+★ A IDENTIDADE QUE ESTA FERRAMENTA AUDITA
+
+    (a) origem, IP conferido   ≈   (c) borda, cacheStatus != hit
+
+porque o que a borda serve de cache NUNCA chega à origem. A diferença entre
+(b) borda total e (c) borda não-hit é, por definição, o que o cache absorveu —
+e é essa diferença que faz o log de origem parecer que o bot sumiu.
+
+MEDIDO EM 2026-08-27 (dia UTC fechado), Googlebot, na escrita desta ferramenta:
+
+    (a) origem com IP conferido contra googlebot.json ....... 13
+    (b) borda total, verifiedBotCategory presente ........... 19
+    (c) borda com cacheStatus != hit ....................... 13
+        cacheStatus = hit ................................... 6
+        sampleInterval médio ................................ 1,0
+
+    13 = 13, exato. A identidade não é hipótese: ela fecha no dado real.
+
+★ POR QUE SÓ DIA UTC FECHADO, E NUNCA O DIA CORRENTE
+
+O dia parcial É a armadilha que originou a ferramenta. Avaliar o dia corrente
+compararia a origem (que continua recebendo) com uma janela de borda que
+termina "agora" — o mesmo erro do `fim = agora`, cometido de novo por quem
+veio auditá-lo. Pedir o dia de hoje é RECUSADO com exit 2 (inconclusivo), e a
+mensagem nomeia o último dia fechado.
+
+★ POR QUE A CONTAGEM DA ORIGEM É POR IP, E NUNCA POR STRING DE User-Agent
+
+Medido neste repositório: o mesmo filtro devolveu 3.535 linhas contando por
+string de User-Agent e 20 conferindo o IP contra as faixas oficiais. Inflação
+de 177x. A string é livre — qualquer cliente escreve "Googlebot" no cabeçalho,
+e as nossas próprias sondas de auditoria escreviam. Conferir o IP contra
+data/ops/bot_ip_ranges/*.json (campo `prefixes`, publicado pelo operador do
+bot) é o que torna o número comparável ao `verifiedBotCategory` da Cloudflare,
+que faz a mesma verificação do outro lado. De quebra, isso exclui sozinho o
+nosso aquecimento (`warm=true`, IP 127.0.0.1), que jamais cai numa faixa da
+Google.
+
+★ EXIT CODES
+
+    0  identidade fecha dentro da tolerância.
+    1  divergência REAL acima da tolerância — defeito de instrumento, e o
+       lugar para consertar é a medição, não o bot.
+    2  INCONCLUSIVO: sem credencial, erro de rede/HTTP/GraphQL, data fora da
+       retenção de 8 dias, dia corrente ou futuro, ou log de origem que não
+       cobre a janela. Reprovar por indisponibilidade de API já foi defeito
+       medido neste repositório — indisponibilidade não é veredito.
+
+CREDENCIAL: resolvida por tools/cloudflare_auth.py (escopo "leitura") --
+`CLOUDFLARE_ZONE_TOKEN` em .env.local (Bearer de escopo de zona, menor
+privilégio, só lê). Fallback para a Global API Key
+(CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN) pelos cabeçalhos X-Auth-Email /
+X-Auth-Key — nessa credencial "Authorization: Bearer" devolve "Invalid API
+Token", o que já custou meses de diagnóstico errado. Nunca ecoada na saída.
+
+Uso:
+    tools/check-reconciliacao-crawl
+    tools/check-reconciliacao-crawl --data 2026-08-27
+    tools/check-reconciliacao-crawl --crawler bingbot --json
+"""
+import argparse
+import datetime
+import glob
+import gzip
+import ipaddress
+import json
+import math
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ = os.environ.get("WIKI_ROOT", os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+ENV_PADRAO = os.path.join(RAIZ, ".env.local")
+FAIXAS_PADRAO = os.path.join(RAIZ, "data/ops/bot_ip_ranges")
+LOG_PADRAO = "/var/log/nginx/wikijuridica"
+API = "https://api.cloudflare.com/client/v4"
+ZONE_TAG = "b2e1366a94c5dcac97f2fc264f18928f"
+
+# Retenção do httpRequestsAdaptiveGroups, medida contra a própria API por
+# tools/generate-bot-agents-daily e tools/measure-crawl-coverage: pedir dia mais
+# velho devolve `code: quota`, "cannot request data older than 1w1d". Recusar
+# ANTES de consultar evita gastar cota para receber um erro conhecido.
+RETENCAO_DIAS = 8
+
+# Teto de grupos por consulta. Esta consulta agrupa só por (cacheStatus,
+# verifiedBotCategory) — sem clientRequestPath —, então o número de grupos é a
+# dezena, não o milhar. 1.000 é folga de duas ordens de grandeza; o aviso de
+# truncamento fica de pé mesmo assim, porque grupo cortado subestimaria (c) e
+# faria a ferramenta acusar divergência que não existe.
+LIMITE_GRUPOS = 1000
+
+# Registry dos crawlers reconciliáveis: só entra quem tem faixa de IP publicada
+# pelo operador em data/ops/bot_ip_ranges/. Sem faixa oficial não existe
+# contagem de origem confiável (ver o bloco sobre a inflação de 177x), e um
+# crawler sem faixa aqui seria um número inventado com cara de medição.
+#
+#   ua_like    — o filtro `userAgent_like` do GraphQL da borda.
+#   ua_marca   — a subcadeia que identifica o mesmo agente na linha do log de
+#                origem. TEM de selecionar a MESMA população que `ua_like`,
+#                senão os dois lados contam coisas diferentes.
+#   faixas     — arquivos de data/ops/bot_ip_ranges/ cujo `prefixes` autentica
+#                esse agente (campo `authenticates_agents` do próprio arquivo).
+CRAWLERS = {
+    # Googlebot/2.1 exclui de propósito GoogleOther e Googlebot-Image, que têm
+    # token próprio de User-Agent e são outro crawler, com outro orçamento.
+    "googlebot": {"ua_like": "%Googlebot/2.1%", "ua_marca": "Googlebot/2.1",
+                  "faixas": ["googlebot.json"]},
+    "bingbot": {"ua_like": "%bingbot%", "ua_marca": "bingbot",
+                "faixas": ["bingbot.json"]},
+    "gptbot": {"ua_like": "%GPTBot%", "ua_marca": "GPTBot",
+               "faixas": ["openai-gptbot.json"]},
+    "oai-searchbot": {"ua_like": "%OAI-SearchBot%", "ua_marca": "OAI-SearchBot",
+                      "faixas": ["openai-searchbot.json"]},
+    "chatgpt-user": {"ua_like": "%ChatGPT-User%", "ua_marca": "ChatGPT-User",
+                     "faixas": ["openai-chatgpt-user.json"]},
+    "claudebot": {"ua_like": "%ClaudeBot%", "ua_marca": "ClaudeBot",
+                  "faixas": ["anthropic.json"]},
+    "perplexitybot": {"ua_like": "%PerplexityBot%", "ua_marca": "PerplexityBot",
+                      "faixas": ["perplexitybot.json"]},
+    "duckduckbot": {"ua_like": "%DuckDuckBot%", "ua_marca": "DuckDuckBot",
+                    "faixas": ["duckduckbot.json"]},
+}
+
+CONSULTA = """
+query($zone: String!, $since: Time!, $until: Time!, $limite: Int!, $ua: String!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $limite,
+        filter: {datetime_geq: $since, datetime_leq: $until, userAgent_like: $ua},
+        orderBy: [count_DESC]) {
+      count
+      avg { sampleInterval }
+      dimensions { cacheStatus verifiedBotCategory }
+    }
+  } }
+}
+"""
+
+# Formato `log_format wj_main` do vhost vivo (ops/nginx/standalone/nginx.conf):
+#
+#   IP - [data] host=H "GET /path HTTP/1.1" STATUS BYTES "UA" allow=1 bot_sim=- ...
+#
+# Só os quatro campos que a reconciliação usa saem capturados. O resto da linha
+# (allow=, bot_sim=, rt=, cf_ray=, inm=, ims=) é deliberadamente ignorado: a
+# população da borda não conhece nenhum deles, e filtrar por um campo que só a
+# origem enxerga faria os dois lados contarem coisas diferentes — que é
+# precisamente o defeito auditado aqui.
+LINHA = re.compile(
+    r'^(?P<ip>\S+) \S+ \[(?P<data>[^\]]+)\] host=\S+ '
+    r'"(?P<req>[^"]*)" (?P<status>\d{3}) \S+ "(?P<ua>[^"]*)"')
+
+# Três sigma sobre a contagem da borda.
+#
+# QUANDO O DATASET É AMOSTRADO (sampleInterval s > 1) este é o erro de
+# amostragem próprio: uma contagem estimada como k×s, a partir de k grupos
+# sorteados com probabilidade 1/s, tem desvio-padrão ~ s·sqrt(k). Três desvios
+# é o envelope.
+#
+# QUANDO s = 1 a borda é censo e o erro de amostragem é ZERO — o termo continua
+# valendo, mas como envelope proporcional ao volume para as divergências
+# LEGÍTIMAS que não são amostragem, listadas no PISO abaixo. Chamar isso de
+# "erro de amostragem" com s=1 seria comentário que mente.
+SIGMAS = 3.0
+
+# Piso absoluto da tolerância.
+#
+# Existem três classes de divergência legítima que não escalam com sqrt(k) e
+# que apareceriam como falso positivo num volume baixo como o medido hoje
+# (13 requisições/dia):
+#
+#   1. FRONTEIRA DO DIA. Requisição carimbada 23:59:59,7 UTC na borda chega à
+#      origem em 00:00:00,1 do dia seguinte. Cai em (c) de um dia e em (a) do
+#      outro. Nos volumes medidos é <= 1 evento/dia.
+#   2. REQUISIÇÃO QUE A BORDA TERMINA SOZINHA. Bloqueio de WAF, 403/429 de
+#      borda, redirecionamento e HTTP->HTTPS entram em (c) e NUNCA chegam à
+#      origem. É por isso que (c) > (a) é o desvio esperado, não anomalia.
+#   3. `stale` e `updating`. A borda serve do cache e revalida à parte; contam
+#      como não-hit e podem produzir a linha de origem em outro instante.
+#
+# 5 cobre as três com folga no volume medido e ainda REPROVA o caso que
+# originou a ferramenta: origem 13 contra borda 0 dá |13-0| = 13 > 5. Se o
+# piso fosse generoso a ponto de absorver 13, a ferramenta nasceria cega para
+# o próprio defeito que veio apanhar.
+PISO_TOLERANCIA = 5.0
+
+
+def ler_env(caminho):
+    """As variáveis do .env.local, com o ambiente do processo tendo
+    precedência. Delegado a tools/cloudflare_auth.py desde 2026-09-03 --
+    `caminho` continua indo até o leitor real, então `--env-file` (usado pela
+    suíte de teste para isolar do .env.local de verdade) continua funcionando
+    sem mudança nenhuma."""
+    return cloudflare_auth.ambiente(caminho)
+
+
+def cabecalhos(env):
+    """(cabeçalhos, rótulo) ou (None, 'sem-credencial'). Delegado a
+    tools/cloudflare_auth.py: `env` já chega pronto (de `ler_env(args.env_file)`,
+    que pode ser um caminho de fixture de teste), então aqui não se relê o
+    .env.local -- só se escolhe o cabeçalho certo.
+
+    Bearer de zona primeiro: é o MENOR privilégio que resolve leitura. A Global
+    API Key só entra como fallback, e nela a autenticação é por X-Auth-Email +
+    X-Auth-Key — "Authorization: Bearer" com essa credencial devolve "Invalid
+    API Token", erro cuja causa foi diagnosticada errado por meses neste repo.
+    """
+    return cloudflare_auth.cabecalhos("leitura", env=env)
+
+
+def ultimo_dia_fechado(agora_utc):
+    """O dia UTC mais recente que já terminou inteiro."""
+    return (agora_utc - datetime.timedelta(days=1)).date()
+
+
+def janela_utc(dia):
+    """(início, fim) do dia UTC, meia-noite a meia-noite, fim EXCLUSIVO."""
+    ini = datetime.datetime.combine(dia, datetime.time.min, datetime.timezone.utc)
+    return ini, ini + datetime.timedelta(days=1)
+
+
+def carregar_faixas(faixas_dir, arquivos):
+    """As redes oficiais do operador do bot, do campo `prefixes`.
+
+    Devolve (redes, erro). Prefixo malformado é PULADO e não derruba a
+    verificação inteira — mas se NENHUMA rede for carregada a função devolve
+    erro, porque sem faixa a contagem de origem viraria contagem por string de
+    User-Agent, que é o defeito de 177x de inflação.
+    """
+    redes = []
+    for nome in arquivos:
+        caminho = os.path.join(faixas_dir, nome)
+        try:
+            with open(caminho, encoding="utf-8") as handle:
+                dados = json.load(handle)
+        except (OSError, ValueError) as erro:
+            return [], "faixa de IP ilegivel em %s: %s" % (caminho, erro)
+        for prefixo in dados.get("prefixes") or []:
+            if not isinstance(prefixo, str):
+                continue
+            try:
+                redes.append(ipaddress.ip_network(prefixo))
+            except ValueError:
+                continue
+    if not redes:
+        return [], "nenhuma faixa de IP valida em %s" % ", ".join(arquivos)
+    return redes, ""
+
+
+def ip_oficial(ip, redes):
+    try:
+        endereco = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(endereco in rede for rede in redes)
+
+
+def instante_da_linha(bruto):
+    """O carimbo da linha convertido para UTC, ou None.
+
+    O nginx grava em horário local (-0300). Somar ou subtrair três horas na mão
+    seria bug no dia da mudança de fuso: `%z` lê o deslocamento que está NA
+    própria linha, então a conversão continua certa se o servidor mudar.
+    """
+    casado = LINHA.match(bruto)
+    if not casado:
+        return None
+    try:
+        local = datetime.datetime.strptime(casado.group("data"), "%d/%b/%Y:%H:%M:%S %z")
+    except ValueError:
+        return None
+    return local.astimezone(datetime.timezone.utc)
+
+
+def abrir_log(caminho):
+    if caminho.endswith(".gz"):
+        return gzip.open(caminho, "rt", encoding="utf-8", errors="replace")
+    return open(caminho, "rt", encoding="utf-8", errors="replace")
+
+
+def primeiro_instante(caminho):
+    """O carimbo da primeira linha legível do arquivo, ou None."""
+    try:
+        with abrir_log(caminho) as handle:
+            for bruto in handle:
+                instante = instante_da_linha(bruto)
+                if instante is not None:
+                    return instante
+    except (OSError, EOFError):
+        return None
+    return None
+
+
+def logs_candidatos(log_dir, ini):
+    """Os arquivos que PODEM conter linhas da janela.
+
+    O nginx escreve em ordem cronológica e a rotação fecha o arquivo, então o
+    mtime de um log rotacionado é o instante da sua ÚLTIMA linha: mtime < início
+    da janela prova que o arquivo termina antes dela. É o filtro que evita
+    descompactar 80 MB de histórico para medir um dia.
+    """
+    candidatos = []
+    for caminho in sorted(glob.glob(os.path.join(log_dir, "access.log*"))):
+        try:
+            if os.path.getmtime(caminho) < ini.timestamp():
+                continue
+        except OSError:
+            continue
+        candidatos.append(caminho)
+    return candidatos
+
+
+def contar_origem(log_dir, redes, ua_marca, ini, fim):
+    """Requisições que chegaram ao nginx, com IP conferido. (resumo, erro).
+
+    Erro não-vazio significa INCONCLUSIVO, nunca zero: origem 0 porque o log
+    sumiu e origem 0 porque o bot não veio são fatos opostos, e devolver o mesmo
+    número para os dois seria a próxima medição enganosa.
+    """
+    if not os.path.isdir(log_dir):
+        return None, "diretorio de log inexistente ou ilegivel: %s" % log_dir
+    candidatos = logs_candidatos(log_dir, ini)
+    if not candidatos:
+        return None, ("nenhum arquivo em %s tem mtime dentro ou depois da janela "
+                      "— o log da data foi rotacionado para fora do disco" % log_dir)
+
+    # A janela só está COBERTA se algum candidato começa antes dela. Sem isso, a
+    # madrugada do dia pode ter sido rotacionada e a contagem sairia baixa com
+    # cara de medição boa.
+    inicios = [i for i in (primeiro_instante(c) for c in candidatos) if i is not None]
+    if not inicios:
+        return None, "nenhuma linha legivel em %s (formato de log mudou?)" % log_dir
+    if min(inicios) > ini:
+        return None, ("o log mais antigo disponivel comeca em %s, depois do inicio "
+                      "da janela %s — o comeco do dia nao esta no disco"
+                      % (min(inicios).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                         ini.strftime("%Y-%m-%dT%H:%M:%SZ")))
+
+    total = 0
+    por_status = {}
+    ua_string = 0
+    lidos = []
+    for caminho in candidatos:
+        try:
+            handle = abrir_log(caminho)
+        except OSError:
+            continue
+        lidos.append(os.path.basename(caminho))
+        with handle:
+            for bruto in handle:
+                if ua_marca not in bruto:
+                    continue
+                casado = LINHA.match(bruto)
+                if not casado or ua_marca not in casado.group("ua"):
+                    continue
+                try:
+                    local = datetime.datetime.strptime(
+                        casado.group("data"), "%d/%b/%Y:%H:%M:%S %z")
+                except ValueError:
+                    continue
+                instante = local.astimezone(datetime.timezone.utc)
+                if not (ini <= instante < fim):
+                    continue
+                ua_string += 1
+                if not ip_oficial(casado.group("ip"), redes):
+                    continue
+                total += 1
+                estado = casado.group("status")
+                por_status[estado] = por_status.get(estado, 0) + 1
+    return {
+        "requisicoes": total,
+        "requisicoes_por_string_ua": ua_string,
+        "por_status": por_status,
+        "arquivos_lidos": lidos,
+    }, ""
+
+
+def graphql(headers, variaveis, tempo_limite=90):
+    """(payload, erro). Todo erro é texto — o chamador transforma em exit 2."""
+    corpo = json.dumps({"query": CONSULTA, "variables": variaveis}).encode("utf-8")
+    pedido = urllib.request.Request(API + "/graphql", data=corpo, headers=headers)
+    try:
+        with urllib.request.urlopen(pedido, timeout=tempo_limite) as resposta:
+            return json.loads(resposta.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as erro:
+        return None, "HTTP %s da API GraphQL" % erro.code
+    except Exception as erro:  # rede, DNS, TLS, timeout, JSON quebrado
+        return None, str(erro)[:200]
+
+
+def grupos_do_payload(payload):
+    """(grupos, erro) a partir do envelope GraphQL.
+
+    Uma função só, usada tanto pela consulta viva quanto pelo fixture, para que
+    o teste exercite EXATAMENTE o caminho de parsing da produção. Parser
+    separado por origem de dado é teste que aprova código que não roda.
+    """
+    if not isinstance(payload, dict):
+        return None, "resposta GraphQL nao e um objeto JSON"
+    if payload.get("errors"):
+        mensagens = [e.get("message", "?") for e in payload["errors"][:2]
+                     if isinstance(e, dict)]
+        return None, "GraphQL: " + "; ".join(mensagens or ["erro sem mensagem"])
+    zonas = ((payload.get("data") or {}).get("viewer") or {}).get("zones")
+    if not zonas:
+        return None, "GraphQL devolveu zero zonas — token sem escopo nesta zona?"
+    grupos = zonas[0].get("httpRequestsAdaptiveGroups")
+    if grupos is None:
+        return None, "resposta sem httpRequestsAdaptiveGroups"
+    return grupos, ""
+
+
+def resumir_borda(grupos):
+    """Separa a borda em (b) total verificado e (c) verificado que não foi hit.
+
+    Categoria vazia = a Cloudflare NÃO autenticou aquele cliente (UA forjado ou
+    sonda nossa). Não entra em nenhum dos dois, e o volume descartado é
+    DEVOLVIDO em vez de sumir — descarte silencioso é a origem da próxima
+    medição enganosa.
+
+    A contagem devolvida é ESTIMADA (count x sampleInterval) porque o outro
+    lado da identidade é um censo: o log de origem tem todas as linhas. Comparar
+    censo com amostra crua subestimaria a borda por um fator s e faria a
+    ferramenta acusar divergência inexistente em dia de amostragem alta.
+    """
+    resumo = {
+        "total_estimado": 0.0, "total_amostrado": 0,
+        "hit_estimado": 0.0, "hit_amostrado": 0,
+        "nao_hit_estimado": 0.0, "nao_hit_amostrado": 0,
+        "descartado_sem_categoria": 0,
+        "grupos": len(grupos),
+        "categorias": {}, "cache_status": {},
+    }
+    peso_total = 0.0
+    for grupo in grupos:
+        if not isinstance(grupo, dict):
+            continue
+        dimensoes = grupo.get("dimensions") or {}
+        quantidade = grupo.get("count") or 0
+        if isinstance(quantidade, bool) or not isinstance(quantidade, (int, float)):
+            continue
+        categoria = (dimensoes.get("verifiedBotCategory") or "").strip()
+        if not categoria:
+            resumo["descartado_sem_categoria"] += int(quantidade)
+            continue
+        intervalo = (grupo.get("avg") or {}).get("sampleInterval")
+        if isinstance(intervalo, bool) or not isinstance(intervalo, (int, float)) \
+                or intervalo < 1:
+            intervalo = 1.0
+        estimado = quantidade * intervalo
+        estado = (dimensoes.get("cacheStatus") or "desconhecido").strip().lower()
+        resumo["total_estimado"] += estimado
+        resumo["total_amostrado"] += int(quantidade)
+        resumo["categorias"][categoria] = resumo["categorias"].get(categoria, 0) + int(quantidade)
+        resumo["cache_status"][estado] = resumo["cache_status"].get(estado, 0) + int(quantidade)
+        peso_total += quantidade * intervalo
+        if estado == "hit":
+            resumo["hit_estimado"] += estimado
+            resumo["hit_amostrado"] += int(quantidade)
+        else:
+            resumo["nao_hit_estimado"] += estimado
+            resumo["nao_hit_amostrado"] += int(quantidade)
+    amostrado = resumo["total_amostrado"]
+    resumo["sample_interval_medio"] = (peso_total / amostrado) if amostrado else 1.0
+    return resumo
+
+
+def tolerancia(nao_hit_amostrado, intervalo_medio):
+    """Largura aceitável de |origem - borda_nao_hit|. Ver SIGMAS e PISO_TOLERANCIA."""
+    intervalo = max(1.0, float(intervalo_medio or 1.0))
+    k = max(1, int(nao_hit_amostrado))
+    return max(PISO_TOLERANCIA, SIGMAS * intervalo * math.sqrt(k))
+
+
+def consultar_borda(headers, ini, fim, ua_like, fixture=None):
+    """(grupos, erro). Com fixture, lê do disco em vez da rede.
+
+    O fixture guarda o ENVELOPE INTEIRO da resposta — é uma captura real,
+    gravada da API, e não um objeto inventado com a forma que eu imagino que a
+    API tenha. Por isso ele atravessa `grupos_do_payload` igual à consulta viva.
+    """
+    if fixture:
+        try:
+            with open(fixture, encoding="utf-8") as handle:
+                return grupos_do_payload(json.load(handle))
+        except (OSError, ValueError) as erro:
+            return None, "fixture GraphQL ilegivel: %s" % erro
+    payload, erro = graphql(headers, {
+        "zone": os.environ.get("CLOUDFLARE_ZONE_ID", ZONE_TAG),
+        "since": ini.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Fim INCLUSIVO na API: o último segundo do dia. A janela interna é
+        # [ini, fim) exclusiva, então desconta-se 1s para não invadir o dia
+        # seguinte e contar duas vezes a mesma requisição em duas execuções.
+        "until": (fim - datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limite": LIMITE_GRUPOS,
+        "ua": ua_like,
+    })
+    if erro:
+        return None, erro
+    return grupos_do_payload(payload)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Reconcilia origem, borda total e borda nao-hit para um dia UTC fechado.")
+    parser.add_argument("--data", help="dia UTC AAAA-MM-DD (padrao: ultimo dia fechado)")
+    parser.add_argument("--crawler", default="googlebot", choices=sorted(CRAWLERS))
+    parser.add_argument("--log-dir", default=LOG_PADRAO)
+    parser.add_argument("--ranges-dir", default=FAIXAS_PADRAO)
+    parser.add_argument("--env-file", default=ENV_PADRAO)
+    parser.add_argument("--graphql-fixture",
+                        help="APENAS TESTE: le a resposta GraphQL de um arquivo "
+                             "JSON gravado, em vez de consultar a API")
+    parser.add_argument("--json", action="store_true", dest="como_json")
+    args = parser.parse_args(argv)
+
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    fechado = ultimo_dia_fechado(agora)
+    if args.data:
+        try:
+            dia = datetime.datetime.strptime(args.data, "%Y-%m-%d").date()
+        except ValueError:
+            print("check-reconciliacao-crawl: INCONCLUSIVO\n"
+                  "  - data invalida %r; use AAAA-MM-DD" % args.data)
+            return 2
+    else:
+        dia = fechado
+
+    # FALSO POSITIVO 1: o dia parcial É a armadilha auditada. Recusar, e dizer
+    # qual dia usar — mensagem de erro que não dá o próximo passo faz o operador
+    # tentar de novo igual.
+    if dia > fechado:
+        print("check-reconciliacao-crawl: INCONCLUSIVO\n"
+              "  - %s ainda nao fechou em UTC (agora sao %s). Dia parcial e a\n"
+              "    propria armadilha que esta ferramenta audita: a borda pararia\n"
+              "    no instante da consulta enquanto a origem continua recebendo.\n"
+              "  - ultimo dia UTC fechado: %s"
+              % (dia.isoformat(), agora.strftime("%Y-%m-%dT%H:%M:%SZ"), fechado.isoformat()))
+        return 2
+
+    idade = (fechado - dia).days
+    if idade >= RETENCAO_DIAS:
+        print("check-reconciliacao-crawl: INCONCLUSIVO\n"
+              "  - %s esta a %d dias do ultimo dia fechado; httpRequestsAdaptiveGroups\n"
+              "    retem %d dias e devolve `code: quota` alem disso.\n"
+              "  - dia mais antigo reconciliavel hoje: %s"
+              % (dia.isoformat(), idade, RETENCAO_DIAS,
+                 (fechado - datetime.timedelta(days=RETENCAO_DIAS - 1)).isoformat()))
+        return 2
+
+    perfil = CRAWLERS[args.crawler]
+    ini, fim = janela_utc(dia)
+
+    redes, erro = carregar_faixas(args.ranges_dir, perfil["faixas"])
+    if erro:
+        print("check-reconciliacao-crawl: INCONCLUSIVO\n  - %s" % erro)
+        return 2
+
+    origem, erro = contar_origem(args.log_dir, redes, perfil["ua_marca"], ini, fim)
+    if erro:
+        print("check-reconciliacao-crawl: INCONCLUSIVO\n  - origem nao medivel: %s" % erro)
+        return 2
+
+    headers = None
+    if not args.graphql_fixture:
+        # FALSO POSITIVO 2: sem credencial é inconclusivo, JAMAIS reprovação.
+        # Reprovar por indisponibilidade de API já foi defeito medido aqui: um
+        # gate que fica vermelho quando a rede cai ensina o operador a ignorar
+        # o vermelho, e aí o vermelho verdadeiro passa despercebido.
+        env = ler_env(args.env_file)
+        headers, rotulo = cabecalhos(env)
+        if headers is None:
+            print("check-reconciliacao-crawl: INCONCLUSIVO\n"
+                  "  - sem credencial Cloudflare (%s): defina CLOUDFLARE_ZONE_TOKEN\n"
+                  "    ou CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN em %s"
+                  % (rotulo, args.env_file))
+            return 2
+
+    grupos, erro = consultar_borda(headers, ini, fim, perfil["ua_like"],
+                                   args.graphql_fixture)
+    if erro:
+        print("check-reconciliacao-crawl: INCONCLUSIVO\n"
+              "  - borda nao medivel: %s\n"
+              "  - indisponibilidade de API nao e veredito sobre o crawler." % erro)
+        return 2
+
+    borda = resumir_borda(grupos)
+    a = origem["requisicoes"]
+    c = borda["nao_hit_estimado"]
+    b = borda["total_estimado"]
+    largura = tolerancia(borda["nao_hit_amostrado"], borda["sample_interval_medio"])
+    divergencia = abs(a - c)
+    # FALSO POSITIVO 3: origem MAIOR que a borda não é defeito enquanto couber
+    # na tolerância — a borda é amostrada e a origem é censo. Por isso o teste é
+    # sobre o MÓDULO da diferença, e não sobre `c >= a`.
+    reprovado = divergencia > largura
+    truncado = borda["grupos"] >= LIMITE_GRUPOS
+
+    resultado = {
+        "check": "reconciliacao-crawl",
+        "date_utc": dia.isoformat(),
+        "crawler": args.crawler,
+        "window_utc": [ini.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       fim.strftime("%Y-%m-%dT%H:%M:%SZ")],
+        "a_origem_ip_conferido": a,
+        "a_origem_por_string_ua": origem["requisicoes_por_string_ua"],
+        "a_origem_por_status": origem["por_status"],
+        "a_logs_lidos": origem["arquivos_lidos"],
+        "b_borda_total_estimado": round(b, 2),
+        "c_borda_nao_hit_estimado": round(c, 2),
+        "borda_hit_estimado": round(borda["hit_estimado"], 2),
+        "borda_nao_hit_amostrado": borda["nao_hit_amostrado"],
+        "borda_total_amostrado": borda["total_amostrado"],
+        "borda_descartado_sem_categoria": borda["descartado_sem_categoria"],
+        "borda_cache_status": borda["cache_status"],
+        "borda_categorias": borda["categorias"],
+        "sample_interval_medio": round(borda["sample_interval_medio"], 3),
+        "divergencia_absoluta": round(divergencia, 2),
+        "tolerancia": round(largura, 2),
+        "query_truncated": truncado,
+        "status": "FAIL" if reprovado else "OK",
+    }
+
+    if args.como_json:
+        print(json.dumps(resultado, ensure_ascii=False, sort_keys=True, indent=1))
+        return 1 if reprovado else 0
+
+    print("check-reconciliacao-crawl: %s" % resultado["status"])
+    print("  dia UTC fechado ....... %s (%s)" % (dia.isoformat(), args.crawler))
+    print("  (a) origem, IP oficial  %d   [por string de UA seriam %d]"
+          % (a, origem["requisicoes_por_string_ua"]))
+    print("  (b) borda total ....... %.0f  (verifiedBotCategory presente)" % b)
+    print("  (c) borda nao-hit ..... %.0f  <- e este que a origem pode ver" % c)
+    print("      absorvido pelo cache %.0f  (b - c: nunca chega a origem)"
+          % borda["hit_estimado"])
+    print("  sampleInterval medio .. %.3f  (amostrado=%d grupos=%d)"
+          % (borda["sample_interval_medio"], borda["nao_hit_amostrado"], borda["grupos"]))
+    print("  |a - c| ............... %.2f   tolerancia %.2f" % (divergencia, largura))
+    if borda["descartado_sem_categoria"]:
+        print("  descartado sem categoria %d  (Cloudflare nao autenticou; UA forjado"
+              " ou sonda propria)" % borda["descartado_sem_categoria"])
+    if truncado:
+        print("  AVISO: %d grupos = teto da consulta; (c) pode estar subestimado"
+              % borda["grupos"])
+    if reprovado:
+        print("  - DIVERGENCIA REAL: a origem viu %d e a borda nao-hit indica %.0f.\n"
+              "    A identidade (a) ~ (c) e fisica: o que a borda serve de cache nao\n"
+              "    chega a origem, mas o que ela NAO serve de cache tem de chegar.\n"
+              "    Isso e defeito de INSTRUMENTO (janela grampeada, log rotacionado,\n"
+              "    filtro de UA descasado entre os dois lados), nao do crawler."
+              % (a, c))
+    return 1 if reprovado else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,822 @@
+#!/bin/sh
+set -eu
+
+# Build and execute the two v2 index gates from an immutable parent commit.
+# No wrapper, executable, source file or binary cache from the shared worktree
+# is an execution input. The caller owns the single outer wall-clock timeout.
+#
+# Performance note: a cold run always re-extracts the pinned Go toolchain and
+# recompiles both gates from scratch (the original, still-safe behavior).
+# When the parent commit (--old) carries an authenticated pin registry
+# (tools/v2-gate-binary-pins.json) whose recorded sha256 matches a binary
+# already sitting in the on-disk cache, that binary is reused verbatim and
+# the toolchain extraction/compile is skipped entirely. The cache directory
+# itself carries NO trust: it is a plain, non-worktree path that any
+# same-UID process could poison, exactly like the pre-existing GOMODCACHE/
+# GOPATH extraction below. The security property is that the sha256 checked
+# at reuse time comes only from the authenticated parent commit, never from
+# the cache or the worktree, so a poisoned cache entry can only ever produce
+# a cache MISS (slow, safe, identical to today), never a false accept -- a
+# collision would require inverting sha256, not writing to a directory.
+
+PATH=/usr/bin:/bin
+export PATH
+
+ROOT=""
+OLD=""
+CANDIDATE=""
+EMIT_PINS=0
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--root)
+		[ "$#" -ge 2 ] || exit 2
+		ROOT="$2"
+		shift 2
+		;;
+	--old)
+		[ "$#" -ge 2 ] || exit 2
+		OLD="$2"
+		shift 2
+		;;
+	--candidate)
+		[ "$#" -ge 2 ] || exit 2
+		CANDIDATE="$2"
+		shift 2
+		;;
+	--emit-pins)
+		EMIT_PINS=1
+		shift
+		;;
+	*)
+		echo "usage: run-v2-index-product-gates --root DIR --old COMMIT [--candidate COMMIT] [--emit-pins]" >&2
+		exit 2
+		;;
+	esac
+done
+[ -n "$ROOT" ] && [ -n "$OLD" ] || {
+	echo "usage: run-v2-index-product-gates --root DIR --old COMMIT [--candidate COMMIT] [--emit-pins]" >&2
+	exit 2
+}
+if [ "$EMIT_PINS" -eq 1 ]; then
+	[ -z "$CANDIDATE" ] || {
+		echo "v2-index-product-gates: --emit-pins não aceita --candidate" >&2
+		exit 2
+	}
+fi
+ROOT="$(CDPATH='' cd -- "$ROOT" && pwd -P)"
+case "$OLD" in
+*[!0-9a-f]* | '')
+	echo "v2-index-product-gates: OID parent inválido" >&2
+	exit 2
+	;;
+esac
+case "${#OLD}" in 40 | 64) ;; *)
+	echo "v2-index-product-gates: tamanho de OID parent inválido" >&2
+	exit 2
+	;;
+esac
+if [ "$EMIT_PINS" -eq 0 ] && [ -z "$CANDIDATE" ]; then
+	case "${GIT_INDEX_FILE:-}" in
+	/*) ;;
+	*)
+		echo "v2-index-product-gates: GIT_INDEX_FILE absoluto é obrigatório sem --candidate" >&2
+		exit 2
+		;;
+	esac
+	[ -f "$GIT_INDEX_FILE" ] && [ ! -L "$GIT_INDEX_FILE" ] || {
+		echo "v2-index-product-gates: índice Git ausente/inseguro" >&2
+		exit 1
+	}
+fi
+
+GIT_BIN=/usr/bin/git
+ENV_BIN=/usr/bin/env
+MKTEMP_BIN=/usr/bin/mktemp
+STAT_BIN=/usr/bin/stat
+RM_BIN=/usr/bin/rm
+CP_BIN=/usr/bin/cp
+CHMOD_BIN=/usr/bin/chmod
+LN_BIN=/usr/bin/ln
+SHA256_BIN=/usr/bin/sha256sum
+# Python pinado: 3.11 no host; fallback para o python3 do sistema quando 3.11
+# não existir (sandbox Cowork tem 3.10) — mesma classe de portabilidade userns
+# das correções 2026-07-29/30; a autoridade do binário é validada logo abaixo.
+PYTHON_BIN=/usr/bin/python3.11
+if [ ! -f "$PYTHON_BIN" ]; then
+	# /usr/bin/python3 é symlink (vetado abaixo); usar o binário real.
+	for PYTHON_CANDIDATE in /usr/bin/python3.12 /usr/bin/python3.10; do
+		if [ -f "$PYTHON_CANDIDATE" ] && [ ! -L "$PYTHON_CANDIDATE" ]; then
+			PYTHON_BIN="$PYTHON_CANDIDATE"
+			break
+		fi
+	done
+fi
+MKDIR_BIN=/usr/bin/mkdir
+for REQUIRED in "$GIT_BIN" "$ENV_BIN" "$MKTEMP_BIN" \
+	"$STAT_BIN" "$RM_BIN" "$CP_BIN" "$CHMOD_BIN" "$LN_BIN" \
+	"$SHA256_BIN" "$PYTHON_BIN" "$MKDIR_BIN"; do
+	[ -f "$REQUIRED" ] && [ -x "$REQUIRED" ] && [ ! -L "$REQUIRED" ] || {
+		echo "v2-index-product-gates: runtime ausente/inseguro: $REQUIRED" >&2
+		exit 1
+	}
+	REQUIRED_UID="$($STAT_BIN -c %u "$REQUIRED")"
+	REQUIRED_MODE="$($STAT_BIN -c %a "$REQUIRED")"
+	# Dono confiável: root (host) OU, sob user namespace com root NÃO mapeado
+	# (sandbox Cowork: host-root aparece como 65534/nobody e é imutável para o
+	# usuário do namespace), o uid 65534 com binário não gravável pelo usuário
+	# corrente. Em host sem userns (uid_map com linha 0), 65534 segue
+	# reprovado. Mesma correção do pre-commit/checker de 2026-07-29/30.
+	REQUIRED_OWNER_OK=1
+	if [ "$REQUIRED_UID" -ne 0 ]; then
+		REQUIRED_OWNER_OK=0
+		if [ "$REQUIRED_UID" -eq 65534 ] && [ ! -w "$REQUIRED" ] &&
+			[ -r /proc/self/uid_map ] &&
+			! grep -q '^[[:space:]]*0[[:space:]]' /proc/self/uid_map; then
+			REQUIRED_OWNER_OK=1
+		fi
+	fi
+	[ "$REQUIRED_OWNER_OK" -eq 1 ] && [ $((0$REQUIRED_MODE & 0022)) -eq 0 ] || {
+		echo "v2-index-product-gates: runtime sem autoridade root/host-root ou mode inseguro: $REQUIRED" >&2
+		exit 1
+	}
+done
+
+GO_ARCHIVE="$ROOT/.toolchains/downloads/go1.26.5.linux-amd64.tar.gz"
+GO_ARCHIVE_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+MODULE_PROXY=/home/rafael/go/pkg/mod/cache/download
+# Portabilidade (sandbox Cowork 2026-07-30): quando o cache de módulos do host
+# não existe, usar o proxy privado versionado do repo — mesmo layout
+# GOPROXY file://, mesma verificação -mod=readonly; nenhum download de rede.
+[ -d "$MODULE_PROXY" ] || MODULE_PROXY="$ROOT/.git/codex-private-go-cache/mod/cache/download"
+# Content-addressed reuse cache for the two gate binaries. Not a worktree
+# path (see header note): its only role is to hand back bytes whose sha256
+# the caller re-verifies against the authenticated parent-commit registry.
+GATE_BIN_CACHE_DIR=/home/rafael/.cache/wiki-v2-gate-bin
+# Sem o HOME do host, o cache content-addressed vive no .cache do repo (já
+# ignorado pelo git); a autenticação por sha256 contra o registro do commit
+# pai permanece idêntica — o cache só devolve bytes, nunca autoridade.
+case "$GATE_BIN_CACHE_DIR" in
+/home/rafael/*)
+	[ -d /home/rafael ] || GATE_BIN_CACHE_DIR="$ROOT/.cache/wiki-v2-gate-bin"
+	;;
+esac
+
+WORK="$($MKTEMP_BIN -d /tmp/wiki-v2-index-gates.XXXXXX)"
+case "$WORK" in /tmp/wiki-v2-index-gates.*) ;; *)
+	echo "v2-index-product-gates: tmp inesperado" >&2
+	exit 1
+	;;
+esac
+cleanup() {
+	case "${WORK:-}" in
+	/tmp/wiki-v2-index-gates.*)
+		# Go normally makes extracted module directories read-only.  A gate
+		# rejection must not turn every invocation into a permanent ~500 MiB
+		# /tmp leak, and cleanup failure must not replace the useful gate
+		# diagnostic.  -modcacherw below makes the first removal the normal
+		# one-pass path.  Only an interrupted extraction that actually leaves
+		# something behind pays for the recursive chmod fallback.
+		"$RM_BIN" -rf -- "$WORK" 2>/dev/null || :
+		if [ -e "$WORK" ] || [ -L "$WORK" ]; then
+			"$CHMOD_BIN" -R u+w -- "$WORK" 2>/dev/null || :
+			"$RM_BIN" -rf -- "$WORK" 2>/dev/null || :
+		fi
+		if [ -e "$WORK" ] || [ -L "$WORK" ]; then
+			echo "v2-index-product-gates: aviso: cleanup privado incompleto: $WORK" >&2
+		fi
+		;;
+	esac
+}
+trap cleanup EXIT HUP INT TERM
+SOURCE="$WORK/source"
+BIN="$WORK/bin"
+ARCHIVE="$WORK/source.tar"
+PRIVATE_INDEX="$WORK/candidate.index"
+GOROOT_PARENT="$WORK/authenticated-go-distribution"
+GO_PRIVATE_TMP="$WORK/go-tmp"
+GO_PRIVATE_PATH="$WORK/gopath"
+GO_PRIVATE_MODCACHE="$WORK/gomodcache"
+GO_PRIVATE_BUILDCACHE="$WORK/gocache"
+"$MKDIR_BIN" -m 700 "$SOURCE" "$BIN" "$GOROOT_PARENT" \
+	"$GO_PRIVATE_TMP" "$GO_PRIVATE_PATH" "$GO_PRIVATE_MODCACHE" \
+	"$GO_PRIVATE_BUILDCACHE"
+OWN_UID="$($STAT_BIN -c %u "$WORK")"
+
+fingerprint() {
+	# `cut` em vez de `set -- $(...)`: o split por palavra era intencional
+	# (queremos o primeiro campo), mas depende de IFS e some numa leitura rapida.
+	#
+	# E NAO E `read ... < <(...)`: este script roda em POSIX sh, onde `local` e
+	# substituicao de processo nao existem (SC3043 e SC3001). A primeira versao
+	# deste conserto usava os dois e trocaria um aviso por tres.
+	hash=$("$SHA256_BIN" "$1" | cut -d' ' -f1)
+	[ -n "$hash" ] || return 1
+	printf '%s' "$hash"
+}
+git_clean() {
+	# --emit-pins never sets GIT_INDEX_FILE (it uses no git index at all);
+	# every other path keeps the exact original behavior of always pinning
+	# GIT_INDEX_FILE in the sanitized environment.
+	if [ -n "${GIT_INDEX_FILE:-}" ]; then
+		"$ENV_BIN" -i \
+			PATH=/usr/bin:/bin HOME=/ XDG_CONFIG_HOME=/nonexistent LC_ALL=C \
+			GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+			GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 \
+			GIT_TERMINAL_PROMPT=0 GIT_INDEX_FILE="$GIT_INDEX_FILE" \
+			"$GIT_BIN" --no-replace-objects -c safe.directory="$ROOT" \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.hooksPath=/dev/null "$@"
+	else
+		"$ENV_BIN" -i \
+			PATH=/usr/bin:/bin HOME=/ XDG_CONFIG_HOME=/nonexistent LC_ALL=C \
+			GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+			GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 \
+			GIT_TERMINAL_PROMPT=0 \
+			"$GIT_BIN" --no-replace-objects -c safe.directory="$ROOT" \
+			-c core.fsmonitor=false -c core.untrackedCache=false \
+			-c core.hooksPath=/dev/null "$@"
+	fi
+}
+
+# Looks up a cached gate binary by its expected (authenticated) sha256 and
+# copies it to DEST when found. Never trusts the cache directory or the file
+# name alone -- the copy is re-hashed after landing in our private WORK, and
+# any mismatch or unsafe metadata is a plain miss, never a hard failure.
+cache_lookup() {
+	PIN="$1"
+	DEST="$2"
+	[ -n "$PIN" ] || return 1
+	CANDIDATE_ENTRY="$GATE_BIN_CACHE_DIR/$PIN"
+	[ -f "$CANDIDATE_ENTRY" ] && [ ! -L "$CANDIDATE_ENTRY" ] || return 1
+	ENTRY_UID="$($STAT_BIN -c %u "$CANDIDATE_ENTRY")"
+	ENTRY_MODE="$($STAT_BIN -c %a "$CANDIDATE_ENTRY")"
+	ENTRY_LINKS="$($STAT_BIN -c %h "$CANDIDATE_ENTRY")"
+	[ "$ENTRY_UID" = "$OWN_UID" ] && [ "$ENTRY_LINKS" -eq 1 ] &&
+		[ $((0$ENTRY_MODE & 0022)) -eq 0 ] || return 1
+	[ "$(fingerprint "$CANDIDATE_ENTRY")" = "$PIN" ] || return 1
+	"$CP_BIN" --reflink=auto -- "$CANDIDATE_ENTRY" "$DEST" || return 1
+	"$CHMOD_BIN" 500 "$DEST" || return 1
+	[ "$(fingerprint "$DEST")" = "$PIN" ] || return 1
+	return 0
+}
+
+# Stores a freshly built gate binary under its own sha256 for future reuse.
+# Only ever called with a binary whose hash was just verified to equal PIN,
+# so this never introduces content the authenticated registry did not
+# already vouch for. Best-effort: any failure here just means the next run
+# builds cold again, never a gate failure.
+cache_store() {
+	PIN="$1"
+	SRC="$2"
+	[ -n "$PIN" ] || return 0
+	[ "$(fingerprint "$SRC")" = "$PIN" ] || return 0
+	if [ ! -e "$GATE_BIN_CACHE_DIR" ]; then
+		"$MKDIR_BIN" -m 700 -p -- "$GATE_BIN_CACHE_DIR" 2>/dev/null || :
+	fi
+	[ -d "$GATE_BIN_CACHE_DIR" ] && [ ! -L "$GATE_BIN_CACHE_DIR" ] || return 0
+	DIR_UID="$($STAT_BIN -c %u "$GATE_BIN_CACHE_DIR")"
+	DIR_MODE="$($STAT_BIN -c %a "$GATE_BIN_CACHE_DIR")"
+	[ "$DIR_UID" = "$OWN_UID" ] && [ $((0$DIR_MODE & 0077)) -eq 0 ] || return 0
+	STAGE="$WORK/cache-stage.$PIN"
+	"$CP_BIN" --reflink=auto -- "$SRC" "$STAGE" 2>/dev/null || return 0
+	"$CHMOD_BIN" 400 "$STAGE" 2>/dev/null || :
+	# Hardlink-or-lose-the-race: if another concurrent commit already stored
+	# the same content-addressed name, ours is redundant and simply dropped.
+	"$LN_BIN" -- "$STAGE" "$GATE_BIN_CACHE_DIR/$PIN" 2>/dev/null || :
+	"$RM_BIN" -f -- "$STAGE" 2>/dev/null || :
+	return 0
+}
+
+if [ "$EMIT_PINS" -eq 0 ]; then
+	if [ -n "$CANDIDATE" ]; then
+		case "$CANDIDATE" in
+		*[!0-9a-f]* | '')
+			echo "v2-index-product-gates: OID candidato inválido" >&2
+			exit 2
+			;;
+		esac
+		case "${#CANDIDATE}" in 40 | 64) ;; *)
+			echo "v2-index-product-gates: tamanho de OID candidato inválido" >&2
+			exit 2
+			;;
+		esac
+		GIT_INDEX_FILE="$PRIVATE_INDEX"
+		export GIT_INDEX_FILE
+		CANDIDATE_TREE="$(git_clean rev-parse --verify "$CANDIDATE^{tree}")"
+		case "$CANDIDATE_TREE" in *[!0-9a-f]* | '')
+			echo "v2-index-product-gates: tree candidato inválido" >&2
+			exit 1
+			;;
+		esac
+		git_clean read-tree "$CANDIDATE_TREE"
+	else
+		AUTH_INDEX="$GIT_INDEX_FILE"
+		INDEX_MODE="$($STAT_BIN -c %a "$AUTH_INDEX")"
+		INDEX_LINKS="$($STAT_BIN -c %h "$AUTH_INDEX")"
+		case "$INDEX_MODE" in *[!0-9]*)
+			echo "v2-index-product-gates: mode de índice inválido" >&2
+			exit 1
+			;;
+		esac
+		[ "$INDEX_LINKS" -eq 1 ] && [ $((0$INDEX_MODE & 0111)) -eq 0 ] &&
+			[ $((0$INDEX_MODE & 0022)) -eq 0 ] || {
+			echo "v2-index-product-gates: índice precisa ser regular único e não gravável/executável por terceiros" >&2
+			exit 1
+		}
+		INDEX_FINGERPRINT="$(fingerprint "$AUTH_INDEX")"
+		"$CP_BIN" --reflink=auto -- "$AUTH_INDEX" "$PRIVATE_INDEX"
+		"$CHMOD_BIN" 600 "$PRIVATE_INDEX"
+		[ "$(fingerprint "$AUTH_INDEX")" = "$INDEX_FINGERPRINT" ] &&
+			[ "$(fingerprint "$PRIVATE_INDEX")" = "$INDEX_FINGERPRINT" ] || {
+			echo "v2-index-product-gates: índice mudou durante snapshot privado" >&2
+			exit 1
+		}
+		GIT_INDEX_FILE="$PRIVATE_INDEX"
+		export GIT_INDEX_FILE
+	fi
+else
+	# --emit-pins never touches any git index; it only rebuilds and reports
+	# sha256 of the two gate binaries from the authenticated parent source.
+	GIT_INDEX_FILE="${GIT_INDEX_FILE:-}"
+fi
+
+require_git_blob_mode() {
+	EXPECTED_MODE="$1"
+	TREEISH="$2"
+	REL="$3"
+	ENTRY="$(git_clean ls-tree "$TREEISH" -- "$REL")"
+	set -- $ENTRY
+	[ "$#" -eq 4 ] && [ "$1" = "$EXPECTED_MODE" ] &&
+		[ "$2" = blob ] && [ "$4" = "$REL" ] || {
+		echo "v2-index-product-gates: mode/tipo autenticado inválido: $TREEISH:$REL" >&2
+		exit 1
+	}
+}
+# Same shape as require_git_blob_mode, but a MISSING entry is a normal,
+# expected state (older parent commits predate the pin registry) and must
+# fall back to the cold path below, not fail the gate. Only a PRESENT entry
+# with the wrong type/mode is treated as an anomaly worth hard-failing on.
+PIN_FILE_PRESENT=0
+require_optional_git_blob_mode() {
+	EXPECTED_MODE="$1"
+	TREEISH="$2"
+	REL="$3"
+	ENTRY="$(git_clean ls-tree "$TREEISH" -- "$REL")"
+	[ -n "$ENTRY" ] || return 0
+	set -- $ENTRY
+	[ "$#" -eq 4 ] && [ "$1" = "$EXPECTED_MODE" ] &&
+		[ "$2" = blob ] && [ "$4" = "$REL" ] || {
+		echo "v2-index-product-gates: entrada opcional autenticada inválida: $TREEISH:$REL" >&2
+		exit 1
+	}
+	PIN_FILE_PRESENT=1
+}
+require_git_blob_mode 100755 "$OLD" tools/check-v2-finalized-commit
+[ "$EMIT_PINS" -eq 1 ] || require_optional_git_blob_mode 100644 "$OLD" tools/v2-gate-binary-pins.json
+
+# The official archive digest is the toolchain authority.  The mutable,
+# pre-extracted .toolchains directory is never a build input.  Extraction
+# itself only happens below when the pinned-binary cache misses (or in
+# --emit-pins mode, which always rebuilds cold on purpose).
+
+# The old commit is the trust root. A gate change must land separately before
+# it may authorize a later product-data commit.
+set -- go.mod go.sum \
+	cmd/check-v2-supersession-integrity \
+	cmd/check-v2-writing-semantic-contract \
+	internal \
+	tools/check-v2-finalized-commit
+if [ "$PIN_FILE_PRESENT" -eq 1 ]; then
+	set -- "$@" tools/v2-gate-binary-pins.json
+fi
+git_clean archive --format=tar --output="$ARCHIVE" "$OLD" -- "$@"
+[ "$($STAT_BIN -c %s "$ARCHIVE")" -le $((512 * 1024 * 1024)) ] || {
+	echo "v2-index-product-gates: snapshot-fonte excede 512 MiB" >&2
+	exit 1
+}
+"$PYTHON_BIN" -I - "$ARCHIVE" "$SOURCE" <<'PY'
+import os
+import pathlib
+import sys
+import tarfile
+
+archive = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+total = 0
+seen = set()
+try:
+    with tarfile.open(archive, mode="r:") as bundle:
+        for member in bundle.getmembers():
+            pure = pathlib.PurePosixPath(member.name)
+            canonical = pure.as_posix()
+            if (not canonical or canonical in seen or
+                    member.name.startswith("/") or
+                    any(part in {"", ".", ".."} for part in pure.parts) or
+                    not (member.isdir() or member.isfile()) or
+                    member.size < 0 or member.size > 128 * 1024 * 1024):
+                raise RuntimeError("unsafe source member: " + member.name)
+            seen.add(canonical)
+            total += member.size
+            if total > 512 * 1024 * 1024:
+                raise RuntimeError("source snapshot exceeds limit")
+            target = root.joinpath(*pure.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if target.is_symlink() or not target.is_dir():
+                    raise RuntimeError("source directory is unsafe")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise RuntimeError("source member cannot be read")
+            content = source.read(member.size + 1)
+            if len(content) != member.size:
+                raise RuntimeError("source member size mismatch")
+            output = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o400,
+            )
+            try:
+                view = memoryview(content)
+                while view:
+                    written = os.write(output, view)
+                    if written < 1:
+                        raise RuntimeError("source extraction stalled")
+                    view = view[written:]
+            finally:
+                os.close(output)
+except (OSError, EOFError, tarfile.TarError, RuntimeError) as error:
+    print(
+        "v2-index-product-gates: snapshot-fonte inseguro: " + str(error),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+
+# Read the pin registry (if any) that this exact authenticated source
+# carries and check whether both gate binaries are already sitting in the
+# reuse cache under those hashes. A parse failure, a schema mismatch, a
+# toolchain-pin mismatch or a cache miss all fall through to PIN_* staying
+# empty, i.e. the unconditional cold-build path a few lines down -- never a
+# hard error, because a stale/missing pin must never block a commit.
+PIN_SUPERSESSION=""
+PIN_WRITING=""
+if [ "$EMIT_PINS" -eq 0 ] && [ "$PIN_FILE_PRESENT" -eq 1 ]; then
+	PIN_FILE="$SOURCE/tools/v2-gate-binary-pins.json"
+	[ -f "$PIN_FILE" ] && [ ! -L "$PIN_FILE" ] || {
+		echo "v2-index-product-gates: pin materializado é inseguro" >&2
+		exit 1
+	}
+	PIN_OUTPUT="$(
+		"$PYTHON_BIN" -I - "$PIN_FILE" "$GO_ARCHIVE_SHA256" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_go_archive = sys.argv[2]
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+try:
+    data = path.read_bytes()
+    if len(data) > 4096:
+        raise RuntimeError("pin file too large")
+    document = json.loads(data)
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise RuntimeError("schema inválido")
+    if document.get("go_archive_sha256") != expected_go_archive:
+        raise RuntimeError("toolchain pin desatualizado")
+    gates = document.get("gates")
+    if not isinstance(gates, dict):
+        raise RuntimeError("gates inválido")
+    supersession = gates.get("supersession")
+    writing = gates.get("writing")
+    if not (isinstance(supersession, str) and HEX64.match(supersession)):
+        raise RuntimeError("hash supersession inválido")
+    if not (isinstance(writing, str) and HEX64.match(writing)):
+        raise RuntimeError("hash writing inválido")
+    print(supersession)
+    print(writing)
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as error:
+    print("v2-index-product-gates: pin ignorado: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+PY
+	)" && {
+		NL='
+'
+		PIN_SUPERSESSION="${PIN_OUTPUT%%${NL}*}"
+		PIN_WRITING="${PIN_OUTPUT#*${NL}}"
+		case "$PIN_SUPERSESSION" in *[!0-9a-f]* | '') PIN_SUPERSESSION="" ;; esac
+		case "$PIN_WRITING" in *[!0-9a-f]* | '') PIN_WRITING="" ;; esac
+		case "${#PIN_SUPERSESSION}" in 64) ;; *) PIN_SUPERSESSION="" ;; esac
+		case "${#PIN_WRITING}" in 64) ;; *) PIN_WRITING="" ;; esac
+		# Two distinct gate packages can never legitimately share a sha256; a
+		# malformed/truncated python output (e.g. a future schema change that
+		# only prints one line) must not silently pass both hex checks with
+		# the same value copied into both variables.
+		if [ -n "$PIN_SUPERSESSION" ] && [ "$PIN_SUPERSESSION" = "$PIN_WRITING" ]; then
+			echo "v2-index-product-gates: pin ignorado: supersession e writing colidem" >&2
+			PIN_SUPERSESSION=""
+			PIN_WRITING=""
+		fi
+	}
+fi
+
+CACHE_READY=0
+if [ "$EMIT_PINS" -eq 0 ] && [ -n "$PIN_SUPERSESSION" ] && [ -n "$PIN_WRITING" ]; then
+	if cache_lookup "$PIN_SUPERSESSION" "$BIN/supersession" &&
+		cache_lookup "$PIN_WRITING" "$BIN/writing"; then
+		CACHE_READY=1
+	else
+		# Never leave a half-populated $BIN from a partial hit; the miss path
+		# below always rebuilds both binaries from scratch.
+		"$RM_BIN" -f -- "$BIN/supersession" "$BIN/writing"
+	fi
+fi
+
+build_gate() {
+	PACKAGE="$1"
+	OUTPUT="$2"
+	(
+		cd "$SOURCE"
+		"$ENV_BIN" -i \
+			PATH="$GOROOT/bin:/usr/bin:/bin" HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent \
+			LC_ALL=C LANG=C TMPDIR="$GO_PRIVATE_TMP" GOENV=off GOTOOLCHAIN=local \
+			GOWORK=off GOFLAGS=-mod=readonly GOPROXY="file://$MODULE_PROXY" \
+			GOSUMDB=off CGO_ENABLED=0 GOROOT="$GOROOT" \
+			GOPATH="$GO_PRIVATE_PATH" GOMODCACHE="$GO_PRIVATE_MODCACHE" \
+			GOCACHE="$GO_PRIVATE_BUILDCACHE" \
+			"$GO_BIN" build -tags=devcmds -mod=readonly -trimpath -buildvcs=false \
+			-modcacherw -o "$OUTPUT" "$PACKAGE"
+	)
+	[ -f "$OUTPUT" ] && [ -x "$OUTPUT" ] && [ ! -L "$OUTPUT" ] || {
+		echo "v2-index-product-gates: build não produziu binário regular" >&2
+		exit 1
+	}
+}
+
+if [ "$CACHE_READY" -eq 0 ]; then
+	# The official archive digest is the toolchain authority.  The mutable,
+	# pre-extracted .toolchains directory is never a build input.
+	"$PYTHON_BIN" -I - "$GO_ARCHIVE" "$GOROOT_PARENT" "$GO_ARCHIVE_SHA256" <<'PY'
+import hashlib
+import io
+import os
+import pathlib
+import stat
+import sys
+import tarfile
+
+archive = pathlib.Path(sys.argv[1])
+destination_root = pathlib.Path(sys.argv[2])
+expected = sys.argv[3]
+try:
+    if archive.resolve(strict=True) != archive:
+        raise RuntimeError("archive path is not canonical")
+    descriptor = os.open(
+        archive, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or
+                before.st_uid != os.geteuid() or before.st_nlink != 1 or
+                stat.S_IMODE(before.st_mode) & 0o022 or
+                before.st_size <= 0 or
+                before.st_size > 128 * 1024 * 1024):
+            raise RuntimeError("archive metadata is unsafe")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("archive truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("archive grew")
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns)
+        after_identity = (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns)
+        if before_identity != after_identity:
+            raise RuntimeError("archive changed during read")
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if hashlib.sha256(payload).hexdigest() != expected:
+        raise RuntimeError("archive SHA256 mismatch")
+    seen = set()
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as bundle:
+        members = bundle.getmembers()
+        if not members or len(members) > 30000:
+            raise RuntimeError("archive inventory is invalid")
+        for member in members:
+            pure = pathlib.PurePosixPath(member.name)
+            canonical = pure.as_posix()
+            if (not canonical or canonical in seen or
+                    pure.parts[0] != "go" or
+                    any(part in {"", ".", ".."} for part in pure.parts) or
+                    member.name.startswith("/") or
+                    not (member.isdir() or member.isfile()) or
+                    member.size < 0 or member.size > 512 * 1024 * 1024):
+                raise RuntimeError("unsafe archive member: " + member.name)
+            seen.add(canonical)
+            total += member.size
+            if total > 2 * 1024 * 1024 * 1024:
+                raise RuntimeError("archive expanded size exceeds limit")
+            target = destination_root.joinpath(*pure.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if target.is_symlink() or not target.is_dir():
+                    raise RuntimeError("archive directory is unsafe")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise RuntimeError("archive member cannot be read")
+            content = source.read(member.size + 1)
+            if len(content) != member.size:
+                raise RuntimeError("archive member size mismatch")
+            mode = 0o500 if member.mode & 0o111 else 0o400
+            output = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                os.O_CLOEXEC | os.O_NOFOLLOW,
+                mode,
+            )
+            try:
+                view = memoryview(content)
+                while view:
+                    written = os.write(output, view)
+                    if written < 1:
+                        raise RuntimeError("archive extraction stalled")
+                    view = view[written:]
+            finally:
+                os.close(output)
+    goroot = destination_root / "go"
+    if (goroot / "VERSION").read_bytes().splitlines()[:1] != [b"go1.26.5"]:
+        raise RuntimeError("toolchain VERSION mismatch")
+    go_binary = goroot / "bin" / "go"
+    go_info = os.lstat(go_binary)
+    if (not stat.S_ISREG(go_info.st_mode) or
+            not go_info.st_mode & stat.S_IXUSR):
+        raise RuntimeError("toolchain go binary is invalid")
+except (OSError, EOFError, tarfile.TarError, RuntimeError) as error:
+    print(
+        "v2-index-product-gates: toolchain oficial inseguro: " + str(error),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+	GOROOT="$GOROOT_PARENT/go"
+	GO_BIN="$GOROOT/bin/go"
+
+	MODULE_PROXY_CANON="$(CDPATH='' cd -- "$MODULE_PROXY" 2>/dev/null && pwd -P)" || {
+		echo "v2-index-product-gates: proxy local de módulos ausente" >&2
+		exit 1
+	}
+	# CAMINHO CANÔNICO, e não "caminho sem symlink" (corrigido em 2026-09-09).
+	#
+	# A exigência original era que `pwd -P` devolvesse exatamente a string
+	# configurada e que o último componente não fosse symlink. Em 2026-09-08 o
+	# cache de módulos do host passou a viver fora de $HOME —
+	# /home/rafael/go/pkg/mod é um symlink para /storage/cache/gomod — e a
+	# guarda passou a recusar TODO commit de página v2 com "proxy local de
+	# módulos não canônico". Bloqueio total do estoque editorial por uma
+	# mudança de layout de disco, sem defeito de segurança nenhum:
+	# `tools/test_pre_commit_product_gates.py` reprovou em 3 casos por isso.
+	#
+	# O que a guarda protege continua protegido, e agora de forma mais forte:
+	# passamos a USAR o caminho já resolvido (`MODULE_PROXY_CANON`) em vez da
+	# string configurada, de modo que nenhuma etapa posterior possa ser
+	# redirecionada trocando um symlink no meio do caminho, e exigimos que o
+	# alvo real seja do próprio usuário e não gravável por grupo/outros — que é
+	# a checagem de modo logo abaixo, agora aplicada ao destino verdadeiro.
+	MODULE_PROXY="$MODULE_PROXY_CANON"
+	MODULE_PROXY_OWNER="$($STAT_BIN -c %U "$MODULE_PROXY")"
+	[ "$MODULE_PROXY_OWNER" = "$(id -un)" ] || [ "$MODULE_PROXY_OWNER" = "root" ] || {
+		echo "v2-index-product-gates: proxy local de módulos de outro dono: $MODULE_PROXY_OWNER" >&2
+		exit 1
+	}
+	MODULE_PROXY_MODE="$($STAT_BIN -c %a "$MODULE_PROXY")"
+	[ $((0$MODULE_PROXY_MODE & 0022)) -eq 0 ] || {
+		echo "v2-index-product-gates: proxy local de módulos gravável por terceiros" >&2
+		exit 1
+	}
+
+	# A committed go.mod is part of the authenticated source closure, but a local
+	# `replace` may point outside that closure (including an absolute path back into
+	# the concurrently mutable worktree).  Parse with the authenticated Go tool,
+	# then reject every filesystem replacement before compiling any gate package.
+	GO_MOD_JSON="$WORK/go-mod.json"
+	(
+		cd "$SOURCE"
+		"$ENV_BIN" -i \
+			PATH="$GOROOT/bin:/usr/bin:/bin" HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent \
+			LC_ALL=C LANG=C TMPDIR="$GO_PRIVATE_TMP" GOENV=off GOTOOLCHAIN=local \
+			GOWORK=off GOROOT="$GOROOT" GOPATH="$GO_PRIVATE_PATH" \
+			GOMODCACHE="$GO_PRIVATE_MODCACHE" GOCACHE="$GO_PRIVATE_BUILDCACHE" \
+			"$GO_BIN" mod edit -json >"$GO_MOD_JSON"
+	)
+	[ "$($STAT_BIN -c %s "$GO_MOD_JSON")" -le $((16 * 1024 * 1024)) ] || {
+		echo "v2-index-product-gates: go.mod autenticado excede representação segura" >&2
+		exit 1
+	}
+	"$PYTHON_BIN" -I - "$GO_MOD_JSON" <<'PY'
+import json
+import pathlib
+import sys
+
+try:
+    document = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+    replacements = document.get("Replace") or []
+    if not isinstance(replacements, list):
+        raise RuntimeError("Replace não é lista")
+    for replacement in replacements:
+        if not isinstance(replacement, dict):
+            raise RuntimeError("replace inválido")
+        target = replacement.get("New")
+        if not isinstance(target, dict):
+            raise RuntimeError("destino de replace inválido")
+        path = target.get("Path")
+        version = target.get("Version")
+        if not isinstance(path, str) or not path:
+            raise RuntimeError("path de replace inválido")
+        if version in (None, ""):
+            raise RuntimeError(
+                "replace local foge da closure imutável: " + path)
+        if not isinstance(version, str):
+            raise RuntimeError("versão de replace inválida")
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as error:
+    print(
+        "v2-index-product-gates: go.mod inseguro: " + str(error),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+
+	build_gate ./cmd/check-v2-supersession-integrity "$BIN/supersession"
+	build_gate ./cmd/check-v2-writing-semantic-contract "$BIN/writing"
+
+	if [ "$EMIT_PINS" -eq 1 ]; then
+		EMITTED_SUPERSESSION="$(fingerprint "$BIN/supersession")"
+		EMITTED_WRITING="$(fingerprint "$BIN/writing")"
+		# Guardar TAMBÉM no modo --emit-pins. Antes, este ramo saía com `exit 0`
+		# logo depois de imprimir, e o binário recém-construído era descartado
+		# junto com $WORK — então o commit SEGUINTE encontrava cache vazio e
+		# pagava outra compilação a frio.
+		#
+		# O estrago medido em 2026-08-12: o cache em ~/.cache/wiki-v2-gate-bin
+		# tinha só duas entradas de 28 de julho, com hashes que não batiam com
+		# nenhum dos pins vigentes. Resultado: TODO commit que tocasse
+		# data/editorial/v2_pages/ reconstruía os dois comandos Go do zero,
+		# dentro do orçamento de 90 s do hook — e com agentes disputando CPU o
+		# gate era morto por timeout, recusando commit de CONTEÚDO, que o
+		# contrato do projeto declara leve por definição.
+		#
+		# Seguro por construção: cache_store recusa qualquer origem cujo sha256
+		# não seja igual ao pin recebido, e aqui o pin É a impressão digital
+		# recém-calculada do próprio binário. Nada entra no cache que não seja
+		# endereçado pelo próprio conteúdo, e o lookup reconfere o hash antes de
+		# usar.
+		cache_store "$EMITTED_SUPERSESSION" "$BIN/supersession"
+		cache_store "$EMITTED_WRITING" "$BIN/writing"
+		printf 'go_archive_sha256=%s\n' "$GO_ARCHIVE_SHA256"
+		printf 'supersession=%s\n' "$EMITTED_SUPERSESSION"
+		printf 'writing=%s\n' "$EMITTED_WRITING"
+		exit 0
+	fi
+
+	cache_store "$PIN_SUPERSESSION" "$BIN/supersession"
+	cache_store "$PIN_WRITING" "$BIN/writing"
+fi
+
+"$ENV_BIN" -i \
+	PATH=/usr/bin:/bin HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent LC_ALL=C \
+	GIT_INDEX_FILE="$GIT_INDEX_FILE" \
+	"$BIN/supersession" --root "$ROOT" --git-index
+"$ENV_BIN" -i \
+	PATH=/usr/bin:/bin HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent LC_ALL=C \
+	GIT_INDEX_FILE="$GIT_INDEX_FILE" \
+	"$BIN/writing" --root "$ROOT" --git-index --bootstrap-aware
+
+OBSERVED_CANDIDATE_TREE="$(git_clean write-tree)"
+if [ -n "$CANDIDATE" ] && [ "$OBSERVED_CANDIDATE_TREE" != "$CANDIDATE_TREE" ]; then
+	echo "v2-index-product-gates: índice privado diverge da árvore candidata" >&2
+	exit 1
+fi
+"$PYTHON_BIN" -I "$SOURCE/tools/check-v2-finalized-commit" \
+	--root "$ROOT" --old "$OLD" --new "$OBSERVED_CANDIDATE_TREE" --product-only
+if [ -z "$CANDIDATE" ]; then
+	[ "$(fingerprint "$AUTH_INDEX")" = "$INDEX_FINGERPRINT" ] || {
+		echo "v2-index-product-gates: índice autoritativo mudou durante os gates" >&2
+		exit 1
+	}
+fi
+
+echo "v2-index-product-gates: PASS source_commit=$OLD candidate_tree=$OBSERVED_CANDIDATE_TREE"

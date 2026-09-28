@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""measure-v2-uniqueness — mede a unicidade REAL do acervo v2, par a par.
+
+Por que existe: o repo alega bloquear 5.600 paginas por
+`batch_global_similarity`, mas o proprio artefato que sustenta esse gate
+(data/editorial/authorial_mass_global_similarity_audit.jsonl) se
+autodenuncia: expected_pairs 31.668.861, compared_pairs 123,
+global_all_pairs_compared false. Ou seja, 0,0004% do espaco foi olhado, e
+o "high_risk_pair_count: 0" nao significa corpus limpo — significa nada
+encontrado em quase nada comparado.
+
+Esta ferramenta compara o corpus INTEIRO e e o unico numero de unicidade
+do projeto que pode ser reproduzido por terceiro. Nao substitui gate:
+produz a evidencia com que se decide se um gate esta certo ou errado.
+
+Metodo (declarado, porque numero sem metodo nao vale):
+  - documento = opening + texto de todas as secoes, minusculo, sem
+    pontuacao, espacos colapsados
+  - shingle de 8 palavras (captura reuso de frase, nao de vocabulario)
+  - MinHash de 96 permutacoes sobre blake2b de 64 bits
+  - LSH em 24 bandas de 4 linhas -> limiar de deteccao ~0.45,
+    sensibilidade ~99,9% em 0.70
+  - Jaccard estimado pela fracao de assinaturas iguais
+
+DETERMINISMO: usa hashlib.blake2b, nunca hash() nativo — hash() de str e
+randomizado por processo (PYTHONHASHSEED), o que faria cada execucao dar
+um numero diferente e destruiria o valor probatorio.
+
+Uso:
+    tools/measure-v2-uniqueness
+    tools/measure-v2-uniqueness --json data/ops/v2_uniqueness_20260806.json
+    tools/measure-v2-uniqueness --threshold 0.5
+"""
+import argparse
+import collections
+import glob
+import hashlib
+import json
+import os
+import re
+import struct
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+PAGES_GLOB = os.path.join(ROOT, "data/editorial/v2_pages/*.jsonl")
+
+NUM_HASHES = 96
+BANDS = 24
+ROWS = 4
+SHINGLE = 8
+MIN_TOKENS = 40
+MASK = (1 << 61) - 1
+# Limite de bucket LSH: acima disso o balde e generico (boilerplate curto
+# compartilhado) e a explosao quadratica nao paga o que revela.
+MAX_BUCKET = 60
+
+WORD_RE = re.compile(r"[^a-zà-ÿ0-9 ]")
+SPACE_RE = re.compile(r"\s+")
+
+
+def tokenize(record):
+    sections = record.get("sections") or []
+    if not sections:
+        return None
+    body = (record.get("opening") or "") + " " + " ".join(
+        (section.get("text") or "") for section in sections
+    )
+    body = WORD_RE.sub(" ", SPACE_RE.sub(" ", body).lower())
+    tokens = body.split()
+    return tokens if len(tokens) >= MIN_TOKENS else None
+
+
+def shingle_hashes(tokens):
+    """Hash estavel de cada janela de SHINGLE palavras."""
+    out = set()
+    for index in range(len(tokens) - SHINGLE + 1):
+        window = " ".join(tokens[index : index + SHINGLE]).encode("utf-8")
+        digest = hashlib.blake2b(window, digest_size=8).digest()
+        out.add(struct.unpack("<Q", digest)[0] & MASK)
+    return out
+
+
+def signature(shingles):
+    """MinHash por permutacao afim — determinista e sem dependencia externa."""
+    sig = []
+    for k in range(NUM_HASHES):
+        a = 2 * k + 1
+        b = k * 7919 + 13
+        sig.append(min(((x * a + b) & MASK) for x in shingles))
+    return tuple(sig)
+
+
+def load_corpus():
+    docs = {}
+    meta = {}
+    duplicates = collections.defaultdict(list)
+    for path in sorted(glob.glob(PAGES_GLOB)):
+        shard = os.path.basename(path)
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                intent = record.get("intent_id")
+                if not intent:
+                    continue
+                duplicates[intent].append(shard)
+                tokens = tokenize(record)
+                if tokens is None:
+                    continue
+                docs[intent] = tokens
+                meta[intent] = {"shard": shard, "title": record.get("title") or ""}
+    collisions = {k: v for k, v in duplicates.items() if len(v) > 1}
+    return docs, meta, collisions
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--threshold", type=float, default=0.30,
+                        help="jaccard minimo para reportar um par")
+    parser.add_argument("--json", dest="json_out", default="",
+                        help="grava o resultado completo neste caminho")
+    args = parser.parse_args()
+
+    docs, meta, collisions = load_corpus()
+    print("documentos com corpo: %d" % len(docs), file=sys.stderr)
+
+    signatures = {}
+    for count, (intent, tokens) in enumerate(docs.items(), 1):
+        shingles = shingle_hashes(tokens)
+        if shingles:
+            signatures[intent] = signature(shingles)
+        if count % 2000 == 0:
+            print("  assinatura %d/%d" % (count, len(docs)), file=sys.stderr)
+
+    buckets = collections.defaultdict(list)
+    for intent, sig in signatures.items():
+        for band in range(BANDS):
+            buckets[(band, sig[band * ROWS : (band + 1) * ROWS])].append(intent)
+
+    candidates = set()
+    skipped_buckets = 0
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        if len(members) > MAX_BUCKET:
+            skipped_buckets += 1
+            continue
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                candidates.add(tuple(sorted((members[i], members[j]))))
+
+    # MinHash ESTIMA; para reportar, confirma-se com Jaccard exato sobre os
+    # shingles reais. Sem esta etapa a ferramenta mente: na primeira versao
+    # (com hash() nativo) tres pares apareceram entre 0.69 e 0.78 e o Jaccard
+    # exato deles era 0.0007-0.0014 — colisao de assinatura, nao similaridade.
+    # Estimar e barato e serve para filtrar; afirmar exige a conta exata.
+    exact_shingles = {}
+
+    def shingles_of(intent):
+        if intent not in exact_shingles:
+            tokens = docs[intent]
+            exact_shingles[intent] = {
+                " ".join(tokens[i : i + SHINGLE])
+                for i in range(len(tokens) - SHINGLE + 1)
+            }
+        return exact_shingles[intent]
+
+    pairs = []
+    estimated_only = 0
+    for left, right in candidates:
+        sig_left, sig_right = signatures[left], signatures[right]
+        estimate = sum(1 for a, b in zip(sig_left, sig_right) if a == b) / NUM_HASHES
+        if estimate < args.threshold:
+            continue
+        left_shingles, right_shingles = shingles_of(left), shingles_of(right)
+        union = left_shingles | right_shingles
+        exact = len(left_shingles & right_shingles) / len(union) if union else 0.0
+        if exact >= args.threshold:
+            pairs.append((exact, left, right))
+        else:
+            estimated_only += 1
+    pairs.sort(reverse=True)
+
+    bands_report = collections.Counter()
+    for jaccard, _, _ in pairs:
+        if jaccard >= 0.85:
+            bands_report[">=0.85 quase-identico"] += 1
+        elif jaccard >= 0.70:
+            bands_report["0.70-0.85 alto"] += 1
+        elif jaccard >= 0.50:
+            bands_report["0.50-0.70 medio"] += 1
+        else:
+            bands_report["<0.50 baixo"] += 1
+
+    affected_070 = {i for j, a, b in pairs if j >= 0.70 for i in (a, b)}
+    affected_050 = {i for j, a, b in pairs if j >= 0.50 for i in (a, b)}
+
+    print()
+    print("=== UNICIDADE DO ACERVO v2 ===")
+    print("metodo: MinHash %d hashes (blake2b) / shingle %d-gram / LSH %dx%d"
+          % (NUM_HASHES, SHINGLE, BANDS, ROWS))
+    print("documentos comparados : %d" % len(signatures))
+    print("pares candidatos LSH  : %d" % len(candidates))
+    print("baldes genericos ignorados (>%d membros): %d" % (MAX_BUCKET, skipped_buckets))
+    print("falsos positivos do MinHash descartados pelo exato: %d" % estimated_only)
+    print()
+    for label in (">=0.85 quase-identico", "0.70-0.85 alto",
+                  "0.50-0.70 medio", "<0.50 baixo"):
+        print("  %-24s %d pares" % (label, bands_report.get(label, 0)))
+    print()
+    print("paginas em par >=0.70 (limiar do contrato): %d" % len(affected_070))
+    print("paginas em par >=0.50                    : %d" % len(affected_050))
+    if collisions:
+        print("intent_ids repetidos entre shards        : %d" % len(collisions))
+
+    if pairs:
+        print()
+        print("=== pares mais similares ===")
+        for jaccard, left, right in pairs[:15]:
+            print("%.3f  %s" % (jaccard, left))
+            print("       %s" % right)
+
+    if args.json_out:
+        out_path = args.json_out if os.path.isabs(args.json_out) else os.path.join(ROOT, args.json_out)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        payload = {
+            "method": {
+                "num_hashes": NUM_HASHES, "shingle": SHINGLE,
+                "bands": BANDS, "rows": ROWS, "hash": "blake2b-64",
+                "max_bucket": MAX_BUCKET, "min_tokens": MIN_TOKENS,
+                "confirmation": "jaccard_exato_sobre_shingles_reais",
+            },
+            "documents_compared": len(signatures),
+            "candidate_pairs": len(candidates),
+            "generic_buckets_skipped": skipped_buckets,
+            "minhash_false_positives_discarded": estimated_only,
+            "bands": dict(bands_report),
+            "pages_in_pair_ge_070": sorted(affected_070),
+            "pages_in_pair_ge_050": sorted(affected_050),
+            "cross_shard_collisions": {k: v for k, v in sorted(collisions.items())},
+            "pairs": [
+                {"jaccard": round(j, 4), "a": a, "b": b,
+                 "title_a": meta.get(a, {}).get("title", ""),
+                 "title_b": meta.get(b, {}).get("title", "")}
+                for j, a, b in pairs
+            ],
+        }
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=1)
+        print("\ngravado %s" % os.path.relpath(out_path, ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

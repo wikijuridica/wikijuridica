@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Trava o contrato do ingress: sem restart, com fingerprint por componente, topologia em fonte unica.
+
+POR QUE ESTE CHECK EXISTE (2026-08-13)
+--------------------------------------
+`tools/deploy-publico` executava `systemctl restart nginx` a cada publicacao,
+justificado no comentario por "o restart do nginx e instantaneo". A medicao
+provou o contrario: `systemctl show nginx` devolve
+`ExecStop=start-stop-daemon --stop --retry QUIT/5` com `TimeoutStopUSec=5s`, e o
+journal de 2026-08-12 registra OITO restarts, cada um com 8 a 9 SEGUNDOS entre
+"Stopping" e "Started" — dois deles encerrados a forca com
+"Stopping timed out. Terminating." Durante a janela, o cloudflared devolve 502
+sem retry por requisicao ("dial tcp 127.0.0.1:8088: connect: connection refused",
+17:43:27 do mesmo dia).
+
+Ha um segundo motivo, mais perigoso que o downtime: `systemctl restart` INICIA
+uma unit `disabled` (disable != mask). Enquanto a linha existisse, desativar o
+nginx compartilhado faria o proximo deploy RESSUSCITA-LO — ou colidir na porta
+com a instancia dedicada — e o smoke passaria mentindo nos dois casos.
+
+O QUE ESTE CHECK COBRA
+----------------------
+1. `deploy-publico` NAO reinicia nem para o nginx (reload e permitido).
+2. O reload e CONDICIONAL ao ingress ter mudado, e a aplicacao e PROVADA
+   (`nginx -s reload` sai 0 antes de o master aceitar a config).
+3. O fingerprint grava hash POR COMPONENTE. Um `layer_sha256` unico responde
+   "mudou ou nao" e nunca "qual mudou" — insuficiente para decidir entre nao
+   tocar no nginx e recarrega-lo.
+4. A topologia (unit, porta, arquivos de config) vive em `ops/ingress.env`, e o
+   deploy le de la. Sem fonte unica, o flip do cutover nao e atomico: metade do
+   sistema olha para a instancia velha e metade para a nova.
+
+READ-ONLY. Nao escreve nada, nao toca em servico.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+DEPLOY = RAIZ / "tools" / "deploy-publico"
+INGRESS_ENV = RAIZ / "ops" / "ingress.env"
+FINGERPRINT = RAIZ / "data" / "ops" / "deploy_layer_fingerprint.json"
+
+# `restart`/`stop` do nginx em linha efetiva (comentario nao conta: os
+# comentarios deste repo citam o defeito de proposito, para nao se perder o
+# porque da correcao).
+RESTART_PROIBIDO = re.compile(r"systemctl\s+(restart|stop)\s+[\"']?\$?\{?(NGINX_UNIT|nginx)\b")
+
+
+def linhas_efetivas(texto: str):
+    for n, linha in enumerate(texto.splitlines(), 1):
+        sem_comentario = linha.split("#", 1)[0]
+        if sem_comentario.strip():
+            yield n, sem_comentario
+
+
+def main() -> int:
+    falhas: list[str] = []
+
+    if not DEPLOY.is_file():
+        print(f"check-ingress-reload-contract: FAIL — {DEPLOY} nao existe")
+        return 1
+    fonte = DEPLOY.read_text(encoding="utf-8")
+
+    # 1. sem restart/stop do nginx
+    for n, linha in linhas_efetivas(fonte):
+        if RESTART_PROIBIDO.search(linha):
+            falhas.append(
+                f"deploy-publico:{n} reinicia ou para o nginx: {linha.strip()!r}. "
+                "Medido: 8-9 s de origem fora do ar por deploy, e `restart` inicia unit desabilitada."
+            )
+
+    # 2. reload condicional e provado
+    if "systemctl reload" not in fonte:
+        falhas.append("deploy-publico nao recarrega o nginx em lugar nenhum — config nova nunca entraria.")
+    if 'INGRESS_MUDOU" -eq 1' not in fonte:
+        falhas.append(
+            "o reload nao e condicionado a INGRESS_MUDOU: todo deploy de conteudo pagaria um reload "
+            "desnecessario, e o sinal de 'a config mudou' se perde."
+        )
+    if "emerg" not in fonte:
+        falhas.append(
+            "o reload nao e PROVADO: `nginx -s reload` sai 0 antes de o master aceitar a config, "
+            "entao e preciso conferir [emerg]/[alert] no error log depois do sinal."
+        )
+
+    # 3. fingerprint por componente
+    for campo in ("BIN_ATUAL", "INGRESS_ATUAL"):
+        if campo not in fonte:
+            falhas.append(f"deploy-publico nao calcula {campo}: o fingerprint voltou a ser um hash unico.")
+    if "bin_sha256" not in fonte or "ingress_sha256" not in fonte:
+        falhas.append("o fingerprint gravado nao tem bin_sha256/ingress_sha256 — nao da para saber QUAL camada mudou.")
+
+    if FINGERPRINT.is_file():
+        try:
+            estado = json.loads(FINGERPRINT.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as erro:
+            falhas.append(f"{FINGERPRINT} nao e JSON valido: {erro}")
+        else:
+            # v1 e aceito como estado herdado: o deploy trata ingress como mudado
+            # quando o campo falta, que e o lado seguro do erro.
+            if estado.get("schema_version") == "deploy_layer_fingerprint_v2":
+                for campo in ("bin_sha256", "ingress_sha256"):
+                    if not estado.get(campo):
+                        falhas.append(f"fingerprint v2 sem {campo} preenchido.")
+
+    # 4. topologia em fonte unica
+    if not INGRESS_ENV.is_file():
+        falhas.append(f"{INGRESS_ENV} nao existe — a topologia voltou a ficar espalhada pelas ferramentas.")
+    else:
+        env = INGRESS_ENV.read_text(encoding="utf-8")
+        for chave in ("WIKI_NGINX_UNIT", "WIKI_ORIGIN_PORT", "WIKI_NGINX_CONF_FONTES"):
+            if not re.search(rf"^{chave}=", env, re.M):
+                falhas.append(f"{INGRESS_ENV} nao declara {chave}.")
+        if "ops/ingress.env" not in fonte:
+            falhas.append("deploy-publico nao le ops/ingress.env — a fonte unica existe mas ninguem a consulta.")
+
+    # 5. a porta nao pode voltar a ser literal nas linhas efetivas do deploy
+    for n, linha in linhas_efetivas(fonte):
+        if "8088" in linha and "WIKI_ORIGIN_PORT" not in linha:
+            falhas.append(
+                f"deploy-publico:{n} usa a porta 8088 literal: {linha.strip()!r}. "
+                "Use ${ORIGIN_PORT}, senao o cutover deixa a sonda na instancia velha."
+            )
+
+    if falhas:
+        print("check-ingress-reload-contract: FAIL")
+        for f in falhas:
+            print(f"  - {f}")
+        return 1
+
+    print("check-ingress-reload-contract: pass")
+    print("  deploy nao reinicia o nginx; reload condicional e provado; fingerprint por componente; topologia em ops/ingress.env")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

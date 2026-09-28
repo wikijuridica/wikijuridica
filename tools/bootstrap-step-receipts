@@ -1,0 +1,1446 @@
+#!/usr/bin/env python3
+"""Content-addressed, fail-closed resume receipts for bootstrap-chain."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import hashlib
+import json
+import os
+import pathlib
+import re
+import secrets
+import stat
+import sys
+import tempfile
+from typing import Any, Iterable, Mapping
+
+
+RECEIPT_SCHEMA = "bootstrap-chain-step-receipt/v3"
+PREPARED_SCHEMA = "bootstrap-chain-step-prepared/v3"
+PROGRESS_SCHEMA = "bootstrap-chain-step-progress/v3"
+SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
+STEP_NAME = re.compile(r"generate-[a-z0-9-]+")
+MAX_CONTROL_BYTES = 64 * 1024
+# Artifact payloads are streamed, never accumulated in memory.  A one-terabyte
+# safety ceiling keeps corrupted metadata bounded without making a few million
+# authored pages fail merely because a JSONL crossed the old 16 GiB limit.
+MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024 * 1024
+# RENAME_NOREPLACE makes every attempt lossless.  A finite retry budget keeps
+# even a hostile/corrupt namespace from turning recovery into an operational
+# loop; random names mean this does not cap the number of preserved versions.
+MAX_STALE_RENAME_ATTEMPTS = 16
+ALLOWED_ARTIFACT_PREFIXES = (
+    "data/editorial/",
+    "data/ops/",
+    "data/source-registry/",
+)
+
+
+class ReceiptError(RuntimeError):
+    pass
+
+
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    _RENAMEAT2.restype = ctypes.c_int
+
+ARTIFACT_IDENTITY_FIELDS = (
+    "bytes",
+    "device",
+    "inode",
+    "mode",
+    "uid",
+    "mtime_ns",
+    "ctime_ns",
+)
+ARTIFACT_RECORD_FIELDS = frozenset(
+    {"path", "sha256", *ARTIFACT_IDENTITY_FIELDS}
+)
+
+
+def validate_factory_chain_lock(root: pathlib.Path) -> None:
+    if os.environ.get("P0_FACTORY_CHAIN_LOCK_HELD") != "1":
+        raise ReceiptError("factory-chain fd7/fd8 authority is required")
+    domain = os.environ.get("P0_FACTORY_CHAIN_LOCK_DOMAIN", "")
+    if domain != "bootstrap-chain":
+        raise ReceiptError("bootstrap receipts require the bootstrap-chain lock domain")
+    if os.environ.get("P0_FACTORY_CHAIN_COORDINATION_MODE") != "exclusive":
+        raise ReceiptError("bootstrap receipts require exclusive repository coordination")
+    root_info = root.stat()
+    repository_identity = f"{root_info.st_dev}:{root_info.st_ino}"
+    base_key = hashlib.sha256(
+        f"device_inode={repository_identity}\n".encode("ascii")
+    ).hexdigest()
+    domain_key = hashlib.sha256(
+        (
+            f"device_inode={repository_identity}\n"
+            f"lock_domain={domain}\n"
+        ).encode("ascii")
+    ).hexdigest()
+    expected_coordination = pathlib.Path(
+        "/tmp/portaljuridico-p0-factory-coordination-v1-"
+        f"{base_key}/p0-factory-coordination.lock"
+    )
+    expected_domain = pathlib.Path(
+        "/tmp/portaljuridico-p0-factory-chain-v2-"
+        f"{domain_key}/p0-factory-chain.lock"
+    )
+    if os.environ.get("P0_FACTORY_CHAIN_COORDINATION_PATH", "") != os.fspath(
+        expected_coordination
+    ):
+        raise ReceiptError("repository coordination pathname does not match repository")
+    if os.environ.get("P0_FACTORY_CHAIN_LOCK_PATH", "") != os.fspath(
+        expected_domain
+    ):
+        raise ReceiptError("factory-chain lock pathname does not match repository")
+
+    for descriptor_number, expected, label in (
+        (7, expected_coordination, "repository coordination fd7"),
+        (8, expected_domain, "factory-chain fd8"),
+    ):
+        try:
+            descriptor = os.fstat(descriptor_number)
+            named = os.stat(expected, follow_symlinks=False)
+        except OSError as error:
+            raise ReceiptError(f"{label} unavailable: {error}") from error
+        if (
+            not stat.S_ISREG(descriptor.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or descriptor.st_uid != os.geteuid()
+            or stat.S_IMODE(descriptor.st_mode) != 0o600
+            or (descriptor.st_dev, descriptor.st_ino)
+            != (named.st_dev, named.st_ino)
+        ):
+            raise ReceiptError(f"{label}/path identity or authority mismatch")
+        try:
+            fdinfo = pathlib.Path(f"/proc/self/fdinfo/{descriptor_number}").read_text(
+                encoding="ascii", errors="strict"
+            )
+        except (OSError, UnicodeError) as error:
+            raise ReceiptError(f"cannot inspect {label}: {error}") from error
+        if not any(
+            line.startswith("lock:")
+            and " FLOCK " in line
+            and " ADVISORY " in line
+            and " WRITE " in line
+            for line in fdinfo.splitlines()
+        ):
+            raise ReceiptError(f"{label} lacks an exclusive kernel lock")
+
+
+def canonical_payload(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def payload_sha256(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def validate_sha256(label: str, value: str) -> str:
+    if SHA256.fullmatch(value) is None:
+        raise ReceiptError(f"{label} is not a canonical sha256 token")
+    return value
+
+
+def canonical_root(raw: str) -> pathlib.Path:
+    absolute = pathlib.Path(os.path.abspath(raw))
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise ReceiptError(f"repository root unavailable: {error}") from error
+    if resolved != absolute or not resolved.is_dir():
+        raise ReceiptError("repository root contains symlinks or is not a directory")
+    return resolved
+
+
+def validate_owned_directory(path: pathlib.Path, *, create: bool = False) -> None:
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise ReceiptError(f"control directory unavailable: {path}: {error}") from error
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o022
+    ):
+        raise ReceiptError(f"unsafe control directory: {path}")
+
+
+def control_paths(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    cache = root / ".cache"
+    chain = cache / "bootstrap-chain"
+    receipts = chain / "step-receipts"
+    validate_owned_directory(cache, create=True)
+    validate_owned_directory(chain, create=True)
+    validate_owned_directory(receipts, create=True)
+    os.chmod(chain, 0o700)
+    os.chmod(receipts, 0o700)
+    return chain / "step-progress.json", receipts
+
+
+def read_regular(path: pathlib.Path, max_bytes: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise ReceiptError(f"cannot open regular file {path}: {error}") from error
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or info.st_size < 0
+            or info.st_size > max_bytes
+        ):
+            raise ReceiptError(f"unsafe regular file {path}")
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ReceiptError(f"short read from {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ReceiptError(f"file grew while read: {path}")
+        after = os.fstat(fd)
+        try:
+            named_after = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise ReceiptError(f"path changed while reading: {path}") from error
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(info) != identity(after) or identity(after) != identity(named_after):
+            raise ReceiptError(f"file changed while reading: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def hash_regular(root: pathlib.Path, relative: str, max_bytes: int) -> dict[str, Any]:
+    pure = pathlib.PurePosixPath(relative)
+    if (
+        not relative
+        or pure.is_absolute()
+        or pure.as_posix() != relative
+        or ".." in pure.parts
+    ):
+        raise ReceiptError(f"unsafe relative path: {relative!r}")
+    path = root.joinpath(*pure.parts)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ReceiptError(f"required output unavailable: {relative}: {error}") from error
+    if resolved != path:
+        raise ReceiptError(f"path crosses a symlink: {relative}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise ReceiptError(f"cannot open regular file {relative}: {error}") from error
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o022
+            or before.st_size < 0
+            or before.st_size > max_bytes
+        ):
+            raise ReceiptError(f"unsafe regular file {relative}")
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ReceiptError(f"short read from {relative}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ReceiptError(f"file grew while hashing: {relative}")
+        after = os.fstat(fd)
+        try:
+            named_after = os.stat(path, follow_symlinks=False)
+            resolved_after = path.resolve(strict=True)
+        except OSError as error:
+            raise ReceiptError(f"path changed while hashing: {relative}") from error
+        if (
+            (before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+             before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or resolved_after != path
+            or (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            != (named_after.st_dev, named_after.st_ino, named_after.st_mode,
+                named_after.st_uid, named_after.st_size,
+                named_after.st_mtime_ns, named_after.st_ctime_ns)
+        ):
+            raise ReceiptError(f"file changed while hashing: {relative}")
+    finally:
+        os.close(fd)
+    return {
+        "path": relative,
+        "sha256": "sha256:" + digest.hexdigest(),
+        "bytes": before.st_size,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mode": stat.S_IMODE(before.st_mode),
+        "uid": before.st_uid,
+        "mtime_ns": before.st_mtime_ns,
+        "ctime_ns": before.st_ctime_ns,
+    }
+
+
+def stat_regular_artifact(
+    root: pathlib.Path, relative: str, max_bytes: int,
+) -> dict[str, Any]:
+    """Authenticate a live artifact identity without rereading its payload.
+
+    Producers in this repository install artifacts by atomic rename.  Device,
+    inode, size, mode, uid, mtime and ctime therefore form a cheap fail-closed
+    resume check.  In particular, an unprivileged writer cannot restore ctime
+    after an in-place mutation.  The content hash is still computed once when
+    the producer completes; resume no longer rereads every earlier multi-GB
+    artifact merely to prove that its exact inode remained untouched.
+    """
+
+    pure = pathlib.PurePosixPath(relative)
+    if (
+        not relative
+        or pure.is_absolute()
+        or pure.as_posix() != relative
+        or ".." in pure.parts
+    ):
+        raise ReceiptError(f"unsafe relative path: {relative!r}")
+    path = root.joinpath(*pure.parts)
+    try:
+        resolved = path.resolve(strict=True)
+        before = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ReceiptError(f"required output unavailable: {relative}: {error}") from error
+    if resolved != path or stat.S_ISLNK(before.st_mode):
+        raise ReceiptError(f"path crosses a symlink: {relative}")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_mode & 0o022
+        or before.st_size < 0
+        or before.st_size > max_bytes
+    ):
+        raise ReceiptError(f"unsafe regular file {relative}")
+    try:
+        after = path.stat(follow_symlinks=False)
+        resolved_after = path.resolve(strict=True)
+    except OSError as error:
+        raise ReceiptError(f"path changed while stating: {relative}") from error
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if resolved_after != path or identity(before) != identity(after):
+        raise ReceiptError(f"file changed while stating: {relative}")
+    return {
+        "path": relative,
+        "bytes": before.st_size,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "mode": stat.S_IMODE(before.st_mode),
+        "uid": before.st_uid,
+        "mtime_ns": before.st_mtime_ns,
+        "ctime_ns": before.st_ctime_ns,
+    }
+
+
+def artifact_identity_matches(
+    root: pathlib.Path, recorded: Mapping[str, Any], max_bytes: int,
+) -> bool:
+    relative = recorded.get("path")
+    if not isinstance(relative, str):
+        return False
+    live = stat_regular_artifact(root, relative, max_bytes)
+    return all(live.get(field) == recorded.get(field) for field in live)
+
+
+def parse_artifacts(raw: str) -> tuple[str, ...]:
+    values = tuple(raw.split("|")) if raw else ()
+    if (
+        not values
+        or len(values) != len(set(values))
+        or any(not canonical_artifact_path(value) for value in values)
+    ):
+        raise ReceiptError(f"invalid artifact set: {raw!r}")
+    return values
+
+
+def canonical_artifact_path(value: str) -> bool:
+    if (
+        not value
+        or len(value.encode("utf-8")) > 4096
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    pure = pathlib.PurePosixPath(value)
+    return (
+        not pure.is_absolute()
+        and pure.as_posix() == value
+        and "." not in pure.parts
+        and ".." not in pure.parts
+        and value.startswith(ALLOWED_ARTIFACT_PREFIXES)
+    )
+
+
+def validate_step_spec(
+    number: int, name: str, wrapper: str, artifacts: str
+) -> tuple[int, str, str, tuple[str, ...]]:
+    if number < 1 or STEP_NAME.fullmatch(name) is None:
+        raise ReceiptError("invalid bootstrap step identity")
+    if wrapper != f"tools/{name}":
+        raise ReceiptError(f"wrapper does not match step {number}: {wrapper}")
+    return number, name, wrapper, parse_artifacts(artifacts)
+
+
+def runtime_fingerprint() -> str:
+    selected = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith(("WIKI_", "P0_", "GO", "LC_"))
+        or key in {"LANG", "TMPDIR", "TZ"}
+    }
+    return payload_sha256(canonical_payload({"environment": selected}))
+
+
+def prepared_input_fingerprint(
+    *, number: int, name: str, epoch: str, detox: str, source: str,
+    wrapper_sha256: str, predecessor: str,
+    pre_artifacts: Iterable[Mapping[str, Any]], runtime: str,
+    reuse_pool: Iterable[str] = (),
+) -> str:
+    payload = canonical_payload({
+        "schema": RECEIPT_SCHEMA,
+        "step_number": number,
+        "step_name": name,
+        "stock_epoch_sha256": epoch,
+        "detox_contract_sha256": detox,
+        "source_contract_sha256": source,
+        "wrapper_sha256": wrapper_sha256,
+        "predecessor_receipt_sha256": predecessor,
+        "pre_artifacts": list(pre_artifacts),
+        "runtime_fingerprint": runtime,
+        # A declaração de pool de reuso muda o que prepare faz com o órfão
+        # (copiar em vez de mover) e o que write aceita como progresso; portanto
+        # entra no fingerprint — write recalcula com os próprios argumentos e
+        # recusa qualquer divergência entre preparar e concluir.
+        "reuse_pool_artifacts": list(reuse_pool),
+    })
+    return payload_sha256(payload)
+
+
+def output_fingerprint(artifacts: Iterable[Mapping[str, Any]]) -> str:
+    # Keep the output fingerprint content-addressed.  Receipt records also bind
+    # filesystem identity for fast resume, but inode/ctime are deliberately not
+    # part of the semantic output digest.
+    normalized = [
+        {
+            "path": artifact.get("path"),
+            "sha256": artifact.get("sha256"),
+            "bytes": artifact.get("bytes"),
+        }
+        for artifact in artifacts
+    ]
+    return payload_sha256(canonical_payload({"artifacts": normalized}))
+
+
+def optional_artifact_snapshot(
+    root: pathlib.Path, relative: str,
+) -> dict[str, Any]:
+    path = root.joinpath(*pathlib.PurePosixPath(relative).parts)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return {"path": relative, "state": "missing"}
+    record = hash_regular(root, relative, MAX_ARTIFACT_BYTES)
+    return {**record, "state": "present"}
+
+
+def valid_pre_artifacts(
+    paths: Iterable[str], value: Any,
+) -> bool:
+    expected = list(paths)
+    if not isinstance(value, list) or len(value) != len(expected):
+        return False
+    for path, item in zip(expected, value, strict=True):
+        if not isinstance(item, dict) or item.get("path") != path:
+            return False
+        if item.get("state") == "missing":
+            if set(item) != {"path", "state"}:
+                return False
+        elif item.get("state") == "present":
+            if (
+                set(item) != ARTIFACT_RECORD_FIELDS | {"state"}
+                or SHA256.fullmatch(str(item.get("sha256"))) is None
+                or any(
+                    not isinstance(item.get(field), int) or item[field] < 0
+                    for field in ARTIFACT_IDENTITY_FIELDS
+                )
+            ):
+                return False
+        else:
+            return False
+    return True
+
+
+def move_to_recoverable_stale(
+    root: pathlib.Path, relative: str, *, resume_step: int, head: str,
+) -> str | None:
+    path = root.joinpath(*pathlib.PurePosixPath(relative).parts)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    before = stat_regular_artifact(root, relative, MAX_ARTIFACT_BYTES)
+    if _RENAMEAT2 is None:
+        raise ReceiptError("renameat2 is required for lossless stale moves")
+    suffix = head.removeprefix("sha256:")[:16]
+    for _attempt in range(MAX_STALE_RENAME_ATTEMPTS):
+        candidate = path.with_name(
+            f"{path.name}.stale-resume-{resume_step:02d}-{suffix}-"
+            f"{secrets.token_hex(8)}"
+        )
+        result = _RENAMEAT2(
+            AT_FDCWD,
+            os.fsencode(path),
+            AT_FDCWD,
+            os.fsencode(candidate),
+            RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number == errno.EEXIST:
+                continue
+            raise ReceiptError(
+                f"cannot move {relative} recoverably: "
+                f"{os.strerror(error_number)}"
+            )
+        try:
+            after = stat_regular_artifact(
+                root, candidate.relative_to(root).as_posix(),
+                MAX_ARTIFACT_BYTES,
+            )
+        except BaseException as error:
+            raise ReceiptError(
+                f"recoverable stale move cannot be authenticated: {relative}"
+            ) from error
+        if any(
+            after.get(field) != before.get(field)
+            for field in (
+                "bytes", "device", "inode", "mode", "uid", "mtime_ns"
+            )
+        ):
+            raise ReceiptError(
+                f"recoverable stale move changed file identity: {relative}"
+            )
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return candidate.relative_to(root).as_posix()
+    raise ReceiptError(
+        f"cannot allocate a unique recoverable stale name after "
+        f"{MAX_STALE_RENAME_ATTEMPTS} attempts: {relative}"
+    )
+
+
+def copy_to_recoverable_stale(
+    root: pathlib.Path, relative: str, *, resume_step: int, head: str,
+) -> dict[str, Any] | None:
+    """Preserve an orphan forensically WITHOUT removing it from its live path.
+
+    Same forensic guarantee as move_to_recoverable_stale (the exact bytes that
+    predate this attempt stay recoverable under a unique .stale-resume-* name),
+    but the canonical path keeps the file so a producer that reuses its own
+    previous output as an idempotent pool can resume instead of restarting.
+    Only outputs the caller declared with --reuse-pool-artifact take this path.
+    """
+
+    path = root.joinpath(*pathlib.PurePosixPath(relative).parts)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    before = stat_regular_artifact(root, relative, MAX_ARTIFACT_BYTES)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    source_fd = os.open(path, flags)
+    try:
+        source_stat = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_stat.st_mode)
+            or source_stat.st_uid != os.geteuid()
+            or source_stat.st_mode & 0o022
+            or source_stat.st_size > MAX_ARTIFACT_BYTES
+        ):
+            raise ReceiptError(f"unsafe regular file {relative}")
+        suffix = head.removeprefix("sha256:")[:16]
+        digest = hashlib.sha256()
+        for _attempt in range(MAX_STALE_RENAME_ATTEMPTS):
+            candidate = path.with_name(
+                f"{path.name}.stale-resume-{resume_step:02d}-{suffix}-"
+                f"{secrets.token_hex(8)}"
+            )
+            try:
+                target_fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    stat.S_IMODE(source_stat.st_mode),
+                )
+            except FileExistsError:
+                continue
+            copied = 0
+            try:
+                os.lseek(source_fd, 0, os.SEEK_SET)
+                while copied < source_stat.st_size:
+                    chunk = os.read(
+                        source_fd,
+                        min(1024 * 1024, source_stat.st_size - copied),
+                    )
+                    if not chunk:
+                        raise ReceiptError(f"short read from {relative}")
+                    digest.update(chunk)
+                    written = 0
+                    while written < len(chunk):
+                        count = os.write(target_fd, chunk[written:])
+                        if count <= 0:
+                            raise ReceiptError(
+                                f"short write preserving {relative}"
+                            )
+                        written += count
+                    copied += len(chunk)
+                os.fsync(target_fd)
+            finally:
+                os.close(target_fd)
+            # The source must not have moved under us while it was copied: a
+            # preserved copy that does not authenticate the pre-state is worse
+            # than no copy at all.
+            after = os.fstat(source_fd)
+            if (
+                after.st_dev != source_stat.st_dev
+                or after.st_ino != source_stat.st_ino
+                or after.st_size != source_stat.st_size
+                or after.st_mtime_ns != source_stat.st_mtime_ns
+                or after.st_ctime_ns != source_stat.st_ctime_ns
+            ):
+                raise ReceiptError(
+                    f"file changed while being preserved: {relative}"
+                )
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return {
+                "path": relative,
+                "preserved_path": candidate.relative_to(root).as_posix(),
+                "sha256": "sha256:" + digest.hexdigest(),
+                "bytes": before["bytes"],
+                "inode": before["inode"],
+                "mtime_ns": before["mtime_ns"],
+            }
+        raise ReceiptError(
+            f"cannot allocate a unique recoverable stale name after "
+            f"{MAX_STALE_RENAME_ATTEMPTS} attempts: {relative}"
+        )
+    finally:
+        os.close(source_fd)
+
+
+def reuse_pool_paths(
+    artifact_paths: Iterable[str], declared: Iterable[str],
+) -> tuple[str, ...]:
+    """Validate --reuse-pool-artifact against the step's declared outputs."""
+    allowed = list(artifact_paths)
+    values = tuple(declared)
+    if len(values) != len(set(values)) or any(
+        value not in allowed for value in values
+    ):
+        raise ReceiptError(
+            "reuse-pool artifacts must be a duplicate-free subset of the "
+            f"declared step outputs: {list(values)!r}"
+        )
+    return tuple(value for value in allowed if value in set(values))
+
+
+def atomic_write(path: pathlib.Path, payload: bytes, mode: int = 0o600) -> None:
+    if path.is_symlink():
+        raise ReceiptError(f"refusing symlink control path: {path}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        written = 0
+        while written < len(payload):
+            count = os.write(fd, payload[written:])
+            if count <= 0:
+                raise ReceiptError(f"short write for {path}")
+            written += count
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def read_json_control(path: pathlib.Path) -> dict[str, Any]:
+    payload = read_regular(path, MAX_CONTROL_BYTES)
+    try:
+        value = json.loads(payload.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReceiptError(f"invalid JSON control file {path}") from error
+    if not isinstance(value, dict) or canonical_payload(value) != payload:
+        raise ReceiptError(f"noncanonical JSON control file {path}")
+    return value
+
+
+def write_progress(
+    path: pathlib.Path, *, state: str, epoch: str, detox: str, source: str,
+    completed_step: int, head: str,
+) -> None:
+    record = {
+        "schema": PROGRESS_SCHEMA,
+        "state": state,
+        "stock_epoch_sha256": epoch,
+        "detox_contract_sha256": detox,
+        "source_contract_sha256": source,
+        "completed_step": completed_step,
+        "head_receipt_sha256": head,
+        "approval": False,
+        "publication_allowed": False,
+    }
+    atomic_write(path, canonical_payload(record))
+
+
+def require_progress(
+    path: pathlib.Path, *, epoch: str, detox: str, source: str,
+) -> dict[str, Any]:
+    record = read_json_control(path)
+    if (
+        record.get("schema") != PROGRESS_SCHEMA
+        or record.get("stock_epoch_sha256") != epoch
+        or record.get("detox_contract_sha256") != detox
+        or record.get("source_contract_sha256") != source
+        or record.get("approval") is not False
+        or record.get("publication_allowed") is not False
+    ):
+        raise ReceiptError("bootstrap progress contract is stale or invalid")
+    return record
+
+
+def install_immutable_receipt(directory: pathlib.Path, payload: bytes) -> str:
+    digest = payload_sha256(payload)
+    path = directory / f"{digest.removeprefix('sha256:')}.json"
+    fd, temporary = tempfile.mkstemp(prefix=".receipt.", dir=directory)
+    try:
+        os.fchmod(fd, 0o400)
+        written = 0
+        while written < len(payload):
+            count = os.write(fd, payload[written:])
+            if count <= 0:
+                raise ReceiptError("short write while installing receipt")
+            written += count
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if read_regular(path, MAX_CONTROL_BYTES) != payload:
+                raise ReceiptError(
+                    "content-addressed receipt path has divergent bytes"
+                )
+        finally:
+            os.unlink(temporary)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return digest
+
+
+def receipt_path(directory: pathlib.Path, digest: str) -> pathlib.Path:
+    validate_sha256("receipt", digest)
+    return directory / f"{digest.removeprefix('sha256:')}.json"
+
+
+def load_receipt(directory: pathlib.Path, digest: str) -> dict[str, Any]:
+    path = receipt_path(directory, digest)
+    payload = read_regular(path, MAX_CONTROL_BYTES)
+    if payload_sha256(payload) != digest:
+        raise ReceiptError(f"receipt filename/content mismatch: {digest}")
+    try:
+        record = json.loads(payload.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReceiptError(f"invalid receipt JSON: {digest}") from error
+    if not isinstance(record, dict) or canonical_payload(record) != payload:
+        raise ReceiptError(f"noncanonical receipt: {digest}")
+    return record
+
+
+def command_reset(args: argparse.Namespace) -> None:
+    root = canonical_root(args.root)
+    validate_factory_chain_lock(root)
+    progress, _ = control_paths(root)
+    validate_sha256("stock epoch", args.epoch)
+    validate_sha256("detox contract", args.detox)
+    validate_sha256("source contract", args.source)
+    if args.invalidate_declared_outputs:
+        specs = read_specs(sys.stdin)
+        outputs = {
+            path
+            for spec in specs.values()
+            for path in spec[3]
+        }
+        if args.optional_output:
+            outputs.update(parse_artifacts("|".join(args.optional_output)))
+        for relative in sorted(outputs):
+            moved = move_to_recoverable_stale(
+                root, relative, resume_step=1, head=args.source
+            )
+            if moved is not None:
+                print(
+                    "bootstrap-step-receipts: reset output moved "
+                    f"{relative} -> {moved}",
+                    file=sys.stderr,
+                )
+    write_progress(
+        progress, state="reset_required", epoch=args.epoch, detox=args.detox,
+        source=args.source, completed_step=0, head="genesis",
+    )
+
+
+def require_predecessor(
+    progress: pathlib.Path, *, number: int, previous: str, epoch: str,
+    detox: str, source: str,
+) -> None:
+    if number == 1:
+        if previous != "genesis":
+            raise ReceiptError("step 1 must start from genesis")
+        current = require_progress(
+            progress, epoch=epoch, detox=detox, source=source
+        )
+        if current.get("state") != "reset_required" or current.get("completed_step") != 0:
+            raise ReceiptError("step 1 requires an explicitly reset progress pointer")
+        return
+    validate_sha256("predecessor", previous)
+    current = require_progress(
+        progress, epoch=epoch, detox=detox, source=source
+    )
+    if (
+        current.get("state") != "completed"
+        or current.get("completed_step") != number - 1
+        or current.get("head_receipt_sha256") != previous
+    ):
+        raise ReceiptError("receipt chain predecessor does not match live progress")
+
+
+def predecessor_output_paths(
+    receipt_directory: pathlib.Path, *, number: int, previous: str,
+) -> set[str]:
+    """Return every output authenticated by the exact predecessor chain."""
+    if number == 1:
+        return set()
+    current = previous
+    outputs: set[str] = set()
+    for expected in range(number - 1, 0, -1):
+        record = load_receipt(receipt_directory, current)
+        if (
+            record.get("schema") != RECEIPT_SCHEMA
+            or record.get("status") != "completed"
+            or record.get("step_number") != expected
+        ):
+            raise ReceiptError("predecessor receipt chain is not contiguous")
+        artifacts = record.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ReceiptError("predecessor receipt has no artifact set")
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or not isinstance(
+                artifact.get("path"), str
+            ):
+                raise ReceiptError("predecessor receipt artifact is invalid")
+            outputs.add(artifact["path"])
+        predecessor = record.get("predecessor_receipt_sha256")
+        if expected == 1:
+            if predecessor != "genesis":
+                raise ReceiptError("predecessor chain lost genesis")
+        else:
+            if not isinstance(predecessor, str) or SHA256.fullmatch(
+                predecessor
+            ) is None:
+                raise ReceiptError("predecessor chain digest is invalid")
+            current = predecessor
+    return outputs
+
+
+def command_prepare(args: argparse.Namespace) -> None:
+    root = canonical_root(args.root)
+    validate_factory_chain_lock(root)
+    progress, receipt_directory = control_paths(root)
+    number, name, wrapper, artifact_paths = validate_step_spec(
+        args.step, args.name, args.wrapper, args.artifacts
+    )
+    validate_sha256("stock epoch", args.epoch)
+    validate_sha256("detox contract", args.detox)
+    validate_sha256("source contract", args.source)
+    require_predecessor(
+        progress, number=number, previous=args.previous, epoch=args.epoch,
+        detox=args.detox, source=args.source,
+    )
+    prior_outputs = predecessor_output_paths(
+        receipt_directory, number=number, previous=args.previous
+    )
+    # A producer may have committed its file and crashed before its receipt was
+    # installed. Such an orphan is not part of the authenticated prefix. Move
+    # it recoverably before retrying so an idempotent/no-op rerun cannot bless
+    # the orphan as a new result. Shared paths already produced by the prefix
+    # are inputs to a later last-writer step and therefore remain live.
+    reuse_pool = reuse_pool_paths(artifact_paths, args.reuse_pool_artifact)
+    preserved_reuse_pool: list[dict[str, Any]] = []
+    for artifact_path in artifact_paths:
+        if artifact_path in prior_outputs:
+            continue
+        if artifact_path in reuse_pool:
+            # Convergência sob o teto de 540s/passo: este output também é o pool
+            # de reuso idempotente do próprio produtor, então MOVÊ-LO zerava o
+            # pool a cada retomada e nenhuma rodada podia convergir. Copiar
+            # preserva as duas propriedades — recuperabilidade forense do órfão
+            # e progresso reaproveitável — e o órfão continua sem poder ser
+            # abençoado sozinho: command_write só autentica bytes inalterados
+            # para este conjunto declarado.
+            preserved = copy_to_recoverable_stale(
+                root, artifact_path, resume_step=number, head=args.source
+            )
+            if preserved is not None:
+                preserved_reuse_pool.append(preserved)
+                print(
+                    "bootstrap-step-receipts: reuse-pool step output preserved "
+                    f"{artifact_path} -> {preserved['preserved_path']}",
+                    file=sys.stderr,
+                )
+            continue
+        moved = move_to_recoverable_stale(
+            root, artifact_path, resume_step=number, head=args.source
+        )
+        if moved is not None:
+            print(
+                "bootstrap-step-receipts: orphan step output moved "
+                f"{artifact_path} -> {moved}",
+                file=sys.stderr,
+            )
+    wrapper_record = hash_regular(root, wrapper, MAX_CONTROL_BYTES)
+    pre_artifacts = [
+        optional_artifact_snapshot(root, path) for path in artifact_paths
+    ]
+    wrapper_sha = wrapper_record["sha256"]
+    runtime = runtime_fingerprint()
+    record = {
+        "schema": PREPARED_SCHEMA,
+        "status": "prepared",
+        "step_number": number,
+        "step_name": name,
+        "wrapper_path": wrapper,
+        "wrapper_sha256": wrapper_sha,
+        "producer_fingerprint": args.source,
+        "stock_epoch_sha256": args.epoch,
+        "detox_contract_sha256": args.detox,
+        "source_contract_sha256": args.source,
+        "predecessor_receipt_sha256": args.previous,
+        "artifact_paths": list(artifact_paths),
+        "reuse_pool_artifacts": list(reuse_pool),
+        "preserved_reuse_pool": preserved_reuse_pool,
+        "pre_artifacts": pre_artifacts,
+        "runtime_fingerprint": runtime,
+        "input_fingerprint": prepared_input_fingerprint(
+            number=number, name=name, epoch=args.epoch, detox=args.detox,
+            source=args.source, wrapper_sha256=wrapper_sha,
+            predecessor=args.previous, pre_artifacts=pre_artifacts,
+            runtime=runtime, reuse_pool=reuse_pool,
+        ),
+        "approval": False,
+        "publication_allowed": False,
+    }
+    print(install_immutable_receipt(receipt_directory, canonical_payload(record)))
+
+
+def command_write(args: argparse.Namespace) -> None:
+    root = canonical_root(args.root)
+    validate_factory_chain_lock(root)
+    progress, receipt_directory = control_paths(root)
+    number, name, wrapper, artifact_paths = validate_step_spec(
+        args.step, args.name, args.wrapper, args.artifacts
+    )
+    validate_sha256("stock epoch", args.epoch)
+    validate_sha256("detox contract", args.detox)
+    validate_sha256("source contract", args.source)
+    validate_sha256("prepared receipt", args.prepared)
+    require_predecessor(
+        progress, number=number, previous=args.previous, epoch=args.epoch,
+        detox=args.detox, source=args.source,
+    )
+    reuse_pool = reuse_pool_paths(artifact_paths, args.reuse_pool_artifact)
+    prepared = load_receipt(receipt_directory, args.prepared)
+    if (
+        prepared.get("schema") != PREPARED_SCHEMA
+        or prepared.get("status") != "prepared"
+        or prepared.get("step_number") != number
+        or prepared.get("step_name") != name
+        or prepared.get("wrapper_path") != wrapper
+        or prepared.get("artifact_paths") != list(artifact_paths)
+        or prepared.get("reuse_pool_artifacts") != list(reuse_pool)
+        or prepared.get("stock_epoch_sha256") != args.epoch
+        or prepared.get("detox_contract_sha256") != args.detox
+        or prepared.get("source_contract_sha256") != args.source
+        or prepared.get("producer_fingerprint") != args.source
+        or prepared.get("predecessor_receipt_sha256") != args.previous
+        or prepared.get("runtime_fingerprint") != runtime_fingerprint()
+        or prepared.get("approval") is not False
+        or prepared.get("publication_allowed") is not False
+    ):
+        raise ReceiptError("prepared step receipt no longer matches completion")
+    wrapper_record = hash_regular(root, wrapper, MAX_CONTROL_BYTES)
+    wrapper_sha = wrapper_record["sha256"]
+    if prepared.get("wrapper_sha256") != wrapper_sha:
+        raise ReceiptError("wrapper changed between prepare and completion")
+    pre_artifacts = prepared.get("pre_artifacts")
+    if (
+        not valid_pre_artifacts(artifact_paths, pre_artifacts)
+        or prepared.get("input_fingerprint") != prepared_input_fingerprint(
+            number=number, name=name, epoch=args.epoch, detox=args.detox,
+            source=args.source, wrapper_sha256=wrapper_sha,
+            predecessor=args.previous, pre_artifacts=pre_artifacts,
+            runtime=prepared["runtime_fingerprint"], reuse_pool=reuse_pool,
+        )
+    ):
+        raise ReceiptError("prepared input fingerprint is invalid")
+    artifacts = [
+        hash_regular(root, path, MAX_ARTIFACT_BYTES) for path in artifact_paths
+    ]
+    changed = any(
+        before.get("state") != "present"
+        or before.get("sha256") != after["sha256"]
+        or before.get("bytes") != after["bytes"]
+        for before, after in zip(pre_artifacts, artifacts, strict=True)
+    )
+    if not changed:
+        # Controle INTACTO: bytes inalterados em TODOS os outputs declarados
+        # continuam sem recibo. Um passo cujo corpus é o próprio pool de reuso
+        # (--reuse-pool-artifact) converge para o ponto fixo — reusa tudo e
+        # regrava bytes idênticos — e por isso declara TAMBÉM uma testemunha de
+        # produção por rodada; é ela que muda, provando que o produtor rodou.
+        # Inferir produção a partir de bytes idênticos abençoaria um produtor
+        # que não fez nada, e isso nunca é aceitável.
+        raise ReceiptError(
+            "producer left every declared output unchanged; no authenticated "
+            "content-addressed reuse receipt is available"
+        )
+    record = {
+        "schema": RECEIPT_SCHEMA,
+        "status": "completed",
+        "step_number": number,
+        "step_name": name,
+        "wrapper_path": wrapper,
+        "wrapper_sha256": wrapper_sha,
+        "producer_fingerprint": args.source,
+        "stock_epoch_sha256": args.epoch,
+        "detox_contract_sha256": args.detox,
+        "source_contract_sha256": args.source,
+        "predecessor_receipt_sha256": args.previous,
+        "prepared_receipt_sha256": args.prepared,
+        "pre_artifacts": pre_artifacts,
+        "runtime_fingerprint": prepared["runtime_fingerprint"],
+        "input_fingerprint": args.prepared,
+        "artifacts": artifacts,
+        "output_fingerprint": output_fingerprint(artifacts),
+        "reuse_pool_artifacts": list(reuse_pool),
+        "preserved_reuse_pool": prepared.get("preserved_reuse_pool", []),
+        "result": "changed",
+        "approval": False,
+        "publication_allowed": False,
+    }
+    digest = install_immutable_receipt(receipt_directory, canonical_payload(record))
+    write_progress(
+        progress, state="completed", epoch=args.epoch, detox=args.detox,
+        source=args.source, completed_step=number, head=digest,
+    )
+    print(digest)
+
+
+def read_specs(stream: Iterable[str]) -> dict[int, tuple[int, str, str, tuple[str, ...]]]:
+    result: dict[int, tuple[int, str, str, tuple[str, ...]]] = {}
+    for raw in stream:
+        line = raw.rstrip("\n")
+        fields = line.split("\t")
+        if len(fields) != 4:
+            raise ReceiptError("resume step spec must have four tab-separated fields")
+        try:
+            number = int(fields[0], 10)
+        except ValueError as error:
+            raise ReceiptError("resume step number is invalid") from error
+        spec = validate_step_spec(number, fields[1], fields[2], fields[3])
+        if number in result:
+            raise ReceiptError(f"duplicate resume step spec: {number}")
+        result[number] = spec
+    if not result or sorted(result) != list(range(1, max(result) + 1)):
+        raise ReceiptError("resume step specs are not contiguous from 1")
+    return result
+
+
+def validate_receipt_contract(
+    root: pathlib.Path, receipt_directory: pathlib.Path,
+    record: Mapping[str, Any], digest: str,
+    spec: tuple[int, str, str, tuple[str, ...]], *, epoch: str,
+    detox: str, source: str,
+) -> None:
+    number, name, wrapper, artifact_paths = spec
+    if (
+        record.get("schema") != RECEIPT_SCHEMA
+        or record.get("status") != "completed"
+        or record.get("step_number") != number
+        or record.get("step_name") != name
+        or record.get("wrapper_path") != wrapper
+        or record.get("stock_epoch_sha256") != epoch
+        or record.get("detox_contract_sha256") != detox
+        or record.get("source_contract_sha256") != source
+        or record.get("producer_fingerprint") != source
+        or record.get("approval") is not False
+        or record.get("publication_allowed") is not False
+    ):
+        raise ReceiptError(f"receipt contract mismatch at step {number}: {digest}")
+    predecessor = record.get("predecessor_receipt_sha256")
+    if number == 1:
+        if predecessor != "genesis":
+            raise ReceiptError("step 1 receipt lost genesis predecessor")
+    elif not isinstance(predecessor, str) or SHA256.fullmatch(predecessor) is None:
+        raise ReceiptError(f"step {number} has invalid predecessor")
+    wrapper_record = hash_regular(root, wrapper, MAX_CONTROL_BYTES)
+    wrapper_sha = wrapper_record["sha256"]
+    if record.get("wrapper_sha256") != wrapper_sha:
+        raise ReceiptError(f"wrapper changed after step {number}: {wrapper}")
+    prepared_digest = record.get("prepared_receipt_sha256")
+    if (
+        not isinstance(prepared_digest, str)
+        or SHA256.fullmatch(prepared_digest) is None
+        or record.get("input_fingerprint") != prepared_digest
+        or record.get("result") != "changed"
+    ):
+        raise ReceiptError(f"prepared receipt bind is invalid at step {number}")
+    prepared = load_receipt(receipt_directory, prepared_digest)
+    pre_artifacts = prepared.get("pre_artifacts")
+    runtime = prepared.get("runtime_fingerprint")
+    # A declaração de pool de reuso entra no input_fingerprint do prepared, e a
+    # re-autenticação do prefixo precisa recompor EXATAMENTE o mesmo valor. Ela
+    # vem do próprio recibo (não de argumento de linha de comando, que o resume
+    # nem recebe): load_receipt já provou que o payload casa com o digest do
+    # nome, então o campo é tão autenticado quanto o resto do recibo. Continua
+    # valendo o invariante de que o pool é subconjunto dos outputs declarados.
+    declared_reuse_pool = prepared.get("reuse_pool_artifacts")
+    if declared_reuse_pool is None:
+        declared_reuse_pool = []
+    if not isinstance(declared_reuse_pool, list):
+        raise ReceiptError(f"reuse-pool declaration is invalid at step {number}")
+    reuse_pool = reuse_pool_paths(artifact_paths, declared_reuse_pool)
+    if (
+        prepared.get("schema") != PREPARED_SCHEMA
+        or prepared.get("status") != "prepared"
+        or prepared.get("step_number") != number
+        or prepared.get("step_name") != name
+        or prepared.get("wrapper_path") != wrapper
+        or prepared.get("wrapper_sha256") != wrapper_sha
+        or prepared.get("artifact_paths") != list(artifact_paths)
+        or prepared.get("stock_epoch_sha256") != epoch
+        or prepared.get("detox_contract_sha256") != detox
+        or prepared.get("source_contract_sha256") != source
+        or prepared.get("producer_fingerprint") != source
+        or prepared.get("predecessor_receipt_sha256") != predecessor
+        or prepared.get("approval") is not False
+        or prepared.get("publication_allowed") is not False
+        or not valid_pre_artifacts(artifact_paths, pre_artifacts)
+        or not isinstance(runtime, str)
+        or SHA256.fullmatch(runtime) is None
+        or prepared.get("input_fingerprint") != prepared_input_fingerprint(
+            number=number, name=name, epoch=epoch, detox=detox,
+            source=source, wrapper_sha256=wrapper_sha,
+            predecessor=predecessor, pre_artifacts=pre_artifacts,
+            runtime=runtime, reuse_pool=reuse_pool,
+        )
+        or record.get("pre_artifacts") != pre_artifacts
+        or record.get("runtime_fingerprint") != runtime
+        or list(reuse_pool) != (record.get("reuse_pool_artifacts") or [])
+    ):
+        raise ReceiptError(f"prepared receipt mismatch at step {number}")
+    artifacts = record.get("artifacts")
+    if (
+        not isinstance(artifacts, list)
+        or [item.get("path") for item in artifacts if isinstance(item, dict)]
+        != list(artifact_paths)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != ARTIFACT_RECORD_FIELDS
+            or SHA256.fullmatch(str(item.get("sha256"))) is None
+            or any(
+                not isinstance(item.get(field), int) or item[field] < 0
+                for field in ARTIFACT_IDENTITY_FIELDS
+            )
+            for item in artifacts
+        )
+        or record.get("output_fingerprint") != output_fingerprint(artifacts)
+    ):
+        raise ReceiptError(f"output receipt shape mismatch at step {number}")
+    changed = any(
+        before.get("state") != "present"
+        or before.get("sha256") != after["sha256"]
+        or before.get("bytes") != after["bytes"]
+        for before, after in zip(pre_artifacts, artifacts, strict=True)
+    )
+    if not changed or record.get("result") != "changed":
+        raise ReceiptError(f"result classification mismatch at step {number}")
+
+
+def command_resume(args: argparse.Namespace) -> None:
+    root = canonical_root(args.root)
+    validate_factory_chain_lock(root)
+    progress_path, receipt_directory = control_paths(root)
+    validate_sha256("stock epoch", args.epoch)
+    validate_sha256("detox contract", args.detox)
+    validate_sha256("source contract", args.source)
+    specs = read_specs(sys.stdin)
+    if args.through < 1 or args.through not in specs:
+        raise ReceiptError("resume prefix is outside the declared step set")
+    progress = require_progress(
+        progress_path, epoch=args.epoch, detox=args.detox, source=args.source
+    )
+    completed = progress.get("completed_step")
+    head = progress.get("head_receipt_sha256")
+    if (
+        progress.get("state") != "completed"
+        or not isinstance(completed, int)
+        or completed < args.through
+        or not isinstance(head, str)
+        or SHA256.fullmatch(head) is None
+    ):
+        raise ReceiptError("no completed receipt chain covers the requested resume prefix")
+
+    if completed > max(specs):
+        raise ReceiptError("progress exceeds the declared bootstrap step set")
+    chain: dict[int, tuple[str, dict[str, Any]]] = {}
+    current_digest = head
+    for expected_number in range(completed, 0, -1):
+        record = load_receipt(receipt_directory, current_digest)
+        if record.get("step_number") != expected_number:
+            raise ReceiptError("receipt chain is not contiguous")
+        chain[expected_number] = (current_digest, record)
+        predecessor = record.get("predecessor_receipt_sha256")
+        if expected_number == 1:
+            if predecessor != "genesis":
+                raise ReceiptError("receipt chain does not terminate at genesis")
+        else:
+            if not isinstance(predecessor, str) or SHA256.fullmatch(predecessor) is None:
+                raise ReceiptError("receipt chain predecessor is invalid")
+            current_digest = predecessor
+
+    if sorted(chain) != list(range(1, completed + 1)):
+        raise ReceiptError("receipt chain is incomplete")
+    for number in range(1, completed + 1):
+        digest, record = chain[number]
+        validate_receipt_contract(
+            root, receipt_directory, record, digest, specs[number], epoch=args.epoch,
+            detox=args.detox, source=args.source,
+        )
+    selected = {number: chain[number] for number in range(1, args.through + 1)}
+    if sorted(selected) != list(range(1, args.through + 1)):
+        raise ReceiptError("receipt chain does not contain the full resume prefix")
+
+    # A completed suffix may supersede a path also written inside the selected
+    # prefix (the official-source aggregate currently has this shape). The live
+    # pathname then represents the suffix writer, so it cannot authenticate the
+    # older prefix state. Fail with the earliest producer that can recreate the
+    # intermediate bytes instead of recommending the same impossible resume in
+    # a loop.
+    writers_by_path: dict[str, list[int]] = {}
+    for number in range(1, completed + 1):
+        for artifact in chain[number][1]["artifacts"]:
+            writers_by_path.setdefault(artifact["path"], []).append(number)
+    superseded: list[tuple[str, int, int]] = []
+    for path, writers in writers_by_path.items():
+        prefix_writers = [number for number in writers if number <= args.through]
+        suffix_writers = [number for number in writers if number > args.through]
+        if prefix_writers and suffix_writers:
+            superseded.append((path, max(prefix_writers), max(suffix_writers)))
+    if superseded:
+        earliest_safe_from = min(
+            min(writers_by_path[path]) for path, _, _ in superseded
+        )
+        details = ",".join(
+            f"{path}:prefix_writer={prefix}:live_writer={suffix}"
+            for path, prefix, suffix in sorted(superseded)
+        )
+        raise ReceiptError(
+            "resume prefix contains outputs superseded by its completed suffix; "
+            f"earliest_safe_from={earliest_safe_from} details={details}"
+        )
+
+    latest_writer: dict[str, int] = {}
+    for number in range(1, args.through + 1):
+        for artifact in selected[number][1]["artifacts"]:
+            latest_writer[artifact["path"]] = number
+    for path, number in latest_writer.items():
+        recorded = next(
+            item for item in selected[number][1]["artifacts"]
+            if item["path"] == path
+        )
+        if not artifact_identity_matches(root, recorded, MAX_ARTIFACT_BYTES):
+            raise ReceiptError(
+                f"resume output is stale after step {number}: {path}"
+            )
+
+    prefix_paths = set(latest_writer)
+    stale_suffix_paths = sorted({
+        artifact["path"]
+        for number in range(args.through + 1, completed + 1)
+        for artifact in chain[number][1]["artifacts"]
+        if artifact["path"] not in prefix_paths
+    })
+    for path in stale_suffix_paths:
+        moved = move_to_recoverable_stale(
+            root, path, resume_step=args.through + 1, head=head
+        )
+        if moved is not None:
+            print(
+                f"bootstrap-step-receipts: stale downstream moved "
+                f"{path} -> {moved}",
+                file=sys.stderr,
+            )
+
+    target_digest = selected[args.through][0]
+    write_progress(
+        progress_path, state="completed", epoch=args.epoch,
+        detox=args.detox, source=args.source,
+        completed_step=args.through, head=target_digest,
+    )
+    print(target_digest)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser()
+    subparsers = result.add_subparsers(dest="command", required=True)
+    for command in ("reset", "prepare", "write", "resume"):
+        child = subparsers.add_parser(command)
+        child.add_argument("--root", required=True)
+        child.add_argument("--epoch", required=True)
+        child.add_argument("--detox", required=True)
+        child.add_argument("--source", required=True)
+    subparsers.choices["reset"].add_argument(
+        "--invalidate-declared-outputs", action="store_true"
+    )
+    subparsers.choices["reset"].add_argument(
+        "--optional-output", action="append", default=[]
+    )
+    for command in ("prepare", "write"):
+        step = subparsers.choices[command]
+        step.add_argument("--step", type=int, required=True)
+        step.add_argument("--name", required=True)
+        step.add_argument("--wrapper", required=True)
+        step.add_argument("--artifacts", required=True)
+        step.add_argument("--previous", required=True)
+        # Declaração explícita, por passo, de que um output declarado também é o
+        # pool de reuso idempotente do próprio produtor. prepare preserva o
+        # órfão por cópia (em vez de mover) e write aceita bytes reproduzidos
+        # como progresso; nenhum outro passo muda de comportamento.
+        step.add_argument(
+            "--reuse-pool-artifact", action="append", default=[]
+        )
+    subparsers.choices["write"].add_argument("--prepared", required=True)
+    resume = subparsers.choices["resume"]
+    resume.add_argument("--through", type=int, required=True)
+    return result
+
+
+def main(argv: list[str]) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if args.command == "reset":
+            command_reset(args)
+        elif args.command == "prepare":
+            command_prepare(args)
+        elif args.command == "write":
+            command_write(args)
+        else:
+            command_resume(args)
+    except (ReceiptError, OSError, ValueError) as error:
+        print(f"bootstrap-step-receipts: {error}", file=sys.stderr)
+        return 75
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

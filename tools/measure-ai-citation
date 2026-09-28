@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""measure-ai-citation — o sinal de citação por IA que a ORIGEM consegue observar.
+
+★ O NOME PROMETE MAIS DO QUE O DADO ENTREGA, E ISSO ESTÁ NO SCHEMA.
+
+Nenhum número aqui é contagem de citação. Citação acontece dentro da resposta do
+assistente, num lugar onde o servidor não tem testemunha. O que este arquivo mede
+é o rastro que sobra no log do nginx quando um assistente CONSIDERA a página para
+montar uma resposta — por isso todo registro carrega, literalmente,
+`is_citation_count: false` e `interpretation: "considered_for_answer"`, e todo
+número é LIMITE INFERIOR. Ler estes campos como "fomos citados N vezes" é o
+mesmo defeito que inflar métrica: o contrato anti-fraude não distingue exagerar
+para cima por má-fé de exagerar por leitura errada de um campo mal nomeado.
+
+★ POR QUE O LOG DO NGINX, E NÃO A BORDA
+
+No plano Free da Cloudflare o GraphQL nega `clientRequestReferer` (mesma família
+de negação de `botScore`/`verifiedBotCategory`, `code: authz`). Sem referer não
+existe clique de volta mensurável na borda — a camada (c) abaixo SÓ é observável
+aqui, no log próprio. É a razão de esta ferramenta existir separada da telemetria
+de borda, e não um capricho de duplicação.
+
+★ TRÊS CAMADAS QUE NÃO SÃO A MESMA COISA (e somá-las é o erro que se evita aqui)
+
+  (a) crawl        — buscador varrendo o acervo (Googlebot, Bingbot,
+                     OAI-SearchBot…). Diz que a página está no índice. NÃO diz
+                     que alguém a leu numa resposta.
+  (b) fetch ao vivo — ChatGPT-User, Perplexity-User, Claude-User, DuckAssistBot,
+                     MistralAI-User, meta-externalfetcher. Cada hit é uma
+                     resposta sendo montada NAQUELE instante com esta página na
+                     mão. É o sinal mais próximo de citação que a origem alcança.
+  (c) clique de volta — o leitor humano que veio da resposta do assistente,
+                     identificado por `Referer` de chatgpt.com / perplexity.ai /
+                     claude.ai / copilot.microsoft.com / gemini.google.com, ou
+                     por `utm_source=chatgpt.com` na URL.
+
+★ DUAS ARMADILHAS DE CATEGORIZAÇÃO, MEDIDAS, QUE FARIAM ESTA FERRAMENTA MENTIR
+
+  1. A Cloudflare classifica OAI-SearchBot como "Search Engine Crawler", e não
+     como bot de IA. Quem agregasse pela CATEGORIA da borda deixaria de fora
+     justamente o crawler de citação que mais nos visita.
+  2. A categoria "AI Crawler" da Cloudflare é quase toda Amazonbot — 3.788 de
+     3.789 requisições em 24 h, contra 1 do GPTBot. Isso é TREINAMENTO de modelo,
+     não interesse de citação. Somar a categoria como "IA se interessou pelo
+     portal" transformaria o rastreio de dataset da Amazon em sinal de negócio.
+
+Daí a regra estrutural: agrega-se por USER-AGENT, com a tabela explícita de
+`CAMADA` abaixo, e treinamento entra numa camada PRÓPRIA, marcada
+`is_citation_interest: false`. Nunca se soma "AI Crawler".
+
+★ CONCILIAÇÃO COM A BORDA
+
+Camadas (a) e (b) são comparáveis com a telemetria da Cloudflare sob uma regra
+que vale sempre: ORIGEM ≤ BORDA. HIT na borda não toca a origem — medido, o
+ShapBot teve 1.267 de 1.597 requisições servidas em HIT. O quociente entre as
+duas séries é fan-out de cache, não erro de medição, e tratá-lo como erro levaria
+a "consertar" uma ferramenta correta. A camada (c) é IMPOSSÍVEL de conciliar: a
+borda no plano Free nega o referer. O registro diz isso em vez de omitir.
+
+★ LEITURA POR PADRÃO, ESCRITA SÓ COM `--gravar`
+
+O nome começa com `measure-` por ordem do dono, mas o papel de escrita é o de um
+`generate-*`: sem `--gravar` esta ferramenta NÃO toca disco nenhum — lê a janela
+inteira do log e imprime. Com `--gravar` ela processa apenas o que veio depois do
+cursor e ACRESCENTA incrementos à série. A convenção `tools/check-*` é read-only
+e `tools/generate-*` escreve; um `measure-` que escrevesse por padrão quebraria a
+expectativa dos dois lados, então a escrita é explícita.
+
+★ O CURSOR É SOMÁVEL — REGRAVAR O TOTAL DO DIA SUBCONTARIA
+
+A janela do log ENCOLHE (logrotate diário, `rotate 30`). Se cada execução
+regravasse o total do dia e o consumidor pegasse "a última linha da chave", uma
+execução posterior — vendo menos log — passaria a reportar MENOS requisições para
+a mesma data. A série mentiria para baixo, na direção que faz concluir "os bots
+pararam de vir", que é a conclusão mais cara possível para este projeto. Por
+isso: linhas são INCREMENTOS (`summable: true`) e quem consome SOMA por
+(date, layer, key). Mesmo racional de tools/generate-bot-traffic-origin:70-85.
+
+★ REUSO, NÃO DUPLICAÇÃO
+
+O parser da linha (`LINE`), `parse_request`, `origem_do_referer`,
+`marcado_como_aquecimento` e `identidade_de` são importados de
+tools/check-access-log-bots, que é o DONO do formato — mesmo padrão de
+tools/report-access-traffic. A identidade de bot vem de tools/botagents (fonte
+única de toda a telemetria). Uma segunda cópia de qualquer uma dessas peças
+divergiria no primeiro reload do nginx, e a divergência apareceria como bot
+"sumindo" de uma série só.
+
+Uso:
+    tools/measure-ai-citation                      # leitura, janela inteira
+    tools/measure-ai-citation --json
+    tools/measure-ai-citation --dia 2026-08-12
+    tools/measure-ai-citation --gravar             # incremental + append na série
+
+Códigos de saída:
+    0  medição emitida (mesmo com zero sinal — ausência de sinal é resultado)
+    1  nenhum log legível
+    2  erro de uso / dependência do repo ausente
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+SERIE = RAIZ / "data" / "ops" / "ai_citation_signal_daily.jsonl"
+CURSOR = RAIZ / "data" / "ops" / "ai_citation_signal_cursor.json"
+SCHEMA = "ai_citation_signal_daily_v1"
+
+# Caminho canônico desde a FASE 2 (2026-08-11): subdiretório próprio, fora do
+# glob `/var/log/nginx/*.log` do logrotate do projeto VIZINHO (/opt/divorcio),
+# que rotacionava de hora em hora e deixava ~13h de histórico. `access.log*`
+# cobre o arquivo vivo e toda rotação, plana ou `.gz`.
+LOG_GLOB_CANONICO = "/var/log/nginx/wikijuridica/access.log*"
+
+# Rotações anteriores ao corte de caminho. São lidas para não jogar fora
+# histórico, e vêm de DOIS lugares que guardam o MESMO conteúdo: a cópia movida
+# para o subdiretório `legacy/` e os arquivos que ficaram no caminho plano
+# antigo. Medido em 2026-08-12: `wikijuridica.access.log.1` e
+# `legacy/wikijuridica.access.log` têm inodes DIFERENTES e md5 IDÊNTICO
+# (696a7d6e…) — são cópias, não hardlinks. Ler os dois globs sem dedupe
+# DOBRARIA a contagem de todo o período pré-migração, então `ler_logs` deduplica
+# por hash de conteúdo (ver lá). Glob que não casa nada não avisa erro: quando a
+# retenção antiga expirar, estes padrões se autolimpam.
+LOG_GLOBS_LEGADO = (
+    "/var/log/nginx/wikijuridica/legacy/wikijuridica.access.log*",
+    "/var/log/nginx/wikijuridica.access.log*",
+)
+
+MES = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
+       "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
+
+# ★ TABELA EXPLÍCITA DE AGENTE → CAMADA.
+#
+# Explícita, e não derivada de uma categoria de terceiro, por causa das duas
+# armadilhas do cabeçalho: a categoria da Cloudflare põe OAI-SearchBot em
+# "Search Engine Crawler" e enche "AI Crawler" de Amazonbot. Quem agrega por
+# categoria alheia herda a taxonomia alheia — e a taxonomia da borda não foi
+# desenhada para responder "quem está montando resposta com a minha página".
+#
+# As chaves são as de tools/botagents.AGENTES (identidade exata do UA). A função
+# declarada lá (`search`/`user`/`training`) e a camada daqui têm o mesmo
+# desenho, e é de propósito: `checar_cobertura_da_tabela` reprova em silêncio
+# nenhum caso — se botagents ganhar um agente de busca ou de fetch que não esteja
+# aqui, o campo `agentes_sem_camada` da saída denuncia, em vez de o agente
+# desaparecer da medição.
+CAMADA = {
+    # (a) CRAWL — varredura do acervo por buscador. Prova indexação, não citação.
+    "googlebot": "crawl",
+    "googlebot-image": "crawl",
+    "googlebot-news": "crawl",
+    "googlebot-video": "crawl",
+    "bingbot": "crawl",
+    "applebot": "crawl",
+    "duckduckbot": "crawl",
+    "yandexbot": "crawl",
+    # Os quatro abaixo são os crawlers de CITAÇÃO: alimentam o índice de onde o
+    # assistente tira fonte. OAI-SearchBot está aqui, e não numa gaveta de "AI",
+    # justamente porque a borda o classifica como buscador comum.
+    "oai-searchbot": "crawl",
+    "claude-searchbot": "crawl",
+    "perplexitybot": "crawl",
+    "mistralai-index": "crawl",
+    "amzn-searchbot": "crawl",
+
+    # (b) FETCH AO VIVO — o assistente busca a página no instante da pergunta.
+    # Cada linha é uma resposta sendo montada com este conteúdo em mãos.
+    "chatgpt-user": "fetch",
+    "claude-user": "fetch",
+    "perplexity-user": "fetch",
+    "duckassistbot": "fetch",
+    "mistralai-user": "fetch",
+    "meta-externalfetcher": "fetch",
+    "amzn-user": "fetch",
+
+    # (t) TREINAMENTO — contado, nomeado e FORA de qualquer soma de interesse de
+    # citação. É a armadilha nº 2 fechada por construção: Amazonbot e GPTBot
+    # aparecem no relatório, mas num balde que diz `is_citation_interest: false`.
+    # Rastreio para treinar modelo não põe a página em resposta nenhuma hoje, e
+    # tratá-lo como sinal de negócio é o erro que a categoria "AI Crawler" da
+    # Cloudflare induz.
+    "gptbot": "treinamento",
+    "claudebot": "treinamento",
+    "ccbot": "treinamento",
+    "bytespider": "treinamento",
+    "amazonbot": "treinamento",
+    "meta-externalagent": "treinamento",
+    "mistralai-training": "treinamento",
+    "google-extended": "treinamento",
+    "applebot-extended": "treinamento",
+}
+
+# Ordem de apresentação: o que está mais perto de citação primeiro.
+ORDEM_CAMADA = ("fetch", "clique_de_volta", "crawl", "treinamento")
+
+# ★ ASSISTENTES QUE MANDAM LEITOR DE VOLTA (camada c).
+#
+# Casamento por HOST do referer — exato ou como sufixo de rótulo (`.chatgpt.com`
+# casa, `malchatgpt.com` não). O valor é a chave do assistente na série.
+#
+# duckduckgo.com está DELIBERADAMENTE FORA: o DuckAssist responde dentro da
+# própria página de resultados, então um clique vindo dali chega com o mesmo
+# referer de uma busca comum do DuckDuckGo. Incluí-lo contaria busca tradicional
+# como clique de assistente — inflação de métrica pela porta dos fundos. O sinal
+# do DuckDuckGo nesta ferramenta é o DuckAssistBot na camada (b), que é
+# inequívoco. Pelo mesmo motivo bing.com está fora (o Copilot tem host próprio).
+ASSISTENTES_CLIQUE = {
+    "chatgpt.com": "chatgpt",
+    "chat.openai.com": "chatgpt",
+    "perplexity.ai": "perplexity",
+    "claude.ai": "claude",
+    "copilot.microsoft.com": "copilot",
+    "gemini.google.com": "gemini",
+    "chat.mistral.ai": "mistral",
+    "grok.com": "grok",
+    "you.com": "you",
+}
+
+# Valores de `utm_source` que os assistentes carimbam no link que entregam ao
+# leitor. É a única evidência de procedência que sobrevive quando o navegador
+# suprime o `Referer` — e sobrevive porque viaja na própria URL, dentro de
+# `$request`, que o log grava desde a primeira geração do formato.
+UTM_ASSISTENTE = {
+    "chatgpt.com": "chatgpt",
+    "openai": "chatgpt",
+    "perplexity": "perplexity",
+    "perplexity.ai": "perplexity",
+    "claude.ai": "claude",
+    "copilot": "copilot",
+    "gemini": "gemini",
+}
+
+# O que é IMPOSSÍVEL medir daqui. Vai em TODO registro gravado, e não só neste
+# cabeçalho, porque linha de JSONL é lida isolada: quem der `grep` numa data e
+# encontrar `requests: 9` precisa ver, na mesma linha, do que aquele 9 não é
+# prova. Documentação que mora longe do dado não protege ninguém.
+NAO_MENSURAVEL = [
+    "citacao_sem_clique: o assistente cita a fonte e o leitor nao clica. Com "
+    "buscas zero-clique na casa dos ~68%, e provavelmente o MAIOR componente — e "
+    "nao deixa rastro nenhum na origem.",
+    "resposta_por_memoria_do_modelo: o modelo responde sobre o conteudo sem "
+    "buscar a pagina. Nenhuma requisicao chega, e a citacao pode existir.",
+    "fetch_descartado: a camada (b) conta a pagina BUSCADA, nao a pagina usada. "
+    "O modelo pode ter lido e descartado; a origem ve os dois casos iguais.",
+    "clique_com_referer_suprimido: navegador, extensao ou politica de referrer "
+    "que apaga o campo transforma clique de assistente em acesso direto.",
+    "conversao: se o leitor virou contato, cliente ou contrato. O log termina no "
+    "byte servido; o resto acontece fora do servidor.",
+]
+
+# ★ A EXCLUSÃO DE TRÁFEGO PRÓPRIO PASSA A VIAJAR NA LINHA (2026-08-26).
+#
+# A exclusão sempre existiu no laço de medição — o que faltava era ela viajar
+# JUNTO DO NÚMERO. JSONL é lido isolado, e quem abrisse só esta série não tinha
+# como saber que o `utm_source=chatgpt.com` do auditor interno ficou de fora.
+#
+# MEDIDO em 912.269 linhas de log (11 a 26/08): os DOIS únicos
+# `utm_source=chatgpt.com` da janela inteira eram INTERNOS — um do
+# `wiki-auditor/1.0` com `warm=true`, outro de `curl/7.88.1` vindo de
+# 127.0.0.1 — e os dois foram excluídos aqui. Um contador ingênuo
+# (`grep utm_source=chatgpt.com`) teria marcado 100% de tráfego próprio como
+# citação por IA. É a razão de estas regras serem contrato, e não detalhe de
+# implementação: 754.147 das 912.269 linhas saíram por elas.
+EXCLUSAO_DE_TRAFEGO_PROPRIO = [
+    "sonda_de_auditoria_bot_sim: cabecalho de simulacao marcado pelo nginx",
+    "aquecimento_marcado_pelo_nginx: campo warm no log de acesso",
+    "ferramenta_interna_por_convencao_de_ua: User-Agent com prefixo wikijuridica-",
+    "ip_nao_publico: loopback, rede privada ou faixa de documentacao",
+    "referer_interno: navegacao dentro do proprio dominio",
+]
+
+# A regra de conciliação, gravada em cada linha para que a comparação com a borda
+# não precise de contexto externo para ser feita certo.
+CONCILIACAO_BORDA = {
+    "crawl": "origem <= borda SEMPRE: HIT na borda nao toca a origem. O quociente "
+             "entre as duas series e fan-out de cache, nao erro de medicao.",
+    "fetch": "origem <= borda SEMPRE: HIT na borda nao toca a origem. O quociente "
+             "entre as duas series e fan-out de cache, nao erro de medicao.",
+    "treinamento": "origem <= borda SEMPRE, mesmo racional de cache.",
+    "clique_de_volta": "IMPOSSIVEL conciliar: o plano Free da Cloudflare nega "
+                       "clientRequestReferer no GraphQL, entao a borda nao tem "
+                       "esta camada. Divergencia aqui nao e bug de nenhum lado.",
+}
+
+# Leitura correta de cada camada, para além do `interpretation` global.
+LEITURA_DA_CAMADA = {
+    "crawl": "indexado_nao_necessariamente_citado",
+    "fetch": "considered_for_answer",
+    "clique_de_volta": "leitor_humano_chegou_de_assistente",
+    "treinamento": "coleta_para_treino_sem_relacao_com_citacao",
+}
+
+
+def carregar_parser_do_check():
+    """Importa o parser de tools/check-access-log-bots (o dono do formato).
+
+    O arquivo não tem extensão .py, então o import é por caminho — mesmo padrão
+    de tools/report-access-traffic:67. O script tem guarda
+    `if __name__ == "__main__"`, então importá-lo não dispara o check.
+
+    Importar em vez de copiar não é preferência de estilo: a `LINE` de lá casa as
+    CINCO gerações do log_format e termina com um sufixo que absorve campos
+    futuros. Uma cópia aqui ficaria ancorada na geração de hoje e, no próximo
+    reload do nginx, passaria a casar ZERO linha — que é exatamente o estrago já
+    registrado em check-access-log-bots:98-102, quando o parser emudeceu e o
+    silêncio se pareceu com aprovação.
+    """
+    caminho = RAIZ / "tools" / "check-access-log-bots"
+    if not caminho.exists():
+        print(f"measure-ai-citation: dependência ausente: {caminho} — esta medição "
+              f"reusa o parser de lá, não duplica o formato do log.", file=sys.stderr)
+        raise SystemExit(2)
+    spec = importlib.util.spec_from_loader(
+        "wj_check_access_log_bots",
+        importlib.machinery.SourceFileLoader("wj_check_access_log_bots", str(caminho)),
+    )
+    if spec is None or spec.loader is None:
+        print(f"measure-ai-citation: não foi possível carregar {caminho}", file=sys.stderr)
+        raise SystemExit(2)
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+def ordem_cronologica(caminho: str) -> tuple[int, str]:
+    """Chave de ordenação que põe a rotação MAIS ANTIGA primeiro.
+
+    `sorted()` puro sobre o glob devolve a ordem errada e de um jeito que engana:
+    `access.log` (o vivo, mais NOVO) vem primeiro, e `access.log.10.gz` vem antes
+    de `access.log.2.gz`, porque a comparação é textual. Processar o log fora de
+    ordem cronológica não afeta soma nem min/max — mas afeta o desempate do
+    cursor dentro do mesmo segundo (ver `medir`), que depende de a sequência de
+    linhas ser a mesma em toda execução. O número da rotação é o que ordena:
+    quanto MAIOR o número, mais velho o arquivo.
+    """
+    nome = os.path.basename(caminho)
+    resto = nome.split("access.log", 1)[-1].removesuffix(".gz").lstrip(".")
+    return (-int(resto) if resto.isdigit() else 0, caminho)
+
+
+def descobrir_logs(glob_canonico: str, incluir_legado: bool) -> list[str]:
+    """Todos os arquivos de log disponíveis, do mais antigo para o mais novo.
+
+    O legado entra por padrão porque descartá-lo jogaria fora o histórico
+    anterior à migração de caminho — mas ele só é seguro de ler junto graças ao
+    dedupe por conteúdo em `ler_logs`, já que as duas cópias do período antigo
+    coexistem no disco.
+    """
+    import glob as _glob
+
+    # O legado vem ANTES: é anterior à migração de caminho, e a sequência tem de
+    # ser cronológica de ponta a ponta para o desempate do cursor valer.
+    caminhos: list[str] = []
+    if incluir_legado:
+        for padrao in LOG_GLOBS_LEGADO:
+            for caminho in sorted(_glob.glob(padrao),
+                                  key=lambda p: ordem_cronologica(p.replace(
+                                      "wikijuridica.access.log", "access.log"))):
+                if caminho not in caminhos:
+                    caminhos.append(caminho)
+    for caminho in sorted(_glob.glob(glob_canonico), key=ordem_cronologica):
+        if caminho not in caminhos:
+            caminhos.append(caminho)
+    return caminhos
+
+
+def ler_logs(caminhos: list[str]) -> tuple[list[str], list[dict], list[tuple[str, str]]]:
+    """Lê os arquivos, deduplicando por CONTEÚDO, e devolve (linhas, lidos, falhas).
+
+    O dedupe é por SHA-256 do conteúdo descomprimido, e não por inode: medido em
+    2026-08-12, `/var/log/nginx/wikijuridica.access.log.1` e
+    `legacy/wikijuridica.access.log` são arquivos DISTINTOS (inodes 659955 e
+    786445) com md5 idêntico. Dedupe por inode deixaria passar a duplicata e
+    dobraria em silêncio toda a contagem do período pré-migração — o tipo de erro
+    que sobe o número e por isso ninguém desconfia.
+
+    O usuário `rafael` pertence ao grupo `adm`, que tem leitura nos logs (0640
+    root/www-data:adm), então a leitura é direta, sem `sudo`. Falta de permissão
+    é reportada por arquivo, nunca engolida.
+    """
+    linhas: list[str] = []
+    lidos: list[dict] = []
+    falhas: list[tuple[str, str]] = []
+    vistos: dict[str, str] = {}
+
+    for caminho in caminhos:
+        try:
+            with open(caminho, "rb") as handle:
+                bruto = handle.read()
+        except PermissionError:
+            falhas.append((caminho, "sem permissão de leitura"))
+            continue
+        except OSError as erro:
+            falhas.append((caminho, str(erro)[:80]))
+            continue
+        if caminho.endswith(".gz"):
+            try:
+                bruto = gzip.decompress(bruto)
+            except OSError as erro:
+                falhas.append((caminho, "gzip inválido: %s" % str(erro)[:60]))
+                continue
+        if not bruto:
+            lidos.append({"path": caminho, "lines": 0, "duplicate_of": None})
+            continue
+        digest = hashlib.sha256(bruto).hexdigest()
+        if digest in vistos:
+            lidos.append({"path": caminho, "lines": 0, "duplicate_of": vistos[digest]})
+            continue
+        vistos[digest] = caminho
+        conteudo = bruto.decode("utf-8", "replace").splitlines()
+        linhas.extend(conteudo)
+        lidos.append({"path": caminho, "lines": len(conteudo), "duplicate_of": None})
+    return linhas, lidos, falhas
+
+
+def instante_de(bruto_tempo: str) -> tuple[str, str]:
+    """Converte `11/Aug/2026:21:54:45 -0300` em (data ISO, instante ordenável).
+
+    O log é hora local do servidor e a comparação é sempre entre linhas do mesmo
+    log — precisa de ORDEM, não de fuso. Devolve ("", "") quando o campo não tem
+    a forma esperada, e a linha é contada como malformada em vez de entrar na
+    série com data errada.
+    """
+    cabeca = bruto_tempo.split()[0] if bruto_tempo else ""
+    partes = cabeca.split(":", 1)
+    if len(partes) != 2:
+        return "", ""
+    dia_bruto, relogio = partes
+    campos = dia_bruto.split("/")
+    if len(campos) != 3 or campos[1] not in MES:
+        return "", ""
+    data = "%s-%s-%s" % (campos[2], MES[campos[1]], campos[0])
+    return data, data + "T" + relogio
+
+
+def consulta_da_request(request: str) -> dict[str, list[str]]:
+    """Extrai a query string do `$request` do log.
+
+    `parse_request` do check corta tudo depois de `?` — o que é certo para
+    agrupar rota, e cego para esta medição: o `utm_source=chatgpt.com` que o
+    assistente carimba no link mora exatamente ali. É a ÚNICA evidência de
+    procedência que sobrevive quando o navegador suprime o `Referer`, e ela já
+    existe no log desde a primeira geração do formato — descartá-la seria perder
+    o sinal por acidente de parser.
+    """
+    partes = request.split()
+    alvo = partes[1] if len(partes) >= 2 else request
+    if "?" not in alvo:
+        return {}
+    try:
+        return urllib.parse.parse_qs(alvo.split("?", 1)[1], keep_blank_values=False)
+    except ValueError:
+        return {}
+
+
+def assistente_do_referer(referer: str | None) -> str | None:
+    """Qual assistente mandou este leitor, ou None.
+
+    Casa por host — exato ou sufixo de rótulo — para que `www.perplexity.ai`
+    conte e `perplexity.ai.exemplo.com` não. Referer None (log anterior à geração
+    que grava o campo) devolve None e é contado à parte pelo chamador: "o campo
+    não existia" não pode virar "ninguém clicou".
+    """
+    if not referer:
+        return None
+    limpo = referer.strip()
+    if limpo in ("", "-"):
+        return None
+    try:
+        host = urllib.parse.urlsplit(limpo).netloc.split("@")[-1].lower()
+    except ValueError:
+        return None
+    host = host.split(":")[0]
+    if not host:
+        return None
+    for dominio, chave in ASSISTENTES_CLIQUE.items():
+        if host == dominio or host.endswith("." + dominio):
+            return chave
+    return None
+
+
+def assistente_do_utm(consulta: dict[str, list[str]]) -> str | None:
+    """Qual assistente carimbou `utm_source` nesta URL, ou None."""
+    for valor in consulta.get("utm_source", []):
+        chave = UTM_ASSISTENTE.get(valor.strip().lower())
+        if chave:
+            return chave
+    return None
+
+
+def checar_cobertura_da_tabela() -> list[str]:
+    """Agentes que botagents conhece como busca/fetch e que `CAMADA` não cobre.
+
+    Existe para que a tabela explícita não se torne uma tabela DESATUALIZADA. O
+    dia em que um operador lançar um agente de citação novo, ele entra em
+    botagents (fonte única) e, se ninguém o classificar aqui, some da medição sem
+    aviso — que é a forma mais cara de erro nesta casa, porque parece silêncio do
+    bot e não silêncio da ferramenta.
+    """
+    return sorted(
+        chave for chave, funcao in botagents.FUNCAO.items()
+        if funcao in ("search", "user") and chave not in CAMADA
+    )
+
+
+def medir(linhas, parser, cursor_anterior: str, vistas_no_segundo: int = 0) -> dict:
+    """Percorre o log e agrega por (data, camada, chave).
+
+    A ordem das exclusões abaixo é significativa: cada linha excluída é contada
+    no PRIMEIRO balde que dispara, nunca em dois. Assim a soma dos baldes de
+    exclusão mais as linhas contadas fecha com o total reconhecido, e qualquer
+    número desta saída pode ser reconferido por aritmética simples — exigência do
+    contrato do dado real, não zelo decorativo.
+    """
+    faixas = botagents.ler_faixas(str(RAIZ))
+
+    total = 0
+    malformadas = 0
+    sem_data = 0
+    ignoradas_pelo_cursor = 0
+    # Cada exclusão é NOMEADA e CONTADA. Número tirado em silêncio é a mesma
+    # classe de defeito que número inflado: nos dois casos o leitor não tem como
+    # refazer a conta.
+    exclusoes: collections.Counter = collections.Counter()
+    exclusoes_por_agente: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    # `sem_campo` (log anterior à geração que grava referer) NÃO é o mesmo que
+    # `ausente` (cliente veio sem referer). Somar os dois faria a camada (c)
+    # afirmar "ninguém chega por link de assistente" quando o que houve foi
+    # mudança de formato de log.
+    referer_por_situacao: collections.Counter = collections.Counter()
+    agentes_fora_da_tabela: collections.Counter = collections.Counter()
+
+    acumulado: dict[tuple[str, str, str], dict] = {}
+    janela_min = ""
+    janela_max = ""
+    cursor_novo = cursor_anterior
+    # ★ O DESEMPATE DENTRO DO SEGUNDO — sem ele o cursor PERDE linha.
+    #
+    # O log tem resolução de SEGUNDO e o nginx escreve várias linhas no mesmo
+    # segundo. Um cursor que pulasse tudo com `instante <= last_seen` descartaria
+    # para sempre as linhas que chegassem no MESMO segundo da última já contada —
+    # subcontagem silenciosa, e justamente na direção que faz concluir "o bot
+    # parou de vir", que é a leitura mais cara que esta série pode induzir.
+    #
+    # A correção: o cursor guarda o instante E quantas linhas daquele segundo já
+    # foram contadas. Aqui, o segundo de fronteira é reprocessado e só as N
+    # primeiras são puladas. Funciona porque o log é append-only (byte já escrito
+    # não se move) e os arquivos são lidos em ordem cronológica estável — ver
+    # `ordem_cronologica`. `linhas_no_segundo_final` é recontado a cada execução
+    # para o cursor seguinte.
+    puladas_no_segundo = 0
+    linhas_no_segundo_final = 0
+
+    for bruta in linhas:
+        bruta = bruta.rstrip("\n")
+        if not bruta.strip():
+            continue
+        total += 1
+        casou = parser.LINE.match(bruta)
+        if not casou:
+            malformadas += 1
+            continue
+        campos = casou.groupdict()
+
+        data, instante = instante_de(campos["time"])
+        if not data:
+            sem_data += 1
+            continue
+        if not janela_min or instante < janela_min:
+            janela_min = instante
+        if not janela_max or instante > janela_max:
+            janela_max = instante
+        if instante > cursor_novo:
+            cursor_novo = instante
+            linhas_no_segundo_final = 1
+        elif instante == cursor_novo:
+            linhas_no_segundo_final += 1
+        if cursor_anterior:
+            if instante < cursor_anterior:
+                ignoradas_pelo_cursor += 1
+                continue
+            if instante == cursor_anterior:
+                # Segundo de fronteira: pula só o que já foi contado antes, e
+                # deixa passar o que foi escrito depois no mesmo segundo.
+                if puladas_no_segundo < vistas_no_segundo:
+                    puladas_no_segundo += 1
+                    ignoradas_pelo_cursor += 1
+                    continue
+
+        user_agent = campos["agent"] or ""
+        ip = campos["addr"]
+        referer = campos["ref"]
+        situacao_referer = parser.origem_do_referer(referer, campos["host"])
+        referer_por_situacao[situacao_referer] += 1
+
+        e_sonda = (campos["bot_sim"] or "").strip() not in ("", "-", "0")
+        e_aquecimento = parser.marcado_como_aquecimento(campos["warm"])
+        # Convenção de prefixo de User-Agent: era o ÚNICO discriminador de
+        # aquecimento antes de o log_format gravar `warm`, e continua sendo o
+        # único para as linhas já escritas. Fica contada à parte para que a
+        # diferença entre prova (marca do nginx) e convenção (string do UA)
+        # permaneça visível, em vez de virar um total indistinto.
+        convencao_interna = user_agent.lower().startswith("wikijuridica-")
+
+        agente = botagents.agente_de(user_agent)
+
+        if e_sonda:
+            exclusoes["sonda_de_auditoria_bot_sim"] += 1
+            if agente:
+                exclusoes_por_agente["sonda_de_auditoria_bot_sim"][agente] += 1
+            continue
+        if e_aquecimento:
+            exclusoes["aquecimento_marcado_pelo_nginx"] += 1
+            continue
+        if convencao_interna:
+            exclusoes["ferramenta_interna_por_convencao_de_ua"] += 1
+            continue
+        if botagents.ip_nao_publico(ip):
+            # Vem depois da marca e antes de qualquer contagem: o endereço não se
+            # escolhe, a string do User-Agent sim. Foi assim que
+            # `WikiJuridicaInfraAudit/1.0`, vindo de 203.0.113.x (faixa de
+            # documentação), contava como visitante em todo ranking.
+            exclusoes["ip_nao_publico"] += 1
+            if agente:
+                exclusoes_por_agente["ip_nao_publico"][agente] += 1
+            continue
+        if situacao_referer == "interno":
+            exclusoes["referer_interno"] += 1
+            continue
+
+        consulta = consulta_da_request(campos["request"])
+        _, caminho = parser.parse_request(campos["request"])
+        status = campos["status"]
+
+        # ── camada (c): clique de volta ──────────────────────────────────────
+        #
+        # Só vale para linha SEM User-Agent de bot conhecido, e a ordem não é
+        # detalhe: um fixture desta casa provou que as duas camadas PODEM
+        # competir pela mesma linha (UA de `meta-externalfetcher` chegando com
+        # `Referer` de perplexity.ai). Classificar aquilo como clique de volta
+        # inventaria um leitor humano que não existiu — inflação de métrica, a
+        # proibição mais dura do contrato. Bot com referer de assistente é bot:
+        # fica na camada dele, e o referer entra só como procedência.
+        origem_clique = None
+        prova_clique = ""
+        if not agente:
+            origem_clique = assistente_do_referer(referer)
+            prova_clique = "referer"
+            if not origem_clique:
+                origem_clique = assistente_do_utm(consulta)
+                prova_clique = "utm_source"
+
+        if origem_clique:
+            registrar(acumulado, data, "clique_de_volta", origem_clique,
+                      ip, caminho, status, "nao_aplicavel", prova_clique)
+            continue
+
+        if not agente:
+            continue
+        camada = CAMADA.get(agente)
+        if not camada:
+            # Bot conhecido que não pertence a nenhuma das camadas (SEO, social,
+            # diagnóstico, infra). Não é ruído a descartar: é o denominador que
+            # permite dizer que o sinal de IA é pequeno *em relação a quê*.
+            agentes_fora_da_tabela[agente] += 1
+            continue
+
+        redes = faixas.get(agente) or []
+        if redes and botagents.em_faixa(ip, redes):
+            autenticidade = "faixa_oficial"
+        elif redes:
+            # Existe faixa publicada e o IP está fora dela. Continua sendo
+            # `nao_verificado`, NUNCA "forjado": esta ferramenta mede citação, e
+            # acusar fraude exige a checagem de rDNS nos dois sentidos que
+            # tools/generate-bot-traffic-origin faz e esta aqui não faz.
+            autenticidade = "nao_verificado"
+        else:
+            # Operador sem faixa publicada (DuckAssistBot, Mistral, Meta). Não
+            # saber quem é não é o mesmo que saber que é falso.
+            autenticidade = "sem_metodo_de_verificacao"
+
+        registrar(acumulado, data, camada, agente,
+                  ip, caminho, status, autenticidade, "user_agent")
+
+    return {
+        "linhas": total,
+        "malformadas": malformadas,
+        "sem_data_reconhecivel": sem_data,
+        "ignoradas_pelo_cursor": ignoradas_pelo_cursor,
+        "exclusoes": dict(exclusoes.most_common()),
+        "exclusoes_por_agente": {
+            balde: dict(contagem.most_common())
+            for balde, contagem in sorted(exclusoes_por_agente.items())
+        },
+        "referer_por_situacao": dict(referer_por_situacao.most_common()),
+        "bots_fora_das_camadas": dict(agentes_fora_da_tabela.most_common()),
+        "agentes_sem_camada": checar_cobertura_da_tabela(),
+        "janela_min": janela_min,
+        "janela_max": janela_max,
+        "cursor_novo": cursor_novo,
+        "linhas_no_segundo_final": linhas_no_segundo_final,
+        "acumulado": acumulado,
+    }
+
+
+def registrar(acumulado, data, camada, chave, ip, caminho, status, autenticidade, prova):
+    """Soma uma requisição no balde (data, camada, chave)."""
+    alvo = acumulado.setdefault((data, camada, chave), {
+        "requests": 0,
+        "ips": set(),
+        "paths": set(),
+        "status": collections.Counter(),
+        "autenticidade": collections.Counter(),
+        "prova": collections.Counter(),
+    })
+    alvo["requests"] += 1
+    alvo["ips"].add(ip)
+    # Teto no conjunto de rotas pelo mesmo motivo de
+    # generate-bot-traffic-origin:308: um crawler varrendo 9.835 páginas encheria
+    # o set sem que a contagem distinta acrescentasse informação nova, e a
+    # memória cresceria com a janela.
+    if len(alvo["paths"]) < 20000:
+        alvo["paths"].add(caminho)
+    alvo["status"][status] += 1
+    alvo["autenticidade"][autenticidade] += 1
+    alvo["prova"][prova] += 1
+
+
+def montar_registros(medicao: dict, cursor_anterior: str) -> list[dict]:
+    """Transforma o acumulado em linhas de série, cada uma auto-explicativa."""
+    registros = []
+    for (data, camada, chave), dados in sorted(medicao["acumulado"].items()):
+        autenticidade = dados["autenticidade"]
+        registros.append({
+            "schema_version": SCHEMA,
+            "date": data,
+            "layer": camada,
+            "key": chave,
+            # INCREMENTO desde a execução anterior. Quem consome SOMA por
+            # (date, layer, key) — pegar "a última linha da chave" SUBCONTA
+            # assim que a janela do log encolher. Ver o racional no cabeçalho.
+            "summable": True,
+            "requests": dados["requests"],
+
+            # ★ OS CAMPOS QUE IMPEDEM A LEITURA ERRADA DO NOME DA FERRAMENTA.
+            # Ficam em TODA linha, e não só na documentação, porque JSONL é lido
+            # isolado: quem der grep numa data tem que ver o caveat junto do
+            # número, não num arquivo que talvez nunca abra.
+            "is_citation_count": False,
+            "interpretation": "considered_for_answer",
+            "layer_interpretation": LEITURA_DA_CAMADA.get(camada, "desconhecida"),
+            "is_lower_bound": True,
+            "lower_bound_reason": "a origem so ve a requisicao que chegou ate ela: "
+                                  "HIT na borda, citacao sem clique, resposta por "
+                                  "memoria do modelo e referer suprimido nao "
+                                  "aparecem aqui. O numero real e >= este.",
+            "nao_mensuravel": NAO_MENSURAVEL,
+            "edge_reconciliation": CONCILIACAO_BORDA.get(camada, ""),
+            "is_citation_interest": camada != "treinamento",
+            "trafego_proprio_excluido": True,
+            "regras_de_exclusao_de_trafego_proprio": EXCLUSAO_DE_TRAFEGO_PROPRIO,
+
+            # Autenticidade: nunca "forjado" — ver o comentário em `medir`.
+            "requests_faixa_oficial": autenticidade.get("faixa_oficial", 0),
+            "requests_nao_verificado": autenticidade.get("nao_verificado", 0),
+            "requests_sem_metodo_de_verificacao": autenticidade.get("sem_metodo_de_verificacao", 0),
+            "identity_method": "faixa de IP oficial (data/ops/bot_ip_ranges) + "
+                               "bot_sim do nginx; sem rDNS nesta ferramenta",
+            "evidence": dict(sorted(dados["prova"].items())),
+
+            # Observações DA JANELA: não somam entre execuções (o mesmo IP e a
+            # mesma rota reaparecem na janela seguinte).
+            "distinct_ips_in_window": len(dados["ips"]),
+            "distinct_paths_in_window": len(dados["paths"]),
+            "window_fields_are_summable": False,
+            "status": dict(sorted(dados["status"].items())),
+
+            "cursor_from": cursor_anterior,
+            "cursor_to": medicao["cursor_novo"],
+        })
+    return registros
+
+
+def envelope(medicao: dict, registros: list[dict], lidos: list[dict], gravou: bool) -> dict:
+    """Resumo da execução — o que foi lido, o que foi excluído, o que não se mede."""
+    por_camada: collections.Counter = collections.Counter()
+    for registro in registros:
+        por_camada[registro["layer"]] += registro["requests"]
+    contadas = sum(por_camada.values())
+    return {
+        "tool": "measure-ai-citation",
+        "schema_version": SCHEMA,
+        "is_citation_count": False,
+        "interpretation": "considered_for_answer",
+        "is_lower_bound": True,
+        "nao_mensuravel": NAO_MENSURAVEL,
+        "edge_reconciliation": CONCILIACAO_BORDA,
+        "arquivos_lidos": lidos,
+        "linhas_lidas": medicao["linhas"],
+        "linhas_malformadas": medicao["malformadas"],
+        "linhas_sem_data_reconhecivel": medicao["sem_data_reconhecivel"],
+        "linhas_ignoradas_pelo_cursor": medicao["ignoradas_pelo_cursor"],
+        "linhas_excluidas": dict(medicao["exclusoes"]),
+        "linhas_excluidas_total": sum(medicao["exclusoes"].values()),
+        "linhas_excluidas_por_agente": medicao["exclusoes_por_agente"],
+        "linhas_contadas": contadas,
+        # A identidade aritmética que permite reconferir a saída inteira sem
+        # confiar nesta ferramenta: reconhecidas = contadas + excluídas +
+        # ignoradas pelo cursor + bots fora das camadas + humano/desconhecido.
+        "linhas_bots_fora_das_camadas": sum(medicao["bots_fora_das_camadas"].values()),
+        "bots_fora_das_camadas": medicao["bots_fora_das_camadas"],
+        "referer_por_situacao": medicao["referer_por_situacao"],
+        "agentes_sem_camada": medicao["agentes_sem_camada"],
+        "janela": {"de": medicao["janela_min"], "ate": medicao["janela_max"]},
+        "por_camada": dict(por_camada),
+        "gravou": gravou,
+        "serie": str(SERIE.relative_to(RAIZ)),
+    }
+
+
+def main() -> int:
+    parser_args = argparse.ArgumentParser(
+        description="Sinal de citacao por IA observavel na origem (log do nginx).")
+    parser_args.add_argument("--log", default=LOG_GLOB_CANONICO,
+                             help="glob do access log (padrão: %(default)s)")
+    parser_args.add_argument("--sem-legado", action="store_true",
+                             help="não lê as rotações anteriores à migração de caminho")
+    parser_args.add_argument("--gravar", action="store_true",
+                             help="processa a partir do cursor e ACRESCENTA incrementos "
+                                  "à série (sem esta flag nada é escrito em disco)")
+    parser_args.add_argument("--dia", help="restringe a saída a uma data (AAAA-MM-DD); "
+                                           "é filtro de LEITURA, incompatível com --gravar")
+    parser_args.add_argument("--json", action="store_true", help="saída estruturada")
+    parser_args.add_argument("--serie", help="caminho alternativo da série (auditoria)")
+    parser_args.add_argument("--cursor", help="caminho alternativo do cursor (auditoria)")
+    args = parser_args.parse_args()
+
+    global SERIE, CURSOR
+    if args.serie:
+        SERIE = pathlib.Path(args.serie).resolve()
+    if args.cursor:
+        CURSOR = pathlib.Path(args.cursor).resolve()
+
+    # `--dia` filtra os REGISTROS, mas o cursor avança sobre TODAS as linhas
+    # lidas. Combinado com `--gravar`, o efeito seria gravar só o dia pedido e
+    # pular para sempre os incrementos dos outros dias — perda permanente e
+    # silenciosa, na direção exata que o cabeçalho deste arquivo condena ("os
+    # bots pararam de vir"). Recusar é a única saída honesta: exibir sem gravar
+    # esconderia a diferença entre o que o operador pediu e o que aconteceu.
+    if args.dia and args.gravar:
+        print("measure-ai-citation: --dia é filtro de LEITURA (auditoria) e não pode "
+              "ser combinado com --gravar: o cursor avançaria sobre os outros dias e "
+              "os incrementos deles seriam perdidos para sempre. Rode --gravar sozinho "
+              "e filtre a série depois.", file=sys.stderr)
+        return 2
+
+    parser = carregar_parser_do_check()
+
+    # As rotações legadas pertencem ao caminho PADRÃO. Quando alguém aponta
+    # `--log` para outro lugar (auditoria, fixture, snapshot), somar o legado
+    # produziria um relatório sobre um log que a pessoa não pediu — e, se o
+    # caminho indicado não existisse, o relatório sairia INTEIRO em cima do
+    # legado, parecendo bem-sucedido. Medir a fonte errada em silêncio é pior do
+    # que não medir.
+    usa_padrao = args.log == LOG_GLOB_CANONICO
+    caminhos = descobrir_logs(args.log, usa_padrao and not args.sem_legado)
+    if not caminhos:
+        detalhe = ("o site pode não ter recebido tráfego ainda"
+                   if usa_padrao else "caminho indicado em --log não existe")
+        print(f"measure-ai-citation: nenhum arquivo casou {args.log} — {detalhe}",
+              file=sys.stderr)
+        return 1
+    linhas, lidos, falhas = ler_logs(caminhos)
+    for caminho, motivo in falhas:
+        print("  aviso: %s ilegível (%s)" % (caminho, motivo), file=sys.stderr)
+    if not linhas:
+        print("measure-ai-citation: nenhum log legível", file=sys.stderr)
+        return 1
+
+    # Cursor SÓ no modo de escrita. Em leitura a janela é sempre inteira: é o que
+    # torna a saída conferível contra uma contagem independente (grep/awk sobre o
+    # mesmo arquivo), que uma leitura incremental tornaria impossível.
+    cursor_anterior = ""
+    vistas_no_segundo = 0
+    if args.gravar:
+        try:
+            with open(CURSOR, encoding="utf-8") as handle:
+                estado = json.load(handle)
+            cursor_anterior = estado.get("last_seen", "")
+            # Cursor de uma versão anterior, sem o desempate: ausente vira 0, o
+            # que reprocessa o segundo de fronteira inteiro. Reprocessar pode
+            # duplicar aquele único segundo; NÃO reprocessar perderia linha para
+            # sempre. Entre um erro que se vê na série e um que some do disco, o
+            # padrão é o que se vê.
+            vistas_no_segundo = int(estado.get("lines_at_last_seen", 0) or 0)
+        except (OSError, ValueError, TypeError):
+            cursor_anterior = ""
+            vistas_no_segundo = 0
+
+    medicao = medir(linhas, parser, cursor_anterior, vistas_no_segundo)
+    registros = montar_registros(medicao, cursor_anterior)
+    if args.dia:
+        registros = [r for r in registros if r["date"] == args.dia]
+
+    gravou = False
+    if args.gravar and registros:
+        SERIE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SERIE, "a", encoding="utf-8") as handle:
+            for registro in registros:
+                handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+        gravou = True
+    if args.gravar and medicao["cursor_novo"]:
+        # O cursor é reescrito MESMO quando o instante não mudou: a contagem do
+        # segundo de fronteira pode ter crescido (linhas novas no mesmo segundo),
+        # e é ela que impede a duplicação na execução seguinte. O cursor avança
+        # também quando nenhum registro nasceu — linha sem sinal de IA já foi
+        # vista, e reprocessá-la só gastaria tempo.
+        CURSOR.parent.mkdir(parents=True, exist_ok=True)
+        with open(CURSOR, "w", encoding="utf-8") as handle:
+            json.dump({"last_seen": medicao["cursor_novo"],
+                       "lines_at_last_seen": medicao["linhas_no_segundo_final"]}, handle)
+            handle.write("\n")
+
+    resumo = envelope(medicao, registros, lidos, gravou)
+
+    if args.json:
+        print(json.dumps({"resumo": resumo, "registros": registros},
+                         ensure_ascii=False, indent=1))
+        return 0
+
+    print("measure-ai-citation — sinal de IA na ORIGEM (log do nginx)")
+    print("  ATENÇÃO: is_citation_count=false. Isto NÃO conta citações; conta a")
+    print("  página sendo CONSIDERADA para uma resposta. Todo número é LIMITE INFERIOR.")
+    lidos_reais = [f for f in lidos if not f["duplicate_of"]]
+    duplicados = [f for f in lidos if f["duplicate_of"]]
+    print("\n  arquivos: %d lido(s), %d ignorado(s) por conteúdo duplicado"
+          % (len(lidos_reais), len(duplicados)))
+    print("  janela: %s -> %s" % (resumo["janela"]["de"] or "-", resumo["janela"]["ate"] or "-"))
+    print("  linhas: %d reconhecidas=%d malformadas=%d sem_data=%d"
+          % (resumo["linhas_lidas"],
+             resumo["linhas_lidas"] - resumo["linhas_malformadas"],
+             resumo["linhas_malformadas"], resumo["linhas_sem_data_reconhecivel"]))
+    if resumo["linhas_ignoradas_pelo_cursor"]:
+        print("  %d linha(s) já contadas em execução anterior (cursor %s)"
+              % (resumo["linhas_ignoradas_pelo_cursor"], cursor_anterior))
+
+    print("\n  EXCLUÍDAS da contagem (anti-fraude — cada uma nomeada e contada):")
+    if resumo["linhas_excluidas"]:
+        for balde, quantas in resumo["linhas_excluidas"].items():
+            print("    %-42s %6d" % (balde, quantas))
+        print("    %-42s %6d" % ("TOTAL EXCLUÍDO", resumo["linhas_excluidas_total"]))
+    else:
+        print("    (nenhuma)")
+
+    for camada in ORDEM_CAMADA:
+        do_grupo = [r for r in registros if r["layer"] == camada]
+        if not do_grupo:
+            continue
+        rotulo = camada
+        if camada == "treinamento":
+            rotulo = "treinamento  (is_citation_interest=false — NÃO é sinal de citação)"
+        print("\n  [%s]  %s" % (rotulo, LEITURA_DA_CAMADA.get(camada, "")))
+        for registro in sorted(do_grupo, key=lambda r: (-r["requests"], r["key"], r["date"])):
+            print("    %-10s %-24s req=%-6d oficial=%-5d nao_verif=%-5d sem_metodo=%-5d IPs=%-3d rotas=%d"
+                  % (registro["date"], registro["key"], registro["requests"],
+                     registro["requests_faixa_oficial"], registro["requests_nao_verificado"],
+                     registro["requests_sem_metodo_de_verificacao"],
+                     registro["distinct_ips_in_window"], registro["distinct_paths_in_window"]))
+
+    if not registros:
+        print("\n  nenhum sinal de IA na janela — ausência de sinal é resultado, não erro")
+
+    print("\n  procedência do referer: %s" % (resumo["referer_por_situacao"] or "-"))
+    if resumo["referer_por_situacao"].get("sem_campo"):
+        print("    'sem_campo' = o log_format daquelas linhas ainda NÃO gravava referer.")
+        print("    Isso é DIFERENTE de 'ninguém clicou' — a camada (c) por referer só")
+        print("    passa a existir depois que o campo entra. O utm_source, esse, já vale.")
+    if resumo["bots_fora_das_camadas"]:
+        print("  bots fora das 3 camadas (SEO/social/diagnóstico): %s"
+              % resumo["bots_fora_das_camadas"])
+    if resumo["agentes_sem_camada"]:
+        print("  ATENÇÃO: agentes de busca/fetch conhecidos por botagents e SEM camada"
+              " nesta tabela: %s" % ", ".join(resumo["agentes_sem_camada"]))
+
+    print("\n  NÃO MENSURÁVEL daqui (por isso todo número é limite inferior):")
+    for item in NAO_MENSURAVEL:
+        print("    - %s" % item)
+    print("\n  conciliação com a borda: crawl/fetch → origem <= borda SEMPRE (HIT não")
+    print("  toca a origem; o quociente é fan-out de cache). clique_de_volta →")
+    print("  IMPOSSÍVEL conciliar: o plano Free nega clientRequestReferer.")
+
+    if gravou:
+        print("\nsérie: %s (+%d registro(s)); cursor -> %s"
+              % (SERIE, len(registros), medicao["cursor_novo"]))
+        print("append-only: as linhas são INCREMENTOS — quem consome SOMA por (date, layer, key)")
+    elif args.gravar:
+        print("\nnada novo desde a execução anterior; nenhum registro acrescentado")
+    else:
+        print("\nmodo LEITURA (padrão): nada foi escrito. Use --gravar para alimentar a série.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

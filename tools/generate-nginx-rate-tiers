@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""generate-nginx-rate-tiers — emite as zonas de rate limit A PARTIR do registry.
+
+O DEFEITO, medido em 2026-08-26: `content/crawl_policy.json` declara seis tiers,
+quatro deles com limite — 30, 60, 20 e 120 requisições por minuto —, e o nginx
+tem **uma zona só**, `wj_generic`, com `rate=3000r/m` e `burst=600`. Um bot de
+treinamento que a política limita a 60 r/m opera hoje a 3000: **cinquenta vezes**
+o declarado.
+
+Registry decorativo é pior que registry ausente, porque mente para quem o lê. E
+`crawl.ValidatePolicy` chega a REPROVAR bot de treinamento sem
+`requests_per_minute` — exige um número que nunca é aplicado.
+
+POR QUE UM GERADOR, E NÃO UM BLOCO ESCRITO À MÃO. A regra do projeto proíbe
+literal fixo de política no código: o número tem de vir do dado. Escrever
+`rate=60r/m` no vhost criaria a quarta cópia da mesma verdade — depois do JSON, do
+`DefaultBotRegistry` e do `botagents.py` —, e este plano já mediu que a terceira
+cópia divergiu em dezesseis tokens sem ninguém notar.
+
+COMO O NGINX PERMITE ISSO, que não é óbvio: `limit_req` referencia uma zona
+FIXA, então não dá para escolher a zona por variável. O idioma correto é o
+inverso — uma zona por tier, e uma CHAVE que fica **vazia** para quem não
+pertence àquele tier. Chave vazia faz o nginx não contar a requisição naquela
+zona. Assim as quatro zonas coexistem e cada requisição cai em exatamente uma.
+
+O QUE ESTE GERADOR NÃO FAZ, de propósito: não toca no bloco `$wj_bot_allow`. Bot
+valioso continua com chave vazia em TODAS as zonas — é o tier
+`unlimited_no_rate_limit`, e ele é a razão de o portal ser barato para quem traz
+citação. Quem governa essa lista é `check-bot-allowlist-derivada`.
+
+Uso:
+    tools/generate-nginx-rate-tiers            # imprime o bloco
+    tools/generate-nginx-rate-tiers --conferir # compara com o que está no vhost
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+POLITICA = os.path.join(RAIZ, "content", "crawl_policy.json")
+VHOST = os.path.join(RAIZ, "ops", "nginx", "wikijuridica.conf")
+# O que a unit REALMENTE carrega: `ExecStart ... -c` aponta para o dedicado,
+# que e autocontido e nao inclui o vhost. Conferir so o vhost daria verde com
+# a producao sem limite nenhum.
+STANDALONE = os.path.join(RAIZ, "ops", "nginx", "standalone", "nginx.conf")
+
+INICIO = "# >>> GERADO POR tools/generate-nginx-rate-tiers — NÃO EDITE À MÃO"
+FIM = "# <<< FIM DO BLOCO GERADO"
+INICIO_APLICACAO = "    # >>> GERADO POR tools/generate-nginx-rate-tiers (aplicação)"
+FIM_APLICACAO = "    # <<< FIM DO BLOCO GERADO (aplicação)"
+
+# TIER_GENERICO É O CURINGA, e por isso recebe tratamento especial (2026-09-03).
+#
+# Todo outro tier tem uma lista FECHADA de User-Agents (os bots do registry
+# marcados com aquele rate_tier), e por isso ganha um map "$http_user_agent
+# -> _marca" que casa só esses tokens. O curinga não tem lista: ele é "todo
+# mundo que NÃO é bot valioso", inclusive visitante humano e qualquer bot
+# nunca cadastrado — e "*" é sentinela removida do laço abaixo, então o
+# curinga sempre teria zero UAs na própria marca.
+#
+# A CHAVE JÁ EXISTIA À MÃO: `map $wj_bot_allow $wj_generic_key { default
+# $wj_client_key; 1 ""; }`, escrita antes deste bloco gerado (não é um NÚMERO
+# duplicado, é a estrutura que isenta bot valioso — não tem por que nascer
+# daqui). O QUE ESTAVA DUPLICADO, e é o que este tratamento elimina, era o
+# NÚMERO: `rate=3000r/m` e `burst=600` escritos à mão em três lugares (a
+# zona, a aplicação, e content/crawl_policy.json). Agora só o JSON os declara.
+TIER_GENERICO = "unknown_guard_rate_limit"
+ZONA_GENERICA = "wj_generic"
+
+
+def sanitiza(nome: str) -> str:
+    """Nome de zona do nginx: letras, dígitos e sublinhado."""
+    return re.sub(r"[^a-z0-9_]", "_", nome.lower())
+
+
+def bloco() -> str:
+    with open(POLITICA, encoding="utf-8") as f:
+        politica = json.load(f)
+
+    tiers = {t["name"]: t for t in politica["rate_tiers"]}
+    # Só entram tiers que declaram um número. `unlimited` não tem zona por
+    # definição, e tier sem `requests_per_minute` não tem o que aplicar — este
+    # gerador não inventa valor, e é por isso que ele os PULA em vez de escolher
+    # um default.
+    aplicaveis = {
+        nome: t for nome, t in tiers.items()
+        if not t.get("unlimited") and isinstance(t.get("requests_per_minute"), int)
+    }
+
+    # UA -> tier, do próprio registry. Um bot sem `rate_tier` não entra: a
+    # ausência é defeito de dado, e `crawl.ValidatePolicy` é quem deve acusá-la.
+    por_tier: dict[str, list[str]] = {}
+    for bot in politica["bot_registry"]:
+        tier = bot.get("rate_tier")
+        if tier not in aplicaveis:
+            continue
+        ua = bot["user_agent"].lower()
+        # A ENTRADA `*` É SENTINELA, NÃO TOKEN — e emiti-la quebra o nginx.
+        #
+        # `~**` não é padrão válido: o PCRE2 recusa com "quantifier does not
+        # follow a repeatable item", e o `nginx -t` reprova a config inteira.
+        # Medido no binário de produção (1.22.1) antes de qualquer aplicação.
+        #
+        # E o "conserto" ingênuo seria pior que o erro. Inverter o default para
+        # capturar "todo o resto" faria a zona contar por `$binary_remote_addr`
+        # CRU, sem a isenção de tráfego interno que o vhost construiu em
+        # `$wj_client_key` — e a simulação sobre 10 dias do log real mostra o
+        # resultado: o IP mais rejeitado seria 127.0.0.1, com 755 respostas 429,
+        # pico de 643 requisições internas num minuto. Seria a reedição do
+        # incidente de 12.975 auto-429s de 2026-08-12, num limiar 25× menor.
+        #
+        # O tier do curinga já é coberto pela zona genérica (3000 r/m sobre
+        # `$wj_client_key`, que isenta o interno). Baixá-lo para 120 é outra
+        # mudança, que exige a isenção e medição própria — não se resolve aqui.
+        if ua in ("*", ""):
+            continue
+        por_tier.setdefault(tier, []).append(ua)
+
+    linhas = [
+        INICIO,
+        "#",
+        "# Os números vêm de content/crawl_policy.json, e é por isso que este bloco",
+        "# é gerado: escrevê-los aqui à mão criaria a quarta cópia da mesma verdade",
+        "# (JSON, DefaultBotRegistry, botagents.py e o nginx) — e a terceira já",
+        "# divergiu em dezesseis tokens sem ninguém notar.",
+        "#",
+        "# O IDIOMA É CHAVE VAZIA, não zona variável: `limit_req` referencia uma zona",
+        "# FIXA, então cada tier tem a sua, e a chave fica vazia para quem não",
+        "# pertence a ele. Chave vazia faz o nginx não contar a requisição naquela",
+        "# zona, então as zonas coexistem e cada requisição cai em exatamente uma.",
+        "#",
+        "# Bot valioso (`unlimited_no_rate_limit`) fica de fora de todas: é o tier sem",
+        "# limite, e governá-lo é assunto de check-bot-allowlist-derivada.",
+        "",
+    ]
+
+    for nome in sorted(aplicaveis):
+        tier = aplicaveis[nome]
+        uas = sorted(por_tier.get(nome, []))
+        # O CURINGA NÃO GANHA MAP DE MARCA — ver o comentário de TIER_GENERICO.
+        # A chave já existe à mão ($wj_generic_key); só o número vem daqui.
+        if nome == TIER_GENERICO:
+            linhas.append(f"# {nome}: {tier['requests_per_minute']} r/m, burst "
+                          f"{tier.get('burst', 0)} — protecao de disponibilidade para "
+                          f"TODO trafego que NAO e bot valioso (curinga; a chave vem do "
+                          f"map $wj_bot_allow -> $wj_generic_key, escrito a mao ACIMA "
+                          f"deste bloco por ser estrutura, nao numero duplicado)")
+            linhas.append(f"limit_req_zone $wj_generic_key zone={ZONA_GENERICA}:10m "
+                          f"rate={tier['requests_per_minute']}r/m;")
+            linhas.append("")
+            continue
+        zona = "wj_tier_" + sanitiza(nome.replace("_tier", "").replace("_standard", "_std"))
+        linhas.append(f"# {nome}: {tier['requests_per_minute']} r/m, burst "
+                      f"{tier.get('burst', 0)} — {len(uas)} bot(s) do registry")
+        # DOIS MAPAS, e o segundo é a guarda que evita um dano silencioso.
+        #
+        # O casamento do nginx é por SUBSTRING, então um bot VALIOSO cujo
+        # User-Agent contenha o token de um bot limitado cairia na zona restrita
+        # apesar de estar no allowlist — e ninguém veria, porque o efeito é uma
+        # requisição a mais na conta de rate limit, não um erro.
+        #
+        # A chave composta `$wj_bot_allow:marca` resolve isso por construção: só
+        # `"0:1"` — não é valioso E pertence a este tier — vira chave real. Bot
+        # valioso produz `"1:1"` ou `"1:"`, que caem no default vazio, e chave
+        # vazia faz o nginx não contar a requisição naquela zona.
+        linhas.append(f"map $http_user_agent ${zona}_marca {{")
+        linhas.append("    default \"\";")
+        for ua in uas:
+            linhas.append(f"    ~*{ua:<28} \"1\";")
+        linhas.append("}")
+        if tier.get("aggregated_by_operator"):
+            # DUAS ZONAS DA MESMA MARCA, e a segunda existe para não premiar quem
+            # forja. A chave desta é o OPERADOR, derivado da faixa de IP que ele
+            # publica (`$wj_operador_do_ip`, de ops/nginx/bot-operators.conf) —
+            # não do User-Agent, que é string que o cliente escolhe e que já foi
+            # medida sendo forjada.
+            #
+            # Sem a segunda, um cliente que digitasse o nome do bot vindo de fora
+            # da faixa produziria operador vazio, chave vazia, e NENHUMA contagem
+            # aqui — ficaria só sob a guarda genérica de 3.000 r/m, isto é, o
+            # forjador teria teto MAIOR que quem não forja. A segunda zona o joga
+            # no teto restritivo, por endereço.
+            #
+            # A captura nomeada é obrigatória: `$1` dentro de `map` é frágil
+            # porque o próximo regex do ciclo o sobrescreve.
+            linhas.append(f"map \"$wj_bot_allow:${zona}_marca:$wj_operador_do_ip\" ${zona}_key {{")
+            linhas.append("    default \"\";")
+            linhas.append("    \"~^0:1:(?<wjop>.+)$\"  $wjop;")
+            linhas.append("}")
+            linhas.append(f"limit_req_zone ${zona}_key zone={zona}:10m "
+                          f"rate={tier['requests_per_minute']}r/m;")
+            linhas.append(f"map \"$wj_bot_allow:${zona}_marca:$wj_operador_do_ip\" ${zona}_nv_key {{")
+            linhas.append("    default \"\";")
+            linhas.append("    \"0:1:\"  $binary_remote_addr;")
+            linhas.append("}")
+            linhas.append(f"limit_req_zone ${zona}_nv_key zone={zona}_nv:10m "
+                          f"rate={tier['unverified_requests_per_minute']}r/m;")
+            linhas.append("")
+            continue
+        linhas.append(f"map \"$wj_bot_allow:${zona}_marca\" ${zona}_key {{")
+        linhas.append("    default \"\";")
+        linhas.append("    \"0:1\"  $binary_remote_addr;")
+        linhas.append("}")
+        linhas.append(f"limit_req_zone ${zona}_key zone={zona}:10m "
+                      f"rate={tier['requests_per_minute']}r/m;")
+        linhas.append("")
+
+    linhas.append(FIM)
+    return "\n".join(linhas)
+
+
+def bloco_aplicacao() -> str:
+    """As diretivas `limit_req`, que vivem no `server{}` e não no `http{}`.
+
+    SÃO DOIS BLOCOS PORQUE O NGINX EXIGE DOIS NÍVEIS, e a primeira versão deste
+    gerador emitia as diretivas COMENTADAS — o que definia quatro zonas que nada
+    referenciava. Rate limit inerte, e o `--conferir` ficava verde, porque ele
+    compara o texto do bloco e comentário é texto.
+
+    E a herança do `limit_req` não é acumulativa: ela SUBSTITUI. A doc é
+    explícita — as diretivas de um nível são herdadas *"if and only if there are
+    no limit_req directives defined on the current level"*. Pôr estas numa
+    `location` desligaria ali a zona genérica de 3000 r/m, que é a guarda de
+    todo o resto. Por isso elas vão ao lado dela, no mesmo `server{}`.
+    """
+    with open(POLITICA, encoding="utf-8") as f:
+        politica = json.load(f)
+    tiers = {t["name"]: t for t in politica["rate_tiers"]}
+    aplicaveis = {
+        nome: t for nome, t in tiers.items()
+        if not t.get("unlimited") and isinstance(t.get("requests_per_minute"), int)
+    }
+    linhas = [INICIO_APLICACAO,
+              "    # Uma linha por zona. A ordem não importa: cada requisição tem chave",
+              "    # em no máximo uma delas, porque a chave é vazia fora do tier."]
+    for nome in sorted(aplicaveis):
+        tier = aplicaveis[nome]
+        # O CURINGA SEMPRE APLICA, mesmo com zero bots do registry na própria
+        # marca — ele é o catch-all de TODO o resto (visitante humano incluído),
+        # não uma zona por bot nomeado. Ver TIER_GENERICO.
+        if nome == TIER_GENERICO:
+            linhas.append(f"    limit_req zone={ZONA_GENERICA} burst={tier.get('burst', 0)} nodelay;")
+            continue
+        zona = "wj_tier_" + sanitiza(nome.replace("_tier", "").replace("_standard", "_std"))
+        if not any(b.get("rate_tier") == nome and b["user_agent"] not in ("*", "")
+                   for b in politica["bot_registry"]):
+            continue
+        linhas.append(f"    limit_req zone={zona} burst={tier.get('burst', 0)} nodelay;")
+        if tier.get("aggregated_by_operator"):
+            # A SEGUNDA ZONA DO TIER TEM DE SER APLICADA TAMBÉM, e esquecê-la é o
+            # defeito que a docstring acima já descreve numa outra forma: zona
+            # definida que nada referencia é rate limit INERTE, e o `--conferir`
+            # fica verde porque ele compara o texto do bloco.
+            #
+            # Sem esta linha, o cliente que declara o nome do bot vindo de fora
+            # da faixa oficial não é contado em zona nenhuma do tier — ele cai só
+            # na guarda genérica, com teto MAIOR que o de quem não forja.
+            linhas.append(f"    limit_req zone={zona}_nv "
+                          f"burst={tier.get('unverified_burst', 0)} nodelay;")
+    linhas.append(FIM_APLICACAO)
+    return "\n".join(linhas)
+
+
+def confere(caminho: str, gerado: str, gerado_aplicacao: str) -> list[str]:
+    """Confere os DOIS blocos num arquivo, e devolve os problemas encontrados."""
+    rel = os.path.relpath(caminho, RAIZ)
+    if not os.path.isfile(caminho):
+        return [f"{rel}: arquivo ausente"]
+    with open(caminho, encoding="utf-8") as f:
+        texto = f.read()
+
+    problemas: list[str] = []
+    for marca_ini, marca_fim, esperado, rotulo in (
+        (INICIO, FIM, gerado, "zonas"),
+        (INICIO_APLICACAO, FIM_APLICACAO, gerado_aplicacao, "aplicação"),
+    ):
+        if marca_ini not in texto:
+            problemas.append(f"{rel}: bloco de {rotulo} AUSENTE")
+            continue
+        # Guarda contra o traceback cru: início presente e fim ausente é arquivo
+        # truncado ou editado à mão, e merece mensagem, não stack trace.
+        if marca_fim not in texto:
+            problemas.append(f"{rel}: bloco de {rotulo} tem início e NÃO tem fim — "
+                             "arquivo truncado ou editado à mão")
+            continue
+        atual = texto[texto.index(marca_ini):texto.index(marca_fim) + len(marca_fim)]
+        if atual.strip() != esperado.strip():
+            problemas.append(f"{rel}: bloco de {rotulo} DIVERGE do registry")
+    return problemas
+
+
+def escreve(caminho: str, gerado: str, gerado_aplicacao: str) -> int:
+    """Substitui os DOIS blocos marcados no arquivo pelo texto gerado agora.
+
+    TODAS as ocorrências de cada par de marcador são substituídas, não só a
+    primeira — `confere()` só audita a primeira (`texto.index`), e
+    `ops/nginx/wikijuridica.conf` tem o bloco de aplicação DUPLICADO (uma cópia
+    fora de `server{}`, sem efeito prático, e a cópia real dentro dele). Uma
+    escrita que tocasse só a primeira deixaria a segunda cópia congelada,
+    divergente do registry sem que `--conferir` visse.
+    """
+    with open(caminho, encoding="utf-8") as f:
+        texto = f.read()
+    trocas = 0
+    for marca_ini, marca_fim, novo in (
+        (INICIO, FIM, gerado),
+        (INICIO_APLICACAO, FIM_APLICACAO, gerado_aplicacao),
+    ):
+        padrao = re.compile(re.escape(marca_ini) + r".*?" + re.escape(marca_fim), re.S)
+        texto, n = padrao.subn(lambda _m, novo=novo: novo, texto)
+        trocas += n
+    with open(caminho, "w", encoding="utf-8") as f:
+        f.write(texto)
+    return trocas
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--conferir", action="store_true",
+                   help="compara os dois blocos com o que está nos arquivos de nginx")
+    p.add_argument("--aplicacao", action="store_true",
+                   help="imprime só o bloco de nível server (as diretivas limit_req)")
+    p.add_argument("--escrever", action="store_true",
+                   help="regrava os blocos marcados nos DOIS arquivos de nginx (vhost e standalone)")
+    args = p.parse_args()
+
+    gerado = bloco()
+    gerado_aplicacao = bloco_aplicacao()
+    if args.aplicacao:
+        print(gerado_aplicacao)
+        return 0
+    if args.escrever:
+        for caminho in (VHOST, STANDALONE):
+            trocas = escreve(caminho, gerado, gerado_aplicacao)
+            print(f"{os.path.relpath(caminho, RAIZ)}: {trocas} bloco(s) regravado(s)")
+        return 0
+    if not args.conferir:
+        print(gerado)
+        print()
+        print(gerado_aplicacao)
+        return 0
+
+    # OS DOIS ARQUIVOS, e é aí que estava o furo: a unit roda
+    # `-c ops/nginx/standalone/nginx.conf`, que é AUTOCONTIDO e não inclui o
+    # vhost. Conferir só o vhost daria verde com a produção sem limite nenhum —
+    # exatamente a classe de gate verde sobre mundo errado que este repositório
+    # já catalogou cinco vezes.
+    problemas: list[str] = []
+    for caminho in (VHOST, STANDALONE):
+        problemas.extend(confere(caminho, gerado, gerado_aplicacao))
+
+    if not problemas:
+        print("check-nginx-rate-tiers: OK (vhost e standalone correspondem ao registry)")
+        return 0
+    print("check-nginx-rate-tiers: FAIL")
+    for problema in problemas:
+        print(f"  - {problema}")
+    print("  Os tiers do registry nao valem enquanto isto nao fechar: o nginx tem")
+    print("  uma zona generica de 3000 r/m, e a politica declara 30, 60, 20 e 120.")
+    print("  Regenere com: tools/generate-nginx-rate-tiers [--aplicacao]")
+    print("  E depois: tools/generate-nginx-standalone, para o dedicado receber.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

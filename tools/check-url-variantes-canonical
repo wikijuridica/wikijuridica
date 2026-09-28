@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""check-url-variantes-canonical — a sentinela da premissa que dispensa corrigir a duplicação de URL.
+
+★ POR QUE ESTE GATE EXISTE (2026-08-29, BUG-089/BUG-138 da caça aos bugs)
+
+Quatro formas da mesma página respondem hoje, e três delas devolvem 200:
+
+    /area/pagina/              200   forma canônica
+    //area/pagina/             200   barra dupla
+    /area/pagina/index.html    200   arquivo explícito
+    /area/pagina               301 → /area/pagina/
+
+Isso é duplicação de conteúdo — e a decisão registrada do projeto é NÃO
+transformá-las em redirecionamento, porque a demanda real medida é só de sondas e
+de um scanner, e porque `rel=canonical` consolida o sinal para a forma limpa. A
+decisão é defensável, e eu a confirmei por medição própria antes de escrever este
+arquivo: as três formas de `/glossario/carencia/` servem
+`rel="canonical" href="https://wikijuridica.com.br/glossario/carencia/"` e
+`robots: index,follow,max-snippet:-1`.
+
+**O defeito não era a duplicação: era a premissa não ter sentinela.** Uma decisão
+de SEO que depende de um `<link>` sair certo em três formas de URL, sem nada que
+verifique se ele continua saindo, é uma decisão que envelhece em silêncio. No dia
+em que o canonical passar a apontar para a própria variante — por uma mudança no
+render, num header, ou numa regra de nginx que reescreva o caminho — o portal
+publica três URLs indexáveis com o mesmo corpo e ninguém fica sabendo, porque
+nenhum gate olha para as variantes.
+
+Este gate é read-only e sonda a produção pela borda. Ele NÃO propõe mudar o
+nginx: ele trava a condição que torna a escolha de não mudá-lo correta.
+
+★ O QUE ELE COBRA, e por quê cada item
+
+  1. `//rota/` e `/rota/index.html` respondem 200 — se um dia devolverem 404,
+     a mudança foi deliberada e este gate é o lugar de registrá-la.
+  2. As duas servem `rel=canonical` apontando para a forma LIMPA, absoluta e em
+     HTTPS. Canonical apontando para a própria variante é o cenário que destrói
+     a consolidação.
+  3. As duas continuam `index,follow` — a tentação é marcá-las `noindex`, e isso
+     seria pior: `noindex` numa URL que o canonical consolida pode propagar o
+     noindex à página canônica. O contrato do projeto já registra esse
+     precedente: "o canonical consolida, o noindex destrói".
+  4. `/rota` sem barra final responde 301 para a forma limpa — nunca 200, que
+     seria uma quarta URL indexável.
+
+★ SONDA
+
+User-Agent próprio e `X-Warming-Request: true`, como o contrato exige: sondar com
+UA de bot real é fraude. A amostra é sorteada por sha256 sobre a lista de URLs
+publicadas (nunca `random` sem semente), então duas execuções do mesmo dia
+conferem as mesmas rotas e a série é comparável.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wikiuniverso  # noqa: E402
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UA = "wikijuridica-superficie-probe/1.0"
+CABECALHOS = {"User-Agent": UA, "X-Warming-Request": "true"}
+TEMPO_LIMITE_S = 20
+
+_CANONICAL = re.compile(rb'rel="canonical"\s+href="([^"]+)"', re.I)
+_ROBOTS = re.compile(rb'<meta\s+name="robots"\s+content="([^"]+)"', re.I)
+
+
+class SemRedirecionar(urllib.request.HTTPRedirectHandler):
+    """O 301 é o que se quer MEDIR, então ele não pode ser seguido em silêncio."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_ABRIDOR = urllib.request.build_opener(SemRedirecionar)
+
+
+def busca(url: str, corpo: bool):
+    pedido = urllib.request.Request(url, method="GET" if corpo else "HEAD", headers=CABECALHOS)
+    try:
+        with _ABRIDOR.open(pedido, timeout=TEMPO_LIMITE_S) as resposta:
+            dados = resposta.read() if corpo else b""
+            return resposta.status, dict(resposta.headers), dados
+    except urllib.error.HTTPError as erro:
+        # 301/404 chegam por aqui porque o redirecionamento está desligado.
+        return erro.code, dict(erro.headers), b""
+    except Exception as erro:
+        return None, {"erro": type(erro).__name__}, b""
+
+
+def confere(url_limpa: str) -> list[str]:
+    """Devolve a lista de problemas desta rota. Lista vazia é aprovação."""
+    problemas: list[str] = []
+    caminho = url_limpa.split("://", 1)[1].split("/", 1)[1]
+    base = url_limpa.rsplit("/" + caminho, 1)[0]
+
+    variantes = {
+        "barra dupla": base + "//" + caminho,
+        "index.html explícito": url_limpa + "index.html",
+    }
+    for nome, alvo in variantes.items():
+        codigo, _, dados = busca(alvo, corpo=True)
+        if codigo != 200:
+            problemas.append(f"{nome}: esperava 200, veio {codigo}")
+            continue
+        achado = _CANONICAL.search(dados)
+        if not achado:
+            problemas.append(f"{nome}: sem rel=canonical")
+        else:
+            visto = achado.group(1).decode("utf-8", "replace")
+            if visto != url_limpa:
+                problemas.append(f"{nome}: canonical aponta para {visto!r}, esperava {url_limpa!r}")
+        robots = _ROBOTS.search(dados)
+        if robots and b"noindex" in robots.group(1).lower():
+            problemas.append(
+                f"{nome}: serve noindex — o canonical consolida e o noindex destrói; "
+                "noindex numa variante pode propagar à canônica"
+            )
+
+    sem_barra = url_limpa.rstrip("/")
+    codigo, cabecalhos, _ = busca(sem_barra, corpo=False)
+    if codigo not in (301, 308):
+        problemas.append(f"sem barra final: esperava 301/308, veio {codigo}")
+    else:
+        destino = cabecalhos.get("Location") or cabecalhos.get("location") or ""
+        if destino not in (url_limpa, "/" + caminho):
+            problemas.append(f"sem barra final: 301 para {destino!r}, esperava {url_limpa!r}")
+    return problemas
+
+
+def amostra(urls: list[str], quantas: int, semente: str) -> list[str]:
+    ordenadas = sorted(
+        urls, key=lambda u: hashlib.sha256((semente + "\x00" + u).encode("utf-8")).hexdigest()
+    )
+    return sorted(ordenadas[:quantas])
+
+
+def main() -> int:
+    analisador = argparse.ArgumentParser(description=__doc__)
+    analisador.add_argument("--amostra", type=int, default=8)
+    analisador.add_argument("--paralelas", type=int, default=4)
+    analisador.add_argument("--semente", default="variantes-canonical")
+    opcoes = analisador.parse_args()
+
+    try:
+        urls = wikiuniverso.urls_publicas(RAIZ)
+    except wikiuniverso.UniversoIndisponivel as erro:
+        print(f"check-url-variantes-canonical: universo indisponível: {erro}", file=sys.stderr)
+        return 2
+    if not urls:
+        # Ausência não é aprovação: sem universo não há o que conferir, e aprovar
+        # aqui seria a porta dos fundos que o repositório já fechou em três gates.
+        print("check-url-variantes-canonical: universo público VAZIO — anomalia", file=sys.stderr)
+        return 2
+
+    alvos = amostra(urls, min(opcoes.amostra, len(urls)), opcoes.semente)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=opcoes.paralelas) as executor:
+        resultados = list(executor.map(confere, alvos))
+
+    reprovadas = 0
+    for url, problemas in zip(alvos, resultados):
+        for problema in problemas:
+            print(f"check-url-variantes-canonical: {url} — {problema}")
+        if problemas:
+            reprovadas += 1
+
+    print(
+        f"check-url-variantes-canonical: {len(alvos) - reprovadas}/{len(alvos)} rotas com as "
+        f"variantes consolidadas pelo canonical (universo {len(urls)})"
+    )
+    return 1 if reprovadas else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

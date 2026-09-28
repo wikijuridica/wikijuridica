@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""generate-nginx-bot-operators — emite o mapa `geo $wj_operador_do_ip`.
+
+O DEFEITO QUE ELE EXISTE PARA CORRIGIR, e ele torna o número do registry uma
+ficção: a chave de toda zona de rate limit do vhost é `$binary_remote_addr`.
+Logo "600 requisições por minuto" não é o teto do OPERADOR — é o teto de cada
+endereço dele. Medido em `data/ops/bot_ip_ranges/`: o Google publica 317
+prefixos, a Meta opera de 406 endereços e a Amazon de 332. O teto efetivo de
+quem distribui é o número declarado multiplicado pelo tamanho da frota, contra
+um uplink que satura em ~44,7 mil requisições por minuto no pior sample medido.
+
+Some-se o segundo defeito, e os dois juntos são a razão de este arquivo existir:
+`$wj_bot_allow` decide isenção pelo USER-AGENT, que é uma string que o cliente
+escolhe. Já foram medidas requisições com `bot_allow=1` declarando `ChatGPT-User`
+de endereços que não são da OpenAI. Chave vazia por User-Agent é chave vazia
+para quem digitar o User-Agent.
+
+A CORREÇÃO É A MESMA PARA OS DOIS: derivar a identidade do ENDEREÇO, que o
+cliente não escolhe, e usar o operador como chave de limite. O `geo` do nginx faz
+isso numa árvore radix — custo por requisição desprezível, e é o mesmo mecanismo
+que o próprio nginx usa para `set_real_ip_from`.
+
+ORDEM DAS FASES, que é o que torna isto correto e não óbvio: `ngx_http_realip`
+roda em POST_READ e `ngx_http_limit_req` em PREACCESS. Quando a zona avalia a
+chave, `$remote_addr` JÁ foi reescrito com o `CF-Connecting-IP`. O `geo` enxerga
+o endereço real do cliente, não o do túnel.
+
+O QUE ESTE GERADOR NÃO FAZ, de propósito: não decide tier nenhum. Ele só diz
+QUEM é o operador de um endereço. Quem casa operador com tier é
+`generate-nginx-rate-tiers`, a partir de `content/crawl_policy.json` — a fonte
+única do número.
+
+Uso:
+    tools/generate-nginx-bot-operators             # imprime o bloco
+    tools/generate-nginx-bot-operators --escrever  # grava ops/nginx/bot-operators.conf
+    tools/generate-nginx-bot-operators --conferir  # compara com o que está no disco
+"""
+
+import argparse
+import glob
+import ipaddress
+import json
+import os
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FAIXAS = os.path.join(RAIZ, "data", "ops", "bot_ip_ranges")
+DESTINO = os.path.join(RAIZ, "ops", "nginx", "bot-operators.conf")
+
+# O OPERADOR É A PESSOA JURÍDICA, NÃO O PRODUTO, e é essa a unidade que satura o
+# uplink. `googlebot.json` e `google-special-crawlers.json` são frotas da mesma
+# empresa e partilham a mesma saída de rede; contá-las em baldes separados seria
+# permitir o dobro a quem tem dois nomes de crawler. O mapeamento é explícito e
+# não derivado do nome do arquivo: derivar por prefixo faria `openai-adsbot` e
+# `openai-gptbot` caírem juntos por acidente de nomenclatura, e um dia um arquivo
+# `open-search.json` entraria no balde da OpenAI sem ninguém notar.
+OPERADOR_POR_ARQUIVO = {
+    "anthropic": "anthropic",
+    "applebot": "apple",
+    "bingbot": "microsoft",
+    "duckassistbot": "duckduckgo",
+    "duckduckbot": "duckduckgo",
+    "google-special-crawlers": "google",
+    "google-user-triggered": "google",
+    "googlebot": "google",
+    "openai-adsbot": "openai",
+    "openai-chatgpt-user": "openai",
+    "openai-gptbot": "openai",
+    "openai-searchbot": "openai",
+    "perplexity-user": "perplexity",
+    "perplexitybot": "perplexity",
+}
+
+
+def prefixos_por_operador():
+    """operador -> lista ordenada de prefixos, sem duplicata.
+
+    Prefixo repetido entre arquivos do mesmo operador é a regra, não a exceção:
+    `duckassistbot.json` e `duckduckbot.json` publicam as MESMAS 486 faixas. O
+    nginx aceita a duplicata com um aviso no `-t`; deduplicar aqui mantém o
+    `nginx -t` limpo, e teste que passa com aviso é teste que ensina a ignorar
+    aviso.
+
+    Prefixo malformado é descartado individualmente e CONTADO: um arquivo com uma
+    linha ruim não pode apagar as outras duzentas, e um descarte silencioso viraria
+    faixa faltando sem ninguém saber.
+    """
+    por_operador = {}
+    desconhecidos = []
+    descartados = 0
+    for caminho in sorted(glob.glob(os.path.join(FAIXAS, "*.json"))):
+        nome = os.path.basename(caminho)[: -len(".json")]
+        operador = OPERADOR_POR_ARQUIVO.get(nome)
+        if operador is None:
+            desconhecidos.append(nome)
+            continue
+        try:
+            with open(caminho, encoding="utf-8") as arquivo:
+                dados = json.load(arquivo)
+        except (OSError, json.JSONDecodeError):
+            desconhecidos.append(nome)
+            continue
+        for prefixo in dados.get("prefixes", []):
+            try:
+                rede = ipaddress.ip_network(prefixo)
+            except ValueError:
+                descartados += 1
+                continue
+            por_operador.setdefault(operador, set()).add(str(rede))
+    return por_operador, desconhecidos, descartados
+
+
+def bloco():
+    por_operador, desconhecidos, descartados = prefixos_por_operador()
+    total = sum(len(p) for p in por_operador.values())
+    linhas = [
+        "# GERADO por tools/generate-nginx-bot-operators — NÃO EDITE À MÃO.",
+        "#",
+        "# `$wj_operador_do_ip` diz de QUEM é o endereço, a partir das faixas que o",
+        "# próprio operador publica (data/ops/bot_ip_ranges/, mantidas pelo timer",
+        "# wikijuridica-bot-ipranges). Vazio significa 'não é de nenhuma frota",
+        "# conhecida' — e nunca 'não é bot': é ausência de prova, não prova de",
+        "# ausência.",
+        "#",
+        "# Serve a duas coisas que o User-Agent não pode servir, porque UA é string",
+        "# que o cliente escolhe: (a) chave de rate limit agregada por operador, em",
+        "# vez de por endereço, e (b) distinguir a frota real de quem apenas declara",
+        "# o nome dela.",
+        "#",
+        f"# {total} prefixo(s) de {len(por_operador)} operador(es); {descartados} prefixo(s)",
+        "# malformado(s) descartado(s) individualmente.",
+        "",
+        "geo $wj_operador_do_ip {",
+        '    default "";',
+    ]
+    for operador in sorted(por_operador):
+        prefixos = sorted(por_operador[operador], key=lambda p: (":" in p, p))
+        linhas.append(f"    # {operador}: {len(prefixos)} prefixo(s)")
+        for prefixo in prefixos:
+            linhas.append(f'    {prefixo} "{operador}";')
+    linhas.append("}")
+    if desconhecidos:
+        linhas.insert(
+            1,
+            "# ATENÇÃO: arquivo(s) de faixa sem operador declarado, ignorado(s): "
+            + ", ".join(sorted(desconhecidos)),
+        )
+    return "\n".join(linhas) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--escrever", action="store_true")
+    parser.add_argument("--conferir", action="store_true")
+    args = parser.parse_args()
+    gerado = bloco()
+    if args.conferir:
+        if not os.path.exists(DESTINO):
+            print(f"{DESTINO} não existe: rode --escrever", file=sys.stderr)
+            return 1
+        with open(DESTINO, encoding="utf-8") as arquivo:
+            no_disco = arquivo.read()
+        if no_disco != gerado:
+            print(f"{DESTINO} divergiu do registry: rode --escrever", file=sys.stderr)
+            return 1
+        print(f"{DESTINO} confere com data/ops/bot_ip_ranges/")
+        return 0
+    if args.escrever:
+        os.makedirs(os.path.dirname(DESTINO), exist_ok=True)
+        temporario = DESTINO + ".tmp"
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            arquivo.write(gerado)
+        os.replace(temporario, DESTINO)
+        print(f"{DESTINO} escrito ({len(gerado.splitlines())} linhas)")
+        return 0
+    sys.stdout.write(gerado)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

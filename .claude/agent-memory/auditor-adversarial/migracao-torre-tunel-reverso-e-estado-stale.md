@@ -1,0 +1,16 @@
+---
+name: migracao-torre-tunel-reverso-e-estado-stale
+description: Migração do servidor (set/2026) — como alcançar a torre pelo túnel reverso 2222, o que "timed out during banner exchange" significa, e que o briefing do orquestrador envelheceu em <1 h (uplink mudou de celular para cabo)
+metadata:
+  type: project
+---
+
+Na migração notebook→torre (2026-09-24) o briefing dizia "torre só pela ancoragem USB do celular"; às 10:50 a torre já estava cabeada (enp10s0, 192.168.1.10) e o túnel `tunel-notebook.service` tinha reiniciado 13 vezes. `ssh -p 2222 rafael@localhost` devolvendo `Connection timed out during banner exchange` não é sshd caído: é o listener -R do notebook preso a uma sessão zumbi (ESTAB com bytes em send-q); confira `journalctl -u ssh | grep tunel-torre` no notebook e `ip -br addr` na torre, e reconecte com `-4`.
+
+**Why:** todo item do veredito sobre "NAT do celular", "MAC muda no replug" e "QUIC atrás do NAT" teria sido escrito contra um estado que já não existia no disco.
+
+**How to apply:** antes de julgar prontidão de passo de migração, re-derive uplink, IP e estado do túnel na hora (`ip -br addr`, `systemctl show tunel-notebook.service -p NRestarts`), e trate o briefing como hipótese. Fatos duráveis conferidos: `authorized_keys` do notebook já tem a própria id_ed25519.pub (08:27); `sudo -n` do rafael no notebook vem do `temp-claude` (NOPASSWD: ALL); `~/go/pkg/mod` é symlink para `/storage/cache/gomod`, que só chega no PASSO 10 — o build do passo 7 do migrar-dados.sh cai no fallback do binário velho (só libc, roda no Ubuntu).
+
+**Adendo 2026-09-24 (pós-cutover):** a torre responde direto em `192.168.1.10` (uid 1000 rafael, sudo no grupo), mas o `known_hosts` do notebook guarda outra chave para esse IP — em BatchMode isso dá `Host key verification failed`. Para verificação read-only use `ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 192.168.1.10 'sh -s' < script` (não grava nada). Fatos do Ubuntu 26.04 dela: coreutils é uutils 0.10.0 (`/usr/bin/nice,env,stat,timeout,mktemp,chmod,readlink,rmdir` → symlinks de root, 1 salto, para `/usr/lib/cargo/bin/coreutils/<nome>`; `rm` → `gnurm`; `python3` → `python3.14`; `/bin/sh` → dash; diretórios da cadeia todos root 755). Bancada em bash NÃO prova hook em dash: rode o bloco extraído com `dash` e `set -eu` lá.
+
+**Adendo 2026-09-24 (pré-transplante, 13:50):** o estado muda DURANTE a auditoria — `tunel-notebook.service` estava `active` no meu primeiro snapshot (13:46:43) e `not-found` 17 s depois (parado 13:47:00 por b22808e3). Re-leia cada achado de unit no fim, antes do veredito. Fatos duráveis do PASSO 8–10: o único boot da torre (11:51) aconteceu ANTES de habilitar/subir o portal (nginx+socket 12:02, cloudflared 12:31 manual) — autonomia de boot nunca foi exercitada; `sudo -n` de `rafael` na torre vem de `/etc/sudoers.d/90-migracao-temporaria` (expira por `expira-sudo-migracao.timer`) e a regra nomeada `wikijuridica-ops` NÃO cobre `consolidar-discos.sh`; `consolidar-discos.sh` não copia `~/.claude/projects` (memória + transcripts do orquestrador ficam só no NVMe velho); `claude` na torre está em `~/.local/bin/claude` (fora do PATH de ssh não-login — `which` falha, o binário existe).

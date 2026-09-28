@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""check-descoberta-do-bing — os quatro canais que o gate de crawl acusa, medidos.
+
+POR QUE EXISTE (2026-09-05). `tools/check-time-to-first-crawl` reprova com
+`bingbot_mediana_acima_do_teto` e imprime:
+
+    Pagina nova levando mais de uma semana para ser PEDIDA, ou backlog de
+    nunca-pedidas que nao encolhe, e o canal de descoberta falhando: sitemap
+    (lastmod, shards), robots.txt, orfas de link interno, IndexNow.
+
+A mediana de 21 dias é REAL — o Googlebot, sobre a mesma população, dá 4. Mas a
+lista de suspeitos da mensagem é uma hipótese, não uma medição, e uma sessão
+inteira já se gastou perseguindo a hipótese errada. Esta ferramenta mede os
+canais e diz qual deles, se algum, está de fato quebrado.
+
+O QUE FOI MEDIDO EM 2026-09-05, e que esta ferramenta reproduz:
+
+  IndexNow          entrega (HTTP 200, ownership_proof_verified_over_http), mas
+                    NÃO move o bingbot: a submissão de 2.679 URLs em 12/08 01:29
+                    rendeu 45 requisições naquele dia e a cobertura ficou em
+                    0,16% até 18/08. O salto veio em 20/08 (484 req/dia,
+                    0,35% → 4,96%), oito dias depois e sem relação. Das 2.679
+                    avisadas, 1.313 (49%) seguiam nunca pedidas 24 dias depois.
+                    Submeter o backlog de novo seria ruído.
+  borda             não desafia: 6.336 respostas 200 contra 9 de 503, 1 de 502,
+                    1 de 520, 2 de 530 e 31 de 404. Zero 403, zero 429, zero
+                    challenge — 0,25% de erro.
+  robots.txt        `BlockedByRobotsTxt: 0` no relatório do próprio Bing.
+  índice do Bing    `InIndex` 149 → 3.468 em 13 dias, monotônico (+289/dia);
+                    `AllOtherCodes` CAINDO 1.327 → 970; `Code4xx: 0`;
+                    impressões 256 → 1.318 e cliques 6 → 25.
+
+CONCLUSÃO: nenhum canal nosso está quebrado. O gargalo é o ritmo com que o Bing
+absorve um domínio novo, e ele melhora em todas as séries. A mediana cai sozinha
+conforme o backlog drena — o gate continua certo em medi-la, e NÃO deve ser
+afrouxado por causa disto.
+
+RESSALVA DE 2026-09-10, e ela reabre a linha "borda" acima. Aqueles "0,25% de
+erro" são o ledger INTEIRO somado, e é assim que a função media: um acumulado
+sem janela. Nessa forma a conta esconde o dia. Os mesmos 9 erros de 503 citados
+ali caíram todos em 2026-09-02, quando o processo Go ficou fora ~16 h, e valiam
+2,11% DAQUELE dia — acima do teto de 2%. O 502 e o 520 da mesma linha vêm de
+2026-08-25 e 2026-09-02; em 2026-08-21 houve um dia de 5,25%. Dois dias acima
+do teto (2026-08-21 e 2026-09-02; o 502 de 2026-08-25 deu 0,15% e é ruído),
+zero reprovações, porque o denominador era de vinte dias. A frase "a borda não
+desafia" continua verdadeira sobre o conjunto e continua enganosa sobre o dia:
+`mede_borda` passou a aplicar o teto DIA A DIA dentro de `JANELA_BORDA`.
+
+E o que motivou a revisão: `Code5xx` do relatório do Bing é ESTOQUE de URLs
+retidas nesse estado, não erro do dia. Lido como fluxo, o campo em 9..11 vira um
+falso "o portal serve 5xx todo dia" — foi o alarme de 2026-09-10, e origem e
+borda mostravam zero naqueles dias. Ele agora reprova, com a palavra "estoque"
+na mensagem e o remédio junto (reentregar por IndexNow).
+
+Esta ferramenta é `check-*`: read-only, não grava nada. Ela reprova quando um
+canal NOSSO quebra de verdade — robots bloqueando, a borda desafiando o bot
+verificado, IndexNow recusando, ou o índice do Bing ENCOLHENDO. Não reprova por
+mediana: isso é do gate que já existe.
+
+USO
+    ./tools/check-descoberta-do-bing
+    ./tools/check-descoberta-do-bing --json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+
+BING_WEBMASTER = "data/ops/bing_webmaster_daily.jsonl"
+EDGE_STATUS = "data/ops/edge_bot_status_daily.jsonl"
+INDEXNOW = "data/ops/indexnow_direct_submissions.jsonl"
+
+# Teto de erro da borda para um bot verificado. 0,25% foi o medido; 2% dá folga
+# de oito vezes e ainda acusa uma borda que passou a desafiar o crawler.
+TETO_ERRO_BORDA_PCT = 2.0
+# Quantos dias de relatório do Bing bastam para dizer se o índice encolheu.
+JANELA_INDICE = 5
+# Quanto o estoque de 5xx do relatório do Bing pode subir num dia sem que isso
+# seja indisponibilidade. O número sai da série do próprio ledger, não de gosto:
+# o incidente real de 2026-09-02 (processo Go fora ~16 h, 1.039 respostas 503 na
+# origem, lideradas por `/mcp` com 510) levou o campo de 2 para 9 em 09-04 — um
+# salto de +7. Os blips de túnel que `mede_borda` decidiu deixar passar movem o
+# estoque em no máximo +2 (09-06 7 → 09-07 11 tem +2 sobre o máximo anterior).
+# Reprovar em +2 seria fazer o mesmo blip reprovar por outra porta, contra a
+# régua que `mede_borda` já fixou ("o gate acusa indisponibilidade, não ruído de
+# túnel"). Acima de +2, é URL nova entrando no estoque e alguém serviu 5xx.
+TOLERANCIA_ENTRADA_5XX = 2
+# Janela da borda, em dias, contada a partir do último dia do ledger. O teto
+# acima se aplica DENTRO dela e DIA A DIA — ver o racional em `mede_borda`.
+# Sete dias porque o bingbot rastreia todo dia: uma janela menor deixaria um
+# fim de semana decidir sozinho, e uma maior volta a diluir a rajada.
+JANELA_BORDA = 7
+
+
+def _jsonl(caminho: pathlib.Path) -> list[dict]:
+    if not caminho.exists():
+        return []
+    registros = []
+    for numero, linha in enumerate(caminho.read_text(encoding="utf-8").splitlines(), 1):
+        if not linha.strip():
+            continue
+        try:
+            registro = json.loads(linha)
+        except json.JSONDecodeError as erro:
+            raise ValueError(f"{caminho.name} linha {numero} não é JSON") from erro
+        if isinstance(registro, dict):
+            registros.append(registro)
+    return registros
+
+
+def mede_robots_e_indice(raiz: pathlib.Path) -> dict:
+    """O que o PRÓPRIO Bing relata sobre nós — fonte primária, não inferência."""
+    diarios = {r["Date"]: r for r in _jsonl(raiz / BING_WEBMASTER)
+               if r.get("tipo") == "rastreio_diario" and r.get("Date")}
+    if not diarios:
+        return {"disponivel": False, "problemas": ["sem relatório de rastreio do Bing"]}
+    datas = sorted(diarios)
+    ultimo = diarios[datas[-1]]
+    janela = datas[-JANELA_INDICE:]
+    indice = [diarios[d].get("InIndex") for d in janela]
+    problemas = []
+    if ultimo.get("BlockedByRobotsTxt"):
+        problemas.append(
+            f"robots bloqueia {ultimo['BlockedByRobotsTxt']} página(s) segundo o Bing")
+    if ultimo.get("Code4xx"):
+        problemas.append(f"Code4xx={ultimo['Code4xx']} no relatório do Bing")
+    # `Code5xx` era lido, impresso e NUNCA avaliado, enquanto o irmão `Code4xx`
+    # ao lado reprovava. A assimetria é o avesso da gravidade: 4xx diz "esta URL
+    # não existe", 5xx diz "o servidor está quebrado", e é o segundo que faz o
+    # crawler reduzir a taxa de rastreio do site INTEIRO.
+    #
+    # E é ESTOQUE, não fluxo do dia — a confusão custou um P0 em 2026-09-10, com
+    # o campo em 9..11 lido como "9 a 11 erros por dia". As duas medições que o
+    # desmentem: `Code2xx` é igual a `InIndex` linha a linha no ledger inteiro
+    # (149/149 … 5052/5049), o que só faz sentido para um conjunto de URLs; e nos
+    # dias 09-03, 09-05 e 09-07 a 09-09 a origem e a borda registraram ZERO erro
+    # ao bingbot enquanto o campo seguia em 9, 9, 11, 10 e 10. Fluxo nenhum,
+    # estoque parado. O fluxo de verdade quem mede é `mede_borda`, acima.
+    #
+    # 2026-09-10 — O PARÁGRAFO ACIMA FICA, e a parte dele que REPROVAVA pelo
+    # nível do estoque está superada por medição. Não se apaga porque o
+    # diagnóstico estava certo: 5xx é mais grave que 4xx e o campo não podia
+    # continuar sendo lido sem ser avaliado. O que estava errado era a régua.
+    #
+    # Três medições próprias derrubaram o `if` que reprovava por `Code5xx > 0`:
+    #
+    #   1. As 9 gêmeas `/x/index.md` que o vermelho mandava reentregar foram
+    #      sondadas uma a uma com a sonda interna
+    #      (-A 'wikijuridica-superficie-probe/1.0' -H 'X-Warming-Request: true').
+    #      NOVE de nove responderam 200, de 8.492 a 13.548 bytes. Não havia URL
+    #      quebrada a remediar — só um número no relatório de terceiro.
+    #   2. A série de `Code5xx` é estoque que sobe E DESCE sozinho, sem que nada
+    #      nosso o toque: 0..1 até 09-02, depois 2, 9, 9, 7, 11, 10, 10. Um gate
+    #      que reprova por um número que nada drena fica vermelho para sempre, e
+    #      vermelho permanente ensina quem lê a ignorar o gate.
+    #   3. `InIndex` SOBE todo dia na mesma janela (2.939 → 5.049) e `Code4xx`
+    #      é zero. O estoque não está custando indexação.
+    #
+    # O remédio que o texto do vermelho mandava executar também não existia: o
+    # lote de `tools/generate-bing-submit-batch` sai do `published_manifest`,
+    # que só tem o HTML canônico, então ele nunca alcança a gêmea `/x/index.md`
+    # — e anunciar a gêmea ao Bing seria pedir indexação do canal de máquina ao
+    # lado do canônico, decisão de SEO que nenhum vermelho de gate autoriza.
+    #
+    # O que fica reprovando é o FLUXO, que `mede_borda` já mede DIA A DIA logo
+    # abaixo, e a ENTRADA nova no estoque, que é o único uso honesto deste campo:
+    # ele é a única fonte que enxerga o rastreio do Bing pelos olhos do Bing, e
+    # portanto o único lugar onde um 5xx servido a bingbot NÃO classificado como
+    # verificado pela borda apareceria.
+    # SÃO DOIS BRAÇOS, e o segundo existe porque o primeiro só vê DEGRAU.
+    # `estoque - max(anteriores)` compara com o dia mais alto da janela, então
+    # uma RAMPA de +2/dia — 10, 12, 14, 16, 18 — dá entrada +2 todos os dias e
+    # nunca dispara, enquanto o estoque dobra em cinco dias. E `mede_borda`
+    # também é cega a essa faixa: 2 erros em ~440 requisições diárias de bingbot
+    # dão 0,45%, sob o teto de 2%. Sem o segundo braço a rampa seria um dano que
+    # NENHUM dos dois instrumentos enxerga, e o único aviso restante seria o
+    # `InIndex` encolhendo — indicador de resultado, que chega tarde.
+    #
+    # O segundo braço mede AMPLITUDE na janela: quanto o estoque de hoje está
+    # acima do menor valor que a janela registrou. Dois blips de +2 em dias
+    # diferentes cabem (amplitude 4 = o dobro da tolerância, e o teste
+    # test_5xx_blip_dentro_da_tolerancia_nao_reprova fica na borda exata); um
+    # terceiro degrau na mesma direção não cabe, e é ele que caracteriza rampa.
+    estoque_5xx = ultimo.get("Code5xx")
+    serie_5xx = [diarios[d].get("Code5xx") for d in janela]
+    anteriores_5xx = [v for v in serie_5xx[:-1] if isinstance(v, int)]
+    entrada_5xx = None
+    amplitude_5xx = None
+    if isinstance(estoque_5xx, int) and anteriores_5xx:
+        entrada_5xx = estoque_5xx - max(anteriores_5xx)
+        piso_5xx = min(anteriores_5xx + [estoque_5xx])
+        amplitude_5xx = estoque_5xx - piso_5xx
+        if entrada_5xx > TOLERANCIA_ENTRADA_5XX:
+            problemas.append(
+                f"entraram {entrada_5xx} URL(s) NOVAS no estoque de 5xx do Bing "
+                f"em {ultimo['Date']}: {estoque_5xx} contra máximo de "
+                f"{max(anteriores_5xx)} nos {len(anteriores_5xx)} dia(s) "
+                f"anteriores (série {serie_5xx}, tolerância de blip "
+                f"{TOLERANCIA_ENTRADA_5XX}) — o portal serviu 5xx a bingbot; "
+                f"confira o processo Go e a borda em "
+                f"data/ops/access/ e data/ops/edge_bot_status_daily.jsonl")
+        elif amplitude_5xx > 2 * TOLERANCIA_ENTRADA_5XX:
+            problemas.append(
+                f"o estoque de 5xx do Bing está em RAMPA: subiu {amplitude_5xx} "
+                f"na janela sem nenhum degrau acima da tolerância "
+                f"({estoque_5xx} em {ultimo['Date']} contra piso de {piso_5xx}, "
+                f"série {serie_5xx}) — crescimento lento cabe abaixo do teto de "
+                f"erro da borda e passaria despercebido pelos dois "
+                f"instrumentos; confira data/ops/access/ e "
+                f"data/ops/edge_bot_status_daily.jsonl")
+    if len(indice) >= 2 and None not in indice and indice[-1] < indice[0]:
+        problemas.append(
+            f"índice do Bing ENCOLHEU na janela: {indice[0]} → {indice[-1]}")
+    return {
+        "disponivel": True,
+        "data": datas[-1],
+        "in_index": ultimo.get("InIndex"),
+        "in_index_janela": indice,
+        "crawled_pages": ultimo.get("CrawledPages"),
+        "blocked_by_robots": ultimo.get("BlockedByRobotsTxt"),
+        "code_4xx": ultimo.get("Code4xx"),
+        "code_5xx": estoque_5xx,
+        "code_5xx_janela": serie_5xx,
+        "code_5xx_entrada": entrada_5xx,
+        "code_5xx_amplitude": amplitude_5xx,
+        "outros_codigos": ultimo.get("AllOtherCodes"),
+        "problemas": problemas,
+    }
+
+
+def mede_borda(raiz: pathlib.Path) -> dict:
+    """A borda desafia o bingbot verificado? 403/429/5xx comem orçamento de rastreio.
+
+    POR DIA E DENTRO DE UMA JANELA, e a diferença custou um P0 (2026-09-10).
+    Até aqui esta função somava o ledger INTEIRO e aplicava o teto ao acumulado
+    de todos os dias. Um orçamento de erro assim se dessensibiliza sozinho: a
+    rajada é um número FIXO de eventos e o denominador cresce todo dia, então a
+    fração tende a zero e o teto nunca mais dispara — quanto mais o portal é
+    rastreado, mais cego fica o detector.
+
+    Medido no dado real (`data/ops/edge_bot_status_daily.jsonl`): em 2026-09-02
+    o processo Go ficou fora ~16 h e o bingbot levou 10 erros (9 de 503 na
+    origem, 1 de 520 na borda) em 474 requisições daquele dia — 2,11%, ACIMA do
+    teto. O acumulado do ledger inteiro dizia 0,37%, e em 2026-08-21 um dia de
+    5,25% também passava despercebido. O incidente existiu nas duas datas; o
+    instrumento não viu nenhuma das duas.
+
+    Com o teto aplicado por dia, esses são exatamente os dois dias que reprovam,
+    e os blips isolados de 2026-09-04 (0,43%) e 2026-09-06 (0,49%) continuam
+    silenciosos — o gate acusa indisponibilidade, não ruído de túnel.
+    """
+    por_dia: dict[str, dict[int, int]] = {}
+    sem_data = 0
+    for registro in _jsonl(raiz / EDGE_STATUS):
+        if "bing" not in str(registro.get("agent_key", "")).lower():
+            continue
+        status = registro.get("edge_response_status")
+        if not isinstance(status, int):
+            continue
+        dia = registro.get("date")
+        if not isinstance(dia, str) or not dia:
+            # Nunca descartar em silêncio: sem `date` não há como janelar, e um
+            # schema que pare de emitir o campo cegaria o gate sem avisar.
+            sem_data += 1
+            continue
+        do_dia = por_dia.setdefault(dia, {})
+        do_dia[status] = do_dia.get(status, 0) + int(
+            registro.get("requests_estimated") or 0)
+
+    problemas = []
+    if sem_data:
+        problemas.append(
+            f"{sem_data} registro(s) de bingbot na borda sem campo `date`: "
+            "impossível janelar, e a janela é o que faz o teto valer")
+    if not por_dia:
+        return {"disponivel": False,
+                "problemas": problemas or ["nenhuma requisição de bingbot na borda"]}
+
+    janela = sorted(por_dia)[-JANELA_BORDA:]
+    por_status: dict[int, int] = {}
+    piores: list[tuple[str, float, int, int]] = []
+    for dia in janela:
+        do_dia = por_dia[dia]
+        for status, n in do_dia.items():
+            por_status[status] = por_status.get(status, 0) + n
+        total_dia = sum(do_dia.values())
+        if not total_dia:
+            continue
+        # 3xx é redirecionamento nosso, não recusa; 2xx é entrega.
+        recusas_dia = sum(n for s, n in do_dia.items()
+                          if s in (401, 403, 429) or s >= 500)
+        pct_dia = 100.0 * recusas_dia / total_dia
+        if pct_dia > TETO_ERRO_BORDA_PCT:
+            piores.append((dia, pct_dia, recusas_dia, total_dia))
+
+    total = sum(por_status.values())
+    recusas = sum(n for s, n in por_status.items() if s in (401, 403, 429) or s >= 500)
+    pct = 100.0 * recusas / total if total else 0.0
+    for dia, pct_dia, recusas_dia, total_dia in piores:
+        detalhe = {s: n for s, n in sorted(por_dia[dia].items())
+                   if s in (401, 403, 429) or s >= 500}
+        problemas.append(
+            f"borda recusou {pct_dia:.2f}% das requisições do bingbot em {dia} "
+            f"({recusas_dia} de {total_dia}, teto {TETO_ERRO_BORDA_PCT}%): {detalhe}")
+    return {
+        "disponivel": True,
+        "janela": janela,
+        "requisicoes": total,
+        "por_status": dict(sorted(por_status.items())),
+        "recusa_pct": round(pct, 2),
+        "dias_acima_do_teto": [dia for dia, _, _, _ in piores],
+        "problemas": problemas,
+    }
+
+
+def mede_indexnow(raiz: pathlib.Path) -> dict:
+    """O endpoint aceita nossas submissões? (Aceitar não é o mesmo que mover.)"""
+    registros = _jsonl(raiz / INDEXNOW)
+    if not registros:
+        return {"disponivel": False, "problemas": ["sem ledger de submissão IndexNow"]}
+    recentes = registros[-10:]
+    falhas = [r for r in recentes if not r.get("success")]
+    sem_prova = [r for r in recentes
+                 if not r.get("ownership_proof_verified_over_http")]
+    problemas = []
+    if falhas:
+        problemas.append(
+            f"{len(falhas)} das {len(recentes)} últimas submissões falharam "
+            f"(http {[r.get('http_status') for r in falhas]})")
+    if sem_prova:
+        problemas.append(
+            f"{len(sem_prova)} submissões sem prova de posse verificada por HTTP")
+    return {
+        "disponivel": True,
+        "ultima": recentes[-1].get("submitted_at"),
+        "urls_ultima": recentes[-1].get("url_count"),
+        "amostra": len(recentes),
+        "problemas": problemas,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="mede os canais de descoberta do Bing")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    canais = {
+        "bing_webmaster": mede_robots_e_indice(RAIZ),
+        "borda": mede_borda(RAIZ),
+        "indexnow": mede_indexnow(RAIZ),
+    }
+    problemas = [f"{nome}: {p}" for nome, dados in canais.items()
+                 for p in dados.get("problemas", [])]
+
+    if args.json:
+        print(json.dumps({"canais": canais, "problemas": problemas},
+                         ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if problemas else 0
+
+    bing = canais["bing_webmaster"]
+    if bing.get("disponivel"):
+        print(f"Bing Webmaster ({bing['data']}): InIndex={bing['in_index']} "
+              f"janela={bing['in_index_janela']} · rastreadas/dia={bing['crawled_pages']} "
+              f"· robots bloqueia={bing['blocked_by_robots']} · 4xx={bing['code_4xx']} "
+              f"· URL(s) retidas em 5xx={bing['code_5xx']} (estoque) "
+              f"· outros={bing['outros_codigos']}")
+        # O estoque de 5xx é dado, não veredito: ele se relata sempre, com a
+        # série e a entrada do dia, para que o leitor veja se o número está
+        # parado (nada a fazer) ou subindo (aí `problemas` já acusou acima).
+        if bing.get("code_5xx"):
+            entrada = bing.get("code_5xx_entrada")
+            variacao = ("sem dia anterior na janela para comparar"
+                        if entrada is None
+                        else f"entrada do dia {entrada:+d} sobre o máximo anterior")
+            print(f"  estoque 5xx do Bing: série {bing['code_5xx_janela']} "
+                  f"— {variacao}, tolerância de blip {TOLERANCIA_ENTRADA_5XX}. "
+                  f"É conjunto retido pelo relatório, não erros do dia: o fluxo "
+                  f"quem mede é a linha da borda, abaixo.")
+    borda = canais["borda"]
+    if borda.get("disponivel"):
+        print(f"borda ({borda['janela'][0]}..{borda['janela'][-1]}): "
+              f"{borda['requisicoes']} requisição(ões) de bingbot, "
+              f"{borda['recusa_pct']}% recusadas no conjunto da janela · "
+              f"{borda['por_status']}")
+    indexnow = canais["indexnow"]
+    if indexnow.get("disponivel"):
+        print(f"IndexNow: última {indexnow['ultima']} com {indexnow['urls_ultima']} URL(s); "
+              f"{indexnow['amostra']} submissões conferidas")
+
+    if problemas:
+        print("\ncheck-descoberta-do-bing: FAIL")
+        for problema in problemas:
+            print(f"  - {problema}")
+        return 1
+    print("\ncheck-descoberta-do-bing: OK — nenhum canal NOSSO de descoberta está "
+          "quebrado.\n  Mediana alta em check-time-to-first-crawl com estes canais sadios "
+          "é ritmo de\n  absorção do Bing, não defeito a consertar aqui — e NÃO é motivo "
+          "para afrouxar\n  aquele gate.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

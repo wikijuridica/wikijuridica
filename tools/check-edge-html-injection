@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""check-edge-html-injection — a borda entrega o HTML que a origem escreveu?
+
+READ-ONLY. Sai != 0 quando a borda ACRESCENTA script ao HTML ou AFROUXA a
+Content-Security-Policy que a origem declara.
+
+POR QUE EXISTE. Medido em 2026-08-26: a Cloudflare insere, em TODO HTML deste
+portal, um `<script type="module" src=".../.webmcp/bridge.js" nonce="..."
+data-packs="c2pa,mcp-server-client">` -- exatamente +160 bytes, ANTES do
+`<link rel=canonical>`. O arquivo tem 47.616 bytes, e NAO existe na origem: o
+proprio nginx e o proprio Go devolvem 404 para `/.webmcp/bridge.js`.
+
+Isso viola tres dos cinco limites que a emenda de 2026-08-19 do CLAUDE.md
+manteve ao liberar JavaScript:
+  - item 2: tamanho medido e declarado no commit -- 47.616 bytes nunca foram;
+  - item 3: nada de bundle nem host externo -- e modulo externo de 47 KB;
+  - item 5: a CSP autoriza por HASH, nunca por token largo. Medido, a origem
+    declara `script-src 'sha256-LWtUrcm...'` e a borda serve
+    `script-src 'sha256-LWtUrcm...' 'nonce-<32 hex>'`. Um nonce autoriza
+    QUALQUER script que a borda escolher injetar.
+
+E ha um custo de terceira ordem: a borda REESCREVE o corpo, e por isso REMOVE o
+ETag. Medido com a Cache Rule ja restaurada e a resposta em cf-cache-status HIT,
+a borda nao devolve ETag nenhum -- entao a revalidacao por If-None-Match nao
+existe do lado de fora, e so sobra o Last-Modified.
+
+POR QUE UM GATE, JA QUE NAO ACHEI O INTERRUPTOR. Porque o que nao se pode
+desligar hoje precisa pelo menos ser VIGIADO: se a injecao crescer, mudar de
+origem, passar a carregar outro pacote ou afrouxar mais a CSP, isto reprova. Os
+dois gates que existiam nao veem nada disso -- `check-ingress-security-headers`
+sobe uma replica do nginx em 127.0.0.1 e NUNCA fala com a borda, e
+`check-agent-surface-live` fala com a borda e passou 100% sem olhar CSP nem
+`<script>`. Gate verde nao e prova: e ausencia de cobertura.
+
+O QUE FOI TENTADO PARA DESLIGAR, e nao existe na API v4 (medido em 2026-08-26):
+as 56 settings da zona (rocket_loader, mirage e automatic_platform_optimization
+estao OFF); os tres rulesets de transformacao (todos com ZERO regras); Workers
+da conta (ZERO scripts) e rotas de Worker na zona (ZERO); e os endpoints
+`ai_crawl_control`, `webmcp`, `mcp_server` e `content_signals`, que nao existem.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+HOST = "wikijuridica.com.br"
+ORIGEM = "http://127.0.0.1:8088"
+BORDA = f"https://{HOST}"
+UA = "wikijuridica-injection-probe/1.0"
+
+# Rotas de HTML de famílias diferentes: home, hub, artigo, institucional, erro.
+# Erro entra de propósito — a página 404 é servida por caminho diferente e já foi
+# onde a injeção apareceu primeiro nesta investigação.
+ROTAS = ["/", "/familia/", "/previdenciario/135-ou-agencia/", "/sobre/",
+         "/metodologia/", "/fontes/", "/nao-existe-mesmo-404/"]
+
+TAG_SCRIPT = re.compile(r"<script\b[^>]*>", re.I)
+# Tokens que afrouxam script-src. 'nonce-' entra porque autoriza qualquer script
+# que quem injeta escolher, que é o oposto de autorizar por hash.
+TOKENS_LARGOS = ("'unsafe-inline'", "'unsafe-eval'", "'self'", "nonce-", "https:", "*")
+
+
+def busca(url, host_header=False):
+    cmd = ["curl", "-sS", "-D", "-", "--max-time", "20", "-A", UA,
+           "-H", "X-Warming-Request: true"]
+    if host_header:
+        cmd += ["-H", f"Host: {HOST}"]
+    cmd.append(url)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+    texto = r.stdout or ""
+    corte = texto.find("\r\n\r\n")
+    if corte < 0:
+        corte = texto.find("\n\n")
+    if corte < 0:
+        return "", ""
+    return texto[:corte], texto[corte:]
+
+
+def csp_de(cabecalhos):
+    for linha in cabecalhos.split("\n"):
+        if linha.lower().startswith("content-security-policy:"):
+            return linha.split(":", 1)[1].strip()
+    return ""
+
+
+def script_src(csp):
+    m = re.search(r"script-src([^;]*)", csp, re.I)
+    return m.group(1).strip() if m else ""
+
+
+def main() -> int:
+    problemas = []
+    conferidas = 0
+    for rota in ROTAS:
+        cab_o, corpo_o = busca(ORIGEM + rota, host_header=True)
+        cab_b, corpo_b = busca(BORDA + rota)
+        if not corpo_o or not corpo_b:
+            problemas.append(f"{rota}: nao consegui comparar (origem ou borda sem resposta)")
+            continue
+        conferidas += 1
+
+        scripts_o = set(TAG_SCRIPT.findall(corpo_o))
+        scripts_b = set(TAG_SCRIPT.findall(corpo_b))
+        acrescentados = scripts_b - scripts_o
+        if acrescentados:
+            delta = len(corpo_b) - len(corpo_o)
+            problemas.append(
+                f"{rota}: a borda ACRESCENTOU {len(acrescentados)} script(s) "
+                f"ausente(s) na origem (+{delta} bytes)")
+            for s in sorted(acrescentados)[:2]:
+                problemas.append(f"      {s[:150]}")
+
+        cspo, cspb = csp_de(cab_o), csp_de(cab_b)
+        so, sb = script_src(cspo), script_src(cspb)
+        if so != sb:
+            problemas.append(f"{rota}: a borda ALTEROU script-src da CSP")
+            problemas.append(f"      origem: {so[:110]}")
+            problemas.append(f"      borda : {sb[:110]}")
+            for token in TOKENS_LARGOS:
+                if token in sb and token not in so:
+                    problemas.append(
+                        f"      ACRESCENTOU {token!r} — a CSP deste portal autoriza por HASH, "
+                        "nunca por token largo (emenda de 2026-08-19, item 5)")
+
+        # ETag: a reescrita de corpo o remove, e sem ele nao ha If-None-Match.
+        tem_etag_o = any(l.lower().startswith("etag:") for l in cab_o.split("\n"))
+        tem_etag_b = any(l.lower().startswith("etag:") for l in cab_b.split("\n"))
+        # O RAMO SO VALE SE A ORIGEM AINDA EMITE ETAG.
+        #
+        # Desde 2026-08-28 o vhost tem `etag off` nas rotas estaticas: o ETag do
+        # nginx e `mtime-size` e o tamanho difere entre a variante comprimida e a
+        # identity, o que anulava o If-Modified-Since correto do crawler. Sem
+        # ETag na origem, `tem_etag_o` e sempre falso e esta checagem virou
+        # vacuo -- passava verde sem medir nada, que e o oposto de uma guarda.
+        #
+        # Agora a ausencia e DECLARADA em vez de silenciosa: quando a origem nao
+        # emite ETag, o relatorio diz que a garantia nao se aplica, em vez de
+        # fingir que passou.
+        if not tem_etag_o:
+            print("  ETag: a origem nao emite (etag off no vhost); a garantia de")
+            print("        preservacao do validador forte NAO SE APLICA a esta rota.")
+        if tem_etag_o and not tem_etag_b:
+            problemas.append(
+                f"{rota}: a origem emite ETag e a borda NAO — sem validador forte do lado "
+                "de fora, If-None-Match nao funciona para nenhum bot")
+
+    print(f"rotas conferidas: {conferidas} de {len(ROTAS)}")
+    if problemas:
+        print("check-edge-html-injection: FAIL")
+        for p in problemas:
+            print(f"  - {p}" if not p.startswith("      ") else p)
+        print("  A injecao NAO tem interruptor na API v4 (56 settings, 3 rulesets de")
+        print("  transformacao vazios, 0 Workers, 0 rotas de Worker — todos medidos).")
+        print("  Este gate existe para que ela nao MUDE em silencio.")
+        return 1
+    print("check-edge-html-injection: OK (a borda entrega o HTML e a CSP que a origem escreveu)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

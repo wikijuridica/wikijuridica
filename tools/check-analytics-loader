@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Executa o carregador de medicao de audiencia e prova o que ele faz.
+
+POR QUE ESTA FERRAMENTA EXISTE: o caminho de serving e Go e nunca precisou testar
+JavaScript. A partir de 2026-08-27 ele emite ~2,6 KB de JS em 10.331 paginas, e
+o modo de falha desse codigo e SILENCIOSO -- uma guarda invertida nao levanta
+erro, ela so descarta (ou coleta) o que nao devia, e o painel resultante e
+indistinguivel de "nao ha visitantes". Teste de Go conferindo substring nao
+apanha isso: so executar apanha.
+
+NAO ACRESCENTA DEPENDENCIA. O go.mod ja carrega 195 diretas; Node ja esta
+instalado na maquina. A ferramenta extrai a constante Loader do proprio arquivo
+Go -- nunca uma copia, que poderia divergir em silencio --, monta um DOM minimo
+e roda os cenarios.
+
+Uso: ./tools/check-analytics-loader [--verbose]
+"""
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+FONTE = RAIZ / "internal" / "webanalytics" / "webanalytics.go"
+
+
+def constante_go(nome: str) -> str:
+    """Le uma constante string do pacote Go. Digitar o valor aqui criaria a
+    divergencia silenciosa que o proprio codigo Go documenta ter evitado."""
+    texto = FONTE.read_text(encoding="utf-8")
+    achado = re.search(r'^\t' + re.escape(nome) + r'\s*=\s*"([^"]*)"', texto, re.M)
+    if not achado:
+        raise SystemExit(f"constante {nome} nao encontrada em {FONTE}")
+    return achado.group(1)
+
+
+def carrega_loader() -> str:
+    """Le a constante Loader do Go e resolve as concatenacoes de identificador."""
+    texto = FONTE.read_text(encoding="utf-8")
+    # TODA constante string do pacote, nao uma lista fechada: o Loader ganhou
+    # SecaoOptOutID depois que esta ferramenta nasceu, e uma lista fechada
+    # quebraria a cada constante nova em vez de acompanhar.
+    ids = dict(re.findall(r'^\t(\w+)\s*=\s*"([^"]*)"', texto, re.M))
+    if not ids:
+        raise SystemExit(f"nao achei constante string alguma em {FONTE}")
+    bruto = re.search(r"const Loader = `(.*?)`\n", texto, re.S)
+    if not bruto:
+        raise SystemExit(f"nao achei a constante Loader em {FONTE}")
+    corpo = bruto.group(1)
+    # O Go concatena assim:  ...id=` + MeasurementID + `...
+    corpo = re.sub(r"`\s*\+\s*(\w+)\s*\+\s*`", lambda m: ids[m.group(1)], corpo)
+    if "` +" in corpo or "+ `" in corpo:
+        raise SystemExit("sobrou concatenacao Go nao resolvida no Loader")
+    return corpo
+
+
+HARNESS = r"""
+'use strict';
+const CENARIO = JSON.parse(process.env.WJ_CENARIO);
+const LOADER = process.env.WJ_LOADER;
+
+// ---- DOM minimo -----------------------------------------------------------
+const injetados = [];
+const ouvintes = {};
+let armazenamento = Object.assign({}, CENARIO.storage || {});
+// Fixture com os cookies REAIS que a medicao grava — inclusive _ga_<ID>, que o
+// GA4 sempre cria e que uma fixture so com "_ga" nao exercitava — mais um alheio,
+// que tem de sobreviver: apagar cookie de outra funcao seria dano, nao zelo.
+const cookies = Object.assign(
+  {_ga: 'GA1.1.x', _ga_H6FQ8CQJNR: 'GS1.1.y', _clck: 'c', _clsk: 's', _uetvid: 'u', outro: 'z'},
+  CENARIO.cookies || {});
+const cookiesApagados = [];
+const storageQuebrado = !!CENARIO.storageQuebrado;
+
+function novoElemento(tag, attrs) {
+  const el = {
+    tagName: String(tag).toUpperCase(), _attrs: Object.assign({}, attrs || {}),
+    _filhos: [], async: false, src: '', type: '', textContent: '', className: '',
+    setAttribute(k, v) { this._attrs[k] = String(v); },
+    getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+    appendChild(f) { this._filhos.push(f); return f; },
+    insertBefore(n) { this._filhos.push(n); return n; },
+    get parentNode() { return this._pai || documento.body; },
+    closest(sel) {
+      // O seletor do loader passou a ser COMPOSTO ("[data-wj-cta],.wa-float-link")
+      // e a casar tambem por classe e por descendencia (".prov a"). Enquanto este
+      // shim so entendia "[atributo]", um seletor legitimo devolvia null e o gate
+      // reprovava por defeito DELE, nao do codigo sob teste.
+      const partes = String(sel).split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+      for (let i = 0; i < partes.length; i++) {
+        const parte = partes[i];
+        const cadeia = parte.split(/\s+/);
+        const alvo = cadeia[cadeia.length - 1];
+        const ancestral = cadeia.length > 1 ? cadeia[0] : null;
+        let no = this;
+        while (no) {
+          if (casaSeletorSimples(no, alvo) && (!ancestral || temAncestral(no, ancestral))) return no;
+          no = no._pai;
+        }
+      }
+      return null;
+    },
+  };
+  return el;
+}
+
+function casaSeletorSimples(no, sel) {
+  if (!no) return false;
+  let m = /^\[([a-z-]+)\]$/.exec(sel);
+  if (m) return !!(no._attrs && m[1] in no._attrs);
+  m = /^\[([a-z-]+)=([^\]]+)\]$/.exec(sel);
+  if (m) return !!(no._attrs && String(no._attrs[m[1]]) === m[2].replace(/^["']|["']$/g, ''));
+  m = /^\.([A-Za-z0-9_-]+)$/.exec(sel);
+  if (m) return String(no.className || '').split(/\s+/).indexOf(m[1]) >= 0;
+  // tag.classe — o Loader usa `nav.toc a`, e sem isto o shim so entendia um dos
+  // dois pedacos e o cenario falhava por defeito da ferramenta.
+  m = /^([a-z]+)\.([A-Za-z0-9_-]+)$/.exec(sel);
+  if (m) {
+    return String(no.tagName || '').toLowerCase() === m[1] &&
+           String(no.className || '').split(/\s+/).indexOf(m[2]) >= 0;
+  }
+  return String(no.tagName || '').toLowerCase() === String(sel).toLowerCase();
+}
+
+function temAncestral(no, sel) {
+  let p = no._pai;
+  while (p) { if (casaSeletorSimples(p, sel)) return true; p = p._pai; }
+  return false;
+}
+
+const alvoSecao = CENARIO.temSecaoCookies ? novoElemento('h2', {}) : null;
+if (alvoSecao) { alvoSecao._pai = novoElemento('section', {}); }
+
+const documento = {
+  location: {
+    pathname: CENARIO.pathname || '/', search: CENARIO.search || '',
+    origin: 'https://wikijuridica.com.br',
+  },
+  head: novoElemento('head', {}), body: novoElemento('body', {}),
+  createElement(tag) {
+    const el = novoElemento(tag, {});
+    if (String(tag).toLowerCase() === 'script') injetados.push(el);
+    return el;
+  },
+  getElementById(id) { return (alvoSecao && id === CENARIO.idSecao) ? alvoSecao : null; },
+  // O loader le as dimensoes editoriais de uma <meta>. Sem este shim ele estoura
+  // em TypeError e o defeito pareceria estar no codigo sob teste.
+  querySelector(sel) {
+    const m = /^meta\[name="([^"]+)"\]$/.exec(String(sel));
+    if (!m) return null;
+    if (!CENARIO.meta || CENARIO.metaNome !== m[1]) return null;
+    return novoElemento('meta', { name: m[1], content: CENARIO.meta });
+  },
+  addEventListener(ev, fn) { (ouvintes[ev] = ouvintes[ev] || []).push(fn); },
+  readyState: 'complete',
+  // document.cookie com semantica minima: leitura devolve o que o cenario
+  // declarou; escrita com max-age=0 e registrada como apagamento. Sem isto nao
+  // ha como provar que o opt-out cumpre a promessa publicada em /privacidade/.
+  get cookie() { return Object.keys(cookies).map(function (k) { return k + '=' + cookies[k]; }).join('; '); },
+  set cookie(v) {
+    const nome = String(v).split('=')[0].trim();
+    if (/max-age=0/.test(String(v))) { delete cookies[nome]; cookiesApagados.push(nome); }
+    else { cookies[nome] = String(v).split('=')[1] || ''; }
+  },
+};
+
+const janela = {
+  document: documento,
+  navigator: {
+    userAgent: CENARIO.ua || '',
+    webdriver: !!CENARIO.webdriver,
+    globalPrivacyControl: CENARIO.gpc === true ? true : undefined,
+  },
+  localStorage: {
+    getItem(k) { if (storageQuebrado) throw new Error('bloqueado'); return k in armazenamento ? armazenamento[k] : null; },
+    setItem(k, v) { if (storageQuebrado) throw new Error('bloqueado'); armazenamento[k] = String(v); },
+    removeItem(k) { if (storageQuebrado) throw new Error('bloqueado'); delete armazenamento[k]; },
+  },
+  setTimeout(fn) { agendados.push(fn); return 1; },
+};
+if (CENARIO.temIdle) janela.requestIdleCallback = function (fn) { agendados.push(fn); };
+const agendados = [];
+
+// ---- executa o loader -----------------------------------------------------
+let erro = null;
+try {
+  new Function('window', 'document', 'navigator', LOADER)(janela, documento, janela.navigator);
+} catch (e) { erro = String(e && e.message || e); }
+
+function dispara(ev, alvo) {
+  let impedido = false;
+  (ouvintes[ev] || []).forEach(function (fn) {
+    fn({ target: alvo, preventDefault() { impedido = true; } });
+  });
+  return impedido;
+}
+
+// ---- acoes do cenario -----------------------------------------------------
+(CENARIO.acoes || []).forEach(function (acao) {
+  if (acao === 'idle') { agendados.slice().forEach(function (fn) { fn(); }); }
+  if (acao === 'clicaCTA') { dispara('click', novoElemento('a', { 'data-wj-cta': '' })); }
+  if (acao === 'clicaOptOut') {
+    const botao = alvoSecao ? alvoSecao._pai._filhos.map(function (p) {
+      return (p._filhos || []).find(function (f) { return f._attrs && 'data-wj-optout' in f._attrs; });
+    }).find(Boolean) : novoElemento('button', { 'data-wj-optout': '' });
+    dispara('click', botao || novoElemento('button', { 'data-wj-optout': '' }));
+  }
+  if (acao === 'pointerdown') { dispara('pointerdown', documento.body); }
+  if (acao === 'clicaFloat') {
+    const link = novoElemento('a', {});
+    link.className = 'wa-float-link';
+    dispara('click', link);
+  }
+  if (acao === 'clicaIndice') {
+    const nav = novoElemento('nav', {});
+    nav.className = 'toc';
+    const link = novoElemento('a', {});
+    link._pai = nav;
+    dispara('click', link);
+  }
+  if (acao === 'clicaRelacionado') {
+    const sec = novoElemento('section', { 'aria-labelledby': 'conteudos-relacionados' });
+    const link = novoElemento('a', {});
+    link._pai = sec;
+    dispara('click', link);
+  }
+  if (acao === 'clicaFonte') {
+    const secao = novoElemento('section', {});
+    secao.className = 'prov';
+    const link = novoElemento('a', {});
+    link._pai = secao;
+    dispara('click', link);
+  }
+  if (acao === 'submeteBusca') {
+    const form = novoElemento('form', {});
+    form.className = 'search-form';
+    dispara('submit', form);
+  }
+});
+
+const controle = alvoSecao ? alvoSecao._pai._filhos.filter(function (f) { return f.tagName === 'P'; }) : [];
+console.log(JSON.stringify({
+  erro: erro,
+  scripts: injetados.map(function (s) { return s.src; }).filter(Boolean),
+  dataLayer: (janela.dataLayer || []).map(function (a) { return Array.prototype.slice.call(a); }),
+  storage: armazenamento,
+  clarity: (janela.clarity && janela.clarity.q ? janela.clarity.q : []).map(function (a) { return Array.prototype.slice.call(a); }),
+  cookiesApagados: cookiesApagados,
+  gaDesligado: Object.keys(janela).filter(function (k) { return k.indexOf('ga-disable-') === 0 && janela[k] === true; }),
+  cookiesRestantes: Object.keys(cookies),
+  controle: controle.map(function (p) {
+    return { texto: p.textContent, botoes: (p._filhos || []).map(function (b) { return b.textContent; }) };
+  }),
+}));
+"""
+
+META_NOME = constante_go("DimensoesMetaName")
+CHAVE_CONSENTIDA = constante_go("ChaveConsentida")
+CHAVE_OPTOUT = constante_go("ChaveOptOut")
+
+GTAG = "https://www.googletagmanager.com/gtag/js?id="
+CLARITY = "https://www.clarity.ms/tag/"
+
+# Navegadores humanos reais. O CUBOT nao e curiosidade: o modelo do aparelho
+# contem "bot", e o navegador embutido de WhatsApp e Instagram (`wv`) e canal
+# dominante do publico deste portal. Um regex de bot ingenuo descartaria a
+# pessoa e ninguem notaria.
+HUMANOS = {
+    "chrome-android": "Mozilla/5.0 (Linux; Android 15; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+    "safari-ios": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
+    "firefox-desktop": "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0",
+    "edge-desktop": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0",
+    "samsung-internet": "Mozilla/5.0 (Linux; Android 14; SAMSUNG SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/125.0.0.0 Mobile Safari/537.36",
+    "webview-whatsapp-cubot": "Mozilla/5.0 (Linux; Android 13; CUBOT KINGKONG 9; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/128.0.0.0 Mobile Safari/537.36",
+}
+
+ROBOS = {
+    "googlebot": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "amazonbot": "Mozilla/5.0 (Linux; like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+    "gptbot": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.2; +https://openai.com/gptbot",
+    "claudebot": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+    "bingbot": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+    "headless": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/140.0.0.0 Safari/537.36",
+}
+
+ID_SECAO = "sec-cookies-e-medicao-de-audiencia"
+
+
+def roda(loader, **cenario):
+    cenario.setdefault("ua", HUMANOS["chrome-android"])
+    cenario.setdefault("temIdle", True)
+    cenario.setdefault("idSecao", ID_SECAO)
+    import os
+    ambiente = dict(os.environ, WJ_CENARIO=json.dumps(cenario), WJ_LOADER=loader)
+    saida = subprocess.run(["node", "-e", HARNESS], env=ambiente,
+                           capture_output=True, text=True, timeout=30)
+    if saida.returncode != 0:
+        raise SystemExit(f"node falhou: {saida.stderr.strip()[-700:]}")
+    return json.loads(saida.stdout)
+
+
+def main() -> int:
+    if not shutil.which("node"):
+        print("REPROVADO: node nao encontrado — sem ele nao ha como provar o comportamento do loader")
+        return 2
+    loader = carrega_loader()
+    verbose = "--verbose" in sys.argv
+    print(f"loader: {len(loader.encode())} bytes, extraido de {FONTE.relative_to(RAIZ)}")
+
+    falhas = []
+
+    def checa(nome, condicao, detalhe=""):
+        if condicao:
+            if verbose:
+                print(f"  ok    {nome}")
+        else:
+            falhas.append(f"{nome}: {detalhe}")
+            print(f"  FALHA {nome}: {detalhe}")
+
+    # 1. Robo nao carrega nada.
+    for nome, ua in ROBOS.items():
+        r = roda(loader, ua=ua, acoes=["idle", "pointerdown"])
+        checa(f"1/robo {nome} nao carrega", r["scripts"] == [], f"injetou {r['scripts']}")
+        checa(f"1/robo {nome} nao empilha consent", r["dataLayer"] == [], f"dataLayer={r['dataLayer']}")
+
+    # 2. webdriver nao carrega.
+    r = roda(loader, webdriver=True, acoes=["idle"])
+    checa("2/webdriver nao carrega", r["scripts"] == [], f"injetou {r['scripts']}")
+
+    # 3. Global Privacy Control barra.
+    r = roda(loader, gpc=True, acoes=["idle"])
+    checa("3/GPC barra", r["scripts"] == [], f"injetou {r['scripts']}")
+
+    # 4. Opt-out gravado barra.
+    r = roda(loader, storage={"wj-medicao": "nao"}, acoes=["idle"])
+    checa("4/opt-out barra", r["scripts"] == [], f"injetou {r['scripts']}")
+
+    # 5. localStorage que LANCA nao quebra a pagina nem impede a medicao.
+    r = roda(loader, storageQuebrado=True, acoes=["idle"])
+    checa("5/storage que lanca nao quebra", r["erro"] is None, f"erro={r['erro']}")
+    checa("5/storage que lanca segue medindo", len(r["scripts"]) == 2, f"scripts={r['scripts']}")
+
+    # 6. Humano real carrega os dois, sem falso positivo de bot.
+    for nome, ua in HUMANOS.items():
+        r = roda(loader, ua=ua, acoes=["idle"])
+        checa(f"6/humano {nome} carrega os dois", len(r["scripts"]) == 2,
+              f"scripts={r['scripts']}")
+        checa(f"6/humano {nome} sem erro", r["erro"] is None, f"erro={r['erro']}")
+
+    # 7. Consent Mode v2 vem ANTES do config, e ad_* fica denied.
+    r = roda(loader, acoes=["idle"])
+    comandos = [c[0] for c in r["dataLayer"]]
+    checa("7/ordem consent antes de config",
+          "consent" in comandos and "config" in comandos
+          and comandos.index("consent") < comandos.index("config"),
+          f"ordem={comandos}")
+    globais = [c for c in r["dataLayer"] if c[0] == "consent" and "region" not in (c[2] or {})]
+    checa("7/ha default global", len(globais) == 1, f"defaults globais={len(globais)}")
+    if globais:
+        cfg = globais[0][2]
+        for chave in ("ad_storage", "ad_user_data", "ad_personalization"):
+            checa(f"7/{chave} denied", cfg.get(chave) == "denied", f"{chave}={cfg.get(chave)}")
+        checa("7/analytics_storage granted fora da UE",
+              cfg.get("analytics_storage") == "granted", f"valor={cfg.get('analytics_storage')}")
+    regionais = [c for c in r["dataLayer"] if c[0] == "consent" and "region" in (c[2] or {})]
+    checa("7/ha default regional", len(regionais) == 1, f"regionais={len(regionais)}")
+    if regionais:
+        reg = regionais[0][2]
+        checa("7/UE nega analytics_storage", reg.get("analytics_storage") == "denied",
+              f"valor={reg.get('analytics_storage')}")
+        for pais in ("DE", "FR", "GB", "CH", "IE"):
+            checa(f"7/regiao inclui {pais}", pais in reg.get("region", []), "ausente")
+
+    # 8. A consulta da busca interna e redigida; utm_ e gclid sobrevivem.
+    r = roda(loader, pathname="/buscar/", search="?q=violencia+domestica", acoes=["idle"])
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    local = cfg[0][2]["page_location"] if cfg else ""
+    checa("8/termo de busca redigido", "@redigido@" in local and "violencia" not in local,
+          f"page_location={local}")
+    r = roda(loader, pathname="/familia/divorcio/", search="?utm_source=x&gclid=y", acoes=["idle"])
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    local = cfg[0][2]["page_location"] if cfg else ""
+    checa("8/utm e gclid preservados", "utm_source=x" in local and "gclid=y" in local,
+          f"page_location={local}")
+
+    # 9. O evento de negocio dispara no CTA.
+    #
+    # Usa clicaCTA ([data-wj-cta]) de proposito: o seletor composto tem de casar as
+    # DUAS formas. O atributo esta em zero paginas hoje — o botao real e
+    # .wa-float-link, coberto pelo cenario 15 —, mas ele volta a existir no dia em
+    # que o gate de fontes liberar renderWhatsAppCTA.
+    r = roda(loader, acoes=["clicaCTA"])
+    eventos = [c for c in r["dataLayer"] if c[0] == "event"]
+    checa("9/whatsapp_click dispara",
+          any(e[1] == "whatsapp_click" for e in eventos), f"eventos={eventos}")
+    checa("9/clique no CTA carrega as tags", len(r["scripts"]) == 2, f"scripts={r['scripts']}")
+
+    # 10. Idle e interacao concorrentes NAO carregam duas vezes.
+    r = roda(loader, acoes=["pointerdown", "idle", "clicaCTA"])
+    checa("10/carrega uma vez so", len(r["scripts"]) == 2,
+          f"{len(r['scripts'])} scripts: {r['scripts']}")
+    checa("10/gtag correto", any(s.startswith(GTAG) for s in r["scripts"]), f"{r['scripts']}")
+    checa("10/clarity correto", any(s.startswith(CLARITY) for s in r["scripts"]), f"{r['scripts']}")
+
+    # 11. O controle de opt-out e montado na pagina de privacidade, e alterna.
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True, acoes=[])
+    checa("11/controle montado", len(r["controle"]) == 1, f"controle={r['controle']}")
+    if r["controle"]:
+        checa("11/estado inicial ativo", "ativa" in r["controle"][0]["texto"],
+              r["controle"][0]["texto"])
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True, acoes=["clicaOptOut"])
+    checa("11/clique grava a recusa", r["storage"].get("wj-medicao") == "nao",
+          f"storage={r['storage']}")
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True,
+             storage={"wj-medicao": "nao"}, acoes=["clicaOptOut"])
+    checa("11/clique reverte a recusa", "wj-medicao" not in r["storage"],
+          f"storage={r['storage']}")
+    checa("11/controle aparece mesmo com opt-out", len(r["controle"]) == 1,
+          "sem controle para quem quer reativar")
+
+    # 12. Fora da pagina de privacidade nao monta controle nenhum.
+    r = roda(loader, pathname="/familia/", temSecaoCookies=False, acoes=["idle"])
+    checa("12/nenhum controle fora da privacidade", r["controle"] == [], f"{r['controle']}")
+
+    # 13. O Clarity NAO carrega na busca interna.
+    #
+    # Ele captura a URL inteira da pagina, e o mascaramento de parametro dele so
+    # existe por pedido ao suporte da Microsoft — rota que depende de terceiro.
+    # O GA4 continua, porque a redacao do `q` acontece antes do envio.
+    r = roda(loader, pathname="/buscar/", search="?q=violencia+domestica", acoes=["idle"])
+    checa("13/gtag carrega na busca", any(s.startswith(GTAG) for s in r["scripts"]), f"{r['scripts']}")
+    checa("13/clarity NAO carrega na busca",
+          not any(s.startswith(CLARITY) for s in r["scripts"]), f"{r['scripts']}")
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    titulo = cfg[0][2].get("page_title", "") if cfg else ""
+    checa("13/titulo da busca redigido", titulo == "Busca interna", f"page_title={titulo!r}")
+    fila = " ".join(str(c) for c in r["clarity"])
+    checa("13/termo nao vaza para a fila do clarity", "violencia" not in fila, fila[:200])
+
+    # 14. As dimensoes editoriais viram etiqueta no Clarity e parametro no GA4.
+    META = "content_group=previdenciario;lane=informativa;tipo=artigo;superficie=acervo;fontes=1-2"
+    r = roda(loader, pathname="/previdenciario/bpc-sem-contribuicao/",
+             meta=META, metaNome=META_NOME, acoes=["idle"])
+    sets = {c[1]: c[2] for c in r["clarity"] if c and c[0] == "set"}
+    for chave, valor in (("content_group", "previdenciario"), ("lane", "informativa"),
+                         ("tipo", "artigo"), ("superficie", "acervo"), ("fontes", "1-2")):
+        checa(f"14/etiqueta {chave}", sets.get(chave) == valor, f"clarity set={sets}")
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    params = cfg[0][2] if cfg else {}
+    checa("14/dimensoes tambem no GA4", params.get("content_group") == "previdenciario", f"config={params}")
+
+    # 14c. Chave reservada na meta NAO pode desfazer a redacao da busca.
+    #
+    # O parse da meta roda depois de cfg.page_location e cfg.page_title, entao uma
+    # dimensao editorial chamada "page_title" sobrescreveria a redacao do termo —
+    # o vazamento voltaria pela porta que a propria instrumentacao abriu.
+    META_HOSTIL = "content_group=familia;page_title=Busca: violencia domestica;page_location=http://x/?q=violencia"
+    r = roda(loader, pathname="/buscar/", search="?q=violencia+domestica",
+             meta=META_HOSTIL, metaNome=META_NOME, acoes=["idle"])
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    params = cfg[0][2] if cfg else {}
+    checa("14c/chave reservada nao sobrescreve o titulo",
+          params.get("page_title") == "Busca interna", f"page_title={params.get('page_title')!r}")
+    checa("14c/chave reservada nao sobrescreve a URL",
+          "violencia" not in str(params.get("page_location", "")), f"{params.get('page_location')!r}")
+    sets = {c[1] for c in r["clarity"] if c and c[0] == "set"}
+    checa("14c/chave reservada nao vira etiqueta",
+          not any(k.startswith("page_") for k in sets), f"etiquetas={sets}")
+    checa("14c/dimensao legitima continua passando", "content_group" in sets, f"etiquetas={sets}")
+
+    # 14b. Pagina sem a meta nao pode quebrar o script.
+    r = roda(loader, acoes=["idle"])
+    checa("14b/sem meta o loader sobrevive", r["erro"] is None, f"erro={r['erro']}")
+    checa("14b/sem meta nenhuma etiqueta e inventada",
+          not [c for c in r["clarity"] if c and c[0] == "set"], f"clarity={r['clarity']}")
+
+    # 15. Os tres eventos de negocio, cada um no seu alvo real.
+    r = roda(loader, acoes=["clicaFloat"])
+    eventos = [c[1] for c in r["dataLayer"] if c[0] == "event"]
+    checa("15/whatsapp_click dispara no botao flutuante", "whatsapp_click" in eventos, f"{eventos}")
+    checa("15/whatsapp_click chega ao clarity",
+          any(c[0] == "event" and c[1] == "whatsapp_click" for c in r["clarity"]), f"{r['clarity']}")
+    checa("15/nenhum upgrade: e no-op no fonte oficial",
+          not any(c[0] == "upgrade" for c in r["clarity"]), f"{r['clarity']}")
+    r = roda(loader, acoes=["clicaFonte"])
+    eventos = [c[1] for c in r["dataLayer"] if c[0] == "event"]
+    checa("15/fonte_oficial dispara na proveniencia", "fonte_oficial" in eventos, f"{eventos}")
+    # O submit parte de uma pagina do acervo — a URL de origem nao tem o termo,
+    # e o evento tampouco pode ganha-lo: ele carrega o FATO da busca, nunca o que
+    # foi digitado.
+    r = roda(loader, pathname="/familia/divorcio/", acoes=["submeteBusca"])
+    eventos = [c for c in r["dataLayer"] if c[0] == "event"]
+    checa("15/busca_interna dispara no submit",
+          any(e[1] == "busca_interna" for e in eventos), f"{eventos}")
+    payload = " ".join(str(e) for e in eventos) + " ".join(str(c) for c in r["clarity"])
+    for vazamento in ("q=", "query", "termo"):
+        checa(f"15/evento de busca sem {vazamento}", vazamento not in payload, payload[:200])
+
+    # 15b. Os dois eventos de navegacao interna.
+    #
+    # `indice_click` e o UNICO evento customizado que chega ao Clarity de forma
+    # confiavel neste portal: o sumario e ancora interna (#sec-...), a pagina nao
+    # navega, e o evento sobrevive. Medido em navegador real em 2026-08-29.
+    r = roda(loader, acoes=["clicaIndice"])
+    checa("15b/indice_click no clarity",
+          any(c[0] == "event" and c[1] == "indice_click" for c in r["clarity"]), f"{r['clarity']}")
+    checa("15b/indice_click no GA4",
+          any(c[0] == "event" and c[1] == "indice_click" for c in r["dataLayer"]), f"{r['dataLayer']}")
+    r = roda(loader, acoes=["clicaRelacionado"])
+    checa("15b/relacionado_click dispara",
+          any(c[0] == "event" and c[1] == "relacionado_click" for c in r["dataLayer"]), f"{r['dataLayer']}")
+
+    # 16. Reativar a medicao devolve o consentimento ao Clarity — na carga seguinte.
+    #
+    # No clique nao da: numa pagina aberta com o opt-out ligado, o script sai
+    # antes de a fila W.clarity existir. Entao o clique grava um marcador e a
+    # proxima carga o entrega. Este cenario ENCADEIA as duas cargas.
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True,
+             storage={"wj-medicao": "nao"}, acoes=["clicaOptOut"])
+    checa("16/reativar grava o marcador", r["storage"].get(CHAVE_CONSENTIDA) == "1",
+          f"storage={r['storage']}")
+    seguinte = roda(loader, storage=r["storage"], acoes=["idle"])
+    consentimentos = [c for c in seguinte["clarity"] if c and c[0] == "consentv2"]
+    checa("16/carga seguinte entrega o consentimento", len(consentimentos) == 1,
+          f"clarity={seguinte['clarity']}")
+    if consentimentos:
+        checa("16/consentimento nao concede publicidade",
+              consentimentos[0][1].get("ad_Storage") == "denied", f"{consentimentos[0]}")
+        checa("16/consentimento concede analytics",
+              consentimentos[0][1].get("analytics_Storage") == "granted", f"{consentimentos[0]}")
+    checa("16/marcador consumido apos carregar", CHAVE_CONSENTIDA not in seguinte["storage"],
+          f"storage={seguinte['storage']}")
+    # ... e o consentimento NAO e entregue duas vezes.
+    terceira = roda(loader, storage=seguinte["storage"], acoes=["idle"])
+    checa("16/consentimento nao se repete",
+          not [c for c in terceira["clarity"] if c and c[0] == "consentv2"], f"{terceira['clarity']}")
+    # ... nem sobrevive ao GPC, que e sinal legal e prevalece.
+    comGPC = roda(loader, gpc=True, storage={CHAVE_CONSENTIDA: "1"}, acoes=["idle"])
+    checa("16/GPC prevalece sobre o marcador", comGPC["clarity"] == [] and comGPC["scripts"] == [],
+          f"clarity={comGPC['clarity']} scripts={comGPC['scripts']}")
+
+    # 18. Desativar INTERROMPE A COLETA na propria pagina, e nao so nas seguintes.
+    #
+    # A pagina de privacidade promete "interrompe a coleta e apaga, no ato". Ate
+    # 2026-08-28 so a segunda metade era verdade: quem clicava em Desativar depois
+    # de a tag ter subido continuava medido ate recarregar. Pior, o gesto real de
+    # RECUSA e a primeira interacao da sessao — e ela mesma dispara pointerdown,
+    # que dispara carrega().
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True,
+             acoes=["idle", "clicaOptOut"])
+    checa("18/GA4 desligado na pagina", r["gaDesligado"] != [], f"gaDesligado={r['gaDesligado']}")
+    updates = [c for c in r["dataLayer"] if c[0] == "consent" and c[1] == "update"]
+    checa("18/consentimento revogado no GA4",
+          any(u[2].get("analytics_storage") == "denied" for u in updates), f"{updates}")
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True,
+             acoes=["pointerdown", "clicaOptOut"])
+    checa("18/recusa como primeira interacao tambem desliga",
+          r["gaDesligado"] != [], f"gaDesligado={r['gaDesligado']}")
+    checa("18/opt-out gravado antes do idle impede o carregamento",
+          roda(loader, storage={CHAVE_OPTOUT: "nao"}, acoes=["pointerdown", "idle"])["scripts"] == [],
+          "quem ja recusou nao pode ver tag nenhuma subir")
+
+    # 19. O marcador de consentimento nao se perde numa carga sem Clarity.
+    #
+    # /buscar/ nao carrega o Clarity, e a pagina de privacidade serve o formulario
+    # de busca no cabecalho: reativar e buscar em seguida e um clique. Se o
+    # marcador fosse consumido ali, o consentimento sumiria sem nunca ter sido
+    # entregue.
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True,
+             storage={CHAVE_OPTOUT: "nao"}, acoes=["clicaOptOut"])
+    naBusca = roda(loader, pathname="/buscar/", search="?q=teste", storage=r["storage"], acoes=["idle"])
+    checa("19/marcador sobrevive a uma carga sem Clarity",
+          naBusca["storage"].get(CHAVE_CONSENTIDA) == "1", f"storage={naBusca['storage']}")
+    depois = roda(loader, storage=naBusca["storage"], acoes=["idle"])
+    checa("19/e e entregue na primeira pagina com Clarity",
+          any(c[0] == "consentv2" for c in depois["clarity"]), f"{depois['clarity']}")
+
+    # 18b. Em /buscar/ o Clarity nunca sobe (if(!buscando) em carrega()), entao
+    # enfileirar evento para ele e alimentar uma fila que ninguem drena. O GA4
+    # continua recebendo — e la que a medicao do evento e fiel.
+    r = roda(loader, pathname="/buscar/", search="?q=teste", acoes=["clicaFloat"])
+    checa("18b/em /buscar/ nenhum evento vai para a fila do clarity",
+          not [c for c in r["clarity"] if c and c[0] == "event"], f"{r['clarity']}")
+    checa("18b/mas o GA4 recebe o evento assim mesmo",
+          any(c[0] == "event" and c[1] == "whatsapp_click" for c in r["dataLayer"]),
+          f"{r['dataLayer']}")
+    # ... e em pagina do acervo as duas ferramentas recebem.
+    r = roda(loader, pathname="/familia/x/", acoes=["clicaFloat"])
+    checa("18b/no acervo o clarity recebe",
+          any(c[0] == "event" and c[1] == "whatsapp_click" for c in r["clarity"]), f"{r['clarity']}")
+
+    # 18c. transport_type NAO pode voltar: e do Universal Analytics e vira
+    # ep.transport_type, dimensao inutil em todo evento.
+    r = roda(loader, acoes=["idle"])
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    checa("18c/sem transport_type no config",
+          cfg and "transport_type" not in cfg[0][2], f"config={cfg[0][2] if cfg else None}")
+
+    # 19b. Carga sem NENHUM gatilho: o marcador nao pode ser consumido por uma
+    # visita em que a tag nunca chegou a subir.
+    semGatilho = roda(loader, storage={CHAVE_CONSENTIDA: "1"}, acoes=[])
+    checa("19b/marcador intacto quando nada carrega",
+          semGatilho["storage"].get(CHAVE_CONSENTIDA) == "1", f"storage={semGatilho['storage']}")
+
+    # 20. A redacao do termo cobre TODA ocorrencia de q=, nao so a primeira.
+    r = roda(loader, pathname="/buscar/", search="?q=divorcio&q=violencia+domestica", acoes=["idle"])
+    cfg = [c for c in r["dataLayer"] if c[0] == "config"]
+    local = cfg[0][2]["page_location"] if cfg else ""
+    checa("20/todas as ocorrencias de q redigidas", "violencia" not in local and "divorcio" not in local, local)
+
+    # 21. O Google-InspectionTool e robo: e o que busca a URL quando o dono pede
+    # inspecao no Search Console, e nao e publico.
+    UA_INSPECAO = ("Mozilla/5.0 (compatible; Google-InspectionTool/1.0; "
+                   "+http://www.google.com/webmasters/bot.html)")
+    r = roda(loader, ua=UA_INSPECAO, acoes=["idle"])
+    checa("21/Google-InspectionTool nao mede", r["scripts"] == [] and r["dataLayer"] == [],
+          f"scripts={r['scripts']}")
+
+    # 22. Com GPC ligado nao se oferece botao que nao faz nada.
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True, gpc=True, acoes=[])
+    checa("22/controle explica o GPC", r["controle"] and "Global Privacy Control" in r["controle"][0]["texto"],
+          f"{r['controle']}")
+    checa("22/sem botao morto sob GPC", r["controle"] and r["controle"][0]["botoes"] == [],
+          f"botoes={r['controle'][0]['botoes'] if r['controle'] else None}")
+
+    # 17. Desativar apaga os cookies que a pagina de privacidade promete apagar.
+    r = roda(loader, pathname="/privacidade/", temSecaoCookies=True, acoes=["clicaOptOut"])
+    checa("17/desativar avisa o clarity",
+          any(c[0] == "consent" and c[1] is False for c in r["clarity"]), f"{r['clarity']}")
+    apagados = set(r["cookiesApagados"])
+    checa("17/apaga exatamente os cookies da medicao",
+          apagados == {"_ga", "_ga_H6FQ8CQJNR", "_clck", "_clsk", "_uetvid"},
+          f"apagados={sorted(apagados)}")
+    checa("17/cookie alheio sobrevive", "outro" in r["cookiesRestantes"],
+          f"restantes={r['cookiesRestantes']}")
+
+    print()
+    if falhas:
+        print(f"REPROVADO: {len(falhas)} verificacao(oes) falharam")
+        return 1
+    print("APROVADO: comportamento do loader provado por execucao")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

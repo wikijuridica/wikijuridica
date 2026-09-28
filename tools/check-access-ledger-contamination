@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""check-access-ledger-contamination — nenhum numero de trafego do projeto pode
+sair do access log com requisicao que o proprio projeto gerou.
+
+POR QUE EXISTE (auditoria de 2026-08-12): o harness de smoke do `cmd/check`
+instanciava o handler HTTP de PRODUCAO — middleware de log incluido — e varria o
+`published_manifest` inteiro com dois User-Agents de Googlebot, sem mandar
+`X-Bot-Simulation`. As 19.253 linhas resultantes ficaram gravadas com
+`bot_simulation:false` e `warming:false`, e por isso passavam pelo unico filtro
+que existia (`tools/check-bot-traffic`, que descarta apenas warming/simulacao).
+O relatorio do dia dizia "Googlebot: 19.259" enquanto a borda da Cloudflare via
+Googlebot real na ordem de dezenas — 3 ordens de grandeza de diferenca. Inflar
+metrica de bot e tratado como fraude pelo contrato do projeto.
+
+Corrigir o produtor (feito em internal/checks/checks.go, commit 4e997e6e) impede
+a proxima contaminacao, mas nao detecta a proxima FORMA de contaminacao: qualquer
+ferramenta nova que bata no handler vivo sem o header repete o defeito em
+silencio, e o unico sinal seria um numero grande que ninguem confere. Este gate e
+esse conferidor.
+
+O QUE ESTE CHECK REPROVA:
+  1. Sessao de varredura sintetica ainda NAO reconhecida na quarentena. Criterio
+     e tetos medidos em tools/accessledger.py — sessao = mesmo User-Agent com
+     intervalo <= 60s entre requisicoes; contaminada quando tem rajada (>=1.000
+     linhas a >=20 req/s com razao de varredura >=0,95) ou quando enumera >=50%
+     do acervo publico. Maior sessao REAL do corpus: 297 linhas a 4,8 req/s,
+     cobrindo 1,3% do acervo.
+  2. Quarentena inconsistente: lote sem arquivo de membros, arquivo de membros
+     com digest diferente do declarado, contagem que nao bate. Quarentena que
+     nao se verifica e licenca aberta para excluir qualquer linha — pior que o
+     defeito que ela veio fechar.
+
+O QUE ELE NAO REPROVA, de proposito:
+  * Linha ja quarentenada. Ela continua no arquivo (append-only, nada se apaga) e
+    o reconhecimento e justamente o que a tira da conta.
+  * Aquecimento (`warming`) e simulacao declarada (`bot_simulation`). Quem ja se
+    declarou sintetico nao precisa de detector.
+  * Flood na MESMA URL. Razao de varredura baixa nao e varredura de acervo; e
+    outro defeito, com dono proprio, e silencia-lo aqui como "sintetico" seria
+    esconder um problema real de producao.
+
+READ-ONLY. Exit 1 em qualquer reprovacao. Nunca escreve a quarentena — quem
+escreve e tools/generate-access-ledger-quarantine (check le, generate grava).
+
+Uso:
+    tools/check-access-ledger-contamination
+    tools/check-access-ledger-contamination --json
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import accessledger  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true", help="saida estruturada")
+    args = parser.parse_args()
+
+    entradas, hashes, problemas = accessledger.carregar_quarentena(ROOT)
+    achados, acervo = accessledger.detectar(ROOT, hashes_ignorados=hashes)
+    rotas_internas = accessledger.detectar_rota_interna(ROOT, hashes_ignorados=hashes)
+
+    relatorio = {
+        "acervo_urls": acervo,
+        "arquivos_lidos": [os.path.basename(c) for c in accessledger.arquivos_do_ledger(ROOT)],
+        "lotes_em_quarentena": len(entradas),
+        "linhas_neutralizadas": len(hashes),
+        "problemas_de_quarentena": problemas,
+        "sessoes_contaminadas_nao_reconhecidas": [
+            {
+                "source_file": s["source_file"],
+                "user_agent": s["user_agent"],
+                "ts_start": s["ts_start"],
+                "ts_end": s["ts_end"],
+                "line_count": s["line_count"],
+                "distinct_paths": s["distinct_paths"],
+                "requests_per_second": round(s["requests_per_second"], 3),
+                "sweep_ratio": round(s["sweep_ratio"], 4),
+                "reasons": s["reasons"],
+            }
+            for s in achados
+        ],
+        "rotas_bloqueadas_no_ingress_nao_reconhecidas": [
+            {
+                "source_file": g["source_file"],
+                "path": g["path"],
+                "ts_start": g["ts_start"],
+                "ts_end": g["ts_end"],
+                "line_count": g["line_count"],
+                "user_agents": g["user_agents"],
+                "reasons": g["reasons"],
+            }
+            for g in rotas_internas
+        ],
+    }
+
+    if args.json:
+        print(json.dumps(relatorio, ensure_ascii=False, indent=1))
+        return 1 if (problemas or achados or rotas_internas) else 0
+
+    print("check-access-ledger-contamination — data/ops/access/access-*.jsonl")
+    print("  arquivos lidos           : %d" % len(relatorio["arquivos_lidos"]))
+    print("  acervo publico           : %s URLs" % (acervo or "(desconhecido)"))
+    print("  lotes em quarentena      : %d  (%d linhas neutralizadas)"
+          % (len(entradas), len(hashes)))
+
+    if problemas:
+        print("\nREPROVADO — quarentena inconsistente:")
+        for problema in problemas:
+            print("  - %s" % problema)
+
+    if achados:
+        print("\nREPROVADO — %d sessao(oes) de varredura sintetica sem reconhecimento "
+              "(%d linhas contando como trafego real):"
+              % (len(achados), sum(s["line_count"] for s in achados)))
+        for sessao in achados:
+            print("  %s %s .. %s" % (sessao["source_file"], sessao["ts_start"], sessao["ts_end"]))
+            print("      %d linhas | %.1f req/s | razao %.2f | %d URLs distintas | ua=%s"
+                  % (sessao["line_count"], sessao["requests_per_second"],
+                     sessao["sweep_ratio"], sessao["distinct_paths"],
+                     sessao["user_agent"] or "(vazio)"))
+            for motivo in sessao["reasons"]:
+                print("      -> %s" % motivo)
+        print("\n  Para reconhecer (o ledger NAO e alterado, nada e apagado):")
+        print("    tools/generate-access-ledger-quarantine --dry-run")
+        print("    tools/generate-access-ledger-quarantine --motivo '...' --revisor '...'")
+
+    if rotas_internas:
+        print("\nREPROVADO — %d rota(s) bloqueada(s) no ingress respondendo neste log "
+              "(%d linhas contando como trafego real):"
+              % (len(rotas_internas), sum(g["line_count"] for g in rotas_internas)))
+        for grupo in rotas_internas:
+            print("  %s %s .. %s" % (grupo["source_file"], grupo["ts_start"], grupo["ts_end"]))
+            print("      %s | %d linhas | UA: %s"
+                  % (grupo["path"], grupo["line_count"],
+                     ", ".join(ua or "(vazio)" for ua in grupo["user_agents"])))
+            for motivo in grupo["reasons"]:
+                print("      -> %s" % motivo)
+
+    if problemas or achados or rotas_internas:
+        return 1
+
+    print("\nOK — nenhuma varredura sintetica nao reconhecida no access log.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""switch-uplink-band — troca a banda do uplink com verificacao e reversao automatica.
+
+POR QUE EXISTE, em vez de um `nmcli con up` digitado na mao: trocar a banda deste
+host derruba, por alguns segundos, TODAS as conexoes de borda dos 26 processos
+cloudflared que servem 9.710 paginas. Um comando solto que der errado deixa o
+portal devolvendo 530 ate alguem perceber. Aqui a troca e uma transacao: mede
+antes, aplica, verifica contra criterio declarado, e REVERTE sozinha se o
+resultado for pior do que o estado de onde saiu.
+
+O QUE VERIFICA depois de aplicar, e por que reverte se falhar:
+  1. associou na banda pedida       — trocar e cair na banda errada e nao trocar
+  2. tem rota default e responde    — enlace associado sem rota nao serve o portal
+  3. perda ate o gateway aceitavel  — o primeiro salto isola o radio do provedor
+  4. bitrate negociado nao piorou   — o motivo da troca era ganhar taxa
+Falhou qualquer um: volta ao perfil anterior e registra o motivo. O sucesso
+tambem e registrado, com os dois estados lado a lado.
+
+O QUE NAO FAZ: nao apaga perfil, nao mexe em senha, nao altera o roteador. Perfil
+duplicado orfao e DESATIVADO (autoconnect no), nunca removido — o contrato deste
+repo proibe destruir configuracao que alguem criou.
+
+Uso:
+    tools/switch-uplink-band --para "MURILO 5G" --banda 5GHz --ensaio
+    tools/switch-uplink-band --para "MURILO 5G" --banda 5GHz
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+HISTORICO = os.path.join(ROOT, "data/ops/uplink_band_switch.jsonl")
+NOTIFICADOR = os.path.join(ROOT, "tools/notify-owner")
+IW = "/usr/sbin/iw"
+SCHEMA = "uplink_band_switch_v1"
+
+
+def rodar(comando, timeout=90):
+    try:
+        r = subprocess.run(comando, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout apos {timeout}s"
+    except OSError as erro:
+        return 127, "", str(erro)
+
+
+def interface_e_gateway():
+    rc, saida, _ = rodar(["ip", "-j", "route", "show", "default"], timeout=10)
+    try:
+        rotas = json.loads(saida) if rc == 0 else []
+        if rotas:
+            return rotas[0].get("dev"), rotas[0].get("gateway")
+    except (ValueError, AttributeError):
+        pass
+    return None, None
+
+
+def estado(interface):
+    dados = {"interface": interface}
+    if not interface:
+        return dados
+    rc, link, _ = rodar([IW, "dev", interface, "link"], timeout=10)
+    if rc != 0 or "Not connected" in link:
+        dados["associado"] = False
+        return dados
+    dados["associado"] = True
+    for chave, padrao, conv in [
+        ("ssid", r"SSID:\s*(.+)", str.strip),
+        ("bssid", r"Connected to ([0-9a-f:]{17})", str.strip),
+        ("freq_mhz", r"freq:\s*(\d+)", int),
+        ("sinal_dbm", r"signal:\s*(-?\d+)", int),
+        ("tx_bitrate_mbit", r"tx bitrate:\s*([\d.]+)", float),
+        ("rx_bitrate_mbit", r"rx bitrate:\s*([\d.]+)", float),
+    ]:
+        m = re.search(padrao, link)
+        if m:
+            dados[chave] = conv(m.group(1))
+    if dados.get("freq_mhz"):
+        dados["banda"] = "5GHz" if dados["freq_mhz"] >= 5000 else "2.4GHz"
+    rc, info, _ = rodar([IW, "dev", interface, "info"], timeout=10)
+    m = re.search(r"channel (\d+).*width: (\d+) MHz", info)
+    if m:
+        dados["canal"] = int(m.group(1))
+        dados["largura_mhz"] = int(m.group(2))
+    _, gateway = interface_e_gateway()
+    dados["gateway"] = gateway
+    dados["ip"] = None
+    rc, saida, _ = rodar(["ip", "-j", "-4", "addr", "show", "dev", interface], timeout=10)
+    try:
+        info_ip = json.loads(saida)
+        dados["ip"] = info_ip[0]["addr_info"][0]["local"]
+    except (ValueError, IndexError, KeyError):
+        pass
+    return dados
+
+
+def perfil_ativo(interface):
+    rc, saida, _ = rodar(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show",
+                          "--active"], timeout=20)
+    for linha in saida.splitlines():
+        partes = linha.split(":")
+        if len(partes) >= 2 and partes[-1] == interface:
+            return ":".join(partes[:-1])
+    return None
+
+
+def alcance(gateway, pacotes=15):
+    if not gateway:
+        return {"perda_pct": 100.0, "erro": "sem gateway"}
+    rc, saida, _ = rodar(["ping", "-n", "-q", "-c", str(pacotes), "-i", "0.2", "-W", "2",
+                          gateway], timeout=pacotes + 25)
+    resultado = {}
+    m = re.search(r"(\d+) packets transmitted, (\d+) received", saida)
+    if m:
+        env, rec = int(m.group(1)), int(m.group(2))
+        resultado["perda_pct"] = round(100.0 * (env - rec) / env, 2) if env else 100.0
+    else:
+        resultado["perda_pct"] = 100.0
+    m = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", saida)
+    if m:
+        resultado.update({"rtt_medio_ms": float(m.group(2)), "rtt_max_ms": float(m.group(3))})
+    return resultado
+
+
+# IDENTIDADE DA SONDA (CLAUDE.md secao 11). Ate 2026-09-10 esta leitura saia
+# como `curl/8.x` para as 25 portas de saude do cloudflared local. O destino e
+# servico NOSSO na maquina, nao o portal: vai o User-Agent da sonda interna e
+# nao vai o `X-Warming-Request`, que so faz sentido onde ha metrica de audiencia
+# a proteger.
+UA_SONDA = "wikijuridica-superficie-probe/1.0"
+
+
+def conexoes_tunel():
+    """Conexoes de borda prontas na frota cloudflared. E o numero que traduz o
+    corte em dano real ao portal — nao um proxy dele."""
+    vivas, total = 0, 0
+    for porta in [20243] + list(range(20251, 20275)):
+        total += 1
+        rc, saida, _ = rodar(["curl", "-s", "--max-time", "3", "-A", UA_SONDA,
+                              f"http://127.0.0.1:{porta}/ready"], timeout=8)
+        if rc == 0 and saida.strip():
+            try:
+                if json.loads(saida).get("readyConnections", 0) > 0:
+                    vivas += 1
+            except ValueError:
+                pass
+    return {"instancias_prontas": vivas, "instancias_totais": total}
+
+
+def esperar_enlace(interface, banda_alvo, limite_s=45):
+    """Espera a associacao assentar. Nao e espera ociosa: e a janela em que o
+    DHCP fecha e a rota aparece, e sem ela a verificacao mediria um enlace que
+    ainda estava subindo e reverteria uma troca que teria dado certo."""
+    inicio = time.monotonic()
+    while time.monotonic() - inicio < limite_s:
+        atual = estado(interface)
+        if atual.get("associado") and atual.get("banda") == banda_alvo \
+                and atual.get("gateway") and atual.get("ip"):
+            return atual
+        time.sleep(2)
+    return estado(interface)
+
+
+def avisar(chave, severidade, titulo, mensagem, evidencia, resolvido=False):
+    """Avisa o dono. `resolvido=True` FECHA a chave em vez de abri-la.
+
+    POR QUE O PARAMETRO EXISTE (2026-09-16): a reversao e o sucesso usavam a
+    MESMA chave `rede-troca-banda`, e o sucesso ia como severidade `info` -- que
+    nao fecha nada no ledger. Resultado: depois de uma reversao, a chave ficava
+    aberta mesmo quando a migracao seguinte dava certo.
+
+    E o mesmo defeito de classe que no mesmo dia deixou um alerta do portal
+    aberto por 263 HORAS com a propria evidencia dizendo que estava tudo verde:
+    gate que sabe abrir e nao sabe fechar. Alarme que nao fecha ensina a ignorar
+    o canal, e ai o proximo incidente real chega onde ninguem mais olha.
+    """
+    comando = [NOTIFICADOR, "--chave", chave]
+    if resolvido:
+        comando.append("--resolvido")
+    else:
+        comando += ["--severidade", severidade]
+    comando += ["--titulo", titulo, "--mensagem", mensagem, "--evidencia", evidencia,
+                "--origem", "switch-uplink-band", "--cooldown", "0"]
+    rodar(comando, timeout=20)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--para", required=True, help="nome do perfil NM de destino")
+    p.add_argument("--banda", required=True, choices=["2.4GHz", "5GHz"])
+    p.add_argument("--desativar-orfaos", default="",
+                   help="perfis duplicados a desativar (autoconnect no), separados por virgula")
+    p.add_argument("--perda-max-pct", type=float, default=10.0)
+    p.add_argument("--ensaio", action="store_true",
+                   help="mostra o que faria, sem tocar na rede")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args()
+
+    interface, _ = interface_e_gateway()
+    if not interface:
+        print("erro: nenhuma rota default; nao ha uplink para trocar", file=sys.stderr)
+        return 2
+
+    antes = estado(interface)
+    perfil_antes = perfil_ativo(interface)
+    tunel_antes = conexoes_tunel()
+    alcance_antes = alcance(antes.get("gateway"))
+
+    plano = [
+        ["nmcli", "connection", "modify", a.para, "802-11-wireless.powersave", "2"],
+        ["nmcli", "connection", "modify", a.para, "connection.autoconnect", "yes"],
+        ["nmcli", "connection", "modify", a.para, "connection.autoconnect-priority", "100"],
+    ]
+    for orfao in [o.strip() for o in a.desativar_orfaos.split(",") if o.strip()]:
+        plano.append(["nmcli", "connection", "modify", orfao, "connection.autoconnect", "no"])
+    plano.append(["nmcli", "connection", "up", a.para, "ifname", interface])
+
+    if a.ensaio:
+        print(f"estado atual: {antes.get('banda')} canal {antes.get('canal')} "
+              f"{antes.get('tx_bitrate_mbit')} Mbit/s {antes.get('sinal_dbm')} dBm "
+              f"ip {antes.get('ip')} perfil '{perfil_antes}'")
+        print(f"tunel: {tunel_antes['instancias_prontas']}/{tunel_antes['instancias_totais']} "
+              f"instancias com conexao de borda")
+        print("\ncomandos que seriam executados:")
+        for comando in plano:
+            print("  " + " ".join(comando))
+        print(f"\ncriterio de aceitacao: banda == {a.banda}, rota default presente, "
+              f"perda ao gateway <= {a.perda_max_pct}%, bitrate >= "
+              f"{antes.get('tx_bitrate_mbit')} Mbit/s")
+        print(f"reversao automatica para: '{perfil_antes}'")
+        return 0
+
+    passos = []
+    for comando in plano:
+        rc, _, erro = rodar(comando, timeout=90)
+        passos.append({"comando": " ".join(comando), "rc": rc, "erro": erro.strip()[:200]})
+
+    depois = esperar_enlace(interface, a.banda)
+    alcance_depois = alcance(depois.get("gateway"))
+
+    falhas = []
+    if depois.get("banda") != a.banda:
+        falhas.append(f"associou em {depois.get('banda')}, esperado {a.banda}")
+    if not depois.get("gateway") or not depois.get("ip"):
+        falhas.append("sem rota default ou sem IP apos a troca")
+    if alcance_depois.get("perda_pct", 100.0) > a.perda_max_pct:
+        falhas.append(f"perda de {alcance_depois.get('perda_pct')}% ate o gateway")
+    bit_antes = antes.get("tx_bitrate_mbit") or 0
+    bit_depois = depois.get("tx_bitrate_mbit") or 0
+    if bit_depois < bit_antes:
+        falhas.append(f"bitrate caiu de {bit_antes} para {bit_depois} Mbit/s")
+
+    reversao = None
+    if falhas and perfil_antes:
+        rc, _, erro = rodar(["nmcli", "connection", "up", perfil_antes, "ifname", interface],
+                            timeout=90)
+        revertido = esperar_enlace(interface, antes.get("banda"), limite_s=45)
+        reversao = {"para": perfil_antes, "rc": rc, "erro": erro.strip()[:200],
+                    "estado": revertido}
+        avisar("rede-troca-banda", "alta", "Troca de banda revertida",
+               f"tentou {a.banda} e voltou para {antes.get('banda')}: {'; '.join(falhas)}",
+               f"tools/switch-uplink-band --para '{a.para}' --banda {a.banda}")
+    elif not falhas:
+        # O sucesso RESOLVE a chave: se uma reversao anterior a deixou aberta,
+        # ela nao pode continuar vermelha depois de a migracao dar certo.
+        avisar("rede-troca-banda", "info", "Uplink migrado de banda",
+               f"{antes.get('banda')} {bit_antes} Mbit/s -> {a.banda} {bit_depois} Mbit/s "
+               f"(sinal {depois.get('sinal_dbm')} dBm, canal {depois.get('canal')}, "
+               f"largura {depois.get('largura_mhz')} MHz)",
+               f"iw dev {interface} link", resolvido=True)
+
+    tunel_depois = conexoes_tunel()
+    evento = {
+        "schema_version": SCHEMA,
+        "executado_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "perfil_destino": a.para, "banda_alvo": a.banda,
+        "perfil_anterior": perfil_antes,
+        "antes": antes, "depois": depois,
+        "alcance_antes": alcance_antes, "alcance_depois": alcance_depois,
+        "tunel_antes": tunel_antes, "tunel_depois": tunel_depois,
+        "passos": passos, "falhas": falhas, "reversao": reversao,
+        "sucesso": not falhas,
+    }
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(evento, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if a.json:
+        print(json.dumps(evento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(f"antes:  {antes.get('banda')} ch{antes.get('canal')} "
+              f"{bit_antes} Mbit/s {antes.get('sinal_dbm')} dBm ip {antes.get('ip')}")
+        print(f"depois: {depois.get('banda')} ch{depois.get('canal')} "
+              f"{bit_depois} Mbit/s {depois.get('sinal_dbm')} dBm ip {depois.get('ip')} "
+              f"largura {depois.get('largura_mhz')} MHz")
+        print(f"tunel:  {tunel_antes['instancias_prontas']} -> "
+              f"{tunel_depois['instancias_prontas']} de {tunel_depois['instancias_totais']}")
+        if falhas:
+            print("FALHOU: " + "; ".join(falhas))
+            print(f"revertido para '{perfil_antes}'" if reversao else "SEM REVERSAO")
+        else:
+            print("OK: criterios de aceitacao atendidos")
+    return 0 if not falhas else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

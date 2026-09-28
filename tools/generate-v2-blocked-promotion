@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""generate-v2-blocked-promotion — promove mecanicamente lotes 100% cobertos
+por data/editorial/v2_blocked_drafts/<slug>.jsonl, sem agente LLM.
+
+POR QUE EXISTE (2026-07-31, ordem do dono): as ondas W4/W5 provaram que o
+gargalo não é escrever — é promover. Páginas completas e revisadas ficavam
+represadas por defeitos de sistema já corrigidos, e re-promovê-las via agente
+custava ~200k tokens por lote para um trabalho 100% mecânico. Este driver usa
+EXCLUSIVAMENTE a API sancionada do produtor (tools/generate_v2_review_queue):
+preflight → staged → verify_staged → dependency_epoch → atomic_replace_cas.
+Nenhuma página é criada ou alterada aqui: só o que o redator já escreveu e
+preservou (regra 5b) entra, byte-validado pelos mesmos gates de sempre.
+
+Uso:
+  tools/generate-v2-blocked-promotion --budget-seconds 35 [--only slug1,slug2]
+Saída: uma linha por lote (PROMOVIDO/SKIP/FALHA + veredito literal), resumo.
+Idempotente: lote cujo shard alvo já divergiu do target_sha256 é SKIP.
+Lotes de glossário são deixados por último (padrão contrato-stale conhecido).
+"""
+import argparse
+import base64
+import json
+import pathlib
+import re
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from tools import generate_v2_review_queue as producer  # noqa: E402
+
+CATALOG = "data/editorial/v2_source_hint_catalog.json"
+QUEUE = ROOT / "scripts/workflows/writing-mass-todo.js"
+BLOCKED = ROOT / "data/editorial/v2_blocked_drafts"
+WS_BASE = ROOT / ".agents/runtime/wworkspaces"
+
+
+def load_batches():
+    src = QUEUE.read_text(encoding="utf-8")
+    match = re.search(r"const batches = (\[.*?\])\n", src, re.S)
+    return json.loads(match.group(1))
+
+
+def blocked_pages(slug):
+    path = BLOCKED / f"{slug}.jsonl"
+    if not path.is_file():
+        return {}
+    pages = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        page = record.get("page")
+        if isinstance(page, dict) and page.get("intent_id"):
+            pages[page["intent_id"]] = page
+    return pages
+
+
+def b64(payload):
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
+    return base64.b64encode(raw).decode("ascii")
+
+
+def promote(batch, contract):
+    slug = batch["slug"]
+    target_rel = f"data/editorial/v2_pages/{slug}.jsonl"
+    target = ROOT / target_rel
+    actual = producer.snapshot_sha256(target, max_bytes=64 * 1024 * 1024)
+    if actual != batch["target_sha256"]:
+        return "SKIP", f"alvo ja evoluiu ({actual[:12]})"
+    derived = derive(batch)
+    batch_intents = batch.get("intent_ids")
+    intent_ids = batch_intents or list(derived.selected_intents)
+    if not intent_ids:
+        return "SKIP", "slice vazio"
+    projection = b64({
+        "source_overrides": {
+            k: {h: dict(s) for h, s in v.items()}
+            for k, v in derived.source_overrides.items()},
+        "strict_source_intents": list(derived.strict_source_intents)})
+    resolution = producer.verify_writing_source_resolution(
+        ROOT, batch["file"], batch["portfolio_sha256"], CATALOG,
+        batch["source_hint_catalog_sha256"], batch["families"],
+        batch["skip"], batch["take"], batch["n"], batch_intents, projection)
+    preserved = batch.get("preserved_record_sha256", {}) or {}
+    reuse = batch.get("reuse", []) or []
+    extras = batch.get("preserve_extras", []) or []
+    current_lines = {}
+    if target.is_file():
+        for line in target.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                current_lines[json.loads(line)["intent_id"]] = line
+    pages = blocked_pages(slug)
+    # Fonte alternativa: final.jsonl pronto deixado por redator no workspace
+    # da MESMA preimagem (raw-recovery/migração integral exige staged inteiro).
+    ws_final = {}
+    for ws in sorted(WS_BASE.glob(
+            f"wiki-v2-{slug}-{batch['target_sha256'][:12]}-*/final.jsonl")):
+        try:
+            rows = [json.loads(l) for l in
+                    ws.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if {r.get("intent_id") for r in rows} >= set(intent_ids):
+                ws_final = {r["intent_id"]: r for r in rows}
+        except (OSError, ValueError):
+            continue
+
+    def align_sources(page, intent):
+        overrides = derived.source_overrides.get(intent)
+        if not overrides:
+            # sem mapa: ainda assim dedupe URL repetida (consolidação manual
+            # do redator pode ter escapado; official_sources proíbe URL dupla)
+            current = page.get("official_sources") or []
+            seen = {}
+            for source in current:
+                url = source.get("url")
+                if url in seen:
+                    prev = seen[url]
+                    claims = [c for c in (
+                        prev.get("anchor_claim", ""),
+                        source.get("anchor_claim", "")) if c]
+                    prev["anchor_claim"] = " | ".join(dict.fromkeys(claims))
+                else:
+                    seen[url] = dict(source)
+            deduped = list(seen.values())
+            if len(deduped) != len(current):
+                page = dict(page)
+                page["official_sources"] = deduped
+            return page
+        groups = {}
+        for hint, source in overrides.items():
+            groups.setdefault(source["url"], {})[hint] = dict(source)
+        expected = [producer._canonical_consolidated_source(g)
+                    for _, g in sorted(
+                        groups.items(), key=lambda kv: min(kv[1]))]
+        current = page.get("official_sources") or []
+        stripped = [{k: s[k] for k in ("name", "url", "anchor_claim")
+                     if k in s} for s in current]
+        if stripped == expected:
+            return page
+        page = dict(page)
+        page["official_sources"] = expected
+        return page
+
+    is_recovery = bool(batch.get("writing_recovery"))
+    lines = []
+    for intent in intent_ids:
+        if intent in preserved and intent in current_lines:
+            lines.append(current_lines[intent])
+            continue
+        page = pages.get(intent) or ws_final.get(intent)
+        if page is None and intent in current_lines:
+            # migração integral: linha vigente re-staged byte a byte
+            lines.append(current_lines[intent])
+            continue
+        if page is None:
+            return "FALHA", f"intent sem pagina represada: {intent}"
+        page = align_sources(dict(page), intent)
+        page.pop("_rescue", None)
+        lines.append(json.dumps(
+            page, ensure_ascii=False, separators=(", ", ": ")))
+    for intent in extras:
+        if intent in current_lines:
+            lines.append(current_lines[intent])
+        else:
+            return "FALHA", f"preserve_extra ausente no shard: {intent}"
+    workdir = pathlib.Path(producer.create_workflow_workspace(
+        slug, batch["target_sha256"], str(WS_BASE)))
+    staged = workdir / "final.jsonl"
+    staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    preservation = {
+        "reuse": reuse, "preserve_extras": extras,
+        "preserved_record_sha256": preserved,
+        # A evidência de raw-recovery entra no dependency_epoch; a preservação
+        # com linhas reusadas exige False (2506: True proíbe qualquer mistura).
+        "authenticated_replacement": False,
+        "semantic_contract_sha256": contract.digest,
+        "semantic_relocation_removals":
+            batch.get("semantic_relocation_removals", []) or [],
+    }
+    snapshot = producer.verify_staged_writing_source_resolution(
+        ROOT, staged, target_rel, batch["target_sha256"], batch["file"],
+        batch["portfolio_sha256"], CATALOG, batch["source_hint_catalog_sha256"],
+        batch["families"], batch["skip"], batch["take"], batch["n"],
+        batch_intents, projection, b64(preservation))
+    evidence = None
+    if batch.get("writing_recovery"):
+        evidence = {
+            "path": ("data/editorial/v2_raw_recovery_preimages/"
+                     f"{batch['target_sha256']}.raw"),
+            "sha256": batch["target_sha256"],
+        }
+    epoch = producer.writing_promotion_dependency_epoch(
+        ROOT, contract, batch["file"], batch["portfolio_sha256"], CATALOG,
+        batch["source_hint_catalog_sha256"],
+        raw_recovery_preimage_evidence=evidence)
+    producer.atomic_replace_cas(
+        target, snapshot.payload, batch["target_sha256"],
+        dependency_sha256=epoch)
+    promoted = producer.snapshot_sha256(target, max_bytes=64 * 1024 * 1024)
+    (workdir / "promoted.sha256").write_text(promoted)
+    return "PROMOVIDO", f"{len(intent_ids)} intents -> {promoted[:12]}"
+
+
+_derive_cache = {}
+
+
+def derive(batch):
+    key = batch["slug"]
+    if key not in _derive_cache:
+        _derive_cache[key] = producer.derive_writing_source_resolution(
+            ROOT, batch["file"], batch["portfolio_sha256"], CATALOG,
+            batch["source_hint_catalog_sha256"], batch["families"],
+            batch["skip"], batch["take"], batch["n"], batch.get("intent_ids"))
+    return _derive_cache[key]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--budget-seconds", type=float, default=35.0)
+    parser.add_argument("--only", default="")
+    args = parser.parse_args()
+    started = time.time()
+    contract = producer.load_writing_semantic_contract(ROOT)
+    producer.verify_writing_semantic_contract_dependencies(ROOT, contract)
+    only = {s for s in args.only.split(",") if s}
+    batches = load_batches()
+    ordered = ([b for b in batches if not b["slug"].startswith("glossario")] +
+               [b for b in batches if b["slug"].startswith("glossario")])
+    done = failed = skipped = 0
+    for batch in ordered:
+        if time.time() - started > args.budget_seconds:
+            print(f"BUDGET atingido; re-rode para continuar")
+            break
+        slug = batch["slug"]
+        if only and slug not in only:
+            continue
+        if not only and not (BLOCKED / f"{slug}.jsonl").is_file():
+            continue
+        try:
+            status, note = promote(batch, contract)
+        except Exception as error:  # noqa: BLE001 — veredito literal é o produto
+            status, note = "FALHA", f"{type(error).__name__}: {error}"
+        print(f"{status} {slug}: {str(note)[:180]}")
+        if status == "PROMOVIDO":
+            done += 1
+            # promoção muda shard listado no dependency map do contrato v3;
+            # recarrega para o epoch dos próximos lotes não nascer stale.
+            contract = producer.load_writing_semantic_contract(ROOT)
+        elif status == "FALHA":
+            failed += 1
+        else:
+            skipped += 1
+    print(f"resumo: promovidos={done} falhas={failed} skips={skipped}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""generate-anchor-claim-publication-20260826 — a fonte passa a dizer o que sustenta.
+
+O DEFEITO (medido em 2026-08-26). Cada fonte oficial do estoque v2 carrega um
+campo `anchor_claim`: uma frase autoral curta dizendo o que aquela fonte
+sustenta naquela página. São 24.417 delas, uma por fonte, 100% preenchidas — e
+NENHUMA chegava à página publicada. Não havia gate barrando: `content.
+SourceProvenance` não tinha campo para recebê-la, então o rodapé de proveniência
+listava URL e data sem dizer o que cada URL prova. O trabalho já estava escrito e
+pago; faltava destino.
+
+O QUE ESTA FERRAMENTA FAZ. Escreve `data/editorial/anchor_claim_publication.jsonl`,
+um registro derivado com UMA linha por rota publicada:
+
+    {"path": "/area/slug/", "content_sha256": "...", "sources": [
+       {"url": "...", "anchor_claim": "...", "text_version": "compilado",
+        "text_version_checked_at": "2026-08-12"}]}
+
+Ela NÃO edita texto de página, NÃO toca `data/editorial/v2_pages`, NÃO reescreve
+`content/pages.json` e NÃO publica nada. Decide, com regra publicada e
+reproduzível, o que pode ir ao ar — e `internal/content` lê a decisão na carga.
+
+`anchor_claim` vazio numa linha é decisão EXPLÍCITA de não publicar, nunca
+ausência de dado: é assim que uma frase recusada por repetição fica impedida de
+voltar por outra porta.
+
+AS QUATRO REGRAS DE RECUSA, e a medição que originou cada uma:
+
+  repetida_entre_paginas    608 strings aparecem em 2+ páginas (3.051
+                            ocorrências). Publicar molde viola anti-template —
+                            uma delas se repete 136 vezes.
+  data_iso_no_texto_visivel 153 ocorrências trazem "2026-08-19" no visível.
+  longo_demais              463 passam de 45 palavras e deixam de ser
+                            atribuição, chegando a transcrever o dispositivo.
+  fragmento_truncado          8 são abertura de citação sem complemento
+                            ("Prescreve:").
+  ptbr_sem_acentuacao       502 (2,06%) escrevem em PT-BR desacentuado —
+                            "Codigo de Processo Civil", "Estabelece a carencia
+                            de 180 contribuicoes mensais". O contrato do
+                            projeto exige acentuação em TUDO que o visitante lê,
+                            e essa é a única regra aqui cuja violação seria
+                            visível a olho nu na página.
+
+E A REGRA POSITIVA, que é o ponto — na forma CORRIGIDA, depois de a primeira
+versão desta ferramenta produzir falso positivo em campo. A ideia era: quando a
+URL da fonte é um dos 28 diplomas com texto integral em `data/legal-corpus/` e a
+fonte nomeia um artigo, esse artigo TEM de existir no corpus, senão a citação
+não sai. Rodada sobre o acervo real, a regra acusou `CLT, art. 189
+(caracterização da insalubridade)` em três páginas — e o art. 189 da CLT EXISTE:
+quem estava incompleto era o corpus.
+
+    Medido: 9 dos 28 diplomas têm buraco na extração de artigos.
+    O CPC declara 1.075 artigos e vai até o 2.027 — 954 ausentes.
+    Só a CLT tem 13 buracos, entre eles os arts. 188, 189, 190, 195, 197 e 198.
+
+Por isso o corpus CONFIRMA e nunca ACUSA. Artigo que resolve no texto integral
+ganha a declaração de versão do texto ("compilado, conferido em 2026-08-12") e
+entra na contagem de conferidos; artigo que não resolve simplesmente não ganha
+confirmação — a afirmação continua publicável, e o caso é contado em
+`artigo_sem_confirmacao_no_corpus` para que o buraco da extração fique VISÍVEL e
+seja corrigido na origem. Ausência de linha não é ausência do fato, e um
+detector que trata as duas como a mesma coisa apaga trabalho correto.
+
+Uso:
+    tools/generate-anchor-claim-publication-20260826 --calibrar 10   # ler antes
+    tools/generate-anchor-claim-publication-20260826 --dry-run
+    tools/generate-anchor-claim-publication-20260826
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ESTOQUE = ROOT / "data/editorial/v2_pages"
+PAGES_JSON = ROOT / "content/pages.json"
+MANIFESTO = ROOT / "data/editorial/published_manifest.jsonl"
+CORPUS = ROOT / "data/legal-corpus"
+SAIDA = ROOT / "data/editorial/anchor_claim_publication.jsonl"
+RELATORIO = ROOT / "data/editorial/anchor_claim_publication_report.json"
+
+# Os mesmos limites que internal/content.AnchorClaimAdmissible aplica. Estão
+# duplicados porque as duas pontas rodam em linguagens diferentes, e a
+# duplicação é vigiada pelo check tools/check-anchor-claim-publication, que
+# recusa divergência entre o registro gravado aqui e a regra que o Go aplica.
+MIN_PALAVRAS = 4
+MAX_PALAVRAS = 45
+DATA_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
+TRACOS = ("-", "–", "—")
+
+# "art. 421", "arts. 133 e 138", "art. 5º-A", "art. 1.030"
+ARTIGO = re.compile(r"arts?\.?\s*(\d[\d\.]*(?:\s*[ºo°]?\s*-\s*[A-Z])?)", re.IGNORECASE)
+
+
+def escrita_atomica(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporario = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporario, path)
+    finally:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+
+
+def normaliza_artigo(bruto: str) -> str:
+    """"1.030" -> "1030"; "5º-A" -> "5-A". A chave do corpus é o número puro,
+    com o sufixo de letra preservado quando existe."""
+    texto = unicodedata.normalize("NFKD", bruto).strip().upper()
+    texto = texto.replace(".", "").replace(" ", "")
+    texto = texto.replace("º", "").replace("O", "").replace("°", "")
+    return texto
+
+
+def carrega_corpus() -> dict[str, dict]:
+    """URL de citação -> diploma. As duas URLs de cada diploma entram (a
+    declarada e a de citação), porque as fontes do acervo usam ora uma, ora
+    outra — a do Código Civil, por exemplo, aponta para a compilada."""
+    por_url: dict[str, dict] = {}
+    for caminho in sorted(glob.glob(str(CORPUS / "*.json"))):
+        with open(caminho, encoding="utf-8") as handle:
+            diploma = json.load(handle)
+        registro = {
+            "slug": diploma.get("slug", ""),
+            "nome": diploma.get("nome", ""),
+            "text_version": diploma.get("text_version", ""),
+            "fetched_at": (diploma.get("fetched_at") or "")[:10],
+            "artigos": {normaliza_artigo(k) for k in (diploma.get("articles") or {})},
+        }
+        for chave in ("citation_url", "declared_url"):
+            url = (diploma.get(chave) or "").strip()
+            if url:
+                por_url[url] = registro
+    return por_url
+
+
+def carrega_estoque() -> dict[str, dict]:
+    """intent_id -> registro INTEIRO do estoque v2. Lê TODOS os shards, nunca só
+    o último: ler o mais recente é exatamente o defeito que mutilou o shard do
+    STF de 50 para 4 registros em 25/08.
+
+    O registro inteiro, e não só `official_sources`, porque o corpo da página é
+    a matéria-prima do vocabulário acentuado — e o corpo NÃO tem chave `text`:
+    é `opening` mais `sections`."""
+    por_intent: dict[str, dict] = {}
+    for caminho in sorted(glob.glob(str(ESTOQUE / "*.jsonl"))):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                registro = json.loads(linha)
+                if registro.get("skipped"):
+                    continue
+                intent = registro.get("intent_id")
+                if not intent:
+                    continue
+                por_intent[intent] = registro
+    return por_intent
+
+
+def carrega_manifesto() -> dict[str, str]:
+    """intent_id -> html_sha256. A chave do manifesto é `unique_intent_id`, e
+    não `intent_id`: procurar a errada devolve zero linhas e faz parecer que o
+    manifesto não tem o dado."""
+    por_intent: dict[str, str] = {}
+    with open(MANIFESTO, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            intent = registro.get("unique_intent_id")
+            sha = registro.get("html_sha256")
+            if intent and sha:
+                por_intent[intent] = sha
+    return por_intent
+
+
+PALAVRA = re.compile(r"[A-Za-zÀ-ÿ]{4,}")
+
+
+def dobra(palavra: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", palavra)
+                   if unicodedata.category(c) != "Mn").lower()
+
+
+def vocabulario_acentuado(registros: dict[str, dict]) -> set[str]:
+    """Formas DESACENTUADAS cuja grafia correta o próprio acervo já usa.
+
+    O vocabulário não é inventado nem importado: ele é medido no CORPO das
+    páginas, que é texto editorial revisado. Para cada palavra, agrupa-se por
+    forma dobrada (sem diacríticos); quando a grafia acentuada domina com folga
+    — pelo menos 50 ocorrências e dez vezes mais frequente que a desacentuada —,
+    a forma sem acento é erro de digitação naquele acervo, não variante.
+
+    Os dois limiares existem para não acusar palavra que legitimamente não tem
+    acento ("prazo", "multa") nem termo raro cuja frequência não sustenta
+    conclusão nenhuma. Medido em 2026-08-26: 363 formas, cobrindo 1.037
+    ocorrências em 502 afirmações.
+    """
+    contagem: collections.Counter[str] = collections.Counter()
+    for registro in registros.values():
+        texto = [registro.get("opening") or ""]
+        texto += [(s.get("text") or "") for s in registro.get("sections") or []]
+        for palavra in PALAVRA.findall(" ".join(texto)):
+            contagem[palavra.lower()] += 1
+    por_dobra: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    for palavra, n in contagem.items():
+        por_dobra[dobra(palavra)][palavra] += n
+    suspeitas: set[str] = set()
+    for chave, formas in por_dobra.items():
+        dominante, n_dominante = formas.most_common(1)[0]
+        if dominante == chave:
+            continue  # a forma sem acento é a correta
+        if n_dominante >= 50 and formas.get(chave, 0) * 10 < n_dominante:
+            suspeitas.add(chave)
+    return suspeitas
+
+
+def recusa_por_forma(claim: str) -> str:
+    texto = claim.strip()
+    if not texto:
+        return "vazio"
+    if texto[0] in TRACOS:
+        return "abre_com_traco_de_transcricao"
+    if DATA_ISO.search(texto):
+        return "data_iso_no_texto_visivel"
+    palavras = len(texto.split())
+    if palavras < MIN_PALAVRAS:
+        return "fragmento_truncado"
+    if palavras > MAX_PALAVRAS:
+        return "longo_demais_para_atribuicao"
+    return ""
+
+
+def confere_no_corpus(url: str, nome: str, claim: str, corpus: dict[str, dict]):
+    """Devolve (veredito, diploma). O corpus CONFIRMA, nunca ACUSA — ver o
+    cabeçalho: 9 dos 28 diplomas têm buraco na extração, e tratar buraco como
+    erro de citação apagaria trabalho correto.
+
+       "fora_do_corpus"  — a URL não é um dos 28 diplomas; nada a conferir.
+       "sem_artigo"      — diploma conhecido, nenhum artigo nomeado.
+       "confere"         — todo artigo nomeado existe no texto integral. É o
+                           único veredito que autoriza declarar a versão do
+                           texto oficial na página.
+       "sem_confirmacao" — diploma conhecido, artigo nomeado que o corpus não
+                           tem. NÃO é acusação: a afirmação continua publicável
+                           e a versão do texto não é declarada, porque não foi
+                           confirmada.
+    """
+    diploma = corpus.get(url.strip())
+    if diploma is None:
+        return "fora_do_corpus", None
+    artigos = {normaliza_artigo(m) for m in ARTIGO.findall(nome + " " + claim)}
+    artigos = {a for a in artigos if a}
+    if not artigos:
+        return "sem_artigo", diploma
+    if any(a not in diploma["artigos"] for a in artigos):
+        return "sem_confirmacao", diploma
+    return "confere", diploma
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true",
+                        help="mede e imprime a partição, sem gravar")
+    parser.add_argument("--calibrar", type=int, default=0, metavar="N",
+                        help="imprime a proveniência de N páginas para leitura humana e sai")
+    args = parser.parse_args()
+
+    corpus = carrega_corpus()
+    estoque = carrega_estoque()
+    manifesto = carrega_manifesto()
+    desacentuadas = vocabulario_acentuado(estoque)
+
+    with open(PAGES_JSON, encoding="utf-8") as handle:
+        paginas = json.load(handle)
+
+    # Censo de repetição sobre o ESTOQUE INTEIRO, não só sobre o publicado: uma
+    # frase que se repete entre uma página no ar e outra que entrará amanhã já
+    # é molde hoje.
+    ocorrencias: collections.Counter[str] = collections.Counter()
+    for registro in estoque.values():
+        for fonte in registro.get("official_sources") or []:
+            claim = (fonte.get("anchor_claim") or "").strip()
+            if claim:
+                ocorrencias[claim] += 1
+
+    particao: collections.Counter[str] = collections.Counter()
+    linhas: list[dict] = []
+    calibracao: list[str] = []
+
+    for pagina in sorted(paginas, key=lambda p: p.get("path") or ""):
+        caminho = pagina.get("path")
+        intent = pagina.get("unique_intent_id")
+        if not caminho or not intent:
+            continue
+        registro = estoque.get(intent)
+        if registro is None:
+            particao["pagina_fora_do_estoque_v2"] += 1
+            continue
+        claim_por_url = {}
+        for fonte in registro.get("official_sources") or []:
+            url = (fonte.get("url") or "").strip()
+            if url:
+                claim_por_url[url] = fonte
+
+        saida_fontes = []
+        for proveniencia in pagina.get("source_provenance") or []:
+            url = (proveniencia.get("source_url") or "").strip()
+            nome = (proveniencia.get("source_name") or "").strip()
+            if not url:
+                continue
+            fonte = claim_por_url.get(url)
+            claim = (fonte.get("anchor_claim") or "").strip() if fonte else ""
+
+            veredito, diploma = confere_no_corpus(url, nome, claim, corpus)
+            versao = diploma["text_version"] if diploma else ""
+            conferido = diploma["fetched_at"] if diploma else ""
+            if veredito == "sem_confirmacao":
+                # O artigo nomeado não está no corpus. Isso NÃO acusa a citação:
+                # 9 dos 28 diplomas têm buraco na extração, e a primeira versão
+                # desta ferramenta, que recusava aqui, acusou `CLT, art. 189` —
+                # artigo que existe na lei e falta no corpus. O caso é contado
+                # para o buraco ficar visível, e nada mais.
+                particao["artigo_sem_confirmacao_no_corpus"] += 1
+
+            motivo = ""
+            if not claim:
+                motivo = "sem_claim_no_estoque"
+            elif ocorrencias.get(claim, 0) >= 2:
+                motivo = "repetida_entre_paginas"
+            else:
+                motivo = recusa_por_forma(claim)
+                if not motivo and any(dobra(p) == p.lower() and p.lower() in desacentuadas
+                                      for p in PALAVRA.findall(claim)):
+                    motivo = "ptbr_sem_acentuacao"
+
+            if motivo:
+                particao["recusa_" + motivo] += 1
+                claim_publicado = ""
+            else:
+                particao["publicada"] += 1
+                claim_publicado = claim
+                if veredito == "confere":
+                    particao["publicada_com_artigo_conferido_no_corpus"] += 1
+
+            registro = {"url": url, "anchor_claim": claim_publicado}
+            if versao and veredito in ("confere", "sem_artigo"):
+                registro["text_version"] = versao
+                registro["text_version_checked_at"] = conferido
+                particao["versao_do_texto_declarada"] += 1
+            saida_fontes.append(registro)
+
+        if not saida_fontes:
+            continue
+        linha = {"path": caminho, "sources": saida_fontes}
+        sha = manifesto.get(intent)
+        if sha:
+            linha["content_sha256"] = sha
+            particao["versao_de_conteudo_declarada"] += 1
+        linhas.append(linha)
+
+        if args.calibrar and len(calibracao) < args.calibrar:
+            publicaveis = [f for f in saida_fontes if f["anchor_claim"]]
+            if not publicaveis:
+                continue
+            bloco = ["=" * 78, caminho, "  versão: sha256:" + (sha or "(fora do manifesto)")]
+            for fonte in saida_fontes:
+                nome = next((p.get("source_name") for p in pagina["source_provenance"]
+                             if (p.get("source_url") or "").strip() == fonte["url"]), fonte["url"])
+                bloco.append("  - " + str(nome))
+                bloco.append("    " + fonte["url"])
+                # O valor da versão sai como DADO cru, entre colchetes, e não
+                # como frase: a prosa PT-BR é montada em Go
+                # (content.TextVersionLabelPTBR) a partir de uma allowlist, e
+                # imprimir aqui uma segunda redação faria a calibração humana
+                # conferir um texto que não é o que vai ao ar. A leitura da
+                # prosa final é feita sobre o renderizador, não sobre isto.
+                if fonte.get("text_version"):
+                    bloco.append("    [text_version=%s checked_at=%s]" %
+                                 (fonte["text_version"], fonte["text_version_checked_at"]))
+                if fonte["anchor_claim"]:
+                    bloco.append("    Sustenta nesta página: " + fonte["anchor_claim"])
+                else:
+                    bloco.append("    (sem afirmação publicada)")
+            calibracao.append("\n".join(bloco))
+
+    if args.calibrar:
+        print("\n".join(calibracao))
+        print("\nLEIA o texto acima antes de liberar o lote. Nada foi gravado.")
+        return 0
+
+    ordenado = sorted(particao.items())
+    relatorio = {
+        "ferramenta": "generate-anchor-claim-publication-20260826",
+        "rotas_com_registro": len(linhas),
+        "claims_no_estoque": sum(ocorrencias.values()),
+        "claims_distintos": len(ocorrencias),
+        "claims_repetidos_distintos": sum(1 for v in ocorrencias.values() if v >= 2),
+        "particao": dict(ordenado),
+        "regras": {
+            "min_palavras": MIN_PALAVRAS,
+            "max_palavras": MAX_PALAVRAS,
+            "repeticao_minima_para_recusa": 2,
+        },
+    }
+    for chave, valor in ordenado:
+        print(f"{chave}: {valor}")
+    print(f"rotas_com_registro: {len(linhas)}")
+
+    if args.dry_run:
+        print("\n--dry-run: nada gravado.")
+        return 0
+
+    payload = "".join(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n"
+                      for linha in linhas)
+    escrita_atomica(SAIDA, payload)
+    escrita_atomica(RELATORIO, json.dumps(relatorio, ensure_ascii=False, indent=1) + "\n")
+    print(f"\ngravado: {SAIDA.relative_to(ROOT)} ({len(linhas)} rotas)")
+    print(f"gravado: {RELATORIO.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

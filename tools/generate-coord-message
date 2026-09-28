@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# tools/generate-coord-message — ESCREVE (não é read-only).
+#
+# Posta uma mensagem no bus de coordenação
+# (.agents/runtime/coordination/bus.jsonl), em vez de colar texto direto no
+# terminal de outro agente (isso NÃO funciona entre sessões — Enter vira
+# newline por detecção de paste). Append de UMA linha JSON, sob flock.
+#
+# Uso:
+#   tools/generate-coord-message --from claude-maestro-pts7 --to codex-eng-pts4 \
+#     --subject "libera lock do sitemap" --body "terminei o release, pode rodar o teste agora"
+#
+#   tools/generate-coord-message --from codex-eng-pts4 --to all --priority alta \
+#     --subject "load alto" --body "load1 em 14.2; avancem em frente independente sem pesado"
+#
+# Flags:
+#   --from ID        obrigatório
+#   --to ID|all      obrigatório
+#   --subject TEXTO  obrigatório
+#   --body TEXTO     obrigatório
+#   --priority normal|alta   opcional, default normal
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+FROM=""
+TO=""
+SUBJECT=""
+BODY=""
+PRIORITY="normal"
+
+usage() {
+	echo "Uso: tools/generate-coord-message --from ID --to ID|all --subject TEXTO --body TEXTO [--priority normal|alta]" >&2
+	exit 2
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--from)
+		[ $# -ge 2 ] || usage
+		FROM="$2"
+		shift 2
+		;;
+	--to)
+		[ $# -ge 2 ] || usage
+		TO="$2"
+		shift 2
+		;;
+	--subject)
+		[ $# -ge 2 ] || usage
+		SUBJECT="$2"
+		shift 2
+		;;
+	--body)
+		[ $# -ge 2 ] || usage
+		BODY="$2"
+		shift 2
+		;;
+	--priority)
+		[ $# -ge 2 ] || usage
+		PRIORITY="$2"
+		shift 2
+		;;
+	-h | --help) usage ;;
+	*)
+		echo "flag desconhecida: $1" >&2
+		usage
+		;;
+	esac
+done
+
+[ -n "$FROM" ] || {
+	echo "erro: --from é obrigatório" >&2
+	usage
+}
+[ -n "$TO" ] || {
+	echo "erro: --to é obrigatório" >&2
+	usage
+}
+[ -n "$SUBJECT" ] || {
+	echo "erro: --subject é obrigatório" >&2
+	usage
+}
+[ -n "$BODY" ] || {
+	echo "erro: --body é obrigatório" >&2
+	usage
+}
+
+case "$PRIORITY" in
+normal | alta) ;;
+*)
+	echo "erro: --priority deve ser normal ou alta" >&2
+	exit 2
+	;;
+esac
+
+python3 - "$ROOT" "$FROM" "$TO" "$PRIORITY" "$SUBJECT" "$BODY" <<'PYEOF'
+import errno
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+import time
+from datetime import datetime
+
+root, frm, to, priority, subject, body = sys.argv[1:7]
+
+MAX_BUS_BYTES = 8 * 1024 * 1024
+MAX_LINE_BYTES = 16 * 1024
+# Sem rotação, bater MAX_BUS_BYTES tira PERMANENTEMENTE de todo agente a
+# capacidade de postar no bus (o append passa a falhar sempre, até intervenção
+# manual). Com "sem teto de agentes"/muitos workflows isso é questão de tempo.
+# Ao ultrapassar o gatilho, o prefixo antigo vai para bus-archive.jsonl (nunca
+# apagado) e a cauda recente fica no bus — tudo sob o mesmo flock.
+ROTATE_TRIGGER_BYTES = 6 * 1024 * 1024
+ROTATE_RETAIN_BYTES = 2 * 1024 * 1024
+ARCHIVE_NAME = "bus-archive.jsonl"
+ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def fail(message, code=1):
+    print(f"erro: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def validate_id(label, value):
+    if not ID_PATTERN.fullmatch(value):
+        fail(f"{label} inválido; use 1–96 caracteres ASCII alfanuméricos, '_' ou '-'", 2)
+
+
+def validate_text(label, value, max_chars, max_bytes):
+    if not value:
+        fail(f"{label} não pode ser vazio", 2)
+    if len(value) > max_chars or len(value.encode("utf-8")) > max_bytes:
+        fail(f"{label} excede o limite de {max_chars} caracteres/{max_bytes} bytes", 2)
+    if "\x00" in value:
+        fail(f"{label} contém NUL", 2)
+    if any(ord(character) < 32 and character not in "\n\t" for character in value):
+        fail(f"{label} contém caractere de controle", 2)
+
+
+def open_absolute_directory(path):
+    if not os.path.isabs(path):
+        fail(f"raiz não absoluta: {path}")
+    current = os.open("/", DIRECTORY_FLAGS)
+    try:
+        for component in (part for part in path.split(os.sep) if part):
+            nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            os.close(current)
+            current = nxt
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def open_relative_directory(parent_fd, relative, create=False):
+    current = os.dup(parent_fd)
+    try:
+        for component in relative.split("/"):
+            if component in ("", ".", ".."):
+                fail(f"componente de diretório inseguro: {relative}")
+            try:
+                nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                nxt = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            named = os.stat(component, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(nxt)
+            if (not stat.S_ISDIR(named.st_mode) or
+                    (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)):
+                os.close(nxt)
+                fail(f"ancestral trocado durante abertura: {relative}")
+            os.close(current)
+            current = nxt
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def checked_regular(fd, directory_fd, name, max_size):
+    opened = os.fstat(fd)
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        fail(f"entrada desapareceu durante uso: {name}")
+    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+            not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        fail(f"{name} deve ser arquivo regular, sem symlink/hardlink e com identidade estável")
+    if opened.st_size > max_size:
+        fail(f"{name} excede o teto de {max_size} bytes")
+    return opened
+
+
+def flock_with_timeout(fd, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fail("não foi possível obter o lock do bus em 10s; prossiga em frente independente")
+            time.sleep(0.05)
+
+
+def rotate_bus_in_place(bus_fd, coord_fd, before):
+    """Arquiva o prefixo antigo do bus e preserva a cauda recente.
+
+    IN PLACE (mesmo inode): o bus_fd já aberto e travado segue válido, e
+    leitores concorrentes que abriram bus.jsonl não passam a ler outro arquivo.
+    Ordem archive-then-shrink: falha entre as duas etapas DUPLICA mensagem no
+    arquivo morto, nunca perde mensagem.
+    """
+    read_fd = os.open(
+        "bus.jsonl",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=coord_fd,
+    )
+    try:
+        reopened = os.fstat(read_fd)
+        opened = os.fstat(bus_fd)
+        if (reopened.st_dev, reopened.st_ino) != (opened.st_dev, opened.st_ino):
+            fail("bus.jsonl trocado durante a rotação")
+        chunks = []
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(read_fd, min(before.st_size - offset, 1 << 20), offset)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            offset += len(chunk)
+        data = b"".join(chunks)
+    finally:
+        os.close(read_fd)
+
+    cut = 0
+    if len(data) > ROTATE_RETAIN_BYTES:
+        newline = data.find(b"\n", len(data) - ROTATE_RETAIN_BYTES)
+        # Corta só em fronteira de linha: nunca parte um JSON ao meio.
+        cut = len(data) if newline < 0 else newline + 1
+    archived, retained = data[:cut], data[cut:]
+    if not archived:
+        return before
+
+    archive_fd = os.open(
+        ARCHIVE_NAME,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=coord_fd,
+    )
+    try:
+        written = os.write(archive_fd, archived)
+        if written != len(archived):
+            fail(f"arquivamento parcial do bus ({written}/{len(archived)} bytes); bus intacto")
+        os.fsync(archive_fd)
+    finally:
+        os.close(archive_fd)
+
+    os.ftruncate(bus_fd, 0)
+    # bus_fd é O_APPEND: após o truncate o fim do arquivo é 0, então o write
+    # reescreve a cauda a partir do início.
+    written = os.write(bus_fd, retained)
+    if written != len(retained):
+        fail(f"reescrita parcial da cauda do bus ({written}/{len(retained)} bytes)")
+    os.fsync(bus_fd)
+    os.fsync(coord_fd)
+    print(
+        f"bus rotacionado: {len(archived)} bytes movidos para "
+        f".agents/runtime/coordination/{ARCHIVE_NAME}; "
+        f"{len(retained)} bytes de cauda recente preservados no bus",
+        file=sys.stderr,
+    )
+    return os.fstat(bus_fd)
+
+
+validate_id("--from", frm)
+if to != "all":
+    validate_id("--to", to)
+validate_text("--subject", subject, 256, 1024)
+validate_text("--body", body, 4096, 12 * 1024)
+
+record = {
+    "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+    "from": frm,
+    "to": to,
+    "priority": priority,
+    "subject": subject,
+    "body": body,
+}
+payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+if len(payload) > MAX_LINE_BYTES:
+    fail(f"mensagem serializada excede {MAX_LINE_BYTES} bytes", 2)
+
+os.umask(0o077)
+root_fd = open_absolute_directory(root)
+try:
+    coord_fd = open_relative_directory(root_fd, ".agents/runtime/coordination", create=True)
+finally:
+    os.close(root_fd)
+
+lock_fd = bus_fd = None
+try:
+    lock_fd = os.open(
+        ".bus.lock",
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+        dir_fd=coord_fd,
+    )
+    checked_regular(lock_fd, coord_fd, ".bus.lock", 0)
+    flock_with_timeout(lock_fd, 10.0)
+    checked_regular(lock_fd, coord_fd, ".bus.lock", 0)
+
+    bus_fd = os.open(
+        "bus.jsonl",
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+        dir_fd=coord_fd,
+    )
+    before = checked_regular(bus_fd, coord_fd, "bus.jsonl", MAX_BUS_BYTES)
+    # Um segundo flock no próprio bus protege interoperabilidade com leitores
+    # e escritores seguros que não conheçam o lock nominal legado.
+    flock_with_timeout(bus_fd, 10.0)
+    before = checked_regular(bus_fd, coord_fd, "bus.jsonl", MAX_BUS_BYTES)
+    if before.st_size + len(payload) > ROTATE_TRIGGER_BYTES:
+        before = rotate_bus_in_place(bus_fd, coord_fd, before)
+    if before.st_size + len(payload) > MAX_BUS_BYTES:
+        fail(
+            f"append recusado: bus atingiria o teto de {MAX_BUS_BYTES} bytes mesmo após "
+            f"a rotação automática (gatilho {ROTATE_TRIGGER_BYTES} B, cauda retida "
+            f"{ROTATE_RETAIN_BYTES} B). Verifique .agents/runtime/coordination/{ARCHIVE_NAME} "
+            f"e se algum produtor está escrevendo em volume anômalo no bus"
+        )
+    written = os.write(bus_fd, payload)
+    if written != len(payload):
+        fail(f"append parcial no bus ({written}/{len(payload)} bytes)")
+    os.fsync(bus_fd)
+    after = checked_regular(bus_fd, coord_fd, "bus.jsonl", MAX_BUS_BYTES)
+    if after.st_size != before.st_size + len(payload):
+        fail("bus foi truncado ou alterado concorrentemente durante o append")
+    os.fsync(coord_fd)
+finally:
+    if bus_fd is not None:
+        try:
+            fcntl.flock(bus_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(bus_fd)
+    if lock_fd is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    os.close(coord_fd)
+
+print("mensagem postada em .agents/runtime/coordination/bus.jsonl")
+PYEOF

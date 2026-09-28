@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# Smoke do binário novo (cmd/server) numa porta de prova, ISOLADO do servidor
+# vivo: stage próprio com symlink para content/ e data/ reais e var/ próprio,
+# mesma técnica do pré-voo de ops/proposed/deploy-2026-08-04.sh.
+# Não toca em produção: não escreve em bin/, não reinicia serviço, não recarrega
+# nginx. Só sobe o binário candidato e mede o que ele responde.
+set -uo pipefail
+
+BINARIO="${1:?uso: smoke.sh <caminho-do-binario>}"
+# O CAMINHO E RESOLVIDO PARA ABSOLUTO ANTES DE QUALQUER `cd`.
+#
+# Este script executa o candidato dentro de um subshell que faz `cd "$STAGE"`
+# (o stage isolado, em var/smoke-binario). Um caminho RELATIVO -- e e assim que
+# tools/deploy-binario-go o passa, "bin/wikijuridica-server.next" -- deixa de
+# resolver ali dentro, e o bash reporta "Arquivo ou diretorio inexistente"
+# apontando para a linha do `exec`, nao para a causa.
+#
+# O sintoma era cruel porque MENTIA sobre o binario: o deploy abortava no passo
+# 2 com "o binario candidato REPROVOU na validacao isolada (exit 90)" e
+# "BINARIO NAO SOBE", quando o binario existia, tinha 43 MB e nunca chegou a ser
+# executado. Medido em 2026-09-05, com o candidato no disco ao lado da mensagem
+# que dizia que ele nao existia.
+if [ "${BINARIO#/}" = "$BINARIO" ]; then
+	BINARIO="$PWD/$BINARIO"
+fi
+if [ ! -x "$BINARIO" ]; then
+	printf 'check-server-binary-smoke: %s nao existe ou nao e executavel\n' "$BINARIO" >&2
+	exit 91
+fi
+PORTA=127.0.0.1:18099
+
+# A SONDA DO PROPRIO PORTAL TEM IDENTIDADE, E ELA E OBRIGATORIA (CLAUDE.md secao
+# 11). Ate 2026-09-10 todo `curl` daqui saia como `curl/8.x`: anonimo no log e,
+# pior, indistinguivel de visita humana na METRICA — o portal media o proprio
+# eco. `wikijuridica-superficie-probe/1.0` e o nome que o contrato fixa para a
+# sonda interna, e `X-Warming-Request: true` e o que
+# `internal/httpserver/access_log.go` le para gravar `warming=true` e manter a
+# requisicao FORA da contagem de trafego.
+#
+# A funcao SOMBREIA o comando: assim nenhuma chamada nova nasce muda, que e como
+# esta divida apareceu. `command curl` chama o binario real e evita recursao.
+UA_SONDA="wikijuridica-superficie-probe/1.0"
+curl() { command curl -A "$UA_SONDA" -H "X-Warming-Request: true" "$@"; }
+STAGE="${WIKI_SMOKE_STAGE:-/opt/wiki/var/smoke-binario}"
+mkdir -p "$STAGE"
+REPO=/opt/wiki
+
+# `${STAGE:?}` e a guarda: com STAGE vazio, `rm -rf "$STAGE/var"` vira
+# `rm -rf /var`. O `:?` aborta antes de apagar qualquer coisa.
+rm -rf "${STAGE:?}/var"
+mkdir -p "$STAGE/var/cache" "$STAGE/var/access-log"
+
+# O CANDIDATO RODA DA RAIZ REAL, E O ISOLAMENTO E DE ESCRITA -- nao de leitura.
+#
+# Ate 2026-09-05 este script fazia `cd "$STAGE"` com symlinks para content/,
+# data/ e go.mod, e o binario NAO SUBIA: internal/publishedmanifest varre public/
+# com filepath.WalkDir, que NAO SEGUE SYMLINK. O link virava uma entrada de
+# arquivo comum, os.ReadFile nele devolvia "is a directory", e o boot falhava
+# fechado -- como deve, porque essa varredura e o que impede pagina orfa no
+# indice do buscador. Acrescentar `ln -sfn public` nao resolvia: reproduzia o
+# mesmo erro com outra mensagem.
+#
+# O isolamento que este smoke precisa e o de ESCRITA: que o candidato nao toque
+# o cache, o ledger e a instancia de producao. Isso o binario ja oferece por
+# variavel -- WIKI_CACHE_DIR, WIKI_ACCESS_LOG_DIR e WIKI_INSTANCE --, e e o
+# mesmo mecanismo que tools/deploy-binario-go usa no passo 2. A licao que
+# originou aquele passo continua honrada, e ela e sobre DISCO, nao sobre
+# diretorio de trabalho: "porta diferente nao isola disco -- cache compartilhado
+# ja destruiu o indice de busca em producao".
+#
+# A leitura, portanto, e da arvore real: content/, data/ e public/ de verdade,
+# que e o que o candidato vai encontrar quando subir para valer. Ensaiar contra
+# uma copia parcial provaria menos, e foi a copia parcial que quebrou.
+CACHE_ISOLADO="$STAGE/var/cache"
+LEDGER_ISOLADO="$STAGE/var/access-log"
+
+falhas=0
+ok() { printf '  OK    %s\n' "$1"; }
+fail() {
+	printf '  FALHA %s\n' "$1"
+	falhas=$((falhas + 1))
+}
+
+(
+	cd "$REPO" || exit 1
+	WIKI_HTTP_ADDR="$PORTA" \
+		WIKI_CACHE_DIR="$CACHE_ISOLADO" \
+		WIKI_ACCESS_LOG_DIR="$LEDGER_ISOLADO" \
+		WIKI_INSTANCE="smoke-binario-$$" \
+		"$BINARIO" >"$STAGE/smoke.log" 2>&1 &
+	echo $! >"$STAGE/pid"
+)
+PID="$(cat "$STAGE/pid")"
+trap 'kill "$PID" 2>/dev/null' EXIT
+
+# A ESPERA DE PRONTIDAO E DERIVADA DE MEDICAO, nao de estimativa.
+#
+# Eram 60 x 0,25 s = 15 s, e o boot deste binario leva 21 s -- medido em
+# 2026-09-05, cronometrado da execucao ate o primeiro 200 em /healthz. O
+# candidato subia certo e o smoke o reprovava por impaciencia, com a mensagem
+# "BINARIO NAO SOBE" que dizia o oposto do que acontecia; o deploy lia isso como
+# defeito do binario e abortava o passo 2.
+#
+# Onde vai o tempo, pelo log do proprio boot: ~17 s carregando content/pages.json
+# e o indice, mais ~2 s abrindo o banco social somente leitura e armando as
+# ferramentas MCP da rede social.
+#
+# 240 x 0,5 s = 120 s da folga de quase 6x sobre o medido -- para host sob carga,
+# que aqui e o caso normal (varias frentes compilando). Isto NAO e "aumentar o
+# timeout para o teste passar": o limite anterior estava abaixo do tempo real de
+# boot, e o numero novo tem a medicao ao lado. Se um dia o boot passar de 120 s,
+# a correcao e investigar o boot -- lentidao em 10k e P0 neste projeto --, nunca
+# subir este numero de novo.
+pronto=0
+for _ in $(seq 1 240); do
+	curl -fsS --max-time 2 -o /dev/null "http://$PORTA/healthz" 2>/dev/null && {
+		pronto=1
+		break
+	}
+	sleep 0.5
+done
+if [ "$pronto" -ne 1 ]; then
+	printf 'BINÁRIO NÃO SOBE — log:\n'
+	cat "$STAGE/smoke.log"
+	exit 90
+fi
+ok "binário sobe com o content/ e data/ reais"
+
+printf '\n== rotas ==\n'
+for rota in / /sobre/ /metodologia/ /privacidade/ /aviso-legal/ /termos/ /buscar/ /fontes/planalto/ '/contato/advogado/?origem=/imobiliario/usucapiao/'; do
+	code="$(curl -s -o /dev/null --max-time 8 -w '%{http_code}' "http://$PORTA$rota")"
+	[ "$code" = "200" ] && ok "$rota -> 200" || fail "$rota -> $code (esperado 200)"
+done
+
+printf '\n== contrato de peso e ausência de JavaScript ==\n'
+for rota in / /sobre/ /buscar/; do
+	corpo="$STAGE/corpo$(echo "$rota" | tr -c 'a-z0-9' '_').html"
+	curl -s --max-time 8 "http://$PORTA$rota" -o "$corpo"
+	bytes=$(stat -c%s "$corpo")
+	[ "$bytes" -le 50000 ] && ok "$rota $bytes bytes (<= 50000)" || fail "$rota $bytes bytes EXCEDE 50000"
+	# O contrato é ZERO JavaScript EXECUTÁVEL. <script type="application/ld+json">
+	# é dado estruturado (JSON-LD), não código: o navegador não o executa e a CSP
+	# do portal declara script-src 'none'. Contar "<script" cru reprovaria o
+	# JSON-LD que o SEO exige. Reprova o que de fato executa: script com src=,
+	# com type de JavaScript, ou sem type nenhum (default = JavaScript).
+	# -F: o '+' de "ld+json" é literal. Como expressão regular ele vira
+	# quantificador e o filtro deixa de casar (medido: 3 JSON-LD reprovando).
+	n=$(grep -oE '<script[^>]*>' "$corpo" | grep -Fvc 'application/ld+json')
+	# O REGISTRO DE FERRAMENTAS WebMCP É UM script executável AUTORIZADO desde
+	# 2026-08-19 (emenda do dono: JS leve para integração de agente de IA). Ele é
+	# inline, sem atributos, e a CSP o autoriza por hash sha256 — o gate byte a byte
+	# vive no Go (internal/htmlpolicy, internal/htmlcontract, internal/checks). Aqui,
+	# num smoke de shell, desconta-se pelo marcador único do corpo dele.
+	w=$(grep -Fc 'document.modelContext||navigator.modelContext' "$corpo" || true)
+	n=$((n - w))
+	[ "$n" -le 0 ] && ok "$rota zero JavaScript executável além do WebMCP (JSON-LD não conta)" || fail "$rota tem $n <script> executável não autorizado"
+done
+
+printf '\n== headers de segurança (lado Go) ==\n'
+H="$STAGE/headers-home.txt"
+curl -s -D "$H" -o /dev/null --max-time 8 "http://$PORTA/"
+for h in Content-Security-Policy Strict-Transport-Security X-Content-Type-Options X-Frame-Options Referrer-Policy Permissions-Policy Cross-Origin-Opener-Policy Cross-Origin-Resource-Policy; do
+	n=$(grep -ci "^$h:" "$H")
+	[ "$n" -eq 1 ] && ok "$h presente 1x" || fail "$h aparece $n vez(es) (esperado 1)"
+done
+
+printf '\n== política de cache por rota ==\n'
+cc_home=$(curl -s -D - -o /dev/null --max-time 8 "http://$PORTA/" | grep -i '^cache-control:' | tr -d '\r')
+printf '  home   %s\n' "$cc_home"
+grep -qi 'max-age=600' <<<"$cc_home" && ok "home com max-age curto" || fail "home sem max-age=600: $cc_home"
+# /buscar/ SEM query é o formulário de busca: idêntico para todo visitante,
+# logo cacheável como qualquer página. O que não pode ser guardado é o
+# RESULTADO (?q=...), específico da consulta, e a página de contato, cujo corpo
+# muda conforme a origem. Exigir no-store no formulário reprovaria conteúdo
+# legitimamente estático; exigi-lo no resultado é o controle que importa.
+cc_busca=$(curl -s -D - -o /dev/null --max-time 8 "http://$PORTA/buscar/" | grep -i '^cache-control:' | tr -d '\r')
+printf '  buscar        %s\n' "$cc_busca"
+grep -qi 'max-age=600' <<<"$cc_busca" && ok "/buscar/ (formulário) cacheável" || fail "/buscar/ sem max-age: $cc_busca"
+# A CONSULTA DE TESTE NAO PODE SER UM TEMA CURADO. `usucapiao` virou tema de
+# busca (internal/httpserver/search.go: TopicOf) e a pagina do tema e
+# cacheavel POR DESENHO -- producao responde `public, max-age=600` a
+# /buscar/?q=usucapiao (medido em 2026-09-08). Este check exigia no-store dela
+# e reprovaria o binario que esta no ar. A consulta sem tema continua
+# no-store, e e ela que prova o controle que importa.
+#
+# E A PRIMEIRA BUSCA A FRIO LEVA DEZENAS DE SEGUNDOS. Medido em 2026-09-08 no
+# candidato isolado, sob carga: healthz em 84 s, primeira /buscar/?q= em 38 s
+# (conexao fechada pelo servidor), a segunda em 3 s. Com --max-time 8 o
+# cabecalho voltava VAZIO e o check dizia "sem no-store" -- reprovando por
+# latencia de aquecimento o que deveria medir politica de cache. Uma
+# requisicao de aquecimento, com prazo proprio, antes das assercoes.
+curl -s -o /dev/null --max-time 120 "http://$PORTA/buscar/?q=aquecimento+do+indice" || true
+for volatil in '/buscar/?q=rescisao+indireta+prova' '/contato/advogado/?origem=/x/' '/healthz'; do
+	cc=$(curl -s -D - -o /dev/null --max-time 30 "http://$PORTA$volatil" | grep -i '^cache-control:' | tr -d '\r')
+	printf '  %-28s %s\n' "$volatil" "$cc"
+	grep -qi 'no-store' <<<"$cc" && ok "$volatil no-store" || fail "$volatil sem no-store: $cc"
+done
+
+printf '\n== página de erro 404 ==\n'
+E="$STAGE/404.html"
+code=$(curl -s -o "$E" -D "$STAGE/404h.txt" --max-time 8 -w '%{http_code}' "http://$PORTA/rota-que-nao-existe-xyz/")
+bytes=$(stat -c%s "$E")
+[ "$code" = "404" ] && ok "status 404" || fail "status $code"
+[ "$bytes" -gt 500 ] && ok "404 tem página própria ($bytes bytes, não os 19 do stdlib)" || fail "404 ainda é o texto cru do stdlib ($bytes bytes)"
+grep -qi 'não\|página' "$E" && ok "404 em PT-BR acentuado" || fail "404 sem PT-BR"
+grep -qi 'noindex' "$STAGE/404h.txt" && ok "404 com noindex" || printf '  nota  404 sem X-Robots-Tag (verificar meta no corpo)\n'
+
+printf '\n== robots.txt (política DEC-023 permissiva) ==\n'
+R="$STAGE/robots.txt"
+curl -s --max-time 8 "http://$PORTA/robots.txt" -o "$R"
+grep -q 'Disallow: /$' "$R" && fail "robots tem 'Disallow: /' — bloqueio total reintroduzido" || ok "robots sem 'Disallow: /'"
+# O GRUPO DO ROBOTS PODE TER VARIOS `User-agent:`, e ler so a linha seguinte
+# media a coisa errada.
+#
+# A RFC 9309 (secao 2.2.1) define que User-agents CONSECUTIVOS formam um grupo
+# unico, e as regras que vem depois valem para todos eles -- e e assim que o
+# nosso robots.txt agrupa a familia do Google e a dos bots de treinamento. O
+# `grep -A1` anterior pegava a linha imediatamente abaixo do bot procurado, que
+# num grupo e OUTRO `User-agent:`, e o smoke reprovava com "GPTBot ->
+# 'User-agent: ClaudeBot'". Medido em 2026-09-05: o binario de PRODUCAO falhava
+# exatamente igual, o que prova que o defeito era da regua, nao do candidato --
+# e um smoke que reprova o binario que ja esta no ar bloqueia todo deploy.
+#
+# Agora o teste percorre o grupo: a partir da linha do bot, pula os User-agent
+# irmaos e le as REGRAS ate o fim do grupo, procurando `Allow: /`. O controle nao
+# afrouxou -- bot cujo grupo nao tenha `Allow: /`, ou que nao apareca no arquivo,
+# continua reprovando, e o `Disallow: /` global segue barrado pela assercao
+# acima.
+for bot in GPTBot ClaudeBot CCBot Googlebot; do
+	veredito=$(awk -v alvo="user-agent: $bot" '
+    BEGIN { no_grupo = 0; lendo_regras = 0; achou_bot = 0; permite = 0 }
+    {
+      linha = $0
+      sub(/\r$/, "", linha)
+      if (tolower(linha) ~ /^user-agent:[ \t]*/) {
+        if (no_grupo && lendo_regras) {
+          if (achou_bot) exit
+          no_grupo = 0; lendo_regras = 0
+        }
+        no_grupo = 1
+        if (tolower(linha) == tolower(alvo)) achou_bot = 1
+        next
+      }
+      if (linha ~ /^[ \t]*$/) {
+        if (achou_bot && lendo_regras) exit
+        no_grupo = 0; lendo_regras = 0; next
+      }
+      if (no_grupo) {
+        lendo_regras = 1
+        if (tolower(linha) ~ /^allow:[ \t]*\/[ \t]*$/) permite = 1
+      }
+    }
+    END { if (!achou_bot) print "ausente"; else if (permite) print "allow"; else print "sem-allow" }
+  ' "$R")
+	case "$veredito" in
+	allow) ok "$bot -> Allow: / (no grupo dele)" ;;
+	ausente) fail "$bot nao aparece no robots.txt" ;;
+	*) fail "$bot -> o grupo dele nao tem 'Allow: /'" ;;
+	esac
+done
+
+printf '\n== busca interna continua noindex ==\n'
+curl -s --max-time 8 "http://$PORTA/buscar/" | grep -qi 'name="robots" content="noindex' && ok "/buscar/ com meta noindex" || fail "/buscar/ sem meta noindex"
+
+printf '\n%d falha(s)\n' "$falhas"
+exit $((falhas > 0 ? 1 : 0))

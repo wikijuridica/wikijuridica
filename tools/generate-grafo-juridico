@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+"""tools/generate-grafo-juridico — constroi data/ai/grafo.sqlite, o grafo de
+conhecimento juridico v1 do wiki (mandato AI-first, camada 1, DEC-058).
+
+POR QUE EXISTE: o portal ja tem quatro projecoes de UMA pagina (HTML, gemea
+Markdown, MCP, A2A/api/v1), mas nenhuma delas expoe a ESTRUTURA que liga
+pagina, dispositivo legal, norma, sumula e tema repetitivo como grafo
+navegavel — so como texto solto (a secao "Percursos por fundamento legal") ou
+como campo isolado (`revogado_por` em texto livre no corpus-oraculo). Um
+agente que pergunta "que paginas se apoiam no art. 421 do Codigo Civil, e o
+que mais cita esse mesmo artigo" hoje precisa fazer scan de JSONL; este
+artefato responde em uma consulta indexada (ver tools/consultar-grafo).
+
+FONTES REAIS (nenhuma inventada; ver docs/DADOS_CONFIAVEIS_E_ARMADILHAS.md,
+secao "data/ai/grafo.sqlite", para as armadilhas medidas de cada uma):
+
+  1. content/legal_cocitation_index.jsonl — pagina->dispositivo (campo
+     `percursos[].urn`/`rotulo`) e a base de pagina<->pagina por dispositivo
+     compartilhado. Gerado por cmd/generate-legal-cocitation
+     (internal/legalcocitation) — NAO EDITADO aqui, so lido.
+  2. data/source-snapshots/manifest.jsonl — o corpus-oraculo: uma linha por
+     documento oficial coletado (lei, decreto, sumula do STF). A maioria das
+     linhas e por-artigo (`dispositivo` tipo "art_5"), e MUITAS normas tem
+     linha duplicada de verdade — mesma URN/dispositivo, uma vez com
+     `revogado_por` vazio e outra preenchida, ou dois `content_sha256`
+     diferentes por recoleta em datas distintas (medido: 2.309 de 6.675
+     chaves urn+dispositivo duplicadas). A representante de cada norma e a
+     de dispositivo vazio MAIS RECENTE por `fetched_at`. Da os nos de
+     norma/sumula e a aresta `revoga` (a partir de `revogado_por`, texto
+     livre resolvido contra os proprios nos do grafo — nunca contra nome
+     adivinhado).
+  3. data/source-registry/stj_precedentes_qualificados.jsonl — temas
+     repetitivos, controversias, IAC, PUIL e SIRDR do STJ (CSV oficial
+     CC-BY, coletado por cmd/enumerate-entities).
+  4. data/editorial/published_manifest.jsonl — as paginas publicadas de
+     verdade (unique_intent_id, path, canonical_url, title); area vem do
+     primeiro segmento do path.
+  5. data/corpus/jurisprudencia/stj-espelhos/registros-*.jsonl (v1.1,
+     2026-09-08) — espelhos de acordaos da Primeira Turma do STJ, dados
+     abertos oficiais sob Creative Commons Atribuicao. Da o no `acordao`
+     (chave `acordao:STJ:<id_fonte>`, ementa integral como citacao
+     identificada — DEC-032, com `base_legal` registrado), a aresta
+     `acordao -julgado_por-> tribunal:STJ` e `acordao -cita-> <alvo>` para
+     cada URN em `dispositivos_citados_urn`. MEDIDO em 862 registros: so
+     34,2% tem alguma URN, e NENHUMA das 70 URNs distintas citadas carrega
+     "!" de artigo — a fonte hoje da granularidade de NORMA, nao de
+     dispositivo, entao `cita` aponta pro no de norma (criado orfao quando
+     ainda nao coletado pelo oraculo). Diretorio ausente nao quebra a
+     geracao: o grafo fica valido sem acordaos.
+
+O QUE ESTE GERADOR NAO FAZ (documentado com todas as letras, nao escondido):
+nao extrai sumula/tema -> dispositivo por adivinhacao de texto livre (so
+citaria uma URN se ela ja estivesse LITERALMENTE nos dados — nenhuma das
+2.384 linhas de temas do STJ nem os enunciados de sumula do STF trazem URN
+embutida, entao essa aresta fica vazia); nao popula `altera`, `aplica`,
+`supera` nem `impactada_por` — nao ha coletor de repercussao geral do STF
+nesta base, e o campo `numero_repercussao_geral_stf` do STJ e so um numero
+solto, sem metadado do lado do STF para virar no honesto; nao cria no
+`dispositivo` a partir de acordao STJ hoje, porque a fonte nao entrega URN
+de artigo (o codigo trata o caso quando entregar, mas nao e exercitado por
+dado real ainda).
+
+MODELO: nos tipados por chave natural (pagina=path; norma=URN sem "!";
+dispositivo=URN com "!art..."; sumula="sumula:<tribunal>:<numero>";
+tema="tema:<tribunal>:<tipo>:<numero>"; tribunal=sigla; area=slug;
+acordao="acordao:<tribunal>:<id_fonte>") e arestas tipadas com peso, fonte
+(arquivo de origem) e evidencia (JSON com o dado exato que fundamenta a
+aresta — nunca so uma alegacao). FTS5 sobre rotulo+chave para busca por
+termo. Indice DERIVADO e SEMPRE regeneravel: constroi tudo em memoria,
+escreve num arquivo temporario e troca por os.replace — quem le nunca ve o
+arquivo pela metade. Um segundo artefato, data/ai/grafo_vizinhanca.jsonl,
+serializa a vizinhanca direta de cada no (uma linha por no) para o servidor
+Go consumir sem round-trip de sqlite por requisicao; exclui `cocitada_com`
+(o Go ja tem isso em memoria por outro artefato) e `da_area` de saida de
+pagina (redundante com o path).
+
+Uso:
+    tools/generate-grafo-juridico
+    tools/generate-grafo-juridico --timings
+    tools/generate-grafo-juridico --dry-run
+    tools/generate-grafo-juridico --root /opt/wiki --out data/ai/grafo.sqlite
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+import unicodedata
+
+DDL = """
+CREATE TABLE nos (
+    id INTEGER PRIMARY KEY,
+    tipo TEXT NOT NULL CHECK(tipo IN ('pagina','norma','dispositivo','sumula','tema','tribunal','area','acordao')),
+    chave TEXT UNIQUE NOT NULL,
+    rotulo TEXT NOT NULL,
+    atributos TEXT NOT NULL
+);
+
+CREATE TABLE arestas (
+    origem INTEGER NOT NULL REFERENCES nos(id),
+    destino INTEGER NOT NULL REFERENCES nos(id),
+    tipo TEXT NOT NULL CHECK(tipo IN ('cita','pertence_a','cocitada_com','revoga','altera','supera','aplica','impactada_por','da_area','julgado_por')),
+    peso REAL NOT NULL DEFAULT 1,
+    fonte TEXT NOT NULL,
+    evidencia TEXT NOT NULL,
+    PRIMARY KEY(origem, destino, tipo)
+);
+
+CREATE VIRTUAL TABLE nos_fts USING fts5(rotulo, chave, content='nos', content_rowid='id');
+
+CREATE TRIGGER nos_fts_ai AFTER INSERT ON nos BEGIN
+    INSERT INTO nos_fts(rowid, rotulo, chave) VALUES (new.id, new.rotulo, new.chave);
+END;
+CREATE TRIGGER nos_fts_ad AFTER DELETE ON nos BEGIN
+    INSERT INTO nos_fts(nos_fts, rowid, rotulo, chave) VALUES('delete', old.id, old.rotulo, old.chave);
+END;
+CREATE TRIGGER nos_fts_au AFTER UPDATE ON nos BEGIN
+    INSERT INTO nos_fts(nos_fts, rowid, rotulo, chave) VALUES('delete', old.id, old.rotulo, old.chave);
+    INSERT INTO nos_fts(rowid, rotulo, chave) VALUES (new.id, new.rotulo, new.chave);
+END;
+
+CREATE TABLE meta (
+    chave TEXT PRIMARY KEY,
+    valor TEXT NOT NULL
+);
+"""
+
+
+RE_ROTA_TEMA_STJ = re.compile(r"^/jurisprudencia/stj-tema-(\d+)/$")
+
+
+def novo_grafo():
+    return {"nos": {}, "arestas": {}}
+
+
+def add_no(grafo, tipo, chave, rotulo, atributos):
+    existente = grafo["nos"].get(chave)
+    if existente is not None:
+        if existente["tipo"] != tipo:
+            raise ValueError(
+                "colisao de chave entre tipos diferentes: %r ja e %r, tentou %r"
+                % (chave, existente["tipo"], tipo)
+            )
+        return
+    grafo["nos"][chave] = {"tipo": tipo, "rotulo": rotulo, "atributos": atributos}
+
+
+_TRIBUNAL_NOME_COMPLETO = {"STF": "Supremo Tribunal Federal", "STJ": "Superior Tribunal de Justiça"}
+
+
+def nome_completo_tribunal(sigla):
+    return _TRIBUNAL_NOME_COMPLETO.get(sigla, sigla)
+
+
+def ler_trecho_do_blob(root, blob_ref, max_chars=240):
+    """Le o comeco do blob do corpus-oraculo (texto oficial ja coletado e
+    hasheado por nos) para servir de rotulo de sumula. Ausencia de blob NAO
+    derruba a geracao: quem chama cai no rotulo estrutural."""
+    caminho = os.path.join(root, "data", "source-snapshots", blob_ref)
+    try:
+        with open(caminho, "r", encoding="utf-8", errors="replace") as f:
+            texto = f.read(max_chars + 1)
+    except OSError:
+        return None
+    texto = " ".join(texto.split())
+    if not texto:
+        return None
+    if len(texto) > max_chars:
+        texto = texto[:max_chars].rstrip() + "…"
+    return texto
+
+
+def add_aresta(grafo, origem, destino, tipo, peso, fonte, evidencia):
+    if origem == destino:
+        return
+    chave = (origem, destino, tipo)
+    if chave in grafo["arestas"]:
+        return
+    grafo["arestas"][chave] = {"peso": peso, "fonte": fonte, "evidencia": evidencia}
+
+
+def norma_base_de_urn(urn):
+    """URN de dispositivo (com '!art...') -> URN da norma-base; URN de norma
+    (sem '!') devolve ela mesma. Funcao unica reaproveitada por toda fonte
+    que precisa separar dispositivo de norma (cocitacao e acordaos do STJ) —
+    nunca duas implementacoes divergentes do mesmo corte."""
+    return urn.split("!")[0]
+
+
+def _rotulo_acordao(d):
+    return f"{d['classe']} {d['numero_processo']} (STJ, {d['orgao_julgador']}, {d['data_julgamento']})"
+
+
+def _processar_acordao_stj(grafo, d, fonte_rel):
+    """Registra um acordao do STJ (chave natural acordao:STJ:<id_fonte>) e as
+    arestas cita/julgado_por dele. Convive com granularidade mista em
+    dispositivos_citados_urn: medido em 2026-09-08 sobre os 862 registros
+    reais da Primeira Turma, NENHUMA das 70 URNs distintas citadas carrega
+    '!' — a fonte hoje só entrega granularidade de NORMA, nunca de artigo.
+    Por isso a citacao aponta direto para o no de norma (criando-o como
+    orfao, igual ao padrao ja usado para norma_bases da cocitacao) quando a
+    URN nao tem '!'; se um dia a URN vier com sufixo de artigo, o ramo
+    dispositivo+pertence_a abaixo ja trata, pela MESMA funcao
+    (norma_base_de_urn) que a fonte 1 usa."""
+    id_fonte = d["id_fonte"]
+    chave_acordao = f"acordao:STJ:{id_fonte}"
+    add_no(
+        grafo, "acordao", chave_acordao, _rotulo_acordao(d),
+        {
+            "relator": d.get("relator", ""),
+            "classe": d.get("classe", ""),
+            "numero_registro": d.get("numero_registro", ""),
+            "data_julgamento": d.get("data_julgamento", ""),
+            "data_publicacao": d.get("data_publicacao", ""),
+            "ementa": d.get("ementa", ""),
+            "base_legal": d.get("base_legal", ""),
+            "fonte_url": d.get("fonte_url", ""),
+            "sha256_conteudo": d.get("sha256_conteudo", ""),
+        },
+    )
+    add_aresta(grafo, chave_acordao, "STJ", "julgado_por", 1.0, fonte_rel, {"id_fonte": id_fonte})
+    for urn in d.get("dispositivos_citados_urn") or []:
+        _citar_urn(grafo, chave_acordao, urn, fonte_rel, {"urn": urn, "id_fonte": id_fonte})
+    # SUMULAS CITADAS (2026-09-08): o coletor passou a extrair "SUM(STF) SUM:000280"
+    # das referencias brutas como "STF:280" -- a MESMA chave dos nos `sumula`
+    # deste grafo. Sumula do STJ ainda nao vem do oraculo: nasce aqui como no
+    # sem enunciado (atributos dizem isso), para a aresta existir com prova.
+    for chave_sumula in d.get("sumulas_citadas") or []:
+        tribunal, _, numero = str(chave_sumula).partition(":")
+        _citar_sumula(grafo, chave_acordao, tribunal, numero, fonte_rel, {"id_fonte": id_fonte})
+
+
+def _citar_urn(grafo, chave_acordao, urn, fonte_rel, evidencia):
+    """Aresta acordao -cita-> dispositivo (com pertence_a para a norma) ou
+    -cita-> norma quando a URN nao tem sufixo '!'. Mesma regra para a fonte 5
+    (parser das referencias brutas) e para a fonte 6 (extracao por LLM)."""
+    norma_base = norma_base_de_urn(urn)
+    if norma_base not in grafo["nos"]:
+        add_no(grafo, "norma", norma_base, norma_base, {"vigencia_status": "desconhecido_sem_coleta_do_oraculo"})
+    if urn != norma_base:
+        add_no(grafo, "dispositivo", urn, urn, {"norma_base": norma_base})
+        add_aresta(
+            grafo, urn, norma_base, "pertence_a", 1.0, fonte_rel,
+            {"urn_dispositivo": urn, "urn_norma": norma_base},
+        )
+        alvo_citacao = urn
+    else:
+        alvo_citacao = norma_base
+    add_aresta(grafo, chave_acordao, alvo_citacao, "cita", 1.0, fonte_rel, evidencia)
+
+
+def _citar_sumula(grafo, chave_acordao, tribunal, numero, fonte_rel, evidencia):
+    """Aresta acordao -cita-> sumula:<TRIB>:<n>, criando o no sem enunciado
+    quando o oraculo ainda nao o trouxe. Tribunal fora de STF/STJ ou numero
+    nao numerico: nada (a fonte nao provou a sumula)."""
+    numero = str(numero)
+    if tribunal not in ("STF", "STJ") or not numero.isdigit():
+        return
+    chave = "sumula:%s:%s" % (tribunal, int(numero))
+    if chave not in grafo["nos"]:
+        add_no(grafo, "sumula", chave, "Súmula %d do %s" % (int(numero), tribunal),
+               {"enunciado": "", "origem": "citada_em_acordao_do_stj_sem_texto_coletado"})
+        if tribunal not in grafo["nos"]:
+            add_no(grafo, "tribunal", tribunal, tribunal, {})
+        add_aresta(grafo, chave, tribunal, "julgado_por", 1.0, fonte_rel, {"sumula": chave})
+    add_aresta(grafo, chave_acordao, chave, "cita", 1.0, fonte_rel, dict(evidencia, sumula=chave))
+
+
+EXTRACOES_REL = "data/ai/extracoes_dispositivos.jsonl"
+
+
+def _processar_extracoes(grafo, root):
+    """Fonte 6 (2026-09-08): data/ai/extracoes_dispositivos.jsonl, escrito pelo
+    cerebro (internal/cerebro/extracao.go) para os acordaos SEM referencia
+    estruturada. Cada item ja passou pela ancora literal (texto_citado ocorre na
+    ementa) e so traz `urn` quando o parser do lexml a provou — aqui entra
+    apenas o que tem `urn` (LexML ou sumula:<TRIB>:<n>). Ultima linha por chave
+    vence (o cerebro reprocessa e apende). Acordao que nao existe no grafo
+    (fonte 5 nao o trouxe) e descartado, nunca inventado. Devolve contagens."""
+    caminho = os.path.join(root, *EXTRACOES_REL.split("/"))
+    contagem = {"registros": 0, "acordaos": 0, "itens_com_urn": 0, "itens_sem_urn": 0, "acordaos_fora_do_grafo": 0}
+    if not os.path.isfile(caminho):
+        return contagem
+    por_chave = {}
+    with open(caminho, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            contagem["registros"] += 1
+            por_chave[d["chave"]] = d
+    for chave_acordao, d in sorted(por_chave.items()):
+        if chave_acordao not in grafo["nos"]:
+            contagem["acordaos_fora_do_grafo"] += 1
+            continue
+        contagem["acordaos"] += 1
+        for item in d.get("dispositivos") or []:
+            urn = item.get("urn") or ""
+            if not urn:
+                contagem["itens_sem_urn"] += 1
+                continue
+            contagem["itens_com_urn"] += 1
+            evidencia = {"texto_citado": item.get("texto_citado", ""), "norma": item.get("norma", ""), "artigo": item.get("artigo", ""),
+                         "modelo": d.get("modelo", ""), "prompt_sha256": d.get("prompt_sha256", ""), "texto_sha256": d.get("texto_sha256", "")}
+            if urn.startswith("sumula:"):
+                _, tribunal, numero = urn.split(":", 2)
+                _citar_sumula(grafo, chave_acordao, tribunal, numero, EXTRACOES_REL, evidencia)
+            else:
+                _citar_urn(grafo, chave_acordao, urn, EXTRACOES_REL, evidencia)
+    return contagem
+
+
+def construir_grafo(root, timings=False):
+    grafo = novo_grafo()
+
+    # Fonte 4 (data/editorial/published_manifest.jsonl): pagina + area
+    # (primeiro segmento do path).
+    caminho_paginas = os.path.join(root, "data", "editorial", "published_manifest.jsonl")
+    with open(caminho_paginas, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            path = d["path"]
+            seg = path.strip("/").split("/")
+            area = seg[0] if seg and seg[0] else ""
+            add_no(
+                grafo, "pagina", path, d["title"],
+                {"intent_id": d["unique_intent_id"], "area": area, "canonical_url": d.get("canonical_url", "")},
+            )
+            if area:
+                add_no(grafo, "area", area, area, {})
+                add_aresta(
+                    grafo, path, area, "da_area", 1.0,
+                    "data/editorial/published_manifest.jsonl", {"path": path},
+                )
+
+    # Fonte 1 (content/legal_cocitation_index.jsonl): cada percurso de uma
+    # pagina cita um dispositivo (URN com "!art..."); a URN sem o "!" e a
+    # norma a que ele pertence.
+    caminho_cocitacao = os.path.join(root, "content", "legal_cocitation_index.jsonl")
+    norma_bases = set()
+    citantes_por_urn = {}
+    norma_rotulo_hint = {}
+    art_split_re = re.compile(r",\s*art", re.IGNORECASE)
+    with open(caminho_cocitacao, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            page_path = d["public_path"]
+            for percurso in d["percursos"]:
+                urn = percurso["urn"]
+                rotulo = percurso["rotulo"]
+                norma_base = norma_base_de_urn(urn)
+                norma_bases.add(norma_base)
+                partes = art_split_re.split(rotulo, maxsplit=1)
+                if len(partes) == 2 and partes[0].strip():
+                    norma_rotulo_hint.setdefault(norma_base, partes[0].strip())
+                add_no(grafo, "dispositivo", urn, rotulo, {"norma_base": norma_base})
+                # Sem no de pagina (nem toda pagina do recorte de cocitacao
+                # precisa estar no published_manifest lido ate aqui), nao ha
+                # aresta 'cita' — nunca se inventa no de pagina so pra ela
+                # caber.
+                if page_path in grafo["nos"]:
+                    add_aresta(
+                        grafo, page_path, urn, "cita", 1.0,
+                        "content/legal_cocitation_index.jsonl",
+                        {"rotulo": rotulo, "intent_id": d["intent_id"]},
+                    )
+                    citantes_por_urn.setdefault(urn, set()).add(page_path)
+                add_aresta(
+                    grafo, urn, norma_base, "pertence_a", 1.0,
+                    "content/legal_cocitation_index.jsonl",
+                    {"urn_dispositivo": urn, "urn_norma": norma_base},
+                )
+
+    # cocitada_com: duas paginas que citam o mesmo dispositivo. Peso = numero
+    # de dispositivos em comum; uma direcao so (origem<destino).
+    pares = {}
+    for urn, paginas in citantes_por_urn.items():
+        ordenadas = sorted(paginas)
+        for i in range(len(ordenadas)):
+            for j in range(i + 1, len(ordenadas)):
+                item = pares.setdefault((ordenadas[i], ordenadas[j]), {"peso": 0, "urns": []})
+                item["peso"] += 1
+                item["urns"].append(urn)
+    for (a, b), item in pares.items():
+        add_aresta(
+            grafo, a, b, "cocitada_com", float(item["peso"]),
+            "content/legal_cocitation_index.jsonl (derivado: dispositivos em comum)",
+            {"dispositivos_urn": sorted(item["urns"])},
+        )
+
+    # Fonte 2 (data/source-snapshots/manifest.jsonl), so a parte de norma por
+    # ora: agrupa por urn_lex (ha linha duplicada de verdade no arquivo — a
+    # representante e a mais recente por fetched_at) e cria um no por norma.
+    caminho_oraculo = os.path.join(root, "data", "source-snapshots", "manifest.jsonl")
+    normas_linhas = {}
+    revogado_por_textos = {}
+    with open(caminho_oraculo, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            if d["tipo"] == "sumula":
+                # 'urn:lex:br:supremo.tribunal.federal:sumula:1963;10' -> STF
+                # (iniciais dos segmentos da propria autoridade da URN).
+                urn = d["urn_lex"]
+                m = re.match(r"^urn:lex:br:([^:]+):sumula:\d+;(\d+)$", urn)
+                if not m:
+                    continue
+                autoridade, numero = m.groups()
+                tribunal = "".join(w[0] for w in autoridade.split(".") if w).upper()
+                chave_sumula = f"sumula:{tribunal}:{numero}"
+                rotulo_sumula = ler_trecho_do_blob(root, d["blob_ref"]) or f"Súmula {numero} do {tribunal}"
+                add_no(
+                    grafo, "sumula", chave_sumula, rotulo_sumula,
+                    {"urn_lex": urn, "content_sha256": d["content_sha256"]},
+                )
+                add_no(grafo, "tribunal", tribunal, nome_completo_tribunal(tribunal), {})
+                add_aresta(grafo, chave_sumula, tribunal, "julgado_por", 1.0, caminho_oraculo, {"urn_lex": urn})
+                continue
+            normas_linhas.setdefault(d["urn_lex"], []).append(d)
+            if d.get("revogado_por"):
+                revogado_por_textos.setdefault(d["urn_lex"], set()).add(
+                    (d["revogado_por"], d.get("dispositivo", ""))
+                )
+
+    for urn, linhas in normas_linhas.items():
+        candidatas = [r for r in linhas if r.get("dispositivo", "") == ""] or linhas
+        representante = sorted(candidatas, key=lambda r: r.get("fetched_at", ""))[-1]
+        add_no(
+            grafo, "norma", urn, urn,
+            {
+                "tipo_norma": representante["tipo"],
+                "vigencia_status": representante.get("vigencia_status", ""),
+                "source_channel": representante.get("source_channel", ""),
+            },
+        )
+
+    # Normas citadas pelas paginas mas nunca coletadas pelo oraculo tambem
+    # viram no — sem isso, dispositivo->norma ficaria orfao.
+    for norma_base in norma_bases:
+        add_no(grafo, "norma", norma_base, norma_base, {"vigencia_status": "desconhecido_sem_coleta_do_oraculo"})
+
+    # Normas que alguma pagina citou com nome de diploma reconhecivel ("Código
+    # Civil, art. 421") ganham esse rotulo real em vez da URN crua.
+    for norma_base, hint in norma_rotulo_hint.items():
+        no = grafo["nos"].get(norma_base)
+        if no is not None and no["tipo"] == "norma":
+            no["rotulo"] = hint
+
+    # revoga: resolve o texto livre de revogado_por contra URN de norma JA
+    # presente no grafo (gramatica fechada tipo+numero — nunca adivinha nome
+    # de diploma a partir de prosa livre; sem alvo resolvido, sem aresta).
+    urn_norma_re = re.compile(r"^urn:lex:br:federal:([a-z.]+):\d{4}-\d{2}-\d{2};(\d+)$")
+    indice_tiponumero = {}
+    for chave, no in grafo["nos"].items():
+        if no["tipo"] != "norma":
+            continue
+        m = urn_norma_re.match(chave)
+        if m:
+            indice_tiponumero.setdefault(m.groups(), chave)
+
+    revoga_tipos = [
+        ("Lei Complementar", "lei.complementar"), ("Lei Delegada", "lei.delegada"),
+        ("Decreto-Lei", "decreto.lei"), ("Decreto Legislativo", "decreto.legislativo"),
+        ("Medida Provisória", "medida.provisoria"), ("Medida Provisoria", "medida.provisoria"),
+        ("Decreto", "decreto"), ("Lei", "lei"),
+    ]
+    revoga_re = re.compile(
+        "(" + "|".join(re.escape(r) for r, _t in revoga_tipos) + r")\s*n[ºo°]?\.?\s*([\d.]+)",
+        re.IGNORECASE,
+    )
+    revoga_tipo_por_rotulo = {r.lower(): t for r, t in revoga_tipos}
+
+    for norma_urn, pares_texto_disp in revogado_por_textos.items():
+        if norma_urn not in grafo["nos"]:
+            continue
+        por_alvo = {}
+        for texto, dispositivo in pares_texto_disp:
+            for m in revoga_re.finditer(texto):
+                tipo_urn = revoga_tipo_por_rotulo.get(m.group(1).lower())
+                numero = m.group(2).replace(".", "")
+                if not tipo_urn or not numero:
+                    continue
+                alvo = indice_tiponumero.get((tipo_urn, numero))
+                if alvo is None or alvo == norma_urn:
+                    continue
+                info = por_alvo.setdefault(alvo, {"textos": set(), "dispositivos": set()})
+                info["textos"].add(texto)
+                if dispositivo:
+                    info["dispositivos"].add(dispositivo)
+        for alvo, info in por_alvo.items():
+            add_aresta(
+                grafo, alvo, norma_urn, "revoga", float(len(info["dispositivos"]) or 1), caminho_oraculo,
+                {"revogado_por_texto": sorted(info["textos"]), "dispositivos_atingidos": sorted(info["dispositivos"])},
+            )
+
+    # Fonte 3 (data/source-registry/stj_precedentes_qualificados.jsonl):
+    # temas/controversias/IAC/PUIL/SIRDR do STJ.
+    caminho_stj = os.path.join(root, "data", "source-registry", "stj_precedentes_qualificados.jsonl")
+    add_no(grafo, "tribunal", "STJ", nome_completo_tribunal("STJ"), {})
+    with open(caminho_stj, "r", encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            d = json.loads(linha)
+            normalizado = unicodedata.normalize("NFKD", d["tipo_precedente"]).encode("ascii", "ignore").decode("ascii")
+            tipo_slug = re.sub(r"[^a-z0-9]+", "-", normalizado.lower().strip()).strip("-")
+            numero = d["numero_precedente"]
+            chave_tema = f"tema:STJ:{tipo_slug}:{numero}"
+            add_no(
+                grafo, "tema", chave_tema, f"{d['tipo_precedente']} {numero} do STJ",
+                {"situacao": d.get("situacao", ""), "orgao_julgador": d.get("orgao_julgador", "")},
+            )
+            add_aresta(
+                grafo, chave_tema, "STJ", "julgado_por", 1.0, caminho_stj,
+                {"numero_precedente": numero, "tipo_precedente": d["tipo_precedente"]},
+            )
+
+    # Fonte 5 (data/corpus/jurisprudencia/stj-espelhos/registros-*.jsonl):
+    # acordaos da Primeira Turma do STJ, espelho oficial de dados abertos
+    # (Creative Commons Atribuicao). Coletor entregue em 2026-09-08; o
+    # diretorio pode nao existir ainda em ambiente antigo — o grafo continua
+    # valido sem acordaos, so sem os nos/arestas desta fonte.
+    add_no(grafo, "tribunal", "STJ", nome_completo_tribunal("STJ"), {})
+    caminho_espelhos = os.path.join(root, "data", "corpus", "jurisprudencia", "stj-espelhos")
+    if os.path.isdir(caminho_espelhos):
+        for nome_arquivo in sorted(os.listdir(caminho_espelhos)):
+            if not (nome_arquivo.startswith("registros-") and nome_arquivo.endswith(".jsonl")):
+                continue
+            fonte_rel = "/".join(("data", "corpus", "jurisprudencia", "stj-espelhos", nome_arquivo))
+            with open(os.path.join(caminho_espelhos, nome_arquivo), "r", encoding="utf-8") as f:
+                for linha in f:
+                    linha = linha.strip()
+                    if not linha:
+                        continue
+                    _processar_acordao_stj(grafo, json.loads(linha), fonte_rel)
+
+    # Fonte 6 (data/ai/extracoes_dispositivos.jsonl): dispositivos e sumulas que o
+    # cerebro extraiu por LLM dos acordaos sem referencia estruturada. Depende da
+    # fonte 5 (o acordao tem de existir); ausente => grafo igual ao de antes.
+    grafo["extracoes"] = _processar_extracoes(grafo, root)
+
+    # FRENTE D: derivadas, sempre por ultimo — elas leem as arestas das fontes
+    # 1 a 6 e nao acrescentam fonte nenhuma.
+    grafo["frente_d"] = _derivar_arestas_frente_d(grafo)
+
+    return grafo
+
+
+# ---------------------------------------------------------------------------
+# FRENTE D (2026-09-09): as tres familias de aresta que o grafo nao tinha.
+#
+# MEDIDO antes de escrever uma linha, por par (tipo_origem, tipo_destino,
+# tipo_aresta) sobre o grafo do dia: `pagina->sumula`, `tema->dispositivo` e
+# `dispositivo->dispositivo` eram ZERO. As tres sao DERIVADAS do que ja esta
+# aqui — nenhuma fonte nova, nenhum fato inventado — e por isso rodam DEPOIS de
+# todas as fontes, sobre as arestas ja montadas.
+#
+# CORTE DE >=3 ACORDAOS, e ele nao e cosmetico. Com >=1 acordao a familia
+# pagina->sumula liga 2.941 paginas e o elo vira ruido; com >=3 sao 1.701
+# paginas com sustentacao repetida. E a mesma licao que o repositorio ja pagou
+# em `precedente-por-norma-inteira-e-ruido`: elo sem forca medida polui o grafo
+# que ele deveria enriquecer. O peso e a contagem de acordaos, para o consumidor
+# poder subir a regua sem reconstruir nada.
+SUPORTE_MINIMO_ACORDAOS = 3
+
+
+def _indice_por_tipo(grafo, tipo_origem, tipo_destino, tipo_aresta):
+    """Devolve {chave_origem: set(chave_destino)} das arestas ja montadas."""
+    nos = grafo["nos"]
+    saida = {}
+    for (origem, destino, tipo) in grafo["arestas"]:
+        if tipo != tipo_aresta:
+            continue
+        no_o = nos.get(origem)
+        no_d = nos.get(destino)
+        if not no_o or not no_d:
+            continue
+        if no_o["tipo"] != tipo_origem or no_d["tipo"] != tipo_destino:
+            continue
+        saida.setdefault(origem, set()).add(destino)
+    return saida
+
+
+def _derivar_arestas_frente_d(grafo):
+    """pagina->sumula, dispositivo<->dispositivo e tema->dispositivo."""
+    contagem = {"pagina_sumula": 0, "dispositivo_dispositivo": 0, "tema_dispositivo": 0,
+                "pares_pagina_sumula_descartados": 0, "pares_dispositivo_descartados": 0}
+
+    ac_disp = _indice_por_tipo(grafo, "acordao", "dispositivo", "cita")
+    ac_sum = _indice_por_tipo(grafo, "acordao", "sumula", "cita")
+    pag_disp = _indice_por_tipo(grafo, "pagina", "dispositivo", "cita")
+
+    disp_para_paginas = {}
+    for pagina, dispositivos in pag_disp.items():
+        for dispositivo in dispositivos:
+            disp_para_paginas.setdefault(dispositivo, set()).add(pagina)
+
+    # 1. pagina -aplica-> sumula: o acordao que cita a sumula cita tambem um
+    #    dispositivo que a pagina invoca. O elo e "esta sumula e aplicada ao
+    #    fundamento desta pagina", sustentado por N acordaos.
+    suporte_ps = {}
+    for acordao, dispositivos in ac_disp.items():
+        sumulas = ac_sum.get(acordao)
+        if not sumulas:
+            continue
+        for dispositivo in dispositivos:
+            for pagina in disp_para_paginas.get(dispositivo, ()):
+                for sumula in sumulas:
+                    entrada = suporte_ps.setdefault((pagina, sumula), {"acordaos": set(), "dispositivos": set()})
+                    entrada["acordaos"].add(acordao)
+                    entrada["dispositivos"].add(dispositivo)
+    for (pagina, sumula), dados in sorted(suporte_ps.items()):
+        n = len(dados["acordaos"])
+        if n < SUPORTE_MINIMO_ACORDAOS:
+            contagem["pares_pagina_sumula_descartados"] += 1
+            continue
+        evidencia = {
+            "acordaos_de_suporte": n,
+            "dispositivos_em_comum": sorted(dados["dispositivos"])[:8],
+            "amostra_de_acordaos": sorted(dados["acordaos"])[:5],
+            "regra": "acordao cita a sumula e cita dispositivo que a pagina invoca",
+        }
+        add_aresta(grafo, pagina, sumula, "aplica", float(n), "derivado:frente-d", evidencia)
+        contagem["pagina_sumula"] += 1
+
+    # 2. dispositivo <-> dispositivo: dois dispositivos citados pelo MESMO
+    #    acordao andam juntos. Aresta simetrica, gravada nos dois sentidos para
+    #    que a vizinhanca de qualquer um dos dois a enxergue sem varredura.
+    suporte_dd = {}
+    for acordao, dispositivos in ac_disp.items():
+        ordenados = sorted(dispositivos)
+        for i, a in enumerate(ordenados):
+            for b in ordenados[i + 1:]:
+                suporte_dd.setdefault((a, b), set()).add(acordao)
+    for (a, b), acordaos in sorted(suporte_dd.items()):
+        n = len(acordaos)
+        if n < SUPORTE_MINIMO_ACORDAOS:
+            contagem["pares_dispositivo_descartados"] += 1
+            continue
+        evidencia = {"acordaos_de_suporte": n, "amostra_de_acordaos": sorted(acordaos)[:5],
+                     "regra": "dois dispositivos citados pelo mesmo acordao"}
+        add_aresta(grafo, a, b, "cocitada_com", float(n), "derivado:frente-d", evidencia)
+        add_aresta(grafo, b, a, "cocitada_com", float(n), "derivado:frente-d", evidencia)
+        contagem["dispositivo_dispositivo"] += 2
+
+    # 3. tema -cita-> dispositivo: a PAGINA do tema
+    #    (/jurisprudencia/stj-tema-<N>/) ja cita os dispositivos da tese; o no do
+    #    tema e o mesmo fato sem a rota. Nada e adivinhado: so entra tema que
+    #    existe no grafo e dispositivo que a pagina ja invoca.
+    #
+    #    Por que NAO por `referencia_legislativa` do CSV do STJ: medido em
+    #    2026-09-09, so 41 dos 2.384 registros a preenchem, e em texto livre
+    #    ("Lei 9.494/1997. Art. 1o-F. Os juros de mora, nas condenacoes...").
+    #    Resolver isso por regex seria adivinhar URN a partir de prosa, que e a
+    #    fabricacao de proveniencia que o contrato proibe.
+    for pagina, dispositivos in sorted(pag_disp.items()):
+        casamento = RE_ROTA_TEMA_STJ.match(pagina)
+        if not casamento:
+            continue
+        chave_tema = "tema:STJ:tema:" + casamento.group(1)
+        if chave_tema not in grafo["nos"]:
+            continue
+        for dispositivo in sorted(dispositivos):
+            evidencia = {"pagina_do_tema": pagina, "regra": "dispositivo invocado pela pagina publicada do tema"}
+            add_aresta(grafo, chave_tema, dispositivo, "cita", 1.0, "derivado:frente-d", evidencia)
+            contagem["tema_dispositivo"] += 1
+
+    return contagem
+
+
+def escrever_sqlite(grafo, out_path):
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".grafo-", suffix=".sqlite.tmp", dir=out_dir)
+    os.close(fd)
+    conn = sqlite3.connect(tmp_path)
+    conn.executescript(DDL)
+
+    chaves_ordenadas = sorted(grafo["nos"].keys())
+    id_por_chave = {chave: i for i, chave in enumerate(chaves_ordenadas, start=1)}
+    linhas_nos = [
+        (
+            id_por_chave[chave], grafo["nos"][chave]["tipo"], chave, grafo["nos"][chave]["rotulo"],
+            json.dumps(grafo["nos"][chave]["atributos"], ensure_ascii=False, sort_keys=True),
+        )
+        for chave in chaves_ordenadas
+    ]
+    with conn:
+        conn.executemany("INSERT INTO nos(id, tipo, chave, rotulo, atributos) VALUES (?,?,?,?,?)", linhas_nos)
+        linhas_arestas = [
+            (
+                id_por_chave[o], id_por_chave[d_], tipo, info["peso"], info["fonte"],
+                json.dumps(info["evidencia"], ensure_ascii=False, sort_keys=True),
+            )
+            for (o, d_, tipo), info in grafo["arestas"].items()
+            if o in id_por_chave and d_ in id_por_chave
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO arestas(origem, destino, tipo, peso, fonte, evidencia) VALUES (?,?,?,?,?,?)",
+            linhas_arestas,
+        )
+    conn.execute("CREATE INDEX idx_arestas_origem ON arestas(origem)")
+    conn.execute("CREATE INDEX idx_arestas_destino ON arestas(destino)")
+
+    with conn:
+        conn.executemany(
+            "INSERT INTO meta(chave, valor) VALUES (?,?)",
+            [
+                ("schema_version", "grafo_juridico_v1"),
+                ("gerado_em", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+                ("total_nos", str(len(linhas_nos))),
+                ("total_arestas", str(len(linhas_arestas))),
+            ],
+        )
+    conn.commit()
+    conn.close()
+    os.replace(tmp_path, out_path)
+    return len(linhas_nos), len(linhas_arestas)
+
+
+def _exclui_do_vizinho(tipo_no, tipo_aresta, direcao):
+    """cocitada_com fica de fora QUANDO E ENTRE PAGINAS (o Go ja tem essa
+    co-citacao em memoria por outro artefato; incluir aqui triplicaria o
+    arquivo). da_area de SAIDA de pagina fica de fora por ser redundante com o
+    proprio path da pagina — a mesma informacao ja esta em atributos.area.
+
+    A RESSALVA DE 2026-09-09: a exclusao era por TIPO DE ARESTA, e a Frente D
+    passou a usar `cocitada_com` tambem entre DISPOSITIVOS (dois artigos citados
+    pelo mesmo acordao). Essas 1.606 arestas nao existem em nenhum outro
+    artefato do Go — excluidas aqui, o bloco "artigos que andam juntos"
+    continuaria morto exatamente como estava antes de a Frente D existir, e o
+    trabalho teria ficado invisivel sem nenhum erro aparecer. Agora a exclusao e
+    por PAR: so a co-citacao de PAGINA sai.
+
+    A RESSALVA DE 2026-09-22: `julgado_por` de ENTRADA em no `tribunal` sai.
+    Cada acordao do corpus aponta para o seu tribunal, entao o no recebe uma
+    aresta por acordao -- medido no artefato vivo: STJ com 168.605 arestas numa
+    linha de 30.348.998 bytes, 463x o buffer padrao do bufio.Scanner. Foi essa
+    linha que derrubou o boot em 2026-09-21T21:10 e produziu 591 reinicios.
+    O corte e por PAR (tribunal + julgado_por + entrada), nunca um teto de grau
+    generico: `Impacto` (internal/grafo/grafo.go) le exatamente as arestas
+    `cita` e `entrada` para responder "o que se apoia nesta norma", e amostrar
+    ali devolveria uma parte apresentada como o todo. Os dois nos `tribunal` nao
+    tem Impacto a perder -- so arestas de entrada, todas do mesmo tipo.
+    O TOTAL NAO SE PERDE: escrever_vizinhanca conta o que saiu e grava
+    `atributos.julgado_por_entrada`, porque `mcp_contexto.go` responde
+    `Total = len(vizinhos)` e, sem o atributo, o MCP passaria a dizer que nada
+    esta ligado ao STJ -- fabricacao de ausencia, o defeito que este corte
+    existe para nao cometer."""
+    if tipo_aresta == "cocitada_com" and tipo_no == "pagina":
+        return True
+    if tipo_aresta == "da_area" and tipo_no == "pagina" and direcao == "saida":
+        return True
+    if tipo_aresta == "julgado_por" and tipo_no == "tribunal" and direcao == "entrada":
+        return True
+    return False
+
+
+def escrever_vizinhanca(grafo, out_path):
+    """Escreve data/ai/grafo_vizinhanca.jsonl: uma linha por no com seus
+    vizinhos diretos, para o servidor Go carregar em memoria sem depender de
+    consulta sqlite por requisicao. Escrita atomica (tmp + os.replace)."""
+    por_origem = {}
+    por_destino = {}
+    for (origem, destino, tipo), info in grafo["arestas"].items():
+        por_origem.setdefault(origem, []).append((tipo, destino, info["peso"]))
+        por_destino.setdefault(destino, []).append((tipo, origem, info["peso"]))
+
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".grafo-vizinhanca-", suffix=".jsonl.tmp", dir=out_dir)
+    total_linhas = 0
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for chave in sorted(grafo["nos"].keys()):
+            no = grafo["nos"][chave]
+            vizinhos = []
+            for tipo, destino, peso in por_origem.get(chave, []):
+                if _exclui_do_vizinho(no["tipo"], tipo, "saida"):
+                    continue
+                alvo = grafo["nos"].get(destino)
+                if alvo is None:
+                    continue
+                vizinhos.append({
+                    "aresta": tipo, "direcao": "saida", "chave": destino,
+                    "tipo": alvo["tipo"], "rotulo": alvo["rotulo"], "peso": peso,
+                })
+            excluidos_de_entrada = {}
+            for tipo, origem, peso in por_destino.get(chave, []):
+                if _exclui_do_vizinho(no["tipo"], tipo, "entrada"):
+                    excluidos_de_entrada[tipo] = excluidos_de_entrada.get(tipo, 0) + 1
+                    continue
+                alvo = grafo["nos"].get(origem)
+                if alvo is None:
+                    continue
+                vizinhos.append({
+                    "aresta": tipo, "direcao": "entrada", "chave": origem,
+                    "tipo": alvo["tipo"], "rotulo": alvo["rotulo"], "peso": peso,
+                })
+            vizinhos.sort(key=lambda v: (v["aresta"], v["direcao"], v["chave"]))
+            # O que foi cortado vira NUMERO no no, nao silencio: sem isto o MCP
+            # responderia "Total = 0" para o STJ, que e' falso.
+            atributos = no["atributos"]
+            if excluidos_de_entrada:
+                atributos = dict(atributos)
+                for tipo_cortado, quantos in sorted(excluidos_de_entrada.items()):
+                    atributos["%s_entrada" % tipo_cortado] = quantos
+            linha = {
+                "chave": chave, "tipo": no["tipo"], "rotulo": no["rotulo"],
+                "atributos": atributos, "vizinhos": vizinhos,
+            }
+            f.write(json.dumps(linha, ensure_ascii=False, sort_keys=True))
+            f.write("\n")
+            total_linhas += 1
+    os.replace(tmp_path, out_path)
+    return total_linhas, os.path.getsize(out_path)
+
+
+def _sha256_arquivo(caminho):
+    h = hashlib.sha256()
+    with open(caminho, "rb") as f:
+        for bloco in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloco)
+    return h.hexdigest()
+
+
+def _contar_linhas(caminho):
+    with open(caminho, "rb") as f:
+        return sum(1 for _ in f)
+
+
+def _contagens_por_tipo(grafo):
+    nos_por_tipo = {}
+    for no in grafo["nos"].values():
+        nos_por_tipo[no["tipo"]] = nos_por_tipo.get(no["tipo"], 0) + 1
+    arestas_por_tipo = {}
+    for (_o, _d, tipo) in grafo["arestas"]:
+        arestas_por_tipo[tipo] = arestas_por_tipo.get(tipo, 0) + 1
+    return nos_por_tipo, arestas_por_tipo
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Constroi data/ai/grafo.sqlite a partir das fontes reais do acervo.")
+    ap.add_argument("--root", default=os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+    ap.add_argument("--out", default="data/ai/grafo.sqlite")
+    ap.add_argument("--timings", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    root = os.path.abspath(args.root)
+    out_path = args.out if os.path.isabs(args.out) else os.path.join(root, args.out)
+
+    t0 = time.monotonic()
+    grafo = construir_grafo(root)
+    if args.timings:
+        print(f"[timings] construir_grafo: {time.monotonic()-t0:.2f}s", file=sys.stderr)
+
+    nos_por_tipo, arestas_por_tipo = _contagens_por_tipo(grafo)
+
+    if args.dry_run:
+        print(json.dumps({
+            "dry_run": True, "total_nos": len(grafo["nos"]), "total_arestas": len(grafo["arestas"]),
+            "nos_por_tipo": nos_por_tipo, "arestas_por_tipo": arestas_por_tipo,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    fontes_rel = [
+        "content/legal_cocitation_index.jsonl",
+        "data/source-snapshots/manifest.jsonl",
+        "data/source-registry/stj_precedentes_qualificados.jsonl",
+        "data/editorial/published_manifest.jsonl",
+    ]
+    fontes = [
+        {"caminho": rel, "linhas": _contar_linhas(os.path.join(root, rel)), "sha256": _sha256_arquivo(os.path.join(root, rel))}
+        for rel in fontes_rel
+    ]
+    caminho_espelhos = os.path.join(root, "data", "corpus", "jurisprudencia", "stj-espelhos")
+    if os.path.isdir(caminho_espelhos):
+        for nome_arquivo in sorted(os.listdir(caminho_espelhos)):
+            if not (nome_arquivo.startswith("registros-") and nome_arquivo.endswith(".jsonl")):
+                continue
+            caminho_rel = "/".join(("data", "corpus", "jurisprudencia", "stj-espelhos", nome_arquivo))
+            fontes.append({
+                "caminho": caminho_rel,
+                "linhas": _contar_linhas(os.path.join(root, caminho_rel)),
+                "sha256": _sha256_arquivo(os.path.join(root, caminho_rel)),
+            })
+    if os.path.isfile(os.path.join(root, *EXTRACOES_REL.split("/"))):
+        fontes.append({
+            "caminho": EXTRACOES_REL,
+            "linhas": _contar_linhas(os.path.join(root, *EXTRACOES_REL.split("/"))),
+            "sha256": _sha256_arquivo(os.path.join(root, *EXTRACOES_REL.split("/"))),
+        })
+
+    t1 = time.monotonic()
+    total_nos, total_arestas = escrever_sqlite(grafo, out_path)
+    if args.timings:
+        print(f"[timings] escrever_sqlite: {time.monotonic()-t1:.2f}s", file=sys.stderr)
+
+    vizinhanca_path = os.path.join(root, "data", "ai", "grafo_vizinhanca.jsonl")
+    t2 = time.monotonic()
+    vizinhanca_linhas, vizinhanca_bytes = escrever_vizinhanca(grafo, vizinhanca_path)
+    if args.timings:
+        print(f"[timings] escrever_vizinhanca: {time.monotonic()-t2:.2f}s", file=sys.stderr)
+
+    tempo_total = time.monotonic() - t0
+    tamanho_bytes = os.path.getsize(out_path)
+    manifesto = {
+        "schema_version": "grafo_juridico_v1",
+        "gerado_em": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "fontes": fontes,
+        "nos_por_tipo": nos_por_tipo,
+        "arestas_por_tipo": arestas_por_tipo,
+        "extracoes_llm": grafo.get("extracoes", {}),
+        "total_nos": total_nos,
+        "total_arestas": total_arestas,
+        "tempo_geracao_segundos": round(tempo_total, 3),
+        "tamanho_sqlite_bytes": tamanho_bytes,
+        "caminho_sqlite": os.path.relpath(out_path, root),
+        "vizinhanca": {
+            "caminho": os.path.relpath(vizinhanca_path, root),
+            "sha256": _sha256_arquivo(vizinhanca_path),
+            "tamanho_bytes": vizinhanca_bytes,
+            "linhas": vizinhanca_linhas,
+        },
+    }
+    manifesto_path = os.path.join(root, "data", "ai", "grafo_manifest.json")
+    os.makedirs(os.path.dirname(manifesto_path), exist_ok=True)
+    fd, tmp_manifesto = tempfile.mkstemp(prefix=".grafo_manifest-", suffix=".json.tmp", dir=os.path.dirname(manifesto_path))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(manifesto, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp_manifesto, manifesto_path)
+
+    print(
+        f"grafo-juridico: {total_nos} nos, {total_arestas} arestas, {tamanho_bytes} bytes, "
+        f"vizinhanca {vizinhanca_linhas} linhas/{vizinhanca_bytes} bytes, {tempo_total:.2f}s -> {out_path}"
+    )
+    frente_d = grafo.get("frente_d") or {}
+    if frente_d:
+        print(
+            "  frente-d (derivadas, suporte >= {minimo} acordaos): pagina->sumula {ps} "
+            "(descartadas {psd} por suporte fraco) · dispositivo<->dispositivo {dd} "
+            "(descartados {ddd} pares) · tema->dispositivo {td}".format(
+                minimo=SUPORTE_MINIMO_ACORDAOS,
+                ps=frente_d.get("pagina_sumula", 0),
+                psd=frente_d.get("pares_pagina_sumula_descartados", 0),
+                dd=frente_d.get("dispositivo_dispositivo", 0),
+                ddd=frente_d.get("pares_dispositivo_descartados", 0),
+                td=frente_d.get("tema_dispositivo", 0),
+            )
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

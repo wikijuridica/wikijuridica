@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""Coleta as metricas agregadas do projeto no Microsoft Clarity e as grava como
+serie propria em data/ops/.
+
+POR QUE ESTA FERRAMENTA EXISTE: instalada a API de cliente do Clarity, o portal
+passou a ENVIAR dado — e o dono continuava sem poder LER esse dado fora do painel
+da Microsoft. Painel nao entra em ledger, nao se compara com a serie de borda,
+nao vira grafico proprio e nao sobrevive a retencao de 30 dias que o Clarity
+aplica. A Data Export API resolve isso, e e o unico canal oficial para tanto.
+
+A TRAVA, DITA SEM RODEIO: o token so pode ser emitido no painel do Clarity
+(Settings -> Data Export -> Generate new API token), por um administrador
+logado. Nao existe rota de codigo para cria-lo. Esta ferramenta nasce pronta e
+comeca a produzir serie no primeiro dia em que a chave existir; sem ela, sai com
+codigo 0 e NAO GRAVA LINHA NENHUMA — dado inventado seria fraude, e uma linha
+vazia no ledger seria pior que ausencia, porque mentiria sobre ter medido.
+
+LIMITES OFICIAIS, respeitados por desenho (learn.microsoft.com/clarity/
+setup-and-installation/clarity-data-export-api, lido em 2026-08-28 e relido em
+2026-09-09):
+  - 10 requisicoes por projeto por dia. O cursor em data/ops/ conta as do dia.
+  - Janela de 1 a 3 dias. Nao ha historico alem disso: por isso a serie propria.
+  - Ate 3 dimensoes por requisicao, resposta limitada a 1.000 linhas, sem
+    paginacao e sem ordem documentada.
+  - Resposta em UTC.
+
+DUAS REQUISICOES POR EXECUCAO (2026-09-09). A unit de medicao pede so `Device`,
+e por isso o portal nunca soube QUAIS paginas recebem sessao humana fora do
+painel. Cada execucao faz agora ate duas requisicoes: a das dimensoes pedidas
+(a chamada antiga, byte a byte) e mais uma com a dimensao `URL`, cujo resultado
+entra no mesmo ledger com o campo derivado `top_urls`. A segunda e opcional em
+tres sentidos: `--sem-url` a desliga; ela nao acontece se `URL` ja estiver nas
+dimensoes pedidas; e a falha DELA nunca muda o codigo de saida que a primeira
+ganhou — a unit encadeia o coletor do Bing depois deste, sem `-`, e um exit != 0
+aqui pularia o Bing e acionaria o alerta do dono.
+
+TETO PROPRIO: 8 das 10 requisicoes do dia. As duas restantes ficam para uso
+manual (curl no terminal, diagnostico do token). O cursor conta CADA requisicao
+feita, inclusive as que a API recusou com 4xx — a Microsoft as conta tambem.
+
+POR QUE `URL` SOZINHA, e nao `URL` + `Device` (a API aceitaria 3 dimensoes):
+a resposta para em 1.000 linhas sem paginar e sem dizer que ordem usou. Medido
+em 2026-08-29 (1 dia): 30 linhas de URL em `Traffic`. Cruzar com `Device`
+multiplica cada URL por ate 4 faixas (PC, Mobile, Tablet, Other) e chega ao
+teto 3 a 4 vezes antes — e um `top_urls` calculado sobre resposta truncada em
+ordem desconhecida seria um numero inventado. `URL` sozinha maximiza o numero de
+paginas distintas que cabem numa requisicao. Quando a resposta encostar no teto,
+a linha sai com `truncado_1000: true` e o `top_urls` deve ser lido como amostra.
+
+Uso:
+  ./tools/collect-clarity-insights                  # 3 dias, dimensao padrao + URL
+  ./tools/collect-clarity-insights --dias 1
+  ./tools/collect-clarity-insights --dimensoes OS,Device,Country/Region
+  ./tools/collect-clarity-insights --dimensoes Device --sem-url   # so a chamada antiga
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+ENV_LOCAL = RAIZ / ".env.local"
+SERIE = RAIZ / "data" / "ops" / "clarity_insights_daily.jsonl"
+CURSOR = RAIZ / "data" / "ops" / "clarity_insights_state.json"
+FONTE_ID = RAIZ / "internal" / "webanalytics" / "webanalytics.go"
+ACERVO = RAIZ / "content" / "pages.json"
+
+ENDPOINT = "https://www.clarity.ms/export-data/api/v1/project-live-insights"
+CHAVE = "WIKI_CLARITY_API_TOKEN"
+
+# AO SAIR PARA A REDE, O PORTAL E O WikijuridicaBot (CLAUDE.md secao 11, ordem
+# do dono de 2026-09-05). Ate 2026-09-10 este coletor saia como
+# `Python-urllib/3.x` para www.clarity.ms, e o gate `check-identidade-de-saida`
+# nao via porque so avaliava arquivo que DEFINE um User-Agent — ausencia
+# escapava da regua que existe para cobrar identidade.
+#
+# O proposito nao se toma emprestado: esta saida LE a metrica do nosso proprio
+# projeto no Clarity, entao ela e medicao de audiencia, nao coleta de fonte
+# oficial nem submissao de URL. A forma abaixo e' exatamente a que
+# `internal/wikijuridicabot.UserAgentComProposito` produziria.
+USER_AGENT = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+              "+https://wikijuridica.com.br/bot/; medicao-de-audiencia)")
+TETO_DIARIO = 10          # o da API, por projeto e por dia
+TETO_COLETOR = 8          # o desta ferramenta: deixa 2 para uso manual
+TETO_LINHAS_API = 1000    # a API corta a resposta aqui, sem paginar
+TETO_TOP_URLS = 100
+SCHEMA = "clarity_insights_v1"
+DIMENSAO_URL = "URL"
+
+# Orcamento de tempo: a unit embrulha o coletor em `timeout 120`. Primeira
+# requisicao 60 s (como sempre foi), segunda 40 s, carga do acervo ~2 s — o pior
+# caso fica abaixo dos 120 s e o coletor do Bing, que vem depois, ainda roda.
+TIMEOUT_PRIMARIA_S = 60
+TIMEOUT_EXTRA_S = 40
+
+# Dimensoes aceitas pela API. Lista fechada porque um nome errado devolve 400 e
+# consome uma das dez requisicoes do dia.
+DIMENSOES_VALIDAS = {"Browser", "Device", "Country/Region", "OS", "Source",
+                     "Medium", "Campaign", "Channel", DIMENSAO_URL}
+
+
+def le_env():
+    """Variavel de ambiente tem precedencia sobre .env.local, como no resto do
+    projeto (ver internal/contactchannel e tools/purge-edge-cache)."""
+    if os.environ.get(CHAVE):
+        return os.environ[CHAVE].strip()
+    try:
+        for linha in ENV_LOCAL.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if not linha or linha.startswith("#") or "=" not in linha:
+                continue
+            nome, valor = linha.split("=", 1)
+            if nome.strip() == CHAVE:
+                return valor.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def project_id():
+    """Le o ClarityProjectID da fonte Go. Digitar o valor aqui criaria a segunda
+    copia que o proprio comentario daquele arquivo existe para impedir."""
+    import re
+    achado = re.search(r'^\tClarityProjectID\s*=\s*"([^"]*)"',
+                       FONTE_ID.read_text(encoding="utf-8"), re.M)
+    if not achado:
+        raise SystemExit(f"ClarityProjectID nao encontrado em {FONTE_ID}")
+    return achado.group(1)
+
+
+def carrega_cursor():
+    try:
+        return json.loads(CURSOR.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def acrescenta_linha(caminho, texto):
+    """Acrescenta UMA linha ao ledger, com fsync.
+
+    Append direto, e nao escrita-em-tmp-e-replace: replace sobre um JSONL
+    append-only exigiria reescrever o arquivo inteiro a cada coleta, e uma queda
+    no meio perderia o historico em vez de perder a linha nova. O fsync garante
+    que a linha esteja no disco antes de o cursor ser atualizado — nessa ordem, o
+    pior caso e recontar uma requisicao, nunca gravar dado sem contar."""
+    with open(caminho, "a", encoding="utf-8") as saida:
+        saida.write(texto)
+        saida.flush()
+        os.fsync(saida.fileno())
+
+
+def grava_atomico(caminho, texto):
+    """Substitui o arquivo inteiro por escrita em tmp + replace atomico. Vale para
+    o CURSOR, que e um documento pequeno reescrito por completo — arquivo de
+    estado truncado por queda de energia e pior que ausente, porque parece dado."""
+    tmp = caminho.with_suffix(caminho.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as saida:
+        saida.write(texto)
+        saida.flush()
+        os.fsync(saida.fileno())
+    os.replace(tmp, caminho)
+
+
+def grava_cursor(cursor):
+    grava_atomico(CURSOR, json.dumps(cursor, ensure_ascii=False, indent=2) + "\n")
+
+
+def _rel(caminho):
+    """Caminho relativo a raiz do repo para o journal e para o ledger; absoluto
+    quando esta fora dela (a bancada aponta os arquivos para um diretorio
+    temporario)."""
+    try:
+        return str(pathlib.Path(caminho).relative_to(RAIZ))
+    except ValueError:
+        return str(caminho)
+
+
+# ---------------------------------------------------------------------------
+# Rede
+# ---------------------------------------------------------------------------
+
+def monta_url(dias, dimensoes):
+    params = {"numOfDays": str(dias)}
+    for i, dim in enumerate(dimensoes, start=1):
+        params[f"dimension{i}"] = dim
+    return ENDPOINT + "?" + urllib.parse.urlencode(params)
+
+
+def busca_http(url, cabecalhos, timeout):
+    """Unico ponto que sai para a rede. Devolve (status, corpo_json); levanta
+    urllib.error.HTTPError, urllib.error.URLError ou ValueError como a urllib.
+    Os testes injetam um substituto com a mesma assinatura."""
+    requisicao = urllib.request.Request(url, headers=cabecalhos)
+    with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
+        return resposta.status, json.loads(resposta.read().decode("utf-8"))
+
+
+def requisita(token, dias, dimensoes, timeout, busca):
+    """Faz UMA requisicao. Devolve (status, bruto, erro): em sucesso erro e None;
+    em 4xx/5xx status e o codigo e bruto e None; em falha de rede/parse status e
+    None. A distincao importa para o cursor: resposta HTTP — mesmo de recusa —
+    e uma requisicao contada pela API; falha antes de chegar la, nao."""
+    url = monta_url(dias, dimensoes)
+    cabecalhos = {"Authorization": "Bearer " + token,
+                  "Content-Type": "application/json",
+                  "User-Agent": USER_AGENT}
+    try:
+        status, bruto = busca(url, cabecalhos, timeout)
+        return status, bruto, None
+    except urllib.error.HTTPError as erro:
+        detalhe = {401: "token ausente, invalido ou expirado",
+                   403: "token sem autorizacao para esta operacao",
+                   400: "parametros invalidos",
+                   429: "teto diario de requisicoes excedido"}.get(erro.code, "")
+        return erro.code, None, f"a API respondeu {erro.code} {detalhe}".rstrip()
+    except (urllib.error.URLError, ValueError) as erro:
+        return None, None, f"falha de rede ou resposta ilegivel: {erro}"
+
+
+# ---------------------------------------------------------------------------
+# Derivacao das URLs
+# ---------------------------------------------------------------------------
+
+def normaliza_path(url):
+    """Reduz a URL que o Clarity devolve ao path servido: sem esquema, sem host,
+    sem query, sem fragmento, percent-decoding desfeito. Devolve None quando nao
+    ha URL (o Clarity devolve `Url: null` para sessoes sem pagina atribuida).
+
+    Nao muda caixa nem barra final: o path e a chave do acervo e o nginx e
+    sensivel a ambos. A equivalencia `/x` ~ `/x/` (a Cloudflare redireciona a
+    primeira para a segunda) e resolvida em `no_acervo`, nao aqui."""
+    if url is None:
+        return None
+    texto = str(url).strip()
+    if not texto:
+        return None
+    partes = urllib.parse.urlsplit(texto)
+    path = partes.path
+    if not partes.scheme and not partes.netloc and not texto.startswith("/"):
+        # "wikijuridica.com.br/x/" sem esquema: urlsplit poe o host no path.
+        # Medido em 2026-08-29, 29/29 URLs vieram absolutas; este ramo so
+        # protege contra a grafia relativa, e trabalha sobre partes.path para a
+        # query nunca vazar para dentro do caminho.
+        path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+    path = urllib.parse.unquote(path)
+    if not path:
+        path = "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def carrega_acervo(caminho=None):
+    """Conjunto de `path` de content/pages.json (lista de paginas, cada uma com
+    `path`). Todo status entra — `noindex` e `needs_review` tambem sao paginas do
+    acervo; o que se quer separar e URL que o portal nao gera (404, sonda,
+    endpoint de maquina). Levanta em arquivo ausente ou ilegivel: acervo vazio
+    marcaria todo path como fora e o campo mentiria."""
+    caminho = ACERVO if caminho is None else caminho
+    paginas = json.loads(pathlib.Path(caminho).read_text(encoding="utf-8"))
+    if not isinstance(paginas, list):
+        raise ValueError(f"{caminho}: esperava lista de paginas")
+    return {p["path"] for p in paginas if isinstance(p, dict) and p.get("path")}
+
+
+def no_acervo(path, acervo):
+    if path in acervo:
+        return True
+    if not path.endswith("/") and path + "/" in acervo:
+        return True
+    return False
+
+
+def _num(valor):
+    """A doc oficial mostra numeros como string ("9554"); a resposta real traz
+    int. Aceita os dois; None e texto ilegivel viram 0."""
+    if valor is None:
+        return 0
+    if isinstance(valor, bool):
+        return int(valor)
+    if isinstance(valor, (int, float)):
+        return valor
+    try:
+        texto = str(valor).strip()
+        return int(texto) if texto.lstrip("-").isdigit() else float(texto)
+    except ValueError:
+        return 0
+
+
+def _url_da_linha(linha):
+    """A dimensao se chama `URL` no pedido e `Url` na resposta. Caso-insensivel
+    para nao depender de qual das duas grafias a Microsoft usa amanha."""
+    for chave, valor in linha.items():
+        if chave.lower() == "url":
+            return valor
+    return None
+
+
+def _por_metrica(bruto):
+    saida = {}
+    if not isinstance(bruto, list):
+        return saida
+    for bloco in bruto:
+        if isinstance(bloco, dict) and isinstance(bloco.get("information"), list):
+            saida[bloco.get("metricName")] = bloco["information"]
+    return saida
+
+
+def deriva_top_urls(bruto, acervo, teto=TETO_TOP_URLS):
+    """Agrega a resposta por path normalizado e devolve (top_urls, resumo).
+
+    `sessoes` e `totalSessionCount` (inclui bot; `sessoes_bot` fica ao lado).
+    `usuarios` e a SOMA de `distinctUserCount` das variantes (fragmento, query)
+    que colapsam no mesmo path — e um teto, nao uma contagem distinta, e por
+    isso se chama assim e nao "usuarios distintos". `paginas_por_sessao` e a
+    razao que a API devolve, ponderada por sessao; a API NAO da pageviews por
+    URL (o `pagesViews` das metricas de clique e o das sessoes com aquele
+    defeito), e nenhum campo aqui finge que da.
+
+    Ordem: sessoes desc, usuarios desc, path asc — deterministica, para que a
+    mesma resposta produza a mesma linha e o ledger nao se regrave a toa."""
+    metricas = _por_metrica(bruto)
+    agregado = {}
+    linhas_sem_url = 0
+    sessoes_sem_url = 0
+
+    def entrada(path):
+        if path not in agregado:
+            agregado[path] = {
+                "url": path, "sessoes": 0, "sessoes_bot": 0, "usuarios": 0,
+                "variantes": set(), "_ppsx": 0.0,
+                "tempo_total_s": 0, "tempo_ativo_s": 0,
+                "_scrollx": 0.0, "_scrollw": 0,
+                "dead_clicks": 0, "rage_clicks": 0, "quickbacks": 0,
+                "erros_script": 0, "error_clicks": 0, "scroll_excessivo": 0,
+            }
+        return agregado[path]
+
+    sessoes_por_url = {}
+    for linha in metricas.get("Traffic", []):
+        url = _url_da_linha(linha)
+        path = normaliza_path(url)
+        sessoes = _num(linha.get("totalSessionCount"))
+        if path is None:
+            linhas_sem_url += 1
+            sessoes_sem_url += sessoes
+            continue
+        sessoes_por_url[str(url)] = sessoes
+        e = entrada(path)
+        e["variantes"].add(str(url))
+        e["sessoes"] += sessoes
+        e["sessoes_bot"] += _num(linha.get("totalBotSessionCount"))
+        e["usuarios"] += _num(linha.get("distinctUserCount"))
+        e["_ppsx"] += _num(linha.get("pagesPerSessionPercentage")) * sessoes
+
+    for linha in metricas.get("EngagementTime", []):
+        path = normaliza_path(_url_da_linha(linha))
+        if path is None:
+            continue
+        e = entrada(path)
+        e["tempo_total_s"] += _num(linha.get("totalTime"))
+        e["tempo_ativo_s"] += _num(linha.get("activeTime"))
+
+    for linha in metricas.get("ScrollDepth", []):
+        url = _url_da_linha(linha)
+        path = normaliza_path(url)
+        if path is None:
+            continue
+        e = entrada(path)
+        peso = sessoes_por_url.get(str(url), 0) or 1
+        e["_scrollx"] += _num(linha.get("averageScrollDepth")) * peso
+        e["_scrollw"] += peso
+
+    cliques = {"DeadClickCount": "dead_clicks", "RageClickCount": "rage_clicks",
+               "QuickbackClick": "quickbacks", "ScriptErrorCount": "erros_script",
+               "ErrorClickCount": "error_clicks", "ExcessiveScroll": "scroll_excessivo"}
+    for nome, campo in cliques.items():
+        for linha in metricas.get(nome, []):
+            path = normaliza_path(_url_da_linha(linha))
+            if path is None:
+                continue
+            entrada(path)[campo] += _num(linha.get("subTotal"))
+
+    saida = []
+    for e in agregado.values():
+        item = {
+            "url": e["url"],
+            "sessoes": e["sessoes"],
+            "sessoes_bot": e["sessoes_bot"],
+            "usuarios": e["usuarios"],
+            "paginas_por_sessao": round(e["_ppsx"] / e["sessoes"], 4) if e["sessoes"] else None,
+            "tempo_total_s": e["tempo_total_s"],
+            "tempo_ativo_s": e["tempo_ativo_s"],
+            "scroll_medio": round(e["_scrollx"] / e["_scrollw"], 2) if e["_scrollw"] else None,
+            "dead_clicks": e["dead_clicks"],
+            "rage_clicks": e["rage_clicks"],
+            "quickbacks": e["quickbacks"],
+            "erros_script": e["erros_script"],
+            "error_clicks": e["error_clicks"],
+            "scroll_excessivo": e["scroll_excessivo"],
+            "variantes": len(e["variantes"]),
+            "no_acervo": no_acervo(e["url"], acervo),
+        }
+        saida.append(item)
+    saida.sort(key=lambda i: (-i["sessoes"], -i["usuarios"], i["url"]))
+
+    linhas_max = max((len(v) for v in metricas.values()), default=0)
+    resumo = {
+        "paths_distintos": len(saida),
+        "linhas_sem_url": linhas_sem_url,
+        "sessoes_sem_url": sessoes_sem_url,
+        "linhas_max_por_metrica": linhas_max,
+        "truncado_1000": linhas_max >= TETO_LINHAS_API,
+        "acervo_paths": len(acervo),
+        "fora_do_acervo": sum(1 for i in saida if not i["no_acervo"]),
+    }
+    return saida[:teto], resumo
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+def ultima_linha_equivalente(dia, dimensoes):
+    """Ultima linha do ledger do MESMO dia UTC com as MESMAS dimensoes, ou None.
+
+    Le de tras para frente e PARA na primeira linha de um dia anterior: o ledger
+    e append-only e cronologico, entao tudo antes dela e mais velho ainda. Sem
+    essa parada, a primeira execucao de cada dia (que nunca acha par) faria o
+    parse de TODO o historico — a linha de URL tem ~223 KB, e um ano dela sao
+    ~80 MB de JSON por execucao."""
+    try:
+        linhas = SERIE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for texto in reversed(linhas):
+        texto = texto.strip()
+        if not texto:
+            continue
+        try:
+            registro = json.loads(texto)
+        except ValueError:
+            continue
+        dia_da_linha = str(registro.get("coletado_em", ""))[:10]
+        if dia_da_linha < dia:
+            return None
+        if dia_da_linha == dia and registro.get("dimensoes") == list(dimensoes):
+            return registro
+    return None
+
+
+def linha_identica(anterior, nova):
+    """Identica no que a API devolveu — janela e metricas — e nao no relogio.
+    `coletado_em` muda a cada execucao; se entrasse na comparacao nada seria
+    identico nunca. O CONTEUDO de `top_urls` tambem fica de fora: e derivado
+    das metricas, e um pages.json que mudou no meio do dia nao e coleta nova.
+    Mas a PRESENCA dele conta: linha cuja derivacao falhou (crua, com
+    `derivacao_urls.erro`) nao e identica a uma que derivou — senao a primeira
+    falha do dia impediria a execucao seguinte de completar o dado."""
+    if anterior is None:
+        return False
+    return (anterior.get("janela_dias") == nova.get("janela_dias")
+            and anterior.get("metricas") == nova.get("metricas")
+            and ("top_urls" in anterior) == ("top_urls" in nova))
+
+
+# ---------------------------------------------------------------------------
+# Programa
+# ---------------------------------------------------------------------------
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--dias", type=int, default=3, choices=(1, 2, 3),
+                        help="janela em dias (a API so aceita 1, 2 ou 3)")
+    parser.add_argument("--dimensoes", default="OS",
+                        help="ate 3 dimensoes separadas por virgula")
+    parser.add_argument("--sem-url", action="store_true",
+                        help="nao faz a segunda requisicao (dimensao URL)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None, busca=busca_http) -> int:
+    args = parse_args(argv)
+
+    dimensoes = [d.strip() for d in args.dimensoes.split(",") if d.strip()]
+    if len(dimensoes) > 3:
+        print("REPROVADO: a API aceita no maximo 3 dimensoes por requisicao")
+        return 1
+    invalidas = [d for d in dimensoes if d not in DIMENSOES_VALIDAS]
+    if invalidas:
+        print(f"REPROVADO: dimensao(oes) fora do vocabulario da API: {invalidas}")
+        print(f"           validas: {sorted(DIMENSOES_VALIDAS)}")
+        return 1
+
+    token = le_env()
+    if not token:
+        print("sem credencial de exportacao: nada foi coletado e nada foi gravado")
+        print("  o token e emitido no painel do Clarity (Settings -> Data Export)")
+        print(f"  e lido de {CHAVE}, no ambiente ou em .env.local")
+        return 0
+
+    hoje = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    cursor = carrega_cursor()
+    if cursor.get("dia") != hoje:
+        cursor["requisicoes_hoje"] = []
+    gastas = cursor.get("requisicoes", 0) if cursor.get("dia") == hoje else 0
+
+    # Plano: a chamada pedida, e a de URL quando fizer sentido. A ordem importa:
+    # a pedida e a que a unit depende e a que o teto deve preservar.
+    plano = [(dimensoes, TIMEOUT_PRIMARIA_S, True)]
+    if not args.sem_url and DIMENSAO_URL not in dimensoes:
+        plano.append(([DIMENSAO_URL], TIMEOUT_EXTRA_S, False))
+
+    SERIE.parent.mkdir(parents=True, exist_ok=True)
+    for dims, timeout, primaria in plano:
+        if gastas >= TETO_COLETOR:
+            print(f"teto do coletor atingido ({gastas}/{TETO_COLETOR} hoje, {hoje}; "
+                  f"a API da {TETO_DIARIO}) — requisicao {dims} nao feita")
+            continue
+
+        status, bruto, erro = requisita(token, args.dias, dims, timeout, busca)
+        agora = dt.datetime.now(dt.timezone.utc).isoformat()
+        if status is not None:
+            # Chegou na API: conta, com ou sem sucesso, e grava JA — o que vier
+            # depois (derivacao, ledger) pode falhar, e requisicao feita que nao
+            # foi contada e cota gasta duas vezes.
+            gastas += 1
+            cursor.setdefault("requisicoes_hoje", []).append(
+                {"em": agora, "dimensoes": dims, "http_status": status})
+            cursor.update({"dia": hoje, "requisicoes": gastas})
+            if erro is not None:
+                cursor["ultimo_erro"] = {"codigo": status, "em": agora, "dimensoes": dims}
+            grava_cursor(cursor)
+        if erro is not None:
+            print(f"REPROVADO: {erro} (dimensoes={dims})")
+            if primaria:
+                # Contrato de sempre: a chamada pedida falhou, o exit diz isso.
+                return 1
+            # A extra falhou: fica registrado no cursor e no journal; o exit e o
+            # que a primaria ganhou, porque a unit encadeia o Bing depois.
+            continue
+
+        linha = {
+            "schema": SCHEMA,
+            "coletado_em": agora,
+            "project_id": project_id(),
+            "janela_dias": args.dias,
+            "dimensoes": dims,
+            "http_status": status,
+            "fuso": "UTC",
+            "metricas": bruto,
+        }
+        resumo = None
+        if DIMENSAO_URL in dims:
+            # A derivacao nunca derruba a coleta: pages.json e reescrito pela
+            # publicacao, e a unit roda enquanto outras frentes publicam. Se ele
+            # estiver ausente ou ilegivel, a linha entra com as metricas cruas
+            # e o erro NOMEADO em derivacao_urls — nao se esconde e nao vira
+            # exit 1 (que pularia o Bing e acionaria o alerta).
+            try:
+                acervo = carrega_acervo()
+                linha["top_urls"], resumo = deriva_top_urls(bruto, acervo)
+                linha["derivacao_urls"] = dict(resumo, acervo_fonte=_rel(ACERVO))
+            except (OSError, ValueError, KeyError, TypeError) as falha:
+                mensagem = f"{type(falha).__name__}: {falha}"
+                linha["derivacao_urls"] = {"erro": mensagem, "acervo_fonte": _rel(ACERVO)}
+                print(f"REPROVADO: derivacao de top_urls falhou ({mensagem}); "
+                      f"linha gravada so com as metricas cruas")
+
+        anterior = ultima_linha_equivalente(hoje, dims)
+        if linha_identica(anterior, linha):
+            print(f"linha identica ja registrada hoje para {dims} "
+                  f"(coletada em {anterior.get('coletado_em')}): nao regravada")
+        else:
+            acrescenta_linha(SERIE, json.dumps(linha, ensure_ascii=False) + "\n")
+        cursor.update({"ultima_coleta": agora, "ultimas_dimensoes": dims})
+        grava_cursor(cursor)
+
+        nomes = [m.get("metricName") for m in bruto if isinstance(m, dict)] if isinstance(bruto, list) else []
+        print(f"coletado: {len(nomes)} metrica(s) em {args.dias} dia(s), dimensoes={dims}")
+        print(f"  metricas: {nomes}")
+        print(f"  gravado em {_rel(SERIE)} ({gastas}/{TETO_COLETOR} requisicoes hoje; "
+              f"teto da API {TETO_DIARIO})")
+        if resumo is not None:
+            print(f"  urls: {resumo['paths_distintos']} paths distintos, "
+                  f"{resumo['fora_do_acervo']} fora do acervo, "
+                  f"{resumo['linhas_sem_url']} linha(s) sem URL, "
+                  f"truncado_1000={resumo['truncado_1000']}")
+            for item in linha["top_urls"][:5]:
+                print(f"    {item['sessoes']:>5} sessoes  {item['url']}"
+                      f"{'' if item['no_acervo'] else '  (fora do acervo)'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

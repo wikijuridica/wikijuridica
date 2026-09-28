@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""generate-painel-de-alcance — quanto o portal ALCANCA, nas tres camadas em que
+isso se pode medir, com a AUTORIDADE de cada numero declarada ao lado dele.
+
+POR QUE ESTE PAINEL, E POR QUE ELE E' PEQUENO
+---------------------------------------------
+Esta sessao errou o volume DUAS VEZES pela mesma causa — medir numa camada e
+apresentar o resultado como se fosse o fato:
+
+  "943 requisicoes de bot em 6 h"   era 17.325 bots em 88.033 requisicoes / 24 h
+  "440 impressoes, 77 cliques"      o painel do Bing mostra ~23.000 citacoes de IA
+
+Nos dois casos o numero estava certo DENTRO da camada e errado FORA dela. A
+correcao nao e' medir mais: e' nunca deixar um numero sair sem dizer de qual
+camada ele veio e o que aquela camada pode e nao pode afirmar. E' a regra 15.
+
+AS TRES CAMADAS, E O QUE CADA UMA PODE AFIRMAR
+----------------------------------------------
+  borda    Cloudflare. VOLUME REAL: e' a unica que ve a requisicao que o cache
+           atendeu sem tocar a origem. Nao ve o que o agente fez com a pagina.
+  citacao  Bing AI Performance. RESPOSTA GERADA: e' a unica que conta citacao de
+           verdade, porque quem conta e' quem gera a resposta. Nao ve o que
+           acontece fora do Copilot.
+  origem   nginx + Go. PISO DECLARADO, e o que SO' existe aqui: rota dinamica,
+           gemea Markdown, /api/v1 e MCP nao passam pela borda com chave propria
+           de cache, e o `Referer` que a Cloudflare nega no plano Free so' e'
+           legivel neste log. Origem <= borda SEMPRE: HIT na borda nao chega aqui.
+
+AUSENCIA E' `null`, NUNCA ZERO. Camada que ainda nao tem serie diz "aguarda", com
+o motivo. Escrever 0 ali afirmaria "medi e nao houve", que e' o oposto de "ainda
+nao medi" — e e' assim que uma lacuna nossa vira, no relatorio seguinte, um fato
+sobre o mundo.
+
+SAIDA
+-----
+`data/ops/painel/alcance.json` (schema `painel_alcance_v1`), no molde que
+`tools/generate-painel` ja usa para `previsao.json`: um arquivo que o painel
+grande LE, em vez de uma secao que este script escreveria dentro dele. Sao
+1.871 linhas escritas por outra frente; entrar la sem necessidade e' risco de
+conflito sem ganho nenhum.
+
+exit 0 = gerou · exit 2 = nao conseguiu ler uma fonte obrigatoria ou gravar
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import sys
+
+RAIZ_PADRAO = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SCHEMA = "painel_alcance_v1"
+
+EDGE_REL = "data/ops/edge_bot_agents_daily.jsonl"
+BING_REL = "data/ops/bing_webmaster_daily.jsonl"
+SINAL_REL = "data/ops/ai_citation_signal_daily.jsonl"
+ACCESS_GLOB = "data/ops/access/access-*.jsonl"
+SAIDA_REL = "data/ops/painel/alcance.json"
+
+# `function` do ledger da borda que conta como agente de IA. A mesma particao que
+# tools/generate-painel usa — duas particoes diferentes para a mesma pergunta
+# fariam os dois paineis discordarem sobre o mesmo dia.
+FUNCOES_IA = frozenset({"training", "search", "user"})
+
+# Classes de rota que SO' a origem ve. Nao e' "o resto": e' a lista do que o
+# contrato chama de canal de maquina.
+ROTAS_DE_MAQUINA = ("mcp", "api", "descritor")
+
+
+class NaoGerou(Exception):
+    """Fonte obrigatoria ilegivel ou saida nao gravavel. Vira exit 2."""
+
+
+def ler_jsonl(caminho, limite_de_linhas=None):
+    if not os.path.exists(caminho):
+        return []
+    registros = []
+    try:
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registros.append(json.loads(linha))
+                except json.JSONDecodeError:
+                    continue
+                if limite_de_linhas and len(registros) >= limite_de_linhas:
+                    break
+    except OSError as erro:
+        raise NaoGerou("nao consegui ler %s: %s" % (caminho, erro))
+    return registros
+
+
+def camada_borda(raiz, dia):
+    """Volume na borda, do ultimo snapshot do dia.
+
+    O ledger e' CUMULATIVO dentro do dia: cada coleta reescreve o total daquele
+    (dia, agente) desde a meia-noite. Somar as linhas contaria o mesmo trafego
+    varias vezes — e' a armadilha que este arquivo ja documentou em
+    data/ops/DADOS_CONFIAVEIS. Por isso: ultima linha por (date, agent_key).
+    """
+    registros = ler_jsonl(os.path.join(raiz, EDGE_REL))
+    por_chave = {}
+    for registro in registros:
+        data = registro.get("date")
+        chave = registro.get("agent_key")
+        if not data or not chave:
+            continue
+        por_chave[(data, chave)] = registro
+
+    dias = sorted({d for d, _ in por_chave})
+    if not dias:
+        return {
+            "camada": "borda",
+            "autoridade": "volume real (Cloudflare ve a requisicao que o cache atendeu)",
+            "estado": "aguarda",
+            "motivo": "%s ainda nao tem nenhuma linha" % EDGE_REL,
+        }
+    # O dia CORRENTE e' parcial na borda (a linha final do dia D nasce em D+1,
+    # no edge-traffic das 06:20 UTC). O painel grande marca esse ponto como
+    # provisorio; aqui a escolha e' mais simples e igualmente honesta: reportar o
+    # ultimo dia FECHADO, e dizer qual e'.
+    fechados = [d for d in dias if d < dia]
+    alvo = fechados[-1] if fechados else dias[-1]
+
+    total = 0
+    ia = 0
+    por_agente = {}
+    for (data, chave), registro in por_chave.items():
+        if data != alvo:
+            continue
+        pedidos = registro.get("requests_estimated")
+        if not isinstance(pedidos, (int, float)):
+            pedidos = registro.get("requests_sampled") or 0
+        total += pedidos
+        if registro.get("function") in FUNCOES_IA:
+            ia += pedidos
+            por_agente[chave] = pedidos
+    maiores = sorted(por_agente.items(), key=lambda par: -par[1])[:8]
+    return {
+        "camada": "borda",
+        "autoridade": "volume real (Cloudflare ve a requisicao que o cache atendeu)",
+        "estado": "medido",
+        "dia": alvo,
+        "dia_e_fechado": alvo in fechados,
+        "requisicoes_de_bot_classificadas": total,
+        "requisicoes_de_agentes_de_ia": ia,
+        "por_agente": dict(maiores),
+        "nao_afirma": "a borda ve a requisicao, nunca o que o agente fez com a pagina; "
+                      "e o que nao tem agent_key nao entra nesta conta.",
+    }
+
+
+def camada_citacao(raiz, dia):
+    """Citacao em resposta gerada, medida por quem gera a resposta."""
+    registros = ler_jsonl(os.path.join(raiz, BING_REL))
+    exports = []
+    contagens = {}
+    reconhecimentos = 0
+    for registro in registros:
+        tipo = registro.get("tipo")
+        if tipo == "citacao_ia_export" and registro.get("ok"):
+            carimbo = registro.get("coletado_em") or ""
+            if len(carimbo) >= 10:
+                exports.append(carimbo[:10])
+        elif tipo == "citacao_ia_reconhecimento":
+            reconhecimentos += 1
+        elif tipo == "citacao_ia_diaria":
+            data = registro.get("data")
+            total = registro.get("total_de_citacoes")
+            if data and isinstance(total, (int, float)):
+                contagens[data] = float(total)
+
+    base = {
+        "camada": "citacao",
+        "autoridade": "resposta gerada (quem conta e' quem gera a resposta: a Microsoft)",
+        "nao_afirma": "o painel do Bing fala do Copilot. OAI-SearchBot, PerplexityBot, "
+                      "ChatGPT-User e Applebot tem indice proprio ou buscam ao vivo, e "
+                      "nada aqui os alcanca.",
+    }
+    if not exports:
+        base.update({
+            "estado": "aguarda",
+            "citacoes": None,
+            "motivo": (
+                "a serie nunca comecou. A API publica nao expoe este dado (62 metodos na "
+                "IWebmasterApi, nenhum de citacao; 28 candidatos testados, 28 x 404; a "
+                "Microsoft declarou em 2026-02-11 que o dado ainda nao sai pela API), e o "
+                "caminho que existe e' o painel na sessao do titular. Falta a UNICA "
+                "dependencia humana do plano, que e' de titularidade e nao de decisao: "
+                "`./tools/collect-bing-ai-citations --login`, uma vez."),
+            "tentativas_de_reconhecimento": reconhecimentos,
+        })
+        return base
+    if not contagens:
+        base.update({
+            "estado": "coleta_ativa_sem_contagem",
+            "citacoes": None,
+            "ultimo_export": max(exports),
+            "exports": len(exports),
+            "motivo": (
+                "FASE 1: o coletor preserva o CSV cru e grava o cabecalho VERBATIM. O "
+                "parser dos campos — e com ele a contagem — so se escreve depois que "
+                "alguem ler aquele cabecalho; escrever antes seria inventar esquema."),
+        })
+        return base
+    fechados = sorted(d for d in contagens if d < dia)
+    alvo = fechados[-1] if fechados else max(contagens)
+    base.update({
+        "estado": "medido",
+        "dia": alvo,
+        "citacoes": contagens[alvo],
+        "ultimo_export": max(exports),
+        "exports": len(exports),
+        "dias_com_contagem": len(contagens),
+    })
+    return base
+
+
+def camada_origem(raiz, dia):
+    """O que SO' a origem ve: rota dinamica, gemea Markdown, /api/v1 e MCP.
+
+    Le o arquivo de acesso do dia pedido — um arquivo, nao os 1,1 GB do
+    diretorio. Aquecimento e simulacao de bot ficam FORA da conta: sonda que
+    entra na metrica faz o portal medir o proprio eco, e isso o contrato trata
+    como fraude contra o dono.
+    """
+    caminho = os.path.join(raiz, "data", "ops", "access", "access-%s.jsonl" % dia)
+    if not os.path.exists(caminho):
+        candidatos = sorted(glob.glob(os.path.join(raiz, ACCESS_GLOB)))
+        if not candidatos:
+            return {
+                "camada": "origem",
+                "autoridade": "piso declarado (origem <= borda sempre: HIT na borda nao chega aqui)",
+                "estado": "aguarda",
+                "motivo": "nenhum arquivo de acesso em %s" % ACCESS_GLOB,
+            }
+        caminho = candidatos[-1]
+        dia = os.path.basename(caminho)[len("access-"):-len(".jsonl")]
+
+    totais = {"total": 0, "proprio_excluido": 0, "gemea_markdown": 0}
+    por_rota = {}
+    mcp_tool_calls_externos = 0
+    mcp_tool_calls_internos = 0
+    try:
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                if registro.get("warming") or registro.get("bot_simulation"):
+                    totais["proprio_excluido"] += 1
+                    # A sonda interna e' contada A PARTE de proposito: saber
+                    # QUANTO se excluiu e' o que impede alguem de suspeitar que a
+                    # exclusao esconde volume.
+                    if registro.get("mcp_method") == "tools/call":
+                        mcp_tool_calls_internos += 1
+                    continue
+                totais["total"] += 1
+                classe = registro.get("route_class")
+                if classe in ROTAS_DE_MAQUINA:
+                    por_rota[classe] = por_rota.get(classe, 0) + 1
+                caminho_pedido = registro.get("path") or ""
+                if caminho_pedido.endswith("/index.md") or caminho_pedido.endswith(".md"):
+                    totais["gemea_markdown"] += 1
+                if registro.get("mcp_method") == "tools/call":
+                    mcp_tool_calls_externos += 1
+    except OSError as erro:
+        raise NaoGerou("nao consegui ler %s: %s" % (caminho, erro))
+
+    return {
+        "camada": "origem",
+        "autoridade": "piso declarado (origem <= borda sempre: HIT na borda nao chega aqui)",
+        "estado": "medido",
+        "dia": dia,
+        "requisicoes_reais": totais["total"],
+        "trafego_proprio_excluido": totais["proprio_excluido"],
+        "gemea_markdown": totais["gemea_markdown"],
+        "por_rota_de_maquina": por_rota,
+        "mcp_tools_call_externos": mcp_tool_calls_externos,
+        "mcp_tools_call_internos": mcp_tool_calls_internos,
+        "nao_afirma": "este numero e' PISO: HIT na borda, citacao sem clique e resposta "
+                      "por memoria do modelo nao chegam aqui.",
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Reune as tres camadas de alcance com a autoridade de cada uma "
+                    "declarada, em data/ops/painel/alcance.json.")
+    parser.add_argument("--raiz", default=RAIZ_PADRAO)
+    parser.add_argument("--hoje", default=None, help="dia UTC de referencia AAAA-MM-DD")
+    parser.add_argument("--saida", default=None, help="caminho do JSON (padrao: %s)" % SAIDA_REL)
+    parser.add_argument("--stdout", action="store_true",
+                        help="imprime o JSON e NAO grava")
+    args = parser.parse_args(argv)
+
+    hoje = args.hoje or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    try:
+        referencia = dt.date.fromisoformat(hoje)
+    except ValueError:
+        print("generate-painel-de-alcance: NAO GEROU — --hoje invalido: %r" % hoje,
+              file=sys.stderr)
+        return 2
+    dia_fechado = (referencia - dt.timedelta(days=1)).isoformat()
+
+    try:
+        painel = {
+            "schema_version": SCHEMA,
+            "gerado_em": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "hoje_utc": hoje,
+            "regra": (
+                "Cada numero sai com a camada declarada. Camada sem serie diz "
+                "'aguarda' com o motivo; ausencia e' null, nunca zero."),
+            # AS TRES CAMADAS OLHAM O MESMO DIA, e isso nao e' arrumacao: o dia
+            # corrente e' PARCIAL em todas elas (a linha final da borda nasce em
+            # D+1, o painel do Bing revisa dias recentes, e o log de acesso ainda
+            # esta sendo escrito). Reportar a borda fechada ao lado de uma origem
+            # de meio-dia poria dois numeros incomparaveis lado a lado, que e'
+            # precisamente o erro que este painel existe para nao cometer.
+            "dia_de_referencia": dia_fechado,
+            "camadas": {
+                "borda": camada_borda(args.raiz, hoje),
+                "citacao": camada_citacao(args.raiz, hoje),
+                "origem": camada_origem(args.raiz, dia_fechado),
+            },
+        }
+    except NaoGerou as erro:
+        print("generate-painel-de-alcance: NAO GEROU — %s" % erro, file=sys.stderr)
+        return 2
+
+    texto = json.dumps(painel, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if args.stdout:
+        sys.stdout.write(texto)
+        return 0
+
+    destino = args.saida or os.path.join(args.raiz, SAIDA_REL)
+    try:
+        os.makedirs(os.path.dirname(destino), exist_ok=True)
+        # Regravar so' quando o conteudo mudou: o `gerado_em` sozinho sujaria a
+        # arvore do git a cada execucao do timer, e arvore suja custa o orcamento
+        # de quem commitar depois.
+        anterior = None
+        if os.path.exists(destino):
+            try:
+                with open(destino, encoding="utf-8") as arquivo:
+                    anterior = json.load(arquivo)
+            except (OSError, json.JSONDecodeError):
+                anterior = None
+        if anterior is not None:
+            comparavel_novo = {k: v for k, v in painel.items() if k != "gerado_em"}
+            comparavel_velho = {k: v for k, v in anterior.items() if k != "gerado_em"}
+            if comparavel_novo == comparavel_velho:
+                print("alcance.json inalterado (conteudo identico); nao regravado.")
+                return 0
+        with open(destino, "w", encoding="utf-8") as arquivo:
+            arquivo.write(texto)
+    except OSError as erro:
+        print("generate-painel-de-alcance: NAO GEROU — nao consegui gravar %s: %s"
+              % (destino, erro), file=sys.stderr)
+        return 2
+
+    print("=== ALCANCE, POR CAMADA ===")
+    for nome in ("borda", "citacao", "origem"):
+        bloco = painel["camadas"][nome]
+        print("%-8s [%s] %s" % (nome, bloco["autoridade"], bloco["estado"]))
+        if bloco["estado"] == "medido" and nome == "borda":
+            print("         dia %s · %d req de bot · %d de agentes de IA"
+                  % (bloco["dia"], bloco["requisicoes_de_bot_classificadas"],
+                     bloco["requisicoes_de_agentes_de_ia"]))
+        elif bloco["estado"] == "medido" and nome == "citacao":
+            print("         dia %s · %.0f citacoes" % (bloco["dia"], bloco["citacoes"]))
+        elif bloco["estado"] == "medido" and nome == "origem":
+            print("         dia %s · %d req reais · %d gemea · %d tools/call externos "
+                  "(%d proprios fora da conta)"
+                  % (bloco["dia"], bloco["requisicoes_reais"], bloco["gemea_markdown"],
+                     bloco["mcp_tools_call_externos"], bloco["mcp_tools_call_internos"]))
+        else:
+            print("         %s" % bloco.get("motivo", "sem motivo registrado"))
+    print()
+    print("gravado em %s" % destino)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

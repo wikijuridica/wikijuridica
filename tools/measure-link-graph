@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""measure-link-graph — o grafo de links internos do acervo, medido no disco.
+
+POR QUE ESTE ARQUIVO EXISTE. A investigação de 2026-08-29 mediu o grafo inteiro
+(reciprocidade, cross-área, doorway por Jaccard, blocos byte-idênticos, âncora
+divergente do manifesto) com scripts de sessão, em diretório temporário. Isso
+viola R3 do docs/CONTRATO_DADO_REAL.md por duas vias: o número não é
+reproduzível por outra pessoa, e o instrumento morre no reboot. Um plano cujos
+critérios de aceite ninguém consegue recalcular não é plano, é opinião com
+tabela. Este comando é aquele script, promovido a código versionado.
+
+O QUE ELE MEDE, E POR QUE SOBRE O DISCO. O bloco "Conteúdos relacionados" é o
+único grafo contextual do portal (medido: 60.664 arestas em 10.116 páginas, e
+ZERO link contextual inline no corpo). Ele sai do disco pelo nginx, então medir
+public/ é medir o que o bot recebe — não o que o publicador pretendia. O mesmo
+raciocínio de tools/check-internal-link-floor.
+
+O QUE ELE NÃO É. Não é gate: não reprova nada, devolve 0 sempre que conseguir
+medir. Quem reprova é internal-link-block-integrity (bloco final) e
+mesh-no-worse (regressão contra esta baseline). Separar o instrumento do
+veredito é o que permite medir o acervo vermelho sem travar o pipeline.
+
+READ-ONLY POR PADRÃO (contrato tools/): imprime JSON no stdout e não toca em
+disco. --gravar-baseline é explícito e nomeado justamente para que a escrita
+nunca aconteça por acidente — tools/check-* são read-only, tools/generate-*
+escrevem, e misturar os dois papéis é bug.
+
+Uso:
+    ./tools/measure-link-graph                    # JSON no stdout
+    ./tools/measure-link-graph --gravar-baseline  # + data/ops/link_graph_baseline.jsonl
+    ./tools/measure-link-graph --amostras 5       # inclui exemplos de cada defeito
+
+Saída 0 = mediu; 2 = erro de uso ou acervo ausente.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from itertools import combinations
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PUBLIC = os.path.join(ROOT, "public")
+MANIFEST = os.path.join(ROOT, "data", "editorial", "published_manifest.jsonl")
+BASELINE = os.path.join(ROOT, "data", "ops", "link_graph_baseline.jsonl")
+
+# O bloco é literal e estável nas 10.116 páginas com malha — não é heurística de
+# posição. internal/render/render.go:978 é quem o emite.
+BLOCO = re.compile(
+    r'<section aria-labelledby="conteudos-relacionados">(.*?)</section>', re.S
+)
+ITEM = re.compile(r'<li><a href="([^"]*)">(.*?)</a></li>', re.S)
+# CHROME é a parte do bloco que NÃO vem do artefato da malha: as âncoras
+# institucionais que internal/render.ChromeInstitucionalDoBloco acrescenta a todo
+# bloco — a de /redesocial/ e, desde 2026-09-05, o espelho de caminho
+# /redesocial/tema/{área}/{slug}/ desta página.
+#
+# POR QUE ELA EXISTE. O espelho é DIFERENTE em cada uma das 10.141 rotas. Hashear
+# o bloco INTEIRO para detectar bloco repetido passaria a não achar grupo nenhum
+# — não porque o molde sumiu, mas porque cada bloco virou único por construção. O
+# detector ficaria verde para sempre, inclusive diante de um doorway perfeito. A
+# forma `<p><a>` é o que separa as duas classes e é contrato: item de malha é
+# `<li><a>` (internal/render/redesocial_tema.go e os testes de contagem daquele
+# pacote), justamente para que ITEM acima não os confunda.
+CHROME = re.compile(r'<p><a href="[^"]*">.*?</a></p>\n?', re.S)
+# href interno sem fragmento nem query, para o grau de entrada TOTAL (a mesma
+# leitura de check-internal-link-floor: origens distintas sobre todos os hrefs).
+HREF = re.compile(r'href="(/[^"#?]*)(?:[^"]*)"')
+TAG = re.compile(r"<[^>]+>")
+TITULO = re.compile(r"<title>(.*?)</title>", re.S)
+
+# Limiar de internallinkmesh.DetectDoorwayMolds: dentro da MESMA área, dois
+# conjuntos de vizinhos com Jaccard acima disto são molde de doorway.
+DOORWAY_JACCARD = 0.50
+# Acima deste número de páginas apontando para o mesmo destino, o par a par
+# explode sem informar nada: um destino muito popular liga todo mundo a todo
+# mundo por construção, e o Jaccard desses pares é baixo justamente por isso.
+# O corte mantém o custo linear e não perde molde real (molde é vizinhança
+# COMPARTILHADA e estreita, não destino popular).
+MAX_ORIGENS_POR_DESTINO = 60
+
+
+def falha(msg: str) -> SystemExit:
+    print(f"measure-link-graph: {msg}", file=sys.stderr)
+    return SystemExit(2)
+
+
+def area_de(path: str) -> str:
+    partes = path.strip("/").split("/")
+    return partes[0] if partes and partes[0] else ""
+
+
+def percentil(valores: list, q: float) -> float:
+    """Percentil por interpolação linear. Determinístico e sem dependência."""
+    if not valores:
+        return 0.0
+    ordenados = sorted(valores)
+    if len(ordenados) == 1:
+        return float(ordenados[0])
+    k = (len(ordenados) - 1) * q
+    piso = int(k)
+    teto = min(piso + 1, len(ordenados) - 1)
+    return float(ordenados[piso] + (ordenados[teto] - ordenados[piso]) * (k - piso))
+
+
+def resumo(valores: list) -> dict:
+    if not valores:
+        return {"n": 0}
+    return {
+        "n": len(valores),
+        "minimo": min(valores),
+        "p10": percentil(valores, 0.10),
+        "mediana": percentil(valores, 0.50),
+        "p90": percentil(valores, 0.90),
+        "p95": percentil(valores, 0.95),
+        "p99": percentil(valores, 0.99),
+        "maximo": max(valores),
+        "media": round(sum(valores) / len(valores), 4),
+    }
+
+
+def carrega_titulos_do_manifesto() -> dict:
+    """path -> title do published_manifest. Ausente não é erro: a divergência
+    de âncora simplesmente não é medível sem ele, e isso é dito na saída."""
+    if not os.path.isfile(MANIFEST):
+        return {}
+    titulos = {}
+    with open(MANIFEST, encoding="utf-8") as fh:
+        for linha in fh:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                reg = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            caminho = reg.get("path")
+            if caminho:
+                titulos[caminho] = reg.get("title", "")
+    return titulos
+
+
+def varre_acervo() -> tuple:
+    """Um passe único sobre public/**/index.html.
+
+    Devolve (paginas, sem_bloco). paginas mapeia rota -> dict com os destinos do
+    bloco, as âncoras, o sha256 do bloco, os bytes e os hrefs internos de FORA
+    do bloco (que é o que compõe o grau de entrada total junto com a malha).
+    """
+    paginas = {}
+    sem_bloco = []
+    for diretorio, _, arquivos in os.walk(PUBLIC):
+        if "index.html" not in arquivos:
+            continue
+        caminho_arquivo = os.path.join(diretorio, "index.html")
+        rel = os.path.relpath(diretorio, PUBLIC)
+        rota = "/" if rel == "." else "/" + rel + "/"
+        try:
+            with open(caminho_arquivo, encoding="utf-8", errors="replace") as fh:
+                doc = fh.read()
+        except OSError:
+            continue
+
+        casou = BLOCO.search(doc)
+        mt = TITULO.search(doc)
+        titulo_servido = html.unescape(mt.group(1).strip()) if mt else ""
+
+        if not casou:
+            sem_bloco.append(rota)
+            bloco_txt = ""
+            destinos, ancoras = [], []
+        else:
+            bloco_txt = casou.group(0)
+            pares = ITEM.findall(casou.group(1))
+            destinos = [p[0] for p in pares]
+            ancoras = [html.unescape(TAG.sub("", p[1])).strip() for p in pares]
+
+        fora = doc.replace(bloco_txt, "") if bloco_txt else doc
+        externos = {h for h in HREF.findall(fora) if h.endswith("/") and h != rota}
+
+        # O HASH É DA PARTE DO ARTEFATO, os BYTES são do bloco inteiro — e a
+        # diferença é deliberada. Identidade ("estas duas páginas emitem o mesmo
+        # bloco?") só faz sentido sobre o que vem da malha; peso ("cabe no teto de
+        # 1.800 B?") é sobre o que o visitante baixa, chrome incluído.
+        bloco_malha = CHROME.sub("", bloco_txt) if bloco_txt else ""
+        paginas[rota] = {
+            "destinos": destinos,
+            "ancoras": ancoras,
+            "bloco_malha_sha256": hashlib.sha256(bloco_malha.encode("utf-8")).hexdigest()
+            if bloco_malha
+            else "",
+            "chrome_ancoras": len(CHROME.findall(bloco_txt)) if bloco_txt else 0,
+            "bloco_bytes": len(bloco_txt.encode("utf-8")),
+            "pagina_bytes": len(doc.encode("utf-8")),
+            "titulo_servido": titulo_servido,
+            "externos": externos,
+        }
+    return paginas, sem_bloco
+
+
+def pares_doorway(malha: dict) -> tuple:
+    """Pares da MESMA área cujos conjuntos de vizinhos passam do limiar de
+    Jaccard. Índice invertido por destino em vez de todos-contra-todos: só
+    páginas que compartilham ao menos um destino podem ter Jaccard > 0."""
+    por_area = defaultdict(dict)
+    for rota, destinos in malha.items():
+        por_area[area_de(rota)][rota] = set(destinos)
+
+    total = 0
+    envolvidas = set()
+    exemplos = []
+    for _, membros in por_area.items():
+        invertido = defaultdict(list)
+        for rota, conjunto in membros.items():
+            for destino in conjunto:
+                invertido[destino].append(rota)
+        compartilhados = Counter()
+        for destino, origens in invertido.items():
+            if len(origens) > MAX_ORIGENS_POR_DESTINO:
+                continue
+            for a, b in combinations(sorted(origens), 2):
+                compartilhados[(a, b)] += 1
+        for (a, b), comuns in compartilhados.items():
+            uniao = len(membros[a] | membros[b])
+            if uniao and comuns / uniao > DOORWAY_JACCARD:
+                total += 1
+                envolvidas.add(a)
+                envolvidas.add(b)
+                if len(exemplos) < 20:
+                    exemplos.append(
+                        {"a": a, "b": b, "jaccard": round(comuns / uniao, 4)}
+                    )
+    return total, len(envolvidas), exemplos
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument(
+        "--gravar-baseline",
+        action="store_true",
+        help="além do stdout, grava data/ops/link_graph_baseline.jsonl",
+    )
+    ap.add_argument(
+        "--amostras",
+        type=int,
+        default=0,
+        help="inclui até N exemplos de cada defeito na saída",
+    )
+    args = ap.parse_args()
+
+    if not os.path.isdir(PUBLIC):
+        raise falha(f"{PUBLIC} não existe — nada publicado para medir")
+
+    paginas, sem_bloco = varre_acervo()
+    if not paginas:
+        raise falha("nenhum index.html encontrado em public/")
+
+    malha = {r: d["destinos"] for r, d in paginas.items() if d["destinos"]}
+    titulos_manifesto = carrega_titulos_do_manifesto()
+
+    # --- arestas, saída, cross-área -------------------------------------
+    arestas = {(o, d) for o, destinos in malha.items() for d in destinos}
+    saida = [len(d) for d in malha.values()]
+    cross = {(o, d) for (o, d) in arestas if area_de(o) != area_de(d)}
+    matriz = Counter((area_de(o), area_de(d)) for (o, d) in arestas)
+
+    # --- reciprocidade ---------------------------------------------------
+    reciprocas = {(o, d) for (o, d) in arestas if (d, o) in arestas}
+    sem_ponte = [r for r, d in malha.items() if all(area_de(x) == area_de(r) for x in d)]
+
+    # --- grau de entrada: malha e TOTAL ----------------------------------
+    entrada_malha = Counter()
+    for origem, destinos in malha.items():
+        for destino in set(destinos):
+            entrada_malha[destino] += 1
+    entrada_total = Counter(entrada_malha)
+    for _, dados in paginas.items():
+        for destino in dados["externos"]:
+            if destino in paginas:
+                entrada_total[destino] += 1
+
+    graus_malha = [entrada_malha.get(r, 0) for r in malha]
+    graus_total = [entrada_total.get(r, 0) for r in malha]
+
+    # --- blocos byte-idênticos -------------------------------------------
+    por_hash = defaultdict(list)
+    for rota, dados in paginas.items():
+        if dados["bloco_malha_sha256"]:
+            por_hash[dados["bloco_malha_sha256"]].append(rota)
+    grupos_identicos = {h: rotas for h, rotas in por_hash.items() if len(rotas) > 1}
+
+    # --- âncora divergente do manifesto -----------------------------------
+    ancoras_divergentes = []
+    if titulos_manifesto:
+        for rota, dados in paginas.items():
+            for destino, ancora in zip(dados["destinos"], dados["ancoras"]):
+                esperado = titulos_manifesto.get(destino)
+                if esperado and ancora != esperado:
+                    ancoras_divergentes.append(
+                        {"origem": rota, "destino": destino,
+                         "ancora": ancora, "manifesto": esperado}
+                    )
+
+    # --- doorway ----------------------------------------------------------
+    doorway_pares, doorway_paginas, doorway_exemplos = pares_doorway(malha)
+
+    # --- defeitos mecânicos ------------------------------------------------
+    defeitos = Counter()
+    for rota, dados in paginas.items():
+        vistos = set()
+        for destino, ancora in zip(dados["destinos"], dados["ancoras"]):
+            if destino == rota:
+                defeitos["autolink"] += 1
+            if destino in vistos:
+                defeitos["destino_repetido_no_bloco"] += 1
+            vistos.add(destino)
+            if not ancora:
+                defeitos["ancora_vazia"] += 1
+            if destino not in paginas:
+                defeitos["destino_inexistente"] += 1
+
+    bloco_bytes = [d["bloco_bytes"] for d in paginas.values() if d["bloco_bytes"]]
+    pagina_bytes = [d["pagina_bytes"] for d in paginas.values()]
+    chrome_por_pagina = Counter(d["chrome_ancoras"] for d in paginas.values() if d["bloco_bytes"])
+
+    medicao = {
+        "record_type": "link_graph_baseline",
+        "schema_version": "link_graph_baseline_v1",
+        "tool": "tools/measure-link-graph",
+        "escopo": "public/**/index.html (o HTML que o nginx serve)",
+        "universo": {
+            "html_em_disco": len(paginas),
+            "com_bloco_de_malha": len(malha),
+            "sem_bloco": len(sem_bloco),
+        },
+        "arestas": {
+            "total": len(arestas),
+            "capacidade_no_teto": len(malha) * max(saida) if saida else 0,
+            "slots_ociosos": (len(malha) * max(saida) - len(arestas)) if saida else 0,
+            "links_por_pagina": dict(sorted(Counter(saida).items())),
+            "saida": resumo(saida),
+        },
+        "cross_area": {
+            "arestas": len(cross),
+            "fracao": round(len(cross) / len(arestas), 6) if arestas else 0.0,
+            "paginas_sem_nenhuma_ponte": len(sem_ponte),
+            "areas_emissoras": len({area_de(o) for (o, _) in arestas}),
+            "areas_fechadas": sorted(
+                a
+                for a in {area_de(o) for (o, _) in arestas}
+                if not any(area_de(o) == a and area_de(d) != a for (o, d) in arestas)
+            ),
+        },
+        "reciprocidade": {
+            "arestas_reciprocas": len(reciprocas),
+            "fracao": round(len(reciprocas) / len(arestas), 6) if arestas else 0.0,
+            "pares_bidirecionais": len(reciprocas) // 2,
+        },
+        "entrada": {
+            "malha": resumo(graus_malha),
+            "total": resumo(graus_total),
+            "orfas_malha": sum(1 for g in graus_malha if g == 0),
+            "abaixo_do_piso_total_3": sum(1 for g in graus_total if g < 3),
+            "distribuicao_malha": dict(sorted(Counter(graus_malha).items())),
+        },
+        "doorway": {
+            "limiar_jaccard": DOORWAY_JACCARD,
+            "pares_mesma_area_acima_do_limiar": doorway_pares,
+            "paginas_envolvidas": doorway_paginas,
+            "corte_origens_por_destino": MAX_ORIGENS_POR_DESTINO,
+        },
+        "blocos_byte_identicos": {
+            # O HASH IGNORA O CHROME INSTITUCIONAL, e sem isso este número seria
+            # zero para sempre: o espelho de caminho torna cada bloco único por
+            # construção. `ancoras_de_chrome_por_pagina` publica quantas âncoras
+            # foram neutralizadas em cada página, para que a neutralização seja
+            # auditável em vez de silenciosa — um dia em que ela devolver 0 no
+            # acervo inteiro é um dia em que o chrome sumiu do disco.
+            "escopo": "bloco sem o chrome institucional (a parte que vem do artefato da malha)",
+            "grupos": len(grupos_identicos),
+            "paginas": sum(len(v) for v in grupos_identicos.values()),
+            "ancoras_de_chrome_por_pagina": dict(sorted(chrome_por_pagina.items())),
+        },
+        "ancoras": {
+            "divergentes_do_manifesto": len(ancoras_divergentes),
+            "destinos_afetados": len({a["destino"] for a in ancoras_divergentes}),
+            "manifesto_disponivel": bool(titulos_manifesto),
+        },
+        "defeitos_mecanicos": dict(sorted(defeitos.items())) or {},
+        "bytes": {
+            "bloco": resumo(bloco_bytes),
+            "pagina": resumo(pagina_bytes),
+            "paginas_acima_de_45kb": sum(1 for b in pagina_bytes if b > 45000),
+            "paginas_acima_de_50kb": sum(1 for b in pagina_bytes if b > 50000),
+        },
+    }
+
+    if args.amostras > 0:
+        n = args.amostras
+        medicao["amostras"] = {
+            "sem_bloco": sorted(sem_bloco)[:n],
+            "sem_ponte_cross_area": sorted(sem_ponte)[:n],
+            "menor_entrada_de_malha": [
+                {"rota": r, "entrada_malha": entrada_malha.get(r, 0)}
+                for r in sorted(malha, key=lambda x: (entrada_malha.get(x, 0), x))[:n]
+            ],
+            "blocos_byte_identicos": [
+                sorted(rotas) for rotas in list(grupos_identicos.values())[:n]
+            ],
+            "ancoras_divergentes": ancoras_divergentes[:n],
+            "doorway": doorway_exemplos[:n],
+            "matriz_area_para_area": [
+                {"de": a, "para": b, "arestas": c}
+                for (a, b), c in matriz.most_common(n)
+            ],
+        }
+
+    print(json.dumps(medicao, ensure_ascii=False, indent=1, sort_keys=True))
+
+    if args.gravar_baseline:
+        os.makedirs(os.path.dirname(BASELINE), exist_ok=True)
+        with open(BASELINE, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(medicao, ensure_ascii=False, sort_keys=True) + "\n")
+        print(f"baseline gravada em {os.path.relpath(BASELINE, ROOT)}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit as exc:
+        raise exc

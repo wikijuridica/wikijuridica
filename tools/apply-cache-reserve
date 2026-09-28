@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""apply-cache-reserve — o interruptor do Cache Reserve da zona, com leitura antes da escrita.
+
+ESCREVE na zona Cloudflare (PATCH), e SO com `--confirmar`. Idempotente: le o
+estado vivo, compara com o alvo e nao faz nada se ja estiver igual. `--dry-run`
+mostra o que faria e nao toca nem a zona nem o ledger. `--status` so le.
+
+POR QUE EXISTE. O Cache Reserve desta zona ja foi ligado e desligado sem que o
+repositorio soubesse: o plano de 2026-08-26 (docs/goal/PLANO_SUPERFICIE_BOTS_
+20260826.md, O15) o observou LIGADO "numa zona que nao cacheia nada"; a API
+viva, lida em 2026-09-09, diz `off` com `modified_on 2026-08-28T23:41:24Z`, e
+o `cache_reserve_clear` registra uma limpeza iniciada oito segundos depois
+(23:41:32Z) e concluida as 01:46:32Z de 29/08. Nenhuma dessas tres acoes tem
+linha em data/ops/edge_rule_apply.jsonl, e `grep -rl cache_reserve tools/ ops/
+internal/ cmd/` devolvia NADA ate esta ferramenta nascer. Estado de producao
+que nenhuma ferramenta le nem escreve e estado que deriva em silencio -- e o
+mesmo defeito que tools/apply-cache-rules fechou para a Cache Rule.
+
+A DECISAO VIGENTE E MANTER DESLIGADO (D1, 2026-09-09; o porque medido esta em
+ops/cloudflare/cache-reserve.json). Esta ferramenta existe para que, no dia em
+que tools/check-cache-reserve-gatilho disser LIGAR, o gesto seja um comando com
+leitura-antes-de-escrever, ledger e confirmacao explicita -- e nao um clique de
+painel que ninguem registra.
+
+O QUE NAO ESTA MEDIDO, com todas as letras: o PATCH com {"value":"on"} NUNCA foi
+executado nesta zona por esta ferramenta. A doc oficial diz "A paid Cache
+Reserve plan is required" (developers.cloudflare.com/cache/advanced-
+configuration/cache-reserve/, lida em 2026-09-09) -- e a zona e plano Free. Se
+a API recusar, a recusa sai IMPRESSA COMO A API A DEVOLVEU e vai para o ledger;
+esta ferramenta nao interpreta nem "corrige" a resposta.
+
+LEDGER (data/ops/edge_rule_apply.jsonl, `schema_version edge_rule_apply_v1`,
+`fase cache_reserve`): DUAS linhas por escrita -- `evento: intencao` ANTES do
+PATCH, com o estado vivo inteiro, e `evento: resultado` DEPOIS, com a resposta
+REAL da API (http_status, success, errors, result). O gate de drift le a
+primeira para saber que a mudanca foi deliberada; quem investiga le a segunda
+para saber o que a API respondeu. Nada e escrito no ledger em --status, em
+--dry-run, nem quando o alvo ja e o estado vivo.
+
+CREDENCIAL: tools/cloudflare_auth.py. Leitura pelo CLOUDFLARE_ZONE_TOKEN (Bearer,
+menor privilegio); escrita SEMPRE pela Global API Key (CLOUDFLARE_EMAIL +
+CLOUDFLARE_API_TOKEN, cabecalhos X-Auth-Email/X-Auth-Key) -- o token de zona
+nao tem escopo de escrita (medido, ver o modulo).
+
+CODIGOS DE SAIDA:
+  0  estado lido (--status) | nada a fazer (ja no alvo) | --dry-run | escrita
+     confirmada pela releitura
+  1  a API recusou (success:false ou HTTP != 2xx), ou a releitura depois do
+     PATCH nao mostra o alvo, ou a leitura inicial falhou (nao se escreve as cegas)
+  2  nao executado: sem credencial, canonico ilegivel, --on/--off sem
+     --confirmar, pedido invalido
+
+Uso:
+    tools/apply-cache-reserve --status
+    tools/apply-cache-reserve --on --dry-run
+    tools/apply-cache-reserve --on --confirmar --motivo "gatilho: ..."
+    tools/apply-cache-reserve --off --confirmar
+    tools/apply-cache-reserve --off --esvaziar --confirmar   # rollback completo: desliga E esvazia
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CANONICO = os.path.join(RAIZ, "ops/cloudflare/cache-reserve.json")
+LEDGER = os.path.join(RAIZ, "data/ops/edge_rule_apply.jsonl")
+ENV = os.path.join(RAIZ, ".env.local")
+API = "https://api.cloudflare.com/client/v4"
+ZONA_PADRAO = "b2e1366a94c5dcac97f2fc264f18928f"
+FASE = "cache_reserve"
+FERRAMENTA = "tools/apply-cache-reserve"
+
+
+def chamar(metodo, url, cabecalhos, corpo=None, timeout=45.0):
+    """(envelope, http_status). Nunca lanca: erro HTTP devolve o corpo JSON que
+    a API manda mesmo em 4xx; falha de rede vira envelope success:false com a
+    mensagem, e status 0. E o mesmo contrato de tools/purge-edge-cache."""
+    dados = json.dumps(corpo).encode("utf-8") if corpo is not None else None
+    req = urllib.request.Request(url, data=dados, headers=cabecalhos, method=metodo)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resposta:
+            return json.loads(resposta.read().decode("utf-8")), resposta.status
+    except urllib.error.HTTPError as erro:
+        try:
+            return json.loads(erro.read().decode("utf-8")), erro.code
+        except Exception:
+            return {"success": False, "errors": [{"message": "HTTP %s" % erro.code}]}, erro.code
+    except Exception as erro:
+        return {"success": False, "errors": [{"message": str(erro)[:160]}]}, 0
+
+
+# Ponto de injecao dos testes: eles trocam CHAMAR por uma API de mentira e nunca
+# tocam a rede. O parser e o fluxo sao os MESMOS nos dois caminhos.
+CHAMAR = chamar
+
+
+def canone():
+    """Le o estado versionado. Falha aqui e exit 2: sem canonico nao ha alvo
+    nem endpoint, e chutar o caminho da API ja produziu gate verde sobre 400
+    (ver ops/cloudflare/tiered-cache.json, 'endpoint_que_NAO_existe')."""
+    with open(CANONICO, encoding="utf-8") as f:
+        dados = json.load(f)
+    endpoints = dados.get("endpoints") or {}
+    for chave in ("estado", "escrita", "limpeza_estado", "limpeza_executar"):
+        if not (endpoints.get(chave) or {}).get("caminho"):
+            raise ValueError(f"ops/cloudflare/cache-reserve.json sem endpoints.{chave}.caminho")
+    if dados.get("valor_esperado") not in ("on", "off"):
+        raise ValueError("ops/cloudflare/cache-reserve.json: valor_esperado tem de ser 'on' ou 'off'")
+    return dados
+
+
+def url_de(dados, chave, zona):
+    return API + dados["endpoints"][chave]["caminho"].replace("{zona}", zona)
+
+
+def erros_de(envelope):
+    return "; ".join(e.get("message", "?") for e in ((envelope or {}).get("errors") or [])) or "sem detalhe"
+
+
+def registrar(linha):
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, "a", encoding="utf-8") as f:
+        f.write(json.dumps(linha, ensure_ascii=False) + "\n")
+
+
+def agora():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def imprime_estado(result, esperado):
+    print(f"cache_reserve : value={result.get('value')!r} modified_on={result.get('modified_on')} "
+          f"editable={result.get('editable')}")
+    if result.get("value") == esperado:
+        print(f"canonico      : valor_esperado={esperado!r} -- bate")
+    else:
+        print(f"canonico      : valor_esperado={esperado!r} -- DIVERGE do vivo "
+              f"(tools/check-cache-reserve-gatilho diz se foi deliberado)")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="interruptor do Cache Reserve da zona: le, compara, escreve so com --confirmar",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--status", action="store_true", help="imprime o estado vivo e o da limpeza; nao escreve")
+    g.add_argument("--on", action="store_true", help="alvo: ligar")
+    g.add_argument("--off", action="store_true", help="alvo: desligar")
+    ap.add_argument("--esvaziar", action="store_true",
+                    help="com --off: depois de desligar, POST em cache_reserve_clear (esvazia o Reserve)")
+    ap.add_argument("--dry-run", action="store_true", help="mostra o que faria; nao escreve nem grava ledger")
+    ap.add_argument("--confirmar", action="store_true", help="autoriza o PATCH (e o POST de limpeza)")
+    ap.add_argument("--motivo", default="", help="texto gravado no ledger junto da intencao")
+    args = ap.parse_args(argv)
+
+    if not (args.status or args.on or args.off):
+        ap.print_usage(file=sys.stderr)
+        print("apply-cache-reserve: diga --status, --on ou --off", file=sys.stderr)
+        return 2
+    if args.esvaziar and not args.off:
+        print("apply-cache-reserve: --esvaziar so faz sentido com --off", file=sys.stderr)
+        return 2
+
+    try:
+        dados = canone()
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"apply-cache-reserve: canonico ilegivel: {e}", file=sys.stderr)
+        return 2
+    esperado = dados["valor_esperado"]
+
+    env = cloudflare_auth.ambiente(ENV)
+    zona = env.get("CLOUDFLARE_ZONE_ID") or dados.get("zona") or ZONA_PADRAO
+    leitura, rotulo_leitura = cloudflare_auth.cabecalhos("leitura", env=env)
+    if leitura is None:
+        print("apply-cache-reserve: sem credencial Cloudflare em .env.local "
+              "(CLOUDFLARE_ZONE_TOKEN ou CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN)", file=sys.stderr)
+        return 2
+
+    url_estado = url_de(dados, "estado", zona)
+    envelope, status = CHAMAR("GET", url_estado, leitura)
+    if not (envelope or {}).get("success"):
+        print(f"apply-cache-reserve: nao consegui LER o cache_reserve (HTTP {status}: {erros_de(envelope)}) "
+              f"-- nao escrevo as cegas", file=sys.stderr)
+        return 1
+    antes = envelope.get("result") or {}
+    vivo = antes.get("value")
+
+    print(f"zona          : {zona}")
+    print(f"credencial    : leitura={rotulo_leitura}")
+    imprime_estado(antes, esperado)
+
+    if args.status:
+        env_limpeza, status_limpeza = CHAMAR("GET", url_de(dados, "limpeza_estado", zona), leitura)
+        if (env_limpeza or {}).get("success"):
+            limpeza = env_limpeza.get("result") or {}
+            print(f"cache_reserve_clear : state={limpeza.get('state')!r} start_ts={limpeza.get('start_ts')} "
+                  f"end_ts={limpeza.get('end_ts')}")
+        else:
+            print(f"cache_reserve_clear : nao lido (HTTP {status_limpeza}: {erros_de(env_limpeza)})")
+        return 0
+
+    alvo = "on" if args.on else "off"
+    precisa_patch = vivo != alvo
+    precisa_limpeza = bool(args.esvaziar)
+
+    if not precisa_patch and not precisa_limpeza:
+        print(f"ja esta {alvo!r} -- nada a fazer (idempotente)")
+        return 0
+
+    if precisa_patch:
+        print(f"vai aplicar   : PATCH {dados['endpoints']['escrita']['caminho']} {{\"value\": {alvo!r}}}"
+              f"  (vivo {vivo!r} -> {alvo!r})")
+    else:
+        print(f"ja esta {alvo!r}; resta a limpeza")
+    if precisa_limpeza:
+        print(f"vai aplicar   : POST {dados['endpoints']['limpeza_executar']['caminho']} (esvazia o Reserve; "
+              f"a doc fala em ate 24 h, medido 2h05 em 2026-08-28)")
+
+    if args.dry_run:
+        print("\n--dry-run: nada escrito na zona, nada gravado no ledger")
+        return 0
+    if not args.confirmar:
+        print("\nNAO EXECUTADO: escrita exige --confirmar (repita o comando com --confirmar)", file=sys.stderr)
+        return 2
+
+    escrita, rotulo_escrita = cloudflare_auth.cabecalhos("escrita", env=env)
+    if escrita is None:
+        print("apply-cache-reserve: escrita exige a Global API Key (CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN); "
+              "o CLOUDFLARE_ZONE_TOKEN so le", file=sys.stderr)
+        return 2
+    print(f"credencial    : escrita={rotulo_escrita}")
+
+    if precisa_patch:
+        # O ESTADO ANTERIOR INTEIRO vai para o ledger ANTES do PATCH.
+        registrar({
+            "schema_version": "edge_rule_apply_v1",
+            "aplicado_em": agora(),
+            "zona": zona,
+            "fase": FASE,
+            "evento": "intencao",
+            "ferramenta": FERRAMENTA,
+            "motivo": args.motivo,
+            "version_antes": antes.get("modified_on"),
+            "regras_antes": [antes],
+            "regras_depois_pretendidas": [{"value": alvo}],
+            "valor_antes": vivo,
+            "valor_pretendido": alvo,
+            "origem": os.path.relpath(CANONICO, RAIZ),
+        })
+        resposta, status = CHAMAR("PATCH", url_de(dados, "escrita", zona), escrita, {"value": alvo})
+        sucesso = bool((resposta or {}).get("success"))
+        registrar({
+            "schema_version": "edge_rule_apply_v1",
+            "aplicado_em": agora(),
+            "zona": zona,
+            "fase": FASE,
+            "evento": "resultado",
+            "ferramenta": FERRAMENTA,
+            "operacao": "PATCH",
+            "valor_pretendido": alvo,
+            "http_status": status,
+            "success": sucesso,
+            "errors": [e.get("message", "") for e in ((resposta or {}).get("errors") or [])],
+            "result": (resposta or {}).get("result"),
+            "origem": os.path.relpath(CANONICO, RAIZ),
+        })
+        if not sucesso:
+            print(f"\nPATCH RECUSADO (HTTP {status}): {erros_de(resposta)}", file=sys.stderr)
+            print("A resposta da API esta no ledger como veio. Nada foi interpretado.", file=sys.stderr)
+            return 1
+        # Releitura: o que vale e o que a zona diz DEPOIS, nao o que o PATCH prometeu.
+        envelope, status = CHAMAR("GET", url_estado, leitura)
+        depois = (envelope or {}).get("result") or {}
+        print(f"\nAPLICADO. value {vivo!r} -> {depois.get('value')!r} (modified_on {depois.get('modified_on')})")
+        if depois.get("value") != alvo:
+            print(f"RELEITURA DIVERGE: a API aceitou o PATCH mas devolve {depois.get('value')!r}", file=sys.stderr)
+            return 1
+
+    if precisa_limpeza:
+        resposta, status = CHAMAR("POST", url_de(dados, "limpeza_executar", zona), escrita, {})
+        sucesso = bool((resposta or {}).get("success"))
+        registrar({
+            "schema_version": "edge_rule_apply_v1",
+            "aplicado_em": agora(),
+            "zona": zona,
+            "fase": FASE,
+            "evento": "resultado",
+            "ferramenta": FERRAMENTA,
+            "operacao": "POST cache_reserve_clear",
+            "http_status": status,
+            "success": sucesso,
+            "errors": [e.get("message", "") for e in ((resposta or {}).get("errors") or [])],
+            "result": (resposta or {}).get("result"),
+            "origem": os.path.relpath(CANONICO, RAIZ),
+        })
+        if not sucesso:
+            print(f"\nLIMPEZA RECUSADA (HTTP {status}): {erros_de(resposta)}", file=sys.stderr)
+            return 1
+        r = (resposta or {}).get("result") or {}
+        print(f"limpeza       : state={r.get('state')!r} start_ts={r.get('start_ts')} "
+              f"(acompanhe com --status; a delecao pode levar horas)")
+
+    print(f"registro em {os.path.relpath(LEDGER, RAIZ)}; agora atualize valor_esperado em "
+          f"{os.path.relpath(CANONICO, RAIZ)} e confira com tools/check-cache-reserve-gatilho")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

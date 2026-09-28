@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# tools/check-untracked-product-inventory — READ-ONLY.
+#
+# Produto (código/conteúdo/dado versionável) não pode viver esquecido em untracked:
+# agente de IA que lê `git status` trata untracked como ruído e acaba ignorando
+# código e conteúdo importantes do projeto. Este check classifica cada arquivo
+# untracked NÃO-ignorado do worktree e, em um segundo passe, confere os artefatos
+# sensíveis que o .gitignore oculta:
+#
+#   PRODUTO — extensão/caminho versionável (.go .py .js .json .jsonl .md .sh ...
+#             ou dentro de cmd/ internal/ tools/ scripts/ content/ docs/ data/ .agents/)
+#   EFEMERO — *.tmp, *.lock, binário ELF reproduzível
+#   OUTRO   — não classificado (sempre listado para triagem manual)
+#
+# Reprova (exit 1) quando existe PRODUTO untracked cuja idade atinge a janela de
+# tolerância (default 24h). Também reprova imediatamente todo *.partial.jsonl ou
+# tools/_tmp_*.py ignorado que não esteja no inventário versionado exato, cujo
+# SHA-256 tenha mudado, que tenha desaparecido ou deixado de estar ignorado. A
+# janela de WIP não se aplica a essa segunda classe: um nome parecido não prova
+# que o conteúdo novo é resíduo histórico.
+#
+# Uso: tools/check-untracked-product-inventory [--max-age-hours N] [--list-all] [--quiet]
+#
+# --quiet (ou WIKI_QUIET=1) altera SO a verbosidade: a linha-resumo com todos os
+# contadores, TODAS as falhas de integridade do inventario sensivel e as linhas
+# REPROVADO/OK continuam iguais; apenas a enumeracao de PRODUTO_STALE fica
+# limitada a uma amostra, com o total explicito logo abaixo. Nenhuma
+# classificacao, nenhum limiar e nenhum exit code muda. Incompativel na pratica
+# com --list-all, que existe justamente para enumerar tudo: se os dois vierem
+# juntos, --list-all vence e a saida completa e preservada.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+IGNORED_SENSITIVE_MANIFEST="data/ops/ignored_sensitive_artifact_inventory.tsv"
+
+MAX_AGE_HOURS=24
+LIST_ALL=0
+QUIET=0
+if [ "${WIKI_QUIET:-0}" = "1" ]; then
+	QUIET=1
+fi
+# Amostra de PRODUTO_STALE exibida no modo silencioso. O CONTADOR permanece
+# exato na linha-resumo; so a enumeracao e limitada.
+QUIET_STALE_SAMPLE=5
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--max-age-hours)
+		if [ $# -lt 2 ]; then
+			echo "--max-age-hours exige um valor" >&2
+			exit 2
+		fi
+		MAX_AGE_HOURS="$2"
+		shift 2
+		;;
+	--list-all)
+		LIST_ALL=1
+		shift
+		;;
+	--quiet | -q)
+		QUIET=1
+		shift
+		;;
+	*)
+		echo "flag desconhecida: $1 (uso: --max-age-hours N | --list-all | --quiet)" >&2
+		exit 2
+		;;
+	esac
+done
+
+# --list-all pede enumeracao integral; ela vence o modo silencioso.
+if [ "$LIST_ALL" = 1 ]; then
+	QUIET=0
+fi
+
+if [[ ! "$MAX_AGE_HOURS" =~ ^[0-9]+$ ]]; then
+	echo "--max-age-hours exige inteiro não negativo; recebido: $MAX_AGE_HOURS" >&2
+	exit 2
+fi
+
+now_epoch="$(date +%s)"
+max_age_seconds=$((MAX_AGE_HOURS * 3600))
+produto=0
+produto_stale=0
+efemero=0
+outro=0
+ignored_sensitive=0
+ignored_sensitive_failures=0
+
+declare -A manifest_sha=()
+declare -A manifest_class=()
+declare -A manifest_reason=()
+# MANIFESTO AUSENTE OU MALFORMADO E EXIT 2, NAO 1 -- e a distincao decide se o
+# alarme toca. Este gate saia com 1 tanto para "medi e existe produto untracked
+# esquecido" (VEREDITO) quanto para "o inventario sensivel nao existe / tem
+# cabecalho invalido / tem sha invalido / esta vazio" (FERRAMENTA QUEBRADA). A
+# unit mascara o 1, para nao alertar em veredito -- entao o inventario podia
+# estar quebrado todos os dias sem que ninguem soubesse, e o gate que existe para
+# achar produto esquecido nao acharia nenhum, silenciosamente. Auditoria de
+# 2026-08-28.
+declare -A ignored_sensitive_seen=()
+
+if [ ! -f "$IGNORED_SENSITIVE_MANIFEST" ]; then
+	echo "REPROVADO: inventário versionado de artefatos ignorados sensíveis ausente: $IGNORED_SENSITIVE_MANIFEST" >&2
+	exit 2
+fi
+
+manifest_line=0
+while IFS=$'\t' read -r path expected_sha classification reason extra; do
+	manifest_line=$((manifest_line + 1))
+	if [ "$manifest_line" -eq 1 ]; then
+		if [ "$path" != "path" ] || [ "$expected_sha" != "sha256" ] || [ "$classification" != "classification" ] || [ "$reason" != "reason" ] || [ -n "${extra:-}" ]; then
+			echo "REPROVADO: cabeçalho inválido no inventário sensível: $IGNORED_SENSITIVE_MANIFEST" >&2
+			exit 2
+		fi
+		continue
+	fi
+	if [ -z "$path" ] || [[ "$path" == \#* ]]; then
+		continue
+	fi
+	if [ -n "${extra:-}" ] || [[ "$path" = /* ]] || [[ "/$path/" == *"/../"* ]]; then
+		echo "REPROVADO: entrada inválida no inventário sensível (linha $manifest_line): $path" >&2
+		exit 2
+	fi
+	case "$path" in
+	*.partial.jsonl)
+		required_class="historical_partial_snapshot"
+		;;
+	tools/_tmp_*.py)
+		required_class="consumed_one_shot_cas_helper"
+		;;
+	*)
+		echo "REPROVADO: caminho fora das classes sensíveis no inventário (linha $manifest_line): $path" >&2
+		exit 2
+		;;
+	esac
+	if [[ ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || [ "$classification" != "$required_class" ] || [ -z "$reason" ]; then
+		echo "REPROVADO: sha256/classificação/razão inválido no inventário (linha $manifest_line): $path" >&2
+		exit 2
+	fi
+	if [ -n "${manifest_sha[$path]+present}" ]; then
+		echo "REPROVADO: caminho duplicado no inventário sensível (linha $manifest_line): $path" >&2
+		exit 2
+	fi
+	manifest_sha["$path"]="$expected_sha"
+	manifest_class["$path"]="$classification"
+	manifest_reason["$path"]="$reason"
+done <"$IGNORED_SENSITIVE_MANIFEST"
+
+if [ "${#manifest_sha[@]}" -eq 0 ]; then
+	echo "REPROVADO: inventário sensível vazio: $IGNORED_SENSITIVE_MANIFEST" >&2
+	exit 2
+fi
+
+while IFS= read -r -d '' path; do
+	if [ ! -f "$path" ]; then
+		continue
+	fi
+	class=""
+	case "$path" in
+	*.tmp | *.lock)
+		class="EFEMERO"
+		;;
+	esac
+	if [ -z "$class" ] && [ -x "$path" ]; then
+		if head -c 4 "$path" 2>/dev/null | od -An -tx1 | grep -q '7f 45 4c 46'; then
+			class="EFEMERO"
+		fi
+	fi
+	if [ -z "$class" ]; then
+		case "$path" in
+		*.go | *.py | *.js | *.mjs | *.ts | *.sh | *.sql | *.json | *.jsonl | *.md | *.txt | *.css | *.html | *.yaml | *.yml)
+			class="PRODUTO"
+			;;
+		cmd/* | internal/* | tools/* | scripts/* | content/* | docs/* | data/* | .agents/* | .githooks/*)
+			class="PRODUTO"
+			;;
+		*)
+			class="OUTRO"
+			;;
+		esac
+	fi
+	mtime="$(stat -c %Y "$path")"
+	age_s=$((now_epoch - mtime))
+	age_h=$((age_s / 3600))
+	case "$class" in
+	PRODUTO)
+		produto=$((produto + 1))
+		if [ "$age_s" -lt 0 ]; then
+			produto_stale=$((produto_stale + 1))
+			printf 'PRODUTO_MTIME_FUTURE %s mtime=%s now=%s\n' "$path" "$mtime" "$now_epoch"
+		elif [ "$age_s" -ge "$max_age_seconds" ]; then
+			produto_stale=$((produto_stale + 1))
+			if [ "$QUIET" != 1 ] || [ "$produto_stale" -le "$QUIET_STALE_SAMPLE" ]; then
+				printf 'PRODUTO_STALE %5dh age_seconds=%s %s\n' "$age_h" "$age_s" "$path"
+			fi
+		elif [ "$LIST_ALL" = 1 ]; then
+			printf 'PRODUTO_WIP   %5dh %s\n' "$age_h" "$path"
+		fi
+		;;
+	EFEMERO)
+		efemero=$((efemero + 1))
+		if [ "$LIST_ALL" = 1 ]; then
+			printf 'EFEMERO       %5dh %s\n' "$age_h" "$path"
+		fi
+		;;
+	OUTRO)
+		outro=$((outro + 1))
+		printf 'OUTRO         %5dh %s\n' "$age_h" "$path"
+		;;
+	esac
+	# `:(exclude)var/nginx` porque o nginx do wiki cria var/nginx/{body,fastcgi,
+	# proxy,scgi,uwsgi} com dono `nobody` e modo 0700, e o caminhador do git nao
+	# consegue abri-los: sao cinco `warning: could not open directory ... Permission
+	# denied` por execucao, poluindo a saida de um gate cujo valor esta justamente
+	# em ser lido. Nao ha produto ali -- sao buffers temporarios do proprio nginx.
+	#
+	# E a MESMA armadilha que ja quebrou o build hoje: `./...` aborta o padrao
+	# inteiro com `open var/nginx/body: permission denied`, e o wrapper devolvia
+	# exit 0 por cima disso. Excluir por pathspec e a correcao nos dois casos.
+done < <(git ls-files --others --exclude-standard -z -- ':(exclude)var/nginx')
+
+if [ "$QUIET" = 1 ] && [ "$produto_stale" -gt "$QUIET_STALE_SAMPLE" ]; then
+	printf 'PRODUTO_STALE_OMITIDOS %s de %s listados acima; rode sem --quiet (ou com --list-all) para a lista inteira\n' \
+		"$((produto_stale - QUIET_STALE_SAMPLE))" "$produto_stale"
+fi
+
+# O primeiro passe não enxerga arquivos cobertos pelo .gitignore. Este segundo
+# passe é intencionalmente independente e usa o inventário exato path+sha256;
+# sobreposição de intent_id ou semelhança nominal não classifica bytes novos.
+while IFS= read -r -d '' path; do
+	case "$path" in
+	*.partial.jsonl | tools/_tmp_*.py)
+		;;
+	*)
+		continue
+		;;
+	esac
+	ignored_sensitive=$((ignored_sensitive + 1))
+	ignored_sensitive_seen["$path"]=1
+	if [ -L "$path" ]; then
+		ignored_sensitive_failures=$((ignored_sensitive_failures + 1))
+		printf 'IGNORED_SENSITIVE_SYMLINK_FORBIDDEN %s\n' "$path"
+		continue
+	fi
+	if [ ! -f "$path" ]; then
+		ignored_sensitive_failures=$((ignored_sensitive_failures + 1))
+		printf 'IGNORED_SENSITIVE_NON_REGULAR %s\n' "$path"
+		continue
+	fi
+	if [ -z "${manifest_sha[$path]+present}" ]; then
+		ignored_sensitive_failures=$((ignored_sensitive_failures + 1))
+		printf 'IGNORED_SENSITIVE_UNMANIFESTED %s\n' "$path"
+		continue
+	fi
+	actual_sha="$(sha256sum -- "$path")"
+	actual_sha="${actual_sha%% *}"
+	if [ "$actual_sha" != "${manifest_sha[$path]}" ]; then
+		ignored_sensitive_failures=$((ignored_sensitive_failures + 1))
+		printf 'IGNORED_SENSITIVE_HASH_MISMATCH %s expected=%s actual=%s\n' \
+			"$path" "${manifest_sha[$path]}" "$actual_sha"
+		continue
+	fi
+	if [ "$LIST_ALL" = 1 ]; then
+		printf 'IGNORED_SENSITIVE_MANIFESTED %s sha256=%s class=%s reason=%s\n' \
+			"$path" "$actual_sha" "${manifest_class[$path]}" "${manifest_reason[$path]}"
+	fi
+	# CORRECAO PARCIAL, e fica dito: com `:(exclude)var/nginx` nas DUAS chamadas os
+	# cinco warnings PERSISTEM. Medido isolando cada uma: a primeira sai limpa, a
+	# segunda continua avisando. A hipotese e que `--ignored` combinado com globs
+	# positivos ignore o pathspec negativo, mas nao confirmei na doc do git e nao vou
+	# insistir: o gate SAI CORRETO (exit 0 quando nao ha produto esquecido, exit 1
+	# quando ha), e o que resta e ruido na saida, nao veredito errado.
+	#
+	# Parei na terceira tentativa por regra propria: gate que reprova duas vezes pela
+	# mesma causa vira investigacao do gate, e continuar aqui seria o looping que
+	# custa token sem produzir nada.
+	#
+	# `--ignored` percorre a arvore ANTES de aplicar os globs, entao ele tambem
+	# esbarra em var/nginx e precisa do mesmo exclude da varredura anterior. Foi
+	# esta chamada, e nao a outra, que continuou emitindo os cinco warnings depois
+	# da primeira correcao -- medido isolando as duas.
+done < <(git ls-files --others --ignored --exclude-standard -z -- \
+	':(glob)*.partial.jsonl' ':(glob)**/*.partial.jsonl' ':(glob)tools/_tmp_*.py' \
+	':(exclude)var/nginx')
+
+for path in "${!manifest_sha[@]}"; do
+	if [ -z "${ignored_sensitive_seen[$path]+present}" ]; then
+		ignored_sensitive_failures=$((ignored_sensitive_failures + 1))
+		if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+			printf 'IGNORED_SENSITIVE_MANIFEST_PATH_MISSING %s\n' "$path"
+		else
+			printf 'IGNORED_SENSITIVE_MANIFEST_PATH_NOT_IGNORED %s\n' "$path"
+		fi
+	fi
+done
+
+echo "untracked_produto=$produto untracked_produto_stale=$produto_stale untracked_efemero=$efemero untracked_outro=$outro ignored_sensitive=$ignored_sensitive ignored_sensitive_failures=$ignored_sensitive_failures ignored_sensitive_manifested=${#manifest_sha[@]} max_age_hours=$MAX_AGE_HOURS"
+if [ "$produto_stale" -gt 0 ] || [ "$ignored_sensitive_failures" -gt 0 ]; then
+	if [ "$produto_stale" -gt 0 ]; then
+		echo "REPROVADO: produto untracked além de ${MAX_AGE_HOURS}h — commitar por pathspec (checkpoint aditivo) ou classificar como efêmero no .gitignore; nunca deletar." >&2
+	fi
+	if [ "$ignored_sensitive_failures" -gt 0 ]; then
+		echo "REPROVADO: artefato ignorado sensível novo, divergente, ausente ou não ignorado — investigar os bytes e atualizar o inventário somente com classificação comprovada." >&2
+	fi
+	exit 1
+fi
+echo "OK: nenhum produto untracked além da janela de ${MAX_AGE_HOURS}h e inventário sensível exato íntegro."

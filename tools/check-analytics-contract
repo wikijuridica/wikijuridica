@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Prova que a medicao de audiencia servida e exatamente a que foi autorizada.
+
+O QUE ESTE GATE PROTEGE, e por que nenhum dos gates anteriores cobria: a partir
+de 2026-08-27 o portal alcanca hosts de terceiro. O contrato de HTML leve
+(internal/htmlcontract) sabe contar <script> e medir bytes, mas nao sabe NADA
+sobre hostname -- `grep googletagmanager` nao casa em nenhum .go do repositorio.
+Um host acrescentado ao script, ou uma CSP que autorize alem do declarado,
+passava por todos os gates existentes.
+
+O modo de falha aqui e SILENCIOSO nas duas direcoes. CSP estreita demais mata o
+Clarity sem erro visivel, e o painel vazio e indistinguivel de "nao ha
+visitantes". CSP larga demais nao quebra nada -- so aumenta a superficie, e
+ninguem descobre.
+
+Uso: ./tools/check-analytics-contract [--public DIR]
+"""
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+FONTE_LOADER = RAIZ / "internal" / "webanalytics" / "webanalytics.go"
+FONTE_CSP = RAIZ / "internal" / "httpserver" / "security_headers.go"
+CONF_NGINX = RAIZ / "ops" / "nginx" / "security-headers.conf"
+SITE = RAIZ / "content" / "site.json"
+FONTE_LANE = RAIZ / "internal" / "content" / "content.go"
+FONTE_WEBMCP = RAIZ / "internal" / "webmcp" / "webmcp.go"
+
+# Os hosts que o portal PODE alcancar. Lista fechada: acrescentar exige vir aqui
+# e dizer por que, que e exatamente o atrito desejado.
+HOSTS_SCRIPT = {"https://www.googletagmanager.com", "https://*.clarity.ms"}
+HOSTS_CONEXAO = HOSTS_SCRIPT | {
+    "https://*.google-analytics.com", "https://*.analytics.google.com", "https://c.bing.com",
+}
+# c.bing.com entra aqui porque o Clarity busca o pixel de sincronizacao de MUID
+# como IMAGEM; estar so em connect-src fazia o navegador recusa-lo em toda visita.
+HOSTS_IMAGEM = HOSTS_SCRIPT | {"https://*.google-analytics.com", "https://c.bing.com"}
+
+# Guardas que o carregador tem de conter. Sao as tres promessas que a pagina de
+# privacidade faz ao titular; sumir com qualquer uma e quebrar o texto publicado.
+GUARDAS = {
+    "recusa gravada pelo visitante": 'localStorage.getItem("wj-medicao")',
+    "Global Privacy Control": "globalPrivacyControl",
+    "guarda de robo": "N.webdriver===true",
+    "publicidade negada": 'ad_storage:"denied"',
+    "consentimento negado na UE": 'analytics_storage:"denied"',
+    "termo de busca redigido": "@redigido@",
+    "titulo da busca redigido": 'cfg.page_title="Busca interna"',
+    "clarity fora da busca interna": "if(!buscando)",
+    "cookies apagados no opt-out": "D.cookie=n",
+    "consentimento so apos ato afirmativo": 'W.clarity("consentv2"',
+    "evento de negocio no botao que existe": 'closest("[data-wj-cta],.wa-float-link")',
+    "dimensoes lidas do HTML": "querySelector('meta[name=",
+}
+
+# Marcadores que reprovariam as 10.331 paginas em checks.htmlPerformanceIssues,
+# que varre o texto INTEIRO sem descontar o script.
+PROIBIDOS_NO_LOADER = ['".js', "'.js", '.js"', ".js'", ".js?", ".js#", ".mjs", ".wasm",
+                       "importmap", "modulepreload", "hydration", "data-hydrate"]
+
+
+def corpo_do_loader(ler=None) -> str:
+    texto = ler(FONTE_LOADER) if ler else FONTE_LOADER.read_text(encoding="utf-8")
+    ids = dict(re.findall(r'^\t(\w+)\s*=\s*"([^"]*)"', texto, re.M))
+    bruto = re.search(r"const Loader = `(.*?)`\n", texto, re.S)
+    if not bruto:
+        raise SystemExit(f"nao achei a constante Loader em {FONTE_LOADER}")
+    return re.sub(r"`\s*\+\s*(\w+)\s*\+\s*`", lambda m: ids[m.group(1)], bruto.group(1))
+
+
+def fontes_da_csp(politica: str) -> dict:
+    saida = {}
+    for diretiva in politica.split(";"):
+        campos = diretiva.strip().split()
+        if campos:
+            saida[campos[0]] = set(campos[1:])
+    return saida
+
+
+def resolve_const_script(fonte: pathlib.Path, ler=None, listar=None) -> str:
+    """Devolve o VALOR de webmcp.Script, resolvendo concatenacao de constantes Go.
+
+    POR QUE ISTO NAO E' UMA REGEX SIMPLES.
+    Ate 2026-09-05 este gate extraia o Script com
+    `const Script = <crase>(.*?)<crase>\n`. Funcionava enquanto a constante fosse
+    um literal unico. Naquele dia webmcp.Script passou a compor o sufixo da
+    gemea a partir de agentsurface.SufixoGemeaMarkdown -- concatenacao de
+    constantes, resolvida pelo compilador, valor final identico byte a byte
+    (conferido por hash). A regex, que nao compila Go, passou a devolver 1.106
+    bytes com a EXPRESSAO CRUA `<crase> + agentsurface.SufixoGemeaMarkdown + <crase>`
+    dentro do JavaScript, em vez dos 1.074 do valor real. O gate reprovou 10.369
+    paginas por uma divergencia que ele mesmo tinha fabricado.
+
+    Gate que le o fonte com regex mede o texto, nao o programa. Enquanto a
+    verificacao viver aqui em Python -- e ela vive, porque compara com o HTML ja
+    publicado em public/ --, o parser precisa ao menos resolver as formas que o
+    Go de fato usa: literais entre crases e referencias a constantes de outros
+    pacotes.
+
+    A guarda contra este parser envelhecer de novo e' Go, nao Python:
+    internal/pageinline.TestHashDoScriptCompostoBateComACSPServida le a
+    constante COMPILADA e a confronta com a CSP servida pelo nginx, sem parsear
+    coisa alguma.
+    """
+    import re as _re
+
+    texto = ler(fonte) if ler else fonte.read_text(encoding="utf-8")
+    declaracao = _re.search(r"^const Script = (.+)$", texto, _re.M)
+    if not declaracao:
+        raise SystemExit(f"nao achei a constante Script em {fonte}")
+    expressao = declaracao.group(1)
+
+    # Os literais entre crases, na ordem, e os simbolos que os separam.
+    partes = _re.split(r"`([^`]*)`", expressao)
+    valor = []
+    for indice, pedaco in enumerate(partes):
+        if indice % 2 == 1:            # capturado: literal entre crases
+            valor.append(pedaco)
+            continue
+        # fora das crases so' pode haver `+` e referencias a constantes
+        for simbolo in _re.findall(r"([A-Za-z_][\w]*)\.([A-Z][\w]*)", pedaco):
+            valor.append(resolve_const_de_pacote(fonte, simbolo[0], simbolo[1], ler, listar))
+    return "".join(valor)
+
+
+def resolve_const_de_pacote(origem: pathlib.Path, pacote: str, nome: str, ler=None, listar=None) -> str:
+    """Le `const <nome> = "valor"` no pacote irmao indicado."""
+    import re as _re
+
+    diretorio = origem.parent.parent / pacote
+    arquivos = listar(diretorio) if listar else (
+        sorted(diretorio.glob("*.go")) if diretorio.is_dir() else [])
+    if not arquivos:
+        raise SystemExit(f"pacote {pacote} sem fontes em {diretorio} (referenciado por {origem})")
+    for arquivo in arquivos:
+        if arquivo.name.endswith("_test.go"):
+            continue
+        achado = _re.search(
+            r"^\s*(?:const\s+)?" + _re.escape(nome) + r"\s*=\s*\"([^\"]*)\"",
+            ler(arquivo) if ler else arquivo.read_text(encoding="utf-8"),
+            _re.M,
+        )
+        if achado:
+            return achado.group(1)
+    raise SystemExit(f"nao achei a constante {pacote}.{nome} em {diretorio}")
+
+
+def _leitor_de_head():
+    """Le arquivos como estavam em HEAD, para comparar VALOR e nao texto."""
+    import subprocess
+
+    def ler(caminho: pathlib.Path) -> str:
+        rel = caminho.relative_to(RAIZ).as_posix()
+        return subprocess.run(
+            ["git", "show", f"HEAD:{rel}"], cwd=str(RAIZ),
+            capture_output=True, text=True, check=True, timeout=20,
+        ).stdout
+
+    def listar(diretorio: pathlib.Path):
+        rel = diretorio.relative_to(RAIZ).as_posix()
+        saida = subprocess.run(
+            ["git", "ls-tree", "--name-only", f"HEAD:{rel}"], cwd=str(RAIZ),
+            capture_output=True, text=True, check=True, timeout=20,
+        ).stdout
+        return [diretorio / nome for nome in sorted(saida.split()) if nome.endswith(".go")]
+
+    return ler, listar
+
+
+def script_composto_inalterado_vs_head() -> bool:
+    """ESTE commit mudou o script que as paginas servem? Compara VALOR, nao arquivo.
+
+    POR QUE ISTO EXISTE. A varredura de public/ custa 5,1s dos 8,3s deste gate
+    (medido em 2026-09-05: 2,70s de glob + 2,37s de leitura, 10.370 arquivos), e
+    responde uma pergunta de DEPLOY -- "o que esta publicado bate com o codigo?"
+    --, nao de commit. Um commit que nao mexe no script nem em public/ nao pode
+    ter mudado essa resposta: ela ja valia antes dele.
+
+    POR QUE COMPARA VALOR E NAO ARQUIVOS. A primeira versao desta funcao
+    comparava os arquivos-fonte, e errou na primeira execucao: internal/agentsurface
+    ganhou 42 linhas de outra frente (uma rota de rede social) que nao tocam o
+    script, e a varredura disparou assim mesmo. Constante de que o script nao
+    depende nao pode custar 10.370 leituras. Comparar o valor RESOLVIDO responde
+    exatamente a pergunta feita.
+
+    Fail-closed: qualquer erro -- git indisponivel, arquivo novo que nao existe em
+    HEAD, parser que nao resolve -- devolve False e a varredura roda. Nao saber se
+    mudou nunca vira "nao mudou".
+    """
+    import subprocess
+
+    try:
+        publico_sujo = subprocess.run(
+            ["git", "diff", "HEAD", "--quiet", "--", "public"], cwd=str(RAIZ),
+            capture_output=True, check=False, timeout=20,
+        ).returncode
+        if publico_sujo != 0:
+            return False   # public/ mudou (ou o git falhou): varre
+        ler, listar = _leitor_de_head()
+        agora = resolve_const_script(FONTE_WEBMCP) + corpo_do_loader()
+        antes = resolve_const_script(FONTE_WEBMCP, ler, listar) + corpo_do_loader(ler)
+    except (OSError, subprocess.SubprocessError, SystemExit, KeyError, AttributeError):
+        return False
+    return agora == antes
+
+def main() -> int:
+    falhas = []
+
+    def exige(nome, condicao, detalhe=""):
+        if not condicao:
+            falhas.append(nome)
+            print(f"  FALHA {nome}: {detalhe}")
+
+    loader = corpo_do_loader()
+    print(f"loader: {len(loader.encode())} bytes")
+
+    # 1. As guardas prometidas ao titular continuam no codigo.
+    for nome, marca in GUARDAS.items():
+        exige(f"guarda/{nome}", marca in loader, f"nao achei {marca!r} no loader")
+
+    # 2. Nada que reprove o contrato de HTML leve nas 10.331 paginas.
+    for proibido in PROIBIDOS_NO_LOADER:
+        exige(f"loader-limpo/{proibido}", proibido not in loader,
+              "reprovaria em checks.htmlPerformanceIssues, que varre o texto inteiro")
+
+    # 3. Os hosts que o loader alcanca sao EXATAMENTE os declarados.
+    achados = set(re.findall(r'https://[a-zA-Z0-9.*-]+', loader))
+    for host in achados:
+        casa = host in HOSTS_SCRIPT or any(
+            h.startswith("https://*.") and host.endswith(h[len("https://*"):]) for h in HOSTS_SCRIPT)
+        exige(f"host-do-loader/{host}", casa, "host nao declarado na allowlist")
+
+    # 4. A CSP do nginx autoriza exatamente o declarado -- nem mais, nem menos.
+    conf = CONF_NGINX.read_text(encoding="utf-8")
+    politica = re.search(r'Content-Security-Policy:\s*([^"]+)"', conf)
+    exige("csp/presente no nginx", politica is not None, f"{CONF_NGINX} sem Content-Security-Policy")
+    if politica:
+        fontes = fontes_da_csp(politica.group(1))
+        for nome, esperados in (("script-src", HOSTS_SCRIPT), ("connect-src", HOSTS_CONEXAO),
+                                ("img-src", HOSTS_IMAGEM)):
+            externos = {f for f in fontes.get(nome, set()) if f.startswith("https://")}
+            exige(f"csp/{nome} sem host a mais", externos <= esperados,
+                  f"host nao declarado: {sorted(externos - esperados)}")
+            exige(f"csp/{nome} sem host a menos", esperados <= externos,
+                  f"host declarado e ausente: {sorted(esperados - externos)}")
+        for largo in ("'unsafe-inline'", "'unsafe-eval'", "'self'", "*", "https:", "data:"):
+            exige(f"csp/script-src sem {largo}", largo not in fontes.get("script-src", set()),
+                  "fonte larga em script-src anula a politica")
+        # O hash do script servido tem de constar. Sao dois durante a transicao.
+        hashes = {f for f in fontes.get("script-src", set()) if f.startswith("'sha256-")}
+        exige("csp/script-src tem hash", len(hashes) >= 1, "nenhum hash em script-src")
+        exige("csp/no maximo dois hashes", len(hashes) <= 2,
+              f"{len(hashes)} hashes — a transicao autoriza no maximo dois")
+
+    # 4b. Paridade Go <-> nginx, que o campo FONTE_CSP sempre prometeu e nunca
+    # cumpriu: ate 2026-08-28 este arquivo era declarado no topo e jamais lido.
+    # A CSP e MONTADA em Go (prefixo + hash + hosts + sufixo), entao o que se
+    # compara aqui e o conjunto de hosts declarado de cada lado — o hash em si e
+    # coberto pelo teste de drift, que roda com o pacote compilado.
+    fonte_csp = FONTE_CSP.read_text(encoding="utf-8")
+    for rotulo, hosts in (("script", HOSTS_SCRIPT), ("conexao", HOSTS_CONEXAO), ("imagem", HOSTS_IMAGEM)):
+        faltando = [h for h in hosts if h not in fonte_csp]
+        exige(f"go/hosts de {rotulo} declarados na fonte", not faltando,
+              f"ausentes em {FONTE_CSP.name}: {faltando}")
+    # A ausencia de fonte larga em script-src ja e cobrada duas vezes, e nos dois
+    # lugares onde ela e VERIFICAVEL: na CSP servida (secao 4, abaixo) e em
+    # httpserver/security_headers_test.go, que le a constante compilada. Repeti-la
+    # por substring na fonte Go so produziria falso positivo, porque os
+    # comentarios do proprio arquivo citam os tokens que a regra proibe.
+
+    # 5. As paginas servidas: um script so, e nenhum recurso externo em markup.
+    publico = RAIZ / "public"
+    if "--public" in sys.argv:
+        publico = pathlib.Path(sys.argv[sys.argv.index("--public") + 1])
+    pular_se_inalterado = "--pular-public-se-inalterado" in sys.argv
+    if not publico.is_dir():
+        print(f"  aviso: {publico} nao existe — pulando a varredura das paginas servidas")
+    elif pular_se_inalterado and script_composto_inalterado_vs_head():
+        print("  o script composto e public/ estao identicos a HEAD — a varredura das "
+              "paginas servidas responderia a mesma coisa que ja respondeu, e fica para "
+              "a passada completa do gate (5,1s poupados)")
+    else:
+        import json
+        base_url = json.loads(SITE.read_text(encoding="utf-8"))["base_url"].rstrip("/")
+        # O script servido e COMPOSTO: webmcp.Script + webanalytics.Loader. Ate
+        # 2026-08-28 este gate comparava por CONTAINMENT e chamava isso de "corpo
+        # identico a constante Go" — o rotulo prometia mais do que a verificacao
+        # entregava, e qualquer coisa acrescentada ANTES ou DEPOIS do Loader
+        # passaria. Agora e igualdade, com as duas metades lidas de suas fontes.
+        composto = resolve_const_script(FONTE_WEBMCP) + loader
+        paginas = sorted(publico.rglob("*.html"))
+        print(f"varrendo {len(paginas)} paginas servidas em {publico}")
+        sem_script, multi, externo, corpo_divergente = [], [], [], []
+        sem_meta, sem_unmask, sem_mask, referrer_indevido, lane_estranha = [], [], [], [], []
+        # Vocabulario de lane, lido do Go: digita-lo aqui criaria a divergencia
+        # que a constante existe para impedir.
+        laneperm = set(re.findall(r'CTALane\w+\s*=\s*"([^"]*)"', FONTE_LANE.read_text(encoding="utf-8")))
+        laneperm.add("nao-declarada")
+        sem_content_group = []
+        for caminho in paginas:
+            html = caminho.read_text(encoding="utf-8", errors="replace")
+            # Paginas de erro montam o proprio <head> (render/error_pages.go) e
+            # nao passam por seo.RenderHead: cobrar meta delas seria gate que
+            # reprova o portal por um comportamento que o codigo declara.
+            de_erro = caminho.name in ("50x.html", "404.html")
+            meta = re.search(r'<meta name="wj-pagina" content="([^"]*)">', html)
+            if not de_erro:
+                if not meta:
+                    sem_meta.append(caminho)
+                else:
+                    dimensoes = dict(
+                        par.split("=", 1) for par in meta.group(1).split(";") if "=" in par
+                    )
+                    lane = dimensoes.get("lane", "")
+                    if lane not in laneperm:
+                        lane_estranha.append((caminho, lane))
+                    # A CHAVE DA AREA E CONTRATO COM O GA4, nao nome interno.
+                    #
+                    # `content_group` e dimensao NATIVA do relatorio Pages and
+                    # screens: ela reporta sozinha. Qualquer outro nome — `area`,
+                    # que era o anterior — vira parametro custom, que so aparece
+                    # em relatorio DEPOIS de alguem registra-lo no Admin, e ate
+                    # la e coletado e DESCARTADO em silencio. Renomear de volta
+                    # nao quebra pagina nenhuma e nao acende luz nenhuma: some so
+                    # o relatorio por area. Por isso o gate cobra o nome.
+                    if not dimensoes.get("content_group", "").strip():
+                        sem_content_group.append(caminho)
+                if 'data-clarity-unmask="true"' not in html:
+                    sem_unmask.append(caminho)
+            # 50x.html nao recebe formulario de busca (render/error_pages.go so
+            # o emite em 404/410), entao nao ha campo para mascarar nele.
+            if caminho.name != "50x.html" and 'data-clarity-mask="true"' not in html:
+                sem_mask.append(caminho)
+            # A meta de referrer vale SO na busca: no acervo ela apagaria o
+            # referenciador interno sem necessidade nenhuma.
+            if 'name="referrer"' in html and "/buscar/" not in str(caminho):
+                referrer_indevido.append(caminho)
+            puros = re.findall(r"<script>(.*?)</script>", html, re.S)
+            if len(puros) == 0:
+                sem_script.append(caminho)
+            elif len(puros) > 1:
+                multi.append(caminho)
+            elif puros[0] != composto:
+                corpo_divergente.append(caminho)
+            # Markup que forca requisicao externa. O script nao conta: o corpo
+            # dele ja foi conferido acima, byte a byte, contra a constante Go.
+            markup = re.sub(r"<script>.*?</script>", "", html, flags=re.S)
+            # O PROPRIO DOMINIO NAO E RECURSO EXTERNO, e a distincao nao e
+            # detalhe: canonical, feed, gemea em Markdown e catalogo de API sao
+            # emitidos em URL ABSOLUTA por exigencia de SEO. Uma versao anterior
+            # deste gate acusou as 10.330 paginas por causa deles -- gate que
+            # grita em tudo nao e gate, e ruido que se aprende a ignorar.
+            for achado in re.finditer(
+                    r'<(?:img|iframe|link|source|video|audio)[^>]+(?:src|href)="(https?://[^"]*)"', markup):
+                if not achado.group(1).startswith(base_url):
+                    externo.append(caminho)
+                    break
+        # Paginas de erro nao emitem script, por contrato (render/error_pages.go).
+        sem_script = [c for c in sem_script if c.name not in ("50x.html", "404.html")]
+        exige("paginas/todas com o script", not sem_script,
+              f"{len(sem_script)} sem script, ex.: {sem_script[:3]}")
+        exige("paginas/nenhuma com dois scripts", not multi,
+              f"{len(multi)} com mais de um, ex.: {multi[:3]}")
+        exige("paginas/script servido identico ao composto Go (byte a byte)", not corpo_divergente,
+              f"{len(corpo_divergente)} divergentes, ex.: {corpo_divergente[:3]}")
+        exige("paginas/nenhum recurso externo em markup", not externo,
+              f"{len(externo)} com recurso externo, ex.: {externo[:3]}")
+        exige("paginas/todas com a meta de dimensoes", not sem_meta,
+              f"{len(sem_meta)} sem meta, ex.: {sem_meta[:3]}")
+        exige("paginas/lane sempre do vocabulario Go", not lane_estranha,
+              f"{len(lane_estranha)} fora do vocabulario, ex.: {lane_estranha[:3]}")
+        exige("paginas/area viaja como content_group (dimensao nativa do GA4)",
+              not sem_content_group,
+              f"{len(sem_content_group)} sem content_group, ex.: {sem_content_group[:3]}")
+        exige("paginas/conteudo publico legivel na gravacao", not sem_unmask,
+              f"{len(sem_unmask)} sem data-clarity-unmask, ex.: {sem_unmask[:3]}")
+        exige("paginas/campo de busca sempre mascarado", not sem_mask,
+              f"{len(sem_mask)} sem data-clarity-mask, ex.: {sem_mask[:3]}")
+        exige("paginas/politica de referrer so na busca", not referrer_indevido,
+              f"{len(referrer_indevido)} fora da busca, ex.: {referrer_indevido[:3]}")
+        busca = publico / "buscar" / "index.html"
+        if busca.is_file():
+            exige("busca/declara a politica de referrer",
+                  '<meta name="referrer" content="origin">' in busca.read_text(encoding="utf-8", errors="replace"),
+                  "sem ela o termo digitado viaja no Referer para a pagina seguinte")
+
+        # 6. A politica de privacidade descreve o que o portal realmente faz.
+        privacidade = publico / "privacidade" / "index.html"
+        if privacidade.is_file():
+            texto = privacidade.read_text(encoding="utf-8", errors="replace")
+            for termo in ("Google Analytics 4", "Microsoft Clarity", "_clck", "_ga",
+                          "Global Privacy Control"):
+                exige(f"privacidade/menciona {termo}", termo in texto,
+                      "a pagina tem de descrever a medicao que o portal faz")
+            # Cobra a PROMESSA em portugues, nao o nome ingles do cabecalho: o
+            # texto e para o titular de dados, e "Referer" nao diz nada a ele.
+            # O que precisa estar la e o compromisso verificavel.
+            for termo in ("_clsk", "MUID", "não repassar o termo",
+                          "não é carregado nas páginas de busca"):
+                exige(f"privacidade/descreve {termo!r}", termo in texto,
+                      "o texto tem de acompanhar o que a medicao passou a fazer")
+            for mentira in ("não usa cookie de rastreamento", "sem JavaScript de terceiro"):
+                exige(f"privacidade/sem a frase antiga {mentira!r}", mentira not in texto,
+                      "declaracao falsa ao titular de dados")
+            exige("privacidade/ancora do controle de recusa",
+                  'id="sec-cookies-e-medicao-de-audiencia"' in texto,
+                  "sem essa ancora o botao de recusa nao e montado")
+
+    print()
+    if falhas:
+        print(f"REPROVADO: {len(falhas)} verificacao(oes)")
+        return 1
+    print("APROVADO: a medicao servida e exatamente a autorizada")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

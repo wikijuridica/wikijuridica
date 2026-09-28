@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""generate-cache-rule-rollback — grava o rollback da Cache Rule como FOTO da
+regra viva, nunca como arquivo escrito a mao.
+
+ESCREVE ops/cloudflare/cache-rule-rollback.json. Nao toca a zona: so faz GET.
+
+POR QUE EXISTE, com a medicao. Ate 2026-08-28 o rollback era um JSON redigido a
+mao, congelado no mtime 2026-08-12T17:30, sem nenhuma data DENTRO do arquivo. A
+regra viva ja ia na version 15 (last_updated 2026-08-26T15:55:35Z) e o snapshot
+divergia em tres pontos que decidem comportamento -- medido por
+tools/check-cache-rule-rollback-frescor naquele dia:
+
+  1. `vary` ausente. O vivo normaliza o Accept com allowlist ["text/markdown"],
+     que e o que fecha a borda em DUAS variantes por URL. Restaurar o arquivo
+     devolveria o envenenamento por Vary corrigido em 2026-08-26 (be4a6cf4).
+  2. `edge_ttl override_origin 604800` contra `respect_origin` no vivo: sete dias
+     pregados por cima do que a origem declara.
+  3. Tres clausulas de exclusao a MENOS: /mcp, /a2a e /.well-known/agent-card.json
+     voltariam para dentro da regra de cache -- endpoints de RPC sob Edge TTL.
+
+Arquivo de rollback envelhece calado, porque ninguem o le entre emergencias. Foto
+tirada por ferramenta carrega a data consigo e pode ser conferida por gate.
+
+O QUE O ARQUIVO GRAVADO NAO E: um arquivo de historico. Ele e a foto do ESTADO
+BOM CORRENTE. O estado ANTERIOR a cada mudanca ja e preservado em dois lugares:
+`data/ops/edge_rule_apply.jsonl`, que tools/apply-cache-rules grava ANTES de cada
+PUT, e o proprio git (`git show HEAD:ops/cloudflare/cache-rule-rollback.json`).
+Por isso aqui nao se cria mais um deposito de copias.
+
+FORMA DO ARQUIVO, e o cuidado que ela exige. O corpo ganha um bloco `_captura`
+com a data legivel, o id, o nome e a version do ruleset. Nao foi medido se o
+endpoint de rulesets tolera campo desconhecido no corpo do PUT, e o instante do
+rollback nao e hora de descobrir: por isso o PUT leva APENAS o array `rules`, e
+esta ferramenta extrai esse corpo com `--corpo-para-put`, que le o arquivo e NAO
+depende de rede -- rollback acontece justamente quando algo esta fora do ar.
+
+Uso:
+    tools/generate-cache-rule-rollback                 # tira a foto e grava
+    tools/generate-cache-rule-rollback --dry-run       # mostra o que mudaria
+    tools/generate-cache-rule-rollback --corpo-para-put > /tmp/corpo.json
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+DESTINO = os.path.join(RAIZ, "ops/cloudflare/cache-rule-rollback.json")
+
+
+# REUSO do gate irmao: dele vem `_credenciais` (a descoberta de 2026-08-26 de que
+# CLOUDFLARE_API_TOKEN e Global API Key, nao Bearer), `normaliza` e o diff
+# conceitual. Gerador e gate compartilhando o mesmo normalizador e o que impede o
+# bug classico de gravar um corpo que o proprio gate reprova.
+def _frescor():
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "check-cache-rule-rollback-frescor")
+    loader = importlib.machinery.SourceFileLoader("check_cache_rule_rollback_frescor", caminho)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)
+    return modulo
+
+
+def corpo_para_put(caminho):
+    """Extrai do snapshot o corpo exato do PUT. Sem rede, de proposito."""
+    with open(caminho, encoding="utf-8") as f:
+        dados = json.load(f)
+    regras = dados.get("rules")
+    if not isinstance(regras, list) or not regras:
+        raise ValueError("o snapshot nao tem array 'rules' preenchido")
+    return {"rules": regras}
+
+
+def montar(vivo, zona, rotulo, mod):
+    agora = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return {
+        "_captura": {
+            "capturado_em": agora,
+            "capturado_por": "tools/generate-cache-rule-rollback",
+            "credencial": rotulo,
+            "zona": zona,
+            "ruleset_id": vivo.get("id"),
+            "ruleset_nome": vivo.get("name"),
+            "ruleset_version": str(vivo.get("version")),
+            "ruleset_last_updated": vivo.get("last_updated"),
+            "leia_isto": (
+                "Foto da Cache Rule VIVA no instante acima, tirada por GET na API. "
+                "Restaurar uma foto velha reintroduz o defeito que a versao seguinte "
+                "corrigiu -- confira com tools/check-cache-rule-rollback-frescor antes "
+                "do PUT. O PUT leva SO o array 'rules': "
+                "tools/generate-cache-rule-rollback --corpo-para-put"
+            ),
+        },
+        "rules": [mod.limpar_regra(r) for r in (vivo.get("rules") or [])],
+    }
+
+
+def escrever(caminho, dados):
+    """Escrita atomica: rollback truncado por queda no meio da gravacao seria o
+    pior arquivo possivel -- ilegivel exatamente quando alguem precisa dele."""
+    texto = json.dumps(dados, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+    # Preservar o modo do destino: os demais corpos de ops/cloudflare/ estao em
+    # 0600, e `os.replace` de um temporario novo entregaria 0644 pelo umask --
+    # afrouxamento silencioso de permissao em arquivo de configuracao de borda.
+    try:
+        modo = os.stat(caminho).st_mode & 0o777
+    except FileNotFoundError:
+        modo = 0o600
+    tmp = caminho + ".parcial"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(texto)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, modo)
+    os.replace(tmp, caminho)
+    return len(texto.encode("utf-8"))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Grava o rollback da Cache Rule a partir da regra viva.")
+    p.add_argument("--dry-run", action="store_true", help="mostra o que mudaria, nao escreve")
+    p.add_argument("--corpo-para-put", action="store_true",
+                   help="imprime em stdout o corpo do PUT extraido do snapshot (sem rede)")
+    args = p.parse_args(argv)
+
+    try:
+        mod = _frescor()
+    except Exception as e:
+        print(f"generate-cache-rule-rollback: nao consegui medir\n  - gate irmao ilegivel: {e}", file=sys.stderr)
+        return 2
+
+    if args.corpo_para_put:
+        try:
+            print(json.dumps(corpo_para_put(DESTINO), ensure_ascii=False, indent=1, sort_keys=True))
+        except (OSError, ValueError) as e:
+            print(f"generate-cache-rule-rollback: nao consegui medir\n  - {e}", file=sys.stderr)
+            return 2
+        return 0
+
+    try:
+        irmao = mod.irmao()
+    except Exception as e:
+        # exit 2, nunca 1: nao conseguir CARREGAR o leitor de credencial e falta
+        # de instrumento, e a regra da casa reserva o 1 para veredito medido.
+        print(f"generate-cache-rule-rollback: nao consegui medir\n  - tools/check-edge-rule-drift ilegivel: {e}",
+              file=sys.stderr)
+        return 2
+    env = irmao.ambiente()
+    zona = env.get("CLOUDFLARE_ZONE_ID", mod.ZONA_PADRAO)
+    _, rotulo = irmao._credenciais(env)
+    vivo, erro = mod.ler_vivo(irmao)
+    if erro:
+        print("generate-cache-rule-rollback: nao consegui tirar a foto")
+        print(f"  - {erro}")
+        print("  Nada foi escrito: sobrescrever o rollback com meia leitura e pior que nao atualizar.")
+        return 2
+    if not (vivo.get("rules") or []):
+        # Fotografar zona vazia GRAVARIA o apagao como se fosse o estado bom, e o
+        # rollback passaria a restaurar o defeito de 2026-08-22 (ruleset v14, zero
+        # regras, cobertura de cache 0,0% em 40 de 40 amostras).
+        print("generate-cache-rule-rollback: nao consegui tirar a foto")
+        print("  - a zona esta com ZERO regras de cache; fotografar isso gravaria o apagao")
+        print("    como estado bom. Reponha com tools/apply-cache-rules e fotografe depois.")
+        return 2
+
+    novo = montar(vivo, zona, rotulo, mod)
+    anterior, _ = mod.ler_snapshot(DESTINO)
+    if anterior is not None and isinstance(anterior.get("rules"), list):
+        diff = mod.diferencas(anterior["rules"], vivo["rules"], irmao.normaliza)
+        if diff:
+            print("o que a foto nova CORRIGE no arquivo anterior:")
+            for l in diff:
+                print("  " + l)
+        else:
+            cap_ant = anterior.get("_captura") or {}
+            mesma_versao = (str(cap_ant.get("ruleset_version")) == str(vivo.get("version"))
+                            and cap_ant.get("ruleset_last_updated") == vivo.get("last_updated"))
+            if mesma_versao:
+                # NAO reescrever so para mexer no `capturado_em`. Rodar isto num
+                # ciclo geraria um diff de git por execucao, e diff que nunca
+                # significa nada ensina a ignorar diff que significa.
+                print("nada a fazer: a foto ja e a regra viva "
+                      f"(version {cap_ant.get('ruleset_version')}, "
+                      f"capturada em {cap_ant.get('capturado_em')}).")
+                return 0
+            print("conteudo do snapshot anterior ja era identico ao vivo; muda so o carimbo.")
+
+    cap = novo["_captura"]
+    if args.dry_run:
+        print(f"--dry-run: NADA escrito. Gravaria {DESTINO}")
+        print(f"  ruleset {cap['ruleset_id']} version {cap['ruleset_version']} "
+              f"(last_updated {cap['ruleset_last_updated']}), {len(novo['rules'])} regra(s)")
+        return 0
+
+    bytes_escritos = escrever(DESTINO, novo)
+    print(f"gravado {os.path.relpath(DESTINO, RAIZ)} ({bytes_escritos} bytes)")
+    print(f"  capturado_em    : {cap['capturado_em']} (credencial {cap['credencial']})")
+    print(f"  ruleset         : {cap['ruleset_id']} | version {cap['ruleset_version']}")
+    print(f"  last_updated    : {cap['ruleset_last_updated']}")
+    print(f"  regras na foto  : {len(novo['rules'])}")
+    print("  Confira com: tools/check-cache-rule-rollback-frescor")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

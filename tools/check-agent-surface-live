@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""check-agent-surface-live — a superfície de agente conferida NO AR, não no teste.
+
+POR QUE EXISTE, e por que teste de unidade não substitui: entre o que o Go
+responde em `httptest` e o que um agente recebe em `https://wikijuridica.com.br`
+há três camadas que o teste não vê — o nginx (que serve 99% das URLs do disco e
+nunca chama o Go), o túnel e a borda da Cloudflare. Cada uma delas já quebrou
+alguma coisa que estava verde no repositório: o `add_header` que apaga headers do
+server, o `$uri` reescrito pelo `try_files`, a Cache Rule que ignora `Vary`.
+
+Esta ferramenta é READ-ONLY (`tools/check-*` não escreve) e responde a UMA
+pergunta por sonda, com veredito. Requisições saem com User-Agent próprio e
+`X-Warming-Request: true`, então não contam como audiência — sonda que se
+disfarça de visitante é fraude de métrica.
+
+Saída: uma linha por sonda; exit 1 se qualquer OBRIGATÓRIA falhar.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SITEMAPS = os.path.join(ROOT, "public", "sitemaps", "*.xml")
+BASE_PADRAO = "https://wikijuridica.com.br"
+
+USER_AGENT = "wikijuridica-agent-surface-probe/1.0 (+interno; sonda de contrato; nao-indexar)"
+ACCEPT_NAVEGADOR = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+
+class Resultado:
+    def __init__(self):
+        self.linhas = []
+        self.falhas = 0
+
+    def anota(self, nome, ok, detalhe, obrigatoria=True):
+        marca = "OK  " if ok else ("FALHA" if obrigatoria else "aviso")
+        if not ok and obrigatoria:
+            self.falhas += 1
+        self.linhas.append("  %-5s %-42s %s" % (marca, nome, detalhe))
+
+
+def pede(url, metodo="GET", accept=None, corpo=None, extras=None, timeout=25):
+    cabecalhos = {"User-Agent": USER_AGENT, "X-Warming-Request": "true"}
+    if accept:
+        cabecalhos["Accept"] = accept
+    if extras:
+        cabecalhos.update(extras)
+    pedido = urllib.request.Request(url, headers=cabecalhos, method=metodo, data=corpo)
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return resposta.status, resposta.headers, resposta.read(200000)
+    except urllib.error.HTTPError as erro:
+        return erro.code, (erro.headers or {}), (erro.read(20000) if erro.fp else b"")
+    except (urllib.error.URLError, OSError, TimeoutError) as erro:
+        return 0, {}, ("erro de rede: " + type(erro).__name__).encode()
+
+
+def cabecalho(headers, nome):
+    """Primeiro valor de um cabeçalho (ou "" se ausente)."""
+    for valor in todos_os_cabecalhos(headers, nome):
+        return valor
+    return ""
+
+
+def todos_os_cabecalhos(headers, nome):
+    """TODAS as ocorrências de um cabeçalho, e não a última.
+
+    O DEFEITO QUE ISTO CORRIGE, e ele cegava a sonda mais importante: a versão
+    anterior devolvia `dict(resposta.headers)`, e dict COLAPSA chaves repetidas —
+    duas linhas `Vary` viravam uma só. A asserção "declara UM único Vary" era,
+    portanto, incapaz de falhar: ela media o que o dict já tinha achatado. Foi
+    exatamente com duas linhas `Vary` na origem que a borda ficou com a primeira
+    e descartou a segunda, e a sonda aprovou.
+
+    `email.message.Message` (que é o que urllib devolve) preserva as repetições
+    em `get_all`.
+    """
+    if hasattr(headers, "get_all"):
+        return [v for v in (headers.get_all(nome) or [])]
+    return [valor for chave, valor in headers.items() if chave.lower() == nome.lower()]
+
+
+def pagina_do_acervo():
+    """Uma rota de DUAS seções — as únicas que têm gêmea em Markdown. Home e hubs
+    estão no sitemap e não negociam; sondar um deles mediria sempre 'não' e a
+    sonda aprovaria por não ter testado nada."""
+    for arquivo in sorted(glob.glob(SITEMAPS)):
+        with open(arquivo, encoding="utf-8") as manipulador:
+            achadas = re.findall(r"<loc>([^<]+)</loc>", manipulador.read())
+        do_acervo = [u for u in achadas if len(u.split("/", 3)[-1].strip("/").split("/")) == 2]
+        if do_acervo:
+            return do_acervo[min(77, len(do_acervo) - 1)]
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--base", default=BASE_PADRAO, help="origem a sondar (padrão: o domínio público)")
+    argumentos = parser.parse_args()
+    base = argumentos.base.rstrip("/")
+    r = Resultado()
+
+    pagina = pagina_do_acervo()
+    if not pagina:
+        print("nenhuma pagina de acervo em public/sitemaps/ — o site foi publicado?", file=sys.stderr)
+        return 2
+    if not pagina.startswith(base):
+        # Permite sondar a origem local (--base http://127.0.0.1:8089) com a lista
+        # de URLs do sitemap, que é absoluta e aponta para o domínio público.
+        pagina = base + "/" + pagina.split("/", 3)[-1]
+    rota = "/" + pagina.split("/", 3)[-1]
+
+    print("sondando %s (pagina de prova: %s)" % (base, rota))
+
+    # ── Descritores ─────────────────────────────────────────────────────────
+    status, headers, corpo = pede(base + "/openapi.json")
+    r.anota("openapi.json", status == 200 and cabecalho(headers, "Content-Type").startswith("application/json"),
+            "%d %s" % (status, cabecalho(headers, "Content-Type")))
+
+    status, headers, corpo = pede(base + "/.well-known/api-catalog")
+    tipo = cabecalho(headers, "Content-Type")
+    r.anota("well-known/api-catalog", status == 200 and tipo.startswith("application/linkset+json"),
+            "%d %s" % (status, tipo))
+
+    # O PREFIXO DO MEDIA TYPE NAO ENXERGA PARAMETRO, e foi por baixo desta sonda
+    # que a lacuna do §4.2 do RFC 9727 passou verde por tempo indeterminado: o
+    # portal servia `application/linkset+json` puro, sem o `profile` que a norma
+    # manda, e nem este script nem o teste do pacote reclamavam. O §7.3 registrou
+    # esse Profile URI justamente para o cliente distinguir um catalogo de APIs de
+    # qualquer outro linkset. A copia literal da norma esta em
+    # docs/rfc/rfc9727-api-catalog.txt.
+    perfil = 'profile="https://www.rfc-editor.org/info/rfc9727"'
+    r.anota("api-catalog: profile do RFC 9727 §4.2", perfil in tipo,
+            tipo or "(sem Content-Type)")
+
+    # §5.4 ("Correct metadata") pede checagem automatizada de sintaxe e linting de
+    # regra de negocio, com "removing duplicate entries" citado nominalmente; a §8
+    # manda auditar o catalogo para nao expor dominio interno nem manter "zombie
+    # API" listada. Nada disso era sondado no ar.
+    if status == 200:
+        try:
+            catalogo = json.loads(corpo.decode("utf-8"))
+        except Exception as erro:
+            r.anota("api-catalog: JSON valido", False, "ilegivel: %s" % erro)
+            catalogo = None
+        else:
+            r.anota("api-catalog: JSON valido", True, "linkset com %d contextos"
+                    % len(catalogo.get("linkset", [])))
+        if catalogo:
+            enderecos = []
+            for contexto in catalogo.get("linkset", []):
+                for relacao, alvo_rel in contexto.items():
+                    if relacao == "anchor":
+                        continue
+                    # A §5.1 do RFC mostra a forma escalar ("api-catalog": "https://...")
+                    # ao lado da forma em array, e as duas sao legitimas.
+                    if isinstance(alvo_rel, str):
+                        enderecos.append((relacao, alvo_rel))
+                        continue
+                    for item in alvo_rel or []:
+                        if isinstance(item, dict) and item.get("href"):
+                            enderecos.append((relacao, item["href"]))
+
+            r.anota("api-catalog: sem href duplicado (§5.4)",
+                    len(enderecos) == len({href for _, href in enderecos}),
+                    "%d href, %d distintos" % (len(enderecos), len({h for _, h in enderecos})))
+
+            vazando = [(rel, href) for rel, href in enderecos
+                       if any(t in href for t in ("127.0.0.1", "localhost", "0.0.0.0", ":8088", ":8089"))
+                       or not href.startswith("https://")]
+            r.anota("api-catalog: nao vaza host interno (§8)", not vazando,
+                    "; ".join("%s=%s" % (rel, href) for rel, href in vazando[:3]) or "todos HTTPS publicos")
+
+            # Promessa falsa e o defeito que mais custa: o agente tenta, leva 404 e
+            # nao volta. O criterio e "nao 404" e nao "200" de proposito — /mcp e
+            # /a2a/v1 sao JSON-RPC sobre POST e respondem 405 a GET, corretamente.
+            mortos = []
+            for rel, href in enderecos:
+                if not href.startswith(base):
+                    continue
+                alvo_status, _, _ = pede(href)
+                if alvo_status == 404:
+                    mortos.append("%s=%s" % (rel, href))
+            r.anota("api-catalog: nenhuma rota anunciada da 404 (§5.4)", not mortos,
+                    "; ".join(mortos[:4]) or "%d enderecos conferidos" % len(enderecos))
+
+    # Agent Skills: o digest declarado tem de bater com o BYTE servido. Digest que
+    # não confere é pior que digest ausente — afirma integridade falsa.
+    status, headers, corpo = pede(base + "/.well-known/agent-skills/index.json")
+    if status == 200:
+        try:
+            indice = json.loads(corpo)
+            conferidos, divergentes = 0, []
+            for habilidade in indice.get("skills", []):
+                st, _hd, doc = pede(habilidade["url"])
+                digest = "sha256:" + hashlib.sha256(doc).hexdigest()
+                if st == 200 and digest == habilidade.get("digest"):
+                    conferidos += 1
+                else:
+                    divergentes.append(habilidade.get("name"))
+            # PISO EXPLICITO: "not divergentes" sozinho aprova um indice VAZIO
+            # como "0 de 0 conferem" — falso-verde que esta sonda carregou ate
+            # 2026-08-20. Indice sem habilidade nenhuma e conforme e inutil, e a
+            # sonda existe justamente para dizer quando a superficie morreu.
+            total = len(indice.get("skills", []))
+            r.anota("agent-skills: digest confere", bool(conferidos) and not divergentes,
+                    "%d de %d conferem%s" % (conferidos, total,
+                                             "" if not divergentes else " — divergem: %s" % divergentes)
+                    + ("" if total else " — indice VAZIO, nenhuma habilidade publicada"))
+        except (ValueError, KeyError) as erro:
+            r.anota("agent-skills: digest confere", False, "indice ilegivel: %s" % erro)
+    else:
+        r.anota("agent-skills: digest confere", False, "indice respondeu %d" % status)
+
+    status, _headers, corpo = pede(base + "/.well-known/mcp-registry-auth")
+    r.anota("mcp-registry-auth", status == 200 and corpo.startswith(b"v=MCPv1;"),
+            "%d %s" % (status, corpo[:24].decode("utf-8", "replace")))
+
+    # ── MCP ─────────────────────────────────────────────────────────────────
+    # GET tem de ser 405: a spec 2026-07-28 eliminou o stream sobre GET, e
+    # responder 405 é o que ela permite (e o que tira o caso do buffering de SSE
+    # no túnel do caminho).
+    status, _headers, _corpo = pede(base + "/mcp")
+    r.anota("MCP: GET recusado", status == 405, "%d" % status)
+
+    # O HANDSHAKE DA ERA 2026-07-28 — e a primeira versão desta sonda não falava
+    # o protocolo. Ela mandava protocolVersion/capabilities/clientInfo soltos em
+    # `params` e teria continuado vermelha mesmo com o servidor perfeito. Medido
+    # contra a origem, o SDK recusou em três degraus, cada um nomeando o que
+    # faltava: `_meta` com "io.modelcontextprotocol/protocolVersion", depois o
+    # header `Mcp-Method`, depois `_meta` com
+    # "io.modelcontextprotocol/clientCapabilities". A spec moveu a negociação
+    # para `_meta` e para os cabeçalhos do transporte; quem não acompanha, não
+    # fala.
+    META_MCP = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "wikijuridica-probe", "version": "1.0"},
+    }
+
+    def chama_mcp(metodo, params=None, nome=None):
+        """Uma chamada JSON-RPC pelo transporte streamable-HTTP.
+
+        A resposta vem como `text/event-stream` mesmo em requisição única — o
+        corpo é `data: {...}`, não JSON puro. Tratar como JSON puro faz a sonda
+        acusar falha num servidor que respondeu certo, que foi o que aconteceu
+        aqui antes desta função existir.
+        """
+        corpo_pedido = dict(params or {})
+        corpo_pedido["_meta"] = META_MCP
+        cabecalhos = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": metodo,
+        }
+        if nome:
+            cabecalhos["Mcp-Name"] = nome
+        pedido = json.dumps({"jsonrpc": "2.0", "id": 1, "method": metodo, "params": corpo_pedido}).encode()
+        st, hd, corpo = pede(base + "/mcp", "POST", corpo=pedido, extras=cabecalhos)
+        for linha in corpo.decode("utf-8", "replace").splitlines():
+            if linha.startswith("data: "):
+                try:
+                    return st, json.loads(linha[6:])
+                except ValueError:
+                    return st, {}
+        try:
+            return st, json.loads(corpo or b"{}")
+        except ValueError:
+            return st, {}
+
+    status, resposta = chama_mcp("tools/list")
+    ferramentas = [t.get("name") for t in (resposta.get("result") or {}).get("tools", [])]
+    # AS DUAS DE LEITURA SEMPRE; A TERCEIRA SO QUANDO A ESCRITA ESTA ARMADA.
+    #
+    # Esta sonda fixava exatamente {buscar_paginas, ler_pagina} e por isso REPROVOU
+    # no momento em que o portal MELHOROU: em 2026-08-19 a ferramenta
+    # relatar_defeito passou a ser registrada (ela nunca era, por causa da ordem de
+    # inicializacao em New() — mcpHandler tem receptor por valor e congelava
+    # relatos == nil), e a sonda acusou falha obrigatoria com a lista correta na
+    # propria mensagem: ['buscar_paginas', 'ler_pagina', 'relatar_defeito'].
+    # Gate que fixa numero envelhece contra o proprio progresso.
+    #
+    # O criterio certo nao e contar: e amarrar cada ferramenta a CAPACIDADE que a
+    # sustenta. As duas de leitura sao incondicionais. relatar_defeito depende do
+    # servidor de autorizacao estar armado neste processo, e isso se detecta sem
+    # adivinhacao: a rota protegida devolve 401 com WWW-Authenticate quando esta
+    # armada, e 404 quando a capacidade nao existe.
+    escrita_armada = False
+    st_relatos, hd_relatos, _corpo_relatos = pede(base + "/api/v1/relatos", metodo="POST")
+    if st_relatos == 401 and "Bearer" in cabecalho(hd_relatos, "WWW-Authenticate"):
+        escrita_armada = True
+    esperadas = {"buscar_paginas", "ler_pagina"}
+    if escrita_armada:
+        esperadas.add("relatar_defeito")
+    # AS TRES DO CONECTOR SAO INCONDICIONAIS. registraFerramentasDeConector
+    # (mcp_conector.go:175) nao tem guarda: search, fetch e responder_pergunta
+    # sobem sempre. Os nomes e o formato de search/fetch vem da especificacao de
+    # outro (OpenAI), nao do nosso transporte, e por isso nao seguem o padrao dos
+    # demais.
+    esperadas |= {"search", "fetch", "responder_pergunta"}
+    # AS QUATRO DA REDE SOCIAL, PELA CAPACIDADE, COMO MANDA A DOUTRINA ACIMA.
+    #
+    # registraFerramentasDaRedeSocial (mcp_social.go:977) devolve cedo com
+    # `s.social == nil`: com o banco social ausente nenhuma delas e registrada, e
+    # `tools/list` conta a verdade sobre ESTE processo. O detector externo dessa
+    # capacidade nao e uma lista escrita aqui -- e o agent-card, que declara a
+    # skill `consultar-rede-social` cuja descricao e montada por
+    # `nomesDasFerramentasDaRedeSocial()` (agentcard.go:196), a MESMA fonte que
+    # nomeia as ferramentas. Assim o gate compara duas superficies publicas do
+    # mesmo processo em vez de guardar um numero que envelhece: se `tools/list`
+    # anunciar a rede social e o agent-card nao (ou o contrario), isso e
+    # divergencia REAL entre o que dois clientes diferentes descobrem.
+    #
+    # A CONDICAO E A MESMA DOS DOIS LADOS, verificado linha a linha em
+    # 2026-09-05: `agentcard.go:179` envolve o bloco inteiro da quarta habilidade
+    # num `if redeSocialArmada`, que e o quarto parametro de
+    # `agentCardDocument` (`:72`) e nao uma constante; os dois call sites o
+    # derivam do mesmo ponteiro que governa as ferramentas -- `httpserver.go:1106`
+    # passa `redeSocial != nil` e `:1203` passa `servidor.social != nil`. Os
+    # outros tres descritores (openAPIDocument, aiCatalogDocument,
+    # authMDDocument) compartilham o booleano, de proposito: um agente nunca le
+    # num descritor uma capacidade que outro nega.
+    #
+    # Logo o gate compara duas superficies que SOBEM E DESCEM JUNTAS, e
+    # divergencia entre elas nao e envelhecimento de baseline: e defeito.
+    #
+    # Foi exatamente por fixar a lista que esta sonda reprovou quando o portal
+    # MELHOROU, duas vezes: em 2026-08-19 com relatar_defeito e em 2026-09-05
+    # com as sete novas.
+    # AS DUAS DE CONTEXTO SAO INCONDICIONAIS, pelo mesmo criterio das tres do
+    # conector: registraFerramentasDeContexto (mcp_contexto.go:406) registra
+    # mudancas_desde e contexto_juridico sem nenhuma guarda; so grafo e impacto
+    # dependem do artefato. Elas subiram em 2026-09-08 (mcpservercard.go:113,
+    # versao 1.2.0 do card) e esta sonda nao as conhecia — foi a TERCEIRA vez
+    # que a lista envelheceu contra o proprio progresso do portal, depois de
+    # relatar_defeito (2026-08-19) e das sete de 2026-09-05. Por isso elas
+    # entram amarradas a condicao ("nenhuma"), e nao como nome solto.
+    esperadas |= {"mudancas_desde", "contexto_juridico"}
+    # AS TRES ARMADAS POR ARTEFATO, pela superficie publica que declara o
+    # armamento — nunca por lista escrita aqui.
+    #
+    # buscar_semantico so e registrada com data/ai/embeddings/ativo.json E o
+    # Ollama respondendo (mcp_semantico.go:84); grafo e impacto so com o
+    # artefato do grafo. Quem publica exatamente essa condicao para fora e o
+    # /auth.md: authmd.go:441 monta o documento com
+    # `s.ferramentasArmadasPorArtefato()`, que devolve
+    # [buscar_semantico?, grafo?, impacto?] lendo os MESMOS ponteiros que as
+    # registram (authmd.go:473). Ler dali e comparar duas superficies publicas
+    # do mesmo processo, que e a doutrina desta sonda; escrever os tres nomes
+    # aqui seria o baseline que ela existe para nao ter.
+    #
+    # O conjunto de CANDIDATOS e fechado de proposito: um nome novo em
+    # /auth.md que nao esteja aqui nao vira expectativa silenciosa — ele
+    # aparece como divergencia e alguem decide.
+    ARMADAS_POR_ARTEFATO = {"buscar_semantico", "grafo", "impacto"}
+    authMDPath = "/auth.md"  # authmd.go:30
+    _st_auth, _hd_auth, corpo_auth = pede(base + authMDPath)
+    texto_auth = (corpo_auth or b"").decode("utf-8", "replace")
+    citadas_no_authmd = {nome for nome in ARMADAS_POR_ARTEFATO
+                         if ("`%s`" % nome) in texto_auth}
+    esperadas |= citadas_no_authmd
+    _st_card, _hd_card, corpo_card = pede(base + "/.well-known/agent-card.json")
+    try:
+        card = json.loads(corpo_card)
+    except (ValueError, TypeError):
+        card = {}
+    skills_do_card = {str(s.get("id")) for s in (card.get("skills") or [])
+                      if isinstance(s, dict)}
+    rede_social_armada = "consultar-rede-social" in skills_do_card
+    if rede_social_armada:
+        esperadas |= {"buscar_duvidas", "ler_duvida", "perfil_de_jurista",
+                      "duvidas_do_tema"}
+    servidas = set(ferramentas)
+    sobrando = sorted(servidas - esperadas)
+    faltando = sorted(esperadas - servidas)
+    r.anota("MCP: tools/list traz as ferramentas das capacidades armadas",
+            status == 200 and servidas == esperadas,
+            "%d | escrita_armada=%s rede_social_armada=%s armadas_por_artefato=%s | "
+            "servidas=%d esperadas=%d | servidas sem capacidade que as sustente=%s | "
+            "capacidade armada sem ferramenta=%s" % (
+                status, escrita_armada, rede_social_armada,
+                sorted(citadas_no_authmd), len(servidas), len(esperadas),
+                sobrando or "nenhuma", faltando or "nenhuma"))
+
+    # A chamada REAL, e não só a listagem: é a diferença entre "o endpoint existe"
+    # e "o acervo responde".
+    status, resposta = chama_mcp(
+        "tools/call",
+        {"name": "buscar_paginas", "arguments": {"consulta": "produto com defeito troca", "limite": 3}},
+        nome="buscar_paginas",
+    )
+    encontradas = ((resposta.get("result") or {}).get("structuredContent") or {}).get("paginas", [])
+    r.anota("MCP: buscar_paginas devolve pagina real",
+            status == 200 and len(encontradas) > 0 and encontradas[0].get("caminho", "").startswith("/"),
+            "%d %d resultado(s)%s" % (status, len(encontradas),
+                                      "" if encontradas else " — %s" % resposta.get("error")))
+
+    # Origin inválido → 403 é MUST da spec, mesmo sem autenticação.
+    status, _headers, _corpo = pede(
+        base + "/mcp", "POST",
+        corpo=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                          "params": {"_meta": META_MCP}}).encode(),
+        extras={
+            "Content-Type": "application/json",
+            "Origin": "https://exemplo-invasor.invalido",
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": "tools/list",
+        })
+    r.anota("MCP: Origin invalido recusado", status == 403, "%d" % status)
+
+    # ── A2A (Agent2Agent) ──────────────────────────────────────────────────
+    # GET tem de ser 405: o binding aqui é POST-only (a2a.go), sem o caminho
+    # de stream sobre GET que a spec 2026-07-28 do MCP eliminou — este
+    # protocolo é outro, e nunca teve GET para começo de conversa.
+    status, _headers, _corpo = pede(base + "/a2a/v1")
+    r.anota("A2A: GET recusado", status == 405, "%d" % status)
+
+    def chama_a2a(metodo, params=None, versao="1.0", com_id=True):
+        """Uma chamada JSON-RPC 2.0 crua — o binding A2A não usa SSE nem
+        `_meta`, ao contrário do MCP: o corpo é JSON puro, e a versão do
+        protocolo viaja no cabeçalho A2A-Version (a2a.go)."""
+        corpo_pedido = {"jsonrpc": "2.0", "method": metodo, "params": params or {}}
+        if com_id:
+            corpo_pedido["id"] = 1
+        cabecalhos = {"Content-Type": "application/json"}
+        if versao is not None:
+            cabecalhos["A2A-Version"] = versao
+        st, hd, corpo = pede(base + "/a2a/v1", "POST", corpo=json.dumps(corpo_pedido).encode(), extras=cabecalhos)
+        try:
+            return st, json.loads(corpo or b"{}")
+        except ValueError:
+            return st, {}
+
+    # A CHAMADA REAL: SendMessage com uma pergunta em português tem de achar
+    # o acervo de verdade — não só responder 200 vazio.
+    status, resposta = chama_a2a("SendMessage", {"message": {
+        "messageId": "sonda-1", "role": "ROLE_USER",
+        "parts": [{"text": "produto com defeito troca"}],
+    }})
+    mensagem = (resposta.get("result") or {}).get("message") or {}
+    partes = mensagem.get("parts") or []
+    r.anota("A2A: SendMessage acha o acervo",
+            status == 200 and mensagem.get("role") == "ROLE_AGENT" and bool(mensagem.get("messageId"))
+            and bool(mensagem.get("contextId")) and len(partes) > 0,
+            "%d role=%s parts=%d%s" % (status, mensagem.get("role"), len(partes),
+                                        "" if partes else " — %s" % resposta.get("error")))
+
+    # OS SETE MÉTODOS QUE A §3.3.4 MANDA RECUSAR COM ERRO NOMEADO, nunca
+    # -32601 (MethodNotFoundError) — é a distinção que separa "não existe" de
+    # "existe e está desligado por desenho", e é o que a crítica adversarial
+    # deste desenho apontou como o defeito mais caro de confundir.
+    for metodo, codigo_esperado in (
+        ("SendStreamingMessage", -32004), ("SubscribeToTask", -32004),
+        ("GetExtendedAgentCard", -32004),
+        ("CreateTaskPushNotificationConfig", -32003), ("GetTaskPushNotificationConfig", -32003),
+        ("ListTaskPushNotificationConfigs", -32003), ("DeleteTaskPushNotificationConfig", -32003),
+    ):
+        status, resposta = chama_a2a(metodo)
+        codigo = (resposta.get("error") or {}).get("code")
+        r.anota("A2A: %s recusado com %d" % (metodo, codigo_esperado),
+                status == 200 and codigo == codigo_esperado,
+                "%d error.code=%s" % (status, codigo))
+
+    # Método fora dos onze nomes → -32601, e SÓ ele.
+    status, resposta = chama_a2a("MetodoInexistente")
+    codigo = (resposta.get("error") or {}).get("code")
+    r.anota("A2A: metodo desconhecido -32601", status == 200 and codigo == -32601, "%d error.code=%s" % (status, codigo))
+
+    # GetTask/CancelTask sobre uma task que nunca existiu → -32001, verdade
+    # medida (este servidor nunca cria Task, ver o comentário de a2a.go).
+    for metodo in ("GetTask", "CancelTask"):
+        status, resposta = chama_a2a(metodo, {"id": "tarefa-que-nao-existe"})
+        codigo = (resposta.get("error") or {}).get("code")
+        r.anota("A2A: %s -32001" % metodo, status == 200 and codigo == -32001, "%d error.code=%s" % (status, codigo))
+
+    # ListTasks: coleção vazia com os QUATRO campos REQUIRED, sem omitempty.
+    status, resposta = chama_a2a("ListTasks", {"pageSize": 10})
+    resultado_lt = resposta.get("result") or {}
+    r.anota("A2A: ListTasks com os 4 campos", status == 200 and
+            "tasks" in resultado_lt and "nextPageToken" in resultado_lt and
+            "pageSize" in resultado_lt and "totalSize" in resultado_lt,
+            "%d %s" % (status, sorted(resultado_lt.keys())))
+
+    # Versão ausente/errada → -32009 (VersionNotSupportedError), nunca 200 OK
+    # silencioso nem -32601.
+    status, resposta = chama_a2a("SendMessage", {"message": {"parts": [{"text": "x"}]}}, versao=None)
+    codigo = (resposta.get("error") or {}).get("code")
+    r.anota("A2A: sem A2A-Version -32009", status == 200 and codigo == -32009, "%d error.code=%s" % (status, codigo))
+
+    # Origin inválido → 403, MESMA proteção do /mcp (hostPermitidoEmRPC /
+    # origemPermitidaEmRPC, reusados — não reimplementados — em a2a.go).
+    _st, hd, _c = pede(base + "/a2a/v1", "POST",
+                        corpo=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "GetTask", "params": {}}).encode(),
+                        extras={"Content-Type": "application/json", "A2A-Version": "1.0",
+                                "Origin": "https://exemplo-invasor.invalido"})
+    r.anota("A2A: Origin invalido recusado", _st == 403, "%d" % _st)
+
+    # O CARD DE DESCOBERTA: campos REQUIRED presentes e arrays não vazios
+    # (§5.7), e a URL que ele anuncia é a MESMA rota sondada acima.
+    status, headers, corpo = pede(base + "/.well-known/agent-card.json")
+    try:
+        card = json.loads(corpo)
+    except ValueError:
+        card = {}
+    interfaces = card.get("supportedInterfaces") or []
+    skills = card.get("skills") or []
+    url_anunciada = (interfaces[0].get("url") if interfaces else "") or ""
+    r.anota("A2A: agent-card.json completo",
+            status == 200 and card.get("name") and card.get("description") and card.get("version")
+            and len(interfaces) > 0 and len(skills) > 0
+            and len(card.get("defaultInputModes") or []) > 0 and len(card.get("defaultOutputModes") or []) > 0
+            and url_anunciada.endswith("/a2a/v1"),
+            "%d name=%r skills=%d interfaces=%d url=%s" % (status, card.get("name"), len(skills), len(interfaces), url_anunciada))
+
+    # ── Negociação de conteúdo ──────────────────────────────────────────────
+    status, headers, corpo = pede(base + rota + "index.md")
+    r.anota("gemea /index.md", status == 200 and cabecalho(headers, "Content-Type").startswith("text/markdown"),
+            "%d %s" % (status, cabecalho(headers, "Content-Type")))
+    # A gêmea NÃO declara Vary: o corpo dela não depende do Accept, e declarar
+    # variação ali criaria duas entradas idênticas por URL na borda.
+    #
+    # A comparação remove `accept-encoding` ANTES de procurar `accept`: a
+    # primeira versão fazia `"accept" not in vary.lower()` e acusava falha em
+    # `Vary: Accept-Encoding`, que é justamente o valor CORRETO — a substring
+    # engana. Sonda que reprova o comportamento certo é pior que sonda ausente.
+    vary_gemea = cabecalho(headers, "Vary").lower().replace("accept-encoding", "")
+    r.anota("gemea sem Vary: Accept", "accept" not in vary_gemea,
+            "Vary=%r" % cabecalho(headers, "Vary"))
+
+    status, headers, corpo = pede(base + rota, accept="text/markdown")
+    r.anota("negociacao por Accept", status == 200 and cabecalho(headers, "Content-Type").startswith("text/markdown"),
+            "%d %s" % (status, cabecalho(headers, "Content-Type")))
+    # UM cabeçalho Vary, e ele tem de conter Accept. As duas metades importam:
+    # duas linhas fazem a borda ficar com a primeira e descartar a segunda
+    # (medido em produção), e sem `Accept` a borda não sabe que a URL negocia.
+    varys = todos_os_cabecalhos(headers, "Vary")
+    tem_accept = bool(varys) and "accept" in varys[0].lower().replace("accept-encoding", "")
+    r.anota("negociada declara UM Vary com Accept", len(varys) == 1 and tem_accept,
+            "%d cabecalho(s): %r" % (len(varys), varys))
+
+    status, headers, corpo = pede(base + rota, accept=ACCEPT_NAVEGADOR)
+    html = corpo.lstrip()[:20].lower().startswith(b"<!doctype html")
+    r.anota("navegador continua no HTML", status == 200 and html,
+            "%d %s" % (status, cabecalho(headers, "Content-Type")))
+    link = cabecalho(headers, "Link")
+    r.anota("Link anuncia catalogo e gemea",
+            'rel="api-catalog"' in link and "index.md" in link and 'type="text/markdown"' in link,
+            link[:90] or "(ausente)")
+
+    # O gate por FORMA de rota: um arquivo que só existe no disco não pode ser
+    # sequestrado para o Go por causa do Accept. `/llms.txt` É markdown e é
+    # exatamente o que um agente pede com esse cabeçalho.
+    #
+    # Só faz sentido ATRAVÉS DO NGINX: estes dois arquivos existem apenas em
+    # public/ e o Go não tem rota para eles, então sondar a origem direta
+    # devolveria 404 legitimamente — e a sonda acusaria defeito onde não há.
+    # Quando o alvo é o binário, o resultado entra como aviso, não como veredito.
+    pelo_nginx = "127.0.0.1:8089" not in base
+    for arquivo in ("/llms.txt", "/feed.xml"):
+        status, headers, _corpo = pede(base + arquivo, accept="text/markdown")
+        r.anota("%s nao e sequestrado" % arquivo.lstrip("/"), status == 200,
+                "%d %s%s" % (status, cabecalho(headers, "Content-Type"),
+                             "" if pelo_nginx else "  (so vale atraves do nginx)"),
+                obrigatoria=pelo_nginx)
+
+    # AS ROTAS QUE A REGRA DE REDIRECT DA BORDA TEM DE DEIXAR EM PAZ.
+    #
+    # Existe uma Single Redirect terminando o 301 de barra final na borda. Escrita
+    # ingenuamente, ela transforma /api, /mcp e /.well-known/api-catalog em
+    # `301 → 404` — os três endpoints que esta superfície inteira existe para
+    # servir —, e faz o mesmo com as rotas de saúde, que respondem 200 SEM barra e
+    # 404 com. A expressão exclui todas; esta sonda prova que continua excluindo,
+    # porque uma edição futura na regra não avisa ninguém.
+    # `caminho_protegido`, e NÃO `rota`: reusar o nome da rota de prova rebindava
+    # a variável que o teste do hub usa logo abaixo — ela terminava valendo
+    # "/openapi.json", o hub virava "/openapi.json/" e a sonda acusava 404 num
+    # hub que responde 200 nas três camadas. Levei três medições para achar que o
+    # defeito era meu, e não do servidor.
+    for caminho_protegido, esperado in (("/api/v1/health", 200), ("/api/v1/pages", 200),
+                                        ("/healthz", 200), ("/livez", 200), ("/readyz", 200),
+                                        ("/.well-known/api-catalog", 200), ("/openapi.json", 200)):
+        status, headers, _corpo = pede(base + caminho_protegido)
+        r.anota("borda nao redireciona %s" % caminho_protegido,
+                status == esperado and not (300 <= status < 400),
+                "%d%s" % (status, "" if status == esperado else " (esperado %d)" % esperado))
+
+    # Hub de área: se anuncia gêmea markdown, ela tem que existir.
+    #
+    # Esta sonda já afirmou o contrário — "hub nao tem gemea, entao nao pode
+    # anunciar alternate" — e virou falso positivo em 2026-08-19, quando o
+    # commit 70bb2ef1 passou a gerar de fato o index.md dos hubs. Premissa
+    # congelada é a mesma doença do comentário que mente: o detector continuava
+    # confiante e o mundo tinha mudado embaixo dele. A pergunta correta não é
+    # se o anúncio existe, é se ele é HONESTO — anunciar alternate que responde
+    # 404 manda o agente para o vazio, e é isso que precisa reprovar.
+    hub = "/" + rota.strip("/").split("/")[0] + "/"
+    status, headers, _corpo = pede(base + hub, accept=ACCEPT_NAVEGADOR)
+    anuncio = cabecalho(headers, "Link") or ""
+    gemea = re.search(r'<([^>]+)>;\s*rel="alternate";\s*type="text/markdown"', anuncio)
+    if not gemea:
+        r.anota("hub e sua gemea markdown", status == 200,
+                "%d, sem anuncio de alternate markdown" % status)
+    else:
+        alvo = gemea.group(1)
+        st_md, hd_md, _c = pede(alvo)
+        tipo = cabecalho(hd_md, "Content-Type")
+        r.anota("hub e sua gemea markdown",
+                status == 200 and st_md == 200 and tipo.startswith("text/markdown"),
+                "hub %d anuncia %s -> %d %s" % (status, alvo.rsplit("/", 2)[-2] + "/" +
+                                                alvo.rsplit("/", 1)[-1], st_md, tipo or "(sem tipo)"))
+
+
+    # ── Descoberta por DNS (DNS-AID + cadeia DNSSEC) ────────────────────────
+    # Fica aqui, e nao num teste de unidade, porque nada disso mora no
+    # repositorio: o SVCB vive na zona da Cloudflare e o DS vive na zona pai
+    # com.br, no Registro.br. So a sonda ao vivo enxerga os dois. Delegada ao
+    # check dedicado, que prova o vinculo DS<->DNSKEY recalculando keytag e
+    # digest -- o defeito que ela existe para pegar (DS orfao apos rotacao de
+    # KSK) derruba o dominio para todo resolvedor validante.
+    if base == BASE_PADRAO:
+        prova = subprocess.run([os.path.join(ROOT, "tools", "check-dns-aid"), "--json"],
+                               capture_output=True, text=True, timeout=120)
+        try:
+            veredito = json.loads(prova.stdout)
+            detalhe = "; ".join(veredito["falhas"])[:140] or "DS confere com a DNSKEY, AD=true"
+        except json.JSONDecodeError:
+            veredito, detalhe = {"ok": False}, (prova.stderr or prova.stdout)[:140]
+        r.anota("dns-aid + cadeia dnssec", bool(veredito.get("ok")), detalhe)
+    else:
+        r.anota("dns-aid + cadeia dnssec", True,
+                "pulada: a descoberta por DNS e do dominio publico, nao da origem %s" % base,
+                obrigatoria=False)
+
+    print("\n".join(r.linhas))
+    if r.falhas:
+        print("\n%d sonda(s) obrigatoria(s) falharam" % r.falhas, file=sys.stderr)
+        return 1
+    print("\ntodas as sondas obrigatorias passaram")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

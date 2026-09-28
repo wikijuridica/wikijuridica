@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""generate-v2-workdir-rescue — varre workspaces de redatores e salva página no cofre.
+
+POR QUE EXISTE (regra do dono 2026-07-29: produto NUNCA mora em /tmp): quando a
+promoção CAS de um lote falha (ex.: intent forçado a strict por hint fora do
+catálogo), o redator preserva o workspace privado wiki-v2-<slug>-<12hex>-* com
+as páginas COMPLETAS (p*.json validados + final.jsonl) — e /tmp morre no
+reboot/GC. Já perdemos 115+147 páginas assim (resgates 63f0b56b e 4f3a7f08).
+
+ONDE VARRE (2026-07-31): os dois lugares onde o workspace privado nasce —
+  1. /tmp/wiki-v2-*                                  (volátil, morre no GC)
+  2. .agents/runtime/wworkspaces/wiki-v2-*           (create_workflow_workspace)
+O nº 2 mora DENTRO do repo mas é workspace, não estoque: o resultado tem que ser
+copiado para o cofre antes do fim do lote, senão a página fica órfã do release.
+
+O QUE FAZ: extrai cada página (final.jsonl linha a linha; fallback p*.json),
+deduplica por sha256 do registro contra (a) o cofre inteiro (todos
+data/editorial/v2_recovered_drafts_*/recovered_pages.jsonl), (b) o estoque ativo
+data/editorial/v2_pages/ (página já promovida não precisa de resgate) e (c) os
+rascunhos barrados pelo CAS em data/editorial/v2_blocked_drafts/*.jsonl — cujo
+registro é o ENVELOPE {blocked_reason, intent_id, missing_hints, page}, então a
+identidade de conteúdo comparada é a de rec["page"], nunca a do envelope. Depois
+APENDE as inéditas ao cofre do dia com proveniência {_rescue: {workdir, slug,
+workdir_mtime}}. Append-only: nunca reescreve nem apaga.
+
+VARIANTE DE INTENT JÁ PROMOVIDO: página cujo intent_id existe no estoque mas
+cujo corpo difere (o sha256 não colide) NÃO é duplicata — é uma segunda redação
+do mesmo intent, trabalho pago que não se descarta. Ela entra no cofre marcada
+com _rescue.same_intent_in_stock=true, para a fila de escrita sancionada decidir
+(reentrada como variante, fusão ou descarte consciente) com o dado na mão.
+
+O cofre é camada de RESGATE bloqueada (nunca é lido pelo release); a reentrada
+no estoque é sempre pela fila de escrita sancionada.
+
+Uso:
+  tools/generate-v2-workdir-rescue --dry-run
+  tools/generate-v2-workdir-rescue --apply
+"""
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Duas origens de workspace privado; o glob do runtime é ancorado no ROOT do
+# repo (não em cwd), então funciona de qualquer diretório e em qualquer mount.
+WORKDIR_GLOBS = (
+    "/tmp/wiki-v2-*",
+    os.path.join(ROOT, ".agents/runtime/wworkspaces/wiki-v2-*"),
+)
+# Casa o NOME-BASE, não o caminho: o mesmo padrão vale em /tmp e no runtime.
+# O '_' no slug é obrigatório: shards como telecom_energia-16 existem e a
+# versão anterior do padrão ([a-z0-9-]) os rejeitava em silêncio, jogando fora
+# 11 páginas redigidas em 6 workspaces (achado da varredura de 2026-07-31).
+# O que desambigua é a âncora -<12hex>-, não o alfabeto do slug.
+WORKDIR_RE = re.compile(r"^wiki-v2-(?P<slug>[a-z0-9_-]+?)-[0-9a-f]{12}-")
+VAULT_GLOB = os.path.join(
+    ROOT, "data/editorial/v2_recovered_drafts_*/recovered_pages.jsonl")
+STOCK_GLOB = os.path.join(ROOT, "data/editorial/v2_pages/*.jsonl")
+BLOCKED_GLOB = os.path.join(ROOT, "data/editorial/v2_blocked_drafts/*.jsonl")
+
+
+def record_key(record: dict) -> str:
+    """Identidade de conteúdo: sha256 do JSON canônico SEM o envelope _rescue."""
+    body = {k: v for k, v in record.items() if k != "_rescue"}
+    return hashlib.sha256(json.dumps(
+        body, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def iter_jsonl_records(pattern: str):
+    """Percorre os registros dict válidos de todo JSONL que casa o glob.
+
+    Linha vazia, JSON inválido ou arquivo ilegível são ignorados: o objetivo é
+    montar o set de dedup mais COMPLETO possível — uma linha corrompida não pode
+    derrubar a varredura nem, pior, fazer o resgate reescrever página já viva.
+    """
+    for path in sorted(glob.glob(pattern)):
+        try:
+            handle = open(path, encoding="utf-8")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+
+
+def workdir_label(workdir: str) -> str:
+    """Proveniência estável: relativa ao repo quando o workspace mora dentro
+    dele, absoluta quando é /tmp. Evita gravar no cofre um caminho de sandbox
+    (/sessions/<...>/mnt/wiki) que não existe no host."""
+    try:
+        relative = os.path.relpath(workdir, ROOT)
+    except ValueError:
+        return workdir
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return workdir
+    return relative
+
+
+def iter_workdir_pages(workdir: str):
+    final = os.path.join(workdir, "final.jsonl")
+    rows = []
+    if os.path.isfile(final):
+        try:
+            with open(final, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        rows.append(json.loads(line))
+            return rows
+        except (OSError, ValueError):
+            rows = []
+    for path in sorted(glob.glob(os.path.join(workdir, "p*.json"))):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                row = json.load(handle)
+            if isinstance(row, dict):
+                rows.append(row)
+        except (OSError, ValueError):
+            continue
+    return rows
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.apply == bool(args.dry_run):
+        parser.error("use exatamente um de --apply / --dry-run")
+
+    known = set()
+    cofre = 0
+    for record in iter_jsonl_records(VAULT_GLOB):
+        known.add(record_key(record))
+        cofre += 1
+    # O estoque também alimenta o índice de intents: intent já promovido com
+    # corpo diferente é VARIANTE, não duplicata (marcada, nunca descartada).
+    stock_intents = set()
+    estoque = 0
+    for record in iter_jsonl_records(STOCK_GLOB):
+        known.add(record_key(record))
+        estoque += 1
+        intent = record.get("intent_id")
+        if isinstance(intent, str) and intent:
+            stock_intents.add(intent)
+    # Rascunho barrado pelo CAS já está salvo no repo: o envelope é
+    # {blocked_reason, intent_id, missing_hints, page} e só a PÁGINA tem a
+    # mesma forma dos registros de workspace, então a chave sai de rec["page"].
+    barrados = 0
+    for record in iter_jsonl_records(BLOCKED_GLOB):
+        page = record.get("page")
+        if not isinstance(page, dict):
+            continue
+        known.add(record_key(page))
+        barrados += 1
+
+    novas = []
+    dirs = varridos = variantes = 0
+    vistos = set()
+    origens = []
+    for pattern in WORKDIR_GLOBS:
+        da_origem = 0
+        for workdir in sorted(glob.glob(pattern)):
+            if workdir in vistos or not os.path.isdir(workdir):
+                continue
+            match = WORKDIR_RE.match(os.path.basename(workdir))
+            if match is None:
+                continue
+            vistos.add(workdir)
+            dirs += 1
+            da_origem += 1
+            slug = match.group("slug")
+            label = workdir_label(workdir)
+            mtime = datetime.datetime.fromtimestamp(
+                os.stat(workdir).st_mtime).isoformat(timespec="seconds")
+            for record in iter_workdir_pages(workdir):
+                if not isinstance(record, dict) or not record.get("intent_id"):
+                    continue
+                varridos += 1
+                key = record_key(record)
+                if key in known:
+                    continue
+                known.add(key)
+                rescued = dict(record)
+                proveniencia = {
+                    "workdir": label, "slug": slug, "workdir_mtime": mtime}
+                if record.get("intent_id") in stock_intents:
+                    proveniencia["same_intent_in_stock"] = True
+                    variantes += 1
+                rescued["_rescue"] = proveniencia
+                novas.append(rescued)
+        origens.append(f"{pattern}={da_origem}")
+
+    print(f"workdirs={dirs} paginas_varridas={varridos} ineditas={len(novas)}")
+    print(f"  origens: {' '.join(origens)}")
+    print(f"  dedup: cofre={cofre} estoque={estoque} barrados={barrados} "
+          f"chaves={len(known) - len(novas)}")
+    print(f"  variantes_mesmo_intent_no_estoque={variantes} "
+          f"(entram no cofre marcadas, nunca descartadas)")
+    if not args.apply or not novas:
+        if not args.apply:
+            print("dry-run: nada gravado")
+        return 0
+    hoje = datetime.date.today().strftime("%Y%m%d")
+    out_dir = os.path.join(ROOT, f"data/editorial/v2_recovered_drafts_{hoje}")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "recovered_pages.jsonl")
+    with open(out, "a", encoding="utf-8") as handle:
+        for record in novas:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+    print(f"cofre: +{len(novas)} paginas em {os.path.relpath(out, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

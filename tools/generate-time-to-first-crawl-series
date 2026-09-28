@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""generate-time-to-first-crawl-series — persiste, dia a dia, o tempo entre
+publicar uma URL e o crawler pedi-la pela PRIMEIRA vez.
+
+POR QUE ELE EXISTE
+
+`tools/measure-time-to-first-crawl` já calculava a métrica em 2026-08-20 e
+imprimia uma tabela bonita que ninguém guardava: `data/ops/` não tinha nenhuma
+série dele. Métrica que só existe no terminal não responde "melhorou?", que é a
+única pergunta que importa depois de uma correção — e esta é a métrica que mede
+diretamente o objetivo do trabalho de rastreio: o intervalo entre publicar e o
+bot aparecer.
+
+O medidor continua sendo a fonte do número; este script não recalcula nada. Ele
+roda o medidor com `--json`, carimba a data e o commit, e acrescenta UMA linha
+por bot ao ledger. Separar quem MEDE de quem ESCREVE é o contrato da casa:
+`tools/check-*` e `tools/measure-*` são read-only, `tools/generate-*` escrevem.
+
+AS DUAS RESSALVAS DO MEDIDOR VIAJAM JUNTO, no próprio registro:
+
+  1. `paths_first_seen` é medido na BORDA — a data é de quando o crawler pediu a
+     rota, não de quando a indexou. Rastreado não é indexado.
+  2. O registro de cobertura começa em 2026-08-05; página publicada antes disso
+     pode ter sido pedida antes da primeira medição, e o intervalo dela é PISO.
+     O campo `anterior_ao_registro` carrega quantas são.
+
+Idempotente por (data, bot): rodar duas vezes no mesmo dia SUBSTITUI a linha do
+dia em vez de duplicar. O ledger de cobertura deste repositório já acumulou 21
+linhas para uma única chave `(data, crawler)` por não ter essa disciplina, e o
+detector de estagnação que lia "as últimas N linhas" passou a ler o replay de um
+run só. Não se repete o defeito num ledger novo.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+RAIZ = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+LEDGER = os.path.join(RAIZ, "data", "ops", "time_to_first_crawl_daily.jsonl")
+MEDIDOR = os.path.join(RAIZ, "tools", "measure-time-to-first-crawl")
+SCHEMA = "time_to_first_crawl_daily_v1"
+
+
+def commit_atual() -> str:
+    try:
+        saida = subprocess.run(
+            ["git", "-C", RAIZ, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        return saida.stdout.strip() if saida.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def mede() -> dict:
+    saida = subprocess.run(
+        [sys.executable, MEDIDOR, "--raiz", RAIZ, "--json"],
+        capture_output=True, text=True, timeout=600, check=False,
+    )
+    if saida.returncode != 0:
+        raise RuntimeError(
+            "o medidor saiu com %d; nao gravo linha derivada de medicao que falhou:\n%s"
+            % (saida.returncode, saida.stderr.strip()[:400])
+        )
+    return json.loads(saida.stdout)
+
+
+def le_ledger() -> list[dict]:
+    if not os.path.exists(LEDGER):
+        return []
+    linhas = []
+    for numero, bruta in enumerate(open(LEDGER, encoding="utf-8"), 1):
+        bruta = bruta.strip()
+        if not bruta:
+            continue
+        try:
+            linhas.append(json.loads(bruta))
+        except json.JSONDecodeError:
+            print("aviso: linha %d do ledger nao e JSON; preservada como esta" % numero,
+                  file=sys.stderr)
+    return linhas
+
+
+def main() -> int:
+    cli = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    cli.add_argument("--dry-run", action="store_true",
+                     help="mostra as linhas que gravaria e nao escreve")
+    argumentos = cli.parse_args()
+
+    agora = datetime.now(timezone.utc)
+    hoje = agora.date().isoformat()
+
+    try:
+        medido = mede()
+    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as erro:
+        print("RECUSADO: %s" % erro, file=sys.stderr)
+        return 2
+
+    novas = []
+    for bot in sorted(medido):
+        dados = medido[bot]
+        visitadas = dados.get("com_primeira_visita", 0)
+        publicadas = dados.get("rotas_publicadas", 0)
+        novas.append({
+            "schema_version": SCHEMA,
+            "date": hoje,
+            "measured_at": agora.isoformat().replace("+00:00", "Z"),
+            "commit": commit_atual(),
+            "bot": bot,
+            "rotas_publicadas": publicadas,
+            "com_primeira_visita": visitadas,
+            "nunca_pedidas": dados.get("nunca_pedidas", 0),
+            # Valor ABSOLUTO ao lado da proporção, sempre. A cobertura deste
+            # portal ja "caiu" de 72,01% para 70,39% enquanto o numerador SUBIA
+            # 125 URLs -- percentagem sobre denominador movel mente.
+            "cobertura_pct": round(100.0 * visitadas / publicadas, 2) if publicadas else None,
+            "mediana_dias": dados.get("mediana_dias"),
+            "media_dias": dados.get("media_dias"),
+            "p90_dias": dados.get("p90_dias"),
+            "maximo_dias": dados.get("maximo_dias"),
+            "anterior_ao_registro": dados.get("anterior_ao_registro", 0),
+            "ressalva": ("intervalo medido na BORDA (pedido, nao indexacao); "
+                         "linhas com anterior_ao_registro>0 tem intervalo PISO"),
+        })
+
+    if argumentos.dry_run:
+        for linha in novas:
+            print(json.dumps(linha, ensure_ascii=False, sort_keys=True))
+        print("ensaio: %d linha(s), nada escrito" % len(novas), file=sys.stderr)
+        return 0
+
+    anteriores = le_ledger()
+    # Idempotencia por (date, bot): o dia corrente e SUBSTITUIDO, nunca duplicado.
+    substituidas = sum(
+        1 for l in anteriores
+        if l.get("date") == hoje and l.get("schema_version") == SCHEMA
+    )
+    mantidas = [
+        l for l in anteriores
+        if not (l.get("date") == hoje and l.get("schema_version") == SCHEMA)
+    ]
+
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    tmp = LEDGER + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as saida:
+        for linha in mantidas + novas:
+            saida.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(tmp, LEDGER)
+    os.chmod(LEDGER, 0o644)
+
+    print("gravadas %d linha(s) em data/ops/%s (%d do dia substituidas, %d preservadas)"
+          % (len(novas), os.path.basename(LEDGER), substituidas, len(mantidas)))
+    for linha in novas:
+        print("  %-16s %5d/%-5d visitadas  mediana %s d  nunca %d"
+              % (linha["bot"], linha["com_primeira_visita"], linha["rotas_publicadas"],
+                 linha["mediana_dias"], linha["nunca_pedidas"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

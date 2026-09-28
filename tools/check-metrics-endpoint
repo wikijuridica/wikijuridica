@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""check-metrics-endpoint — valida o /metrics do binário Go do portal.
+
+O contrato de HTML leve (docs/SEO_CRAWL_INDEXING.md) admite UM <script> na página desde a
+emenda de 2026-08-19 — o registro de ferramentas WebMCP, autorizado por hash na CSP — e proíbe
+qualquer outro,
+então analytics de terceiro está fora por construção. A observabilidade do
+portal vem de dois lugares, ambos sem uma linha de JavaScript:
+
+  1. o access log do nginx (log_format wj_main) — ver tools/report-access-traffic;
+  2. o /metrics do binário Go — que é o que ESTE check valida.
+
+O endpoint é servido por internal/httpserver (case "/metrics" em serveHTTP) a
+partir de um prometheus.Registry PRÓPRIO (prometheus.NewRegistry em
+newRuntimeMetrics). Registry próprio não traz os coletores padrão, então não
+existe go_* nem process_* aqui — só as séries portal_* declaradas no repo.
+
+FAMÍLIAS ESPERADAS (todas declaradas em internal/httpserver/httpserver.go,
+função newRuntimeMetrics, e registradas no MustRegister do final dela):
+
+  transporte (por method/route_class/status, sem cardinalidade de URL):
+    portal_http_requests_total
+    portal_http_response_bytes_total
+    portal_http_request_duration_seconds   (histograma)
+
+  produto:
+    portal_bot_class_requests_total   (por classe de bot — crawl.BotClass*)
+    portal_pages_served_total         (páginas jurídicas servidas, por status)
+    portal_http_5xx_total             (erros de servidor)
+
+Uma família AUSENTE não é motivo para afrouxar este check: significa que o
+binário no ar é mais antigo que o código do repo (as métricas de produto são
+recentes) e precisa ser reconstruído e reiniciado —
+
+    ./tools/go-modern build -o /opt/wiki/bin/wikijuridica-server ./cmd/server
+    sudo systemctl restart wikijuridica-server
+
+Este check é READ-ONLY: só faz um GET no endpoint. Não escreve nada, não muda
+configuração, não reinicia serviço.
+
+PORTA: o alvo padrão é 127.0.0.1:8089 (o binário Go direto). NÃO adianta apontar
+para o nginx em 127.0.0.1:8088: ele responde `location = /metrics { return 404; }`
+de propósito, para que a observabilidade interna nunca seja exposta no ingress
+público (ops/nginx/wikijuridica.conf).
+
+Uso:
+    ./tools/check-metrics-endpoint
+    ./tools/check-metrics-endpoint --url http://127.0.0.1:8089/metrics
+    ./tools/check-metrics-endpoint --json
+
+Códigos de saída:
+    0  endpoint saudável, formato válido, todas as famílias presentes
+    1  reprovado (inalcançável, status errado, formato inválido, família ausente)
+    2  erro de uso (argumento inválido)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_URL = "http://127.0.0.1:8089/metrics"
+
+# Famílias exigidas, espelhando newRuntimeMetrics em
+# internal/httpserver/httpserver.go. Separadas por papel só para a mensagem de
+# erro dizer QUAL camada quebrou — ambas são obrigatórias.
+FAMILIAS_TRANSPORTE = (
+    "portal_http_requests_total",
+    "portal_http_response_bytes_total",
+    "portal_http_request_duration_seconds",
+)
+FAMILIAS_PRODUTO = (
+    "portal_bot_class_requests_total",
+    "portal_pages_served_total",
+    "portal_http_5xx_total",
+)
+
+# As 5 classes de crawl.BotClass* (internal/crawl/crawl.go:12-16). O servidor
+# pré-inicializa todas em zero justamente para que a série exista antes de
+# qualquer tráfego; se alguma sumir, o alerta que depende dela fica cego.
+CLASSES_DE_BOT = (
+    "valuable_search_or_user_bot",
+    "ads_validation_bot",
+    "training_bot",
+    "product_use_control",
+    "unknown_or_standard_user_agent",
+)
+
+# Nomes de label proibidos: explodem a cardinalidade da série e vazam a URL
+# pedida para dentro do sistema de métricas.
+LABELS_PROIBIDOS = frozenset({
+    "path", "url", "slug", "page", "query", "q",
+    "user_agent", "useragent", "ua", "ip", "remote_addr", "client",
+})
+
+NOME_METRICA = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
+NOME_LABEL = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+# Linha de amostra: nome{labels} valor [timestamp]
+AMOSTRA = re.compile(
+    r"^(?P<nome>[a-zA-Z_:][a-zA-Z0-9_:]*)"
+    r"(?:\{(?P<labels>.*)\})?"
+    r"[ \t]+(?P<valor>\S+)"
+    r"(?:[ \t]+(?P<ts>-?\d+))?[ \t]*$"
+)
+# Um par label="valor", com escapes \\ \" \n tolerados dentro do valor.
+PAR_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+TIPOS_VALIDOS = frozenset({"counter", "gauge", "histogram", "summary", "untyped"})
+
+
+def valor_valido(bruto: str) -> bool:
+    """Um valor Prometheus é float, ou NaN/+Inf/-Inf."""
+    if bruto in {"NaN", "+Inf", "-Inf", "Inf"}:
+        return True
+    try:
+        float(bruto)
+    except ValueError:
+        return False
+    return True
+
+
+def separar_pares(labels: str) -> list[tuple[str, str]]:
+    """Extrai os pares label=valor de dentro das chaves de uma amostra."""
+    return [(m.group(1), m.group(2)) for m in PAR_LABEL.finditer(labels)]
+
+
+def buscar(url: str, timeout: float) -> tuple[int, str, str]:
+    """GET no endpoint. Devolve (status, content_type, corpo)."""
+    requisicao = urllib.request.Request(
+        url,
+        method="GET",
+        # UA próprio e explícito: nunca fingir ser bot real (regra anti-fraude
+        # do projeto), e o header deixa a requisição interna identificável no
+        # access log caso um dia passe pelo nginx.
+        headers={
+            "User-Agent": "wikijuridica-check-metrics-endpoint/1.0",
+            "X-Warming-Request": "true",
+        },
+    )
+    with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
+        corpo = resposta.read().decode("utf-8", errors="replace")
+        return resposta.status, resposta.headers.get("Content-Type", ""), corpo
+
+
+def analisar_formato(corpo: str) -> dict:
+    """Faz o parse do texto Prometheus e devolve famílias, séries e erros."""
+    familias: dict[str, str] = {}          # nome -> tipo declarado no # TYPE
+    ajudas: set[str] = set()               # nomes com # HELP
+    amostras: dict[str, list[dict]] = {}   # nome da amostra -> lista de séries
+    erros: list[str] = []
+    total_amostras = 0
+
+    for numero, bruta in enumerate(corpo.splitlines(), start=1):
+        linha = bruta.strip()
+        if not linha:
+            continue
+        if linha.startswith("#"):
+            partes = linha[1:].strip().split(None, 2)
+            if not partes:
+                continue
+            if partes[0] == "TYPE":
+                if len(partes) < 3:
+                    erros.append(f"linha {numero}: '# TYPE' incompleto: {bruta!r}")
+                    continue
+                nome, tipo = partes[1], partes[2].strip().lower()
+                if not NOME_METRICA.match(nome):
+                    erros.append(f"linha {numero}: nome de métrica inválido em '# TYPE': {nome!r}")
+                elif tipo not in TIPOS_VALIDOS:
+                    erros.append(f"linha {numero}: tipo desconhecido {tipo!r} para {nome}")
+                elif nome in familias:
+                    erros.append(f"linha {numero}: '# TYPE' duplicado para {nome}")
+                else:
+                    familias[nome] = tipo
+            elif partes[0] == "HELP":
+                if len(partes) >= 2:
+                    ajudas.add(partes[1])
+            continue
+
+        casado = AMOSTRA.match(linha)
+        if not casado:
+            erros.append(f"linha {numero}: amostra fora do formato Prometheus: {bruta!r}")
+            continue
+        nome = casado.group("nome")
+        if not valor_valido(casado.group("valor")):
+            erros.append(f"linha {numero}: valor não numérico {casado.group('valor')!r} em {nome}")
+            continue
+
+        pares: list[tuple[str, str]] = []
+        cru = casado.group("labels")
+        if cru is not None and cru.strip():
+            pares = separar_pares(cru)
+            if not pares:
+                erros.append(f"linha {numero}: bloco de labels ilegível em {nome}: {cru!r}")
+            for chave, _ in pares:
+                if not NOME_LABEL.match(chave):
+                    erros.append(f"linha {numero}: nome de label inválido {chave!r} em {nome}")
+
+        total_amostras += 1
+        amostras.setdefault(nome, []).append({
+            "labels": dict(pares),
+            "valor": casado.group("valor"),
+        })
+
+    return {
+        "familias": familias,
+        "ajudas": ajudas,
+        "amostras": amostras,
+        "erros_formato": erros,
+        "total_amostras": total_amostras,
+    }
+
+
+def familia_presente(nome: str, parsed: dict) -> bool:
+    """Uma família conta como presente se declarou '# TYPE' ou emitiu amostra.
+
+    Histograma emite as amostras com sufixo (_bucket/_sum/_count), então a
+    checagem por amostra também aceita os sufixos.
+    """
+    if nome in parsed["familias"]:
+        return True
+    if nome in parsed["amostras"]:
+        return True
+    return any(
+        chave.startswith(nome + sufixo)
+        for chave in parsed["amostras"]
+        for sufixo in ("_bucket", "_sum", "_count")
+    )
+
+
+def checar_cardinalidade(parsed: dict) -> list[str]:
+    """Reprova label que carrega URL/UA — a série viraria uma por página."""
+    problemas: list[str] = []
+    for nome, series in parsed["amostras"].items():
+        if not nome.startswith("portal_"):
+            continue
+        for serie in series:
+            for chave, valor in serie["labels"].items():
+                if chave.lower() in LABELS_PROIBIDOS:
+                    problemas.append(
+                        f"{nome}: label proibido {chave!r} (cardinalidade de URL/UA)"
+                    )
+                elif valor.startswith("/"):
+                    problemas.append(
+                        f"{nome}: label {chave}={valor!r} parece um caminho de URL"
+                    )
+    return sorted(set(problemas))
+
+
+def checar_classes_de_bot(parsed: dict) -> list[str]:
+    """Todas as 5 classes de bot devem existir mesmo sem tráfego."""
+    series = parsed["amostras"].get("portal_bot_class_requests_total")
+    if series is None:
+        return []  # ausência da família já é reprovada em outro lugar
+    vistas = {serie["labels"].get("bot_class", "") for serie in series}
+    return [classe for classe in CLASSES_DE_BOT if classe not in vistas]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--url", default=DEFAULT_URL,
+                        help="endereço do /metrics (padrão: %(default)s)")
+    parser.add_argument("--timeout", type=float, default=5.0,
+                        help="tempo limite em segundos (padrão: %(default)s)")
+    parser.add_argument("--json", action="store_true", help="saída estruturada")
+    args = parser.parse_args()
+
+    if args.timeout <= 0:
+        print("check-metrics-endpoint: --timeout precisa ser maior que zero", file=sys.stderr)
+        return 2
+
+    reprovacoes: list[str] = []
+    resultado: dict = {"url": args.url}
+
+    try:
+        status, content_type, corpo = buscar(args.url, args.timeout)
+    except urllib.error.HTTPError as erro:
+        print(f"check-metrics-endpoint: REPROVADO — {args.url} respondeu "
+              f"HTTP {erro.code} (esperado 200)", file=sys.stderr)
+        if erro.code == 404:
+            print("  dica: 404 é a resposta do nginx em 127.0.0.1:8088, que bloqueia "
+                  "/metrics de propósito. Aponte para o binário Go em 127.0.0.1:8089.",
+                  file=sys.stderr)
+        return 1
+    except urllib.error.URLError as erro:
+        print(f"check-metrics-endpoint: REPROVADO — {args.url} inalcançável: {erro.reason}",
+              file=sys.stderr)
+        print("  o binário do portal não está no ar; suba com "
+              "'sudo systemctl start wikijuridica-server' e repita.", file=sys.stderr)
+        return 1
+    except OSError as erro:
+        print(f"check-metrics-endpoint: REPROVADO — falha de rede em {args.url}: {erro}",
+              file=sys.stderr)
+        return 1
+
+    resultado["status_http"] = status
+    resultado["content_type"] = content_type
+
+    if status != 200:
+        reprovacoes.append(f"status HTTP {status} (esperado 200)")
+    if not content_type.lower().startswith("text/plain"):
+        reprovacoes.append(
+            f"Content-Type {content_type!r} não é o texto Prometheus (esperado text/plain)"
+        )
+
+    parsed = analisar_formato(corpo)
+    resultado["familias"] = dict(sorted(parsed["familias"].items()))
+    resultado["total_amostras"] = parsed["total_amostras"]
+
+    if parsed["total_amostras"] == 0:
+        reprovacoes.append("nenhuma amostra de métrica no corpo da resposta")
+    for erro in parsed["erros_formato"][:20]:
+        reprovacoes.append(f"formato inválido: {erro}")
+
+    faltando_transporte = [n for n in FAMILIAS_TRANSPORTE if not familia_presente(n, parsed)]
+    faltando_produto = [n for n in FAMILIAS_PRODUTO if not familia_presente(n, parsed)]
+    resultado["familias_ausentes"] = faltando_transporte + faltando_produto
+    for nome in faltando_transporte:
+        reprovacoes.append(f"família de transporte ausente: {nome}")
+    for nome in faltando_produto:
+        reprovacoes.append(f"família de produto ausente: {nome}")
+
+    problemas_cardinalidade = checar_cardinalidade(parsed)
+    resultado["cardinalidade"] = problemas_cardinalidade
+    reprovacoes.extend(problemas_cardinalidade)
+
+    classes_faltando = checar_classes_de_bot(parsed)
+    resultado["classes_de_bot_ausentes"] = classes_faltando
+    for classe in classes_faltando:
+        reprovacoes.append(
+            f"classe de bot {classe!r} não aparece em portal_bot_class_requests_total"
+        )
+
+    resultado["reprovacoes"] = reprovacoes
+    resultado["aprovado"] = not reprovacoes
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=1))
+    else:
+        print(f"check-metrics-endpoint: {args.url}")
+        print(f"  status={status} content_type={content_type or '(vazio)'}")
+        print(f"  famílias={len(parsed['familias'])} amostras={parsed['total_amostras']}")
+        for nome, tipo in sorted(parsed["familias"].items()):
+            print(f"    {nome} ({tipo})")
+
+    if reprovacoes:
+        print(f"\ncheck-metrics-endpoint: REPROVADO — {len(reprovacoes)} problema(s):",
+              file=sys.stderr)
+        for problema in reprovacoes:
+            print(f"  - {problema}", file=sys.stderr)
+        if faltando_produto:
+            print("\n  As métricas de produto existem em internal/httpserver/httpserver.go "
+                  "(newRuntimeMetrics).\n  Ausência no endpoint = binário no ar mais antigo "
+                  "que o código. Reconstrua e reinicie:\n"
+                  "    ./tools/go-modern build -o /opt/wiki/bin/wikijuridica-server ./cmd/server\n"
+                  "    sudo systemctl restart wikijuridica-server", file=sys.stderr)
+        return 1
+
+    print("\ncheck-metrics-endpoint: OK — endpoint 200, formato Prometheus válido, "
+          "todas as famílias presentes, sem cardinalidade de URL")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

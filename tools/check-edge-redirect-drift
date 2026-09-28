@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""check-edge-redirect-drift — a regra de barra final declarada quebra algum arquivo servido, e ela está viva na zona?
+
+READ-ONLY. Sai 1 quando a regra versionada redirecionaria um arquivo que o
+nginx serve pelo nome (asset), ou quando a fase `http_request_dynamic_redirect`
+viva diverge de ops/cloudflare/dynamic-redirect-rules.json. Sai 2 quando NÃO
+CONSEGUE medir a zona (sem credencial, API fora) — indisponibilidade nunca é
+reprovação neste repositório; nesse caso a checagem estrutural, que não precisa
+de rede, ainda roda e ainda reprova.
+
+POR QUE EXISTE (medido em 2026-09-04). Havia gate de deriva para o WAF e para
+as Cache Rules, e NENHUM lendo os redirects — `grep -rln dynamic-redirect-rules.json
+tools/` devolvia vazio. Duas coisas apareceram no primeiro minuto em que alguém
+olhou:
+
+1. A expressão versionada exclui `.txt .xml .md .json .ico .png .svg
+   .webmanifest .html` e **não exclui `.css` nem `.js`**. Aplicá-la como estava
+   mandaria `/assets/wj-<hash>.css` para `/assets/wj-<hash>.css/` com 301 — a
+   folha das 10.141 páginas morre, e o sintoma ("site sem estilo") não aponta
+   para um arquivo de borda que ninguém lê. A `location ^~ /assets/` do nginx
+   fica perfeitamente correta enquanto isso.
+
+2. A fase viva na zona tinha **zero regras**: a regra versionada nunca foi
+   aplicada. Por isso o defeito acima nunca se manifestou, e por isso ninguém o
+   encontrou. É a mesma classe da Cache Rule esvaziada pelo painel em
+   2026-08-22, que levou cinco dias para alguém consumir o alarme — com a
+   diferença de que aqui não havia alarme nenhum.
+
+A checagem estrutural NÃO usa lista de extensões escrita à mão: ela varre o que
+o `public/` realmente contém e pergunta, arquivo por arquivo, se a expressão o
+redirecionaria. Extensão nova (`.woff2`, `.webp`) passa a ser coberta no dia em
+que o primeiro arquivo dela é publicado, sem ninguém lembrar de atualizar nada.
+
+O QUE `public/` NÃO ENXERGA, E POR QUE ISTO É MAIS QUE UM ARQUIVO A MAIS
+(2026-09-05). A rede social não passa por `public/`: `/redesocial/` é rota
+DINÂMICA, servida pelo processo da 8091, e a folha de estilo dela — o único
+token que `style-src` autoriza — sai de um handler Go, não do disco. O gate
+media 166 arquivos, dizia "nenhum seria redirecionado" e saía verde sem ter
+olhado uma vez para `/redesocial/assets/`: verde sobre o que não se mede, que é
+a regra R2 do contrato do dado real. A exclusão desse prefixo já estava correta
+no `dynamic-redirect-rules.json`; o que faltava era o gate saber que ela importa
+— e reprovar no dia em que alguém a apagar por parecer supérflua.
+
+A derivação continua sem lista escrita à mão: o caminho sai de
+`socialheaders.PrefixoDeEstilo`, a MESMA constante que a CSP dos dois .conf do
+nginx nomeia byte a byte, e que `internal/socialheaders` amarra a
+`socialtema.URLDaFolha()` por teste. Mudar um byte do CSS muda o hash, muda a
+constante e muda o caminho que este gate verifica, sem ninguém tocar aqui.
+
+`--regras <arquivo>` mede uma cópia da regra em vez da versionada. Existe para
+provar o gate por mutação — zona deliberadamente divergente, exclusão removida —
+sem escrever nada no repositório. READ-ONLY como o resto.
+
+CREDENCIAL: nenhuma nova. Usa tools/cloudflare_auth.py no escopo "leitura"
+(token de zona), que cobre GET de ruleset.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.parse
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(RAIZ, "tools"))
+
+DECLARADO = os.path.join(RAIZ, "ops", "cloudflare", "dynamic-redirect-rules.json")
+PUBLICO = os.path.join(RAIZ, "public")
+FASE = "http_request_dynamic_redirect"
+DOMINIO = "wikijuridica.com.br"
+
+# A rede social é servida pelo processo da 8091, então nada dela aparece em
+# `public/`. Estes dois nomes são o que liga o gate àquela superfície.
+#
+# A FONTE É A CONSTANTE DA CSP, e não o disco, porque no disco não há arquivo: o
+# `<link>` de toda tela aponta para uma URL que um handler Go monta. A constante
+# é o contrato que o nginx repete em social-headers-publico.conf e em
+# social-headers-privado.conf, e `internal/socialheaders` já reprova quando ela
+# se afasta de `socialtema.URLDaFolha()`.
+FONTE_DA_FOLHA_SOCIAL = os.path.join(RAIZ, "internal", "socialheaders", "socialheaders.go")
+
+# O prefixo que a regra de barra final tem de excluir, e que
+# `location ^~ /redesocial/assets/` serve pelo nome. Ele fica aqui como
+# constante para que a asserção abaixo — a folha vive SOB o prefixo, e não É o
+# prefixo — espelhe a de internal/socialheaders/socialheaders_test.go: autorizar
+# o diretório inteiro daria a um upload de visitante o direito de ser
+# interpretado como folha de estilo.
+PREFIXO_DE_ASSETS_SOCIAL = "/redesocial/assets/"
+
+# Servidos pelo diretório que os contém, nunca pelo próprio nome: o path sem
+# barra é exatamente o que a regra existe para redirecionar.
+SERVIDOS_PELO_DIRETORIO = {"index.html", "index.md"}
+
+# Sufixos de codificação pré-comprimida. `index.html.br` é entregue por
+# negociação de `Accept-Encoding` sobre a URL do arquivo original — nenhum
+# cliente pede `/pagina/index.html.br`, e contá-los produziu 10.480 falsos
+# positivos na primeira execução deste gate. A variante só é descartada quando
+# o arquivo original existe ao lado: assim um `.br` órfão continua sendo
+# tratado como arquivo de verdade, em vez de sumir da verificação.
+SUFIXOS_DE_COMPRESSAO = (".br", ".gz", ".zst")
+
+
+def extensoes_excluidas(expressao: str) -> set[str]:
+    return set(re.findall(r'ends_with\(http\.request\.uri\.path,\s*"([^"]+)"\)', expressao))
+
+
+def prefixos_excluidos(expressao: str) -> set[str]:
+    return set(re.findall(r'starts_with\(http\.request\.uri\.path,\s*"([^"]+)"\)', expressao))
+
+
+def paths_exatos_excluidos(expressao: str) -> set[str]:
+    return set(re.findall(r'http\.request\.uri\.path\s+ne\s+"([^"]+)"', expressao))
+
+
+def seria_redirecionado(path: str, expressao: str) -> bool:
+    """A regra manda 301 neste path? Só é consultada para arquivo servido pelo
+    próprio nome — path que já termina em barra nunca entra na regra."""
+    if path in paths_exatos_excluidos(expressao):
+        return False
+    for prefixo in prefixos_excluidos(expressao):
+        if path.startswith(prefixo):
+            return False
+    for extensao in extensoes_excluidas(expressao):
+        if path.endswith(extensao):
+            return False
+    return True
+
+
+def arquivos_servidos_pelo_nome() -> list[str]:
+    """Paths que o nginx serve pelo próprio nome, derivados do disco."""
+    if not os.path.isdir(PUBLICO):
+        return []
+    achados = []
+    for diretorio, _, arquivos in os.walk(PUBLICO):
+        presentes = set(arquivos)
+        for nome in arquivos:
+            if nome in SERVIDOS_PELO_DIRETORIO:
+                continue
+            if any(
+                nome.endswith(sufixo) and nome[: -len(sufixo)] in presentes
+                for sufixo in SUFIXOS_DE_COMPRESSAO
+            ):
+                continue
+            completo = os.path.join(diretorio, nome)
+            rel = os.path.relpath(completo, PUBLICO).replace(os.sep, "/")
+            achados.append("/" + rel)
+    return achados
+
+
+# `const PrefixoDeEstilo = "..."` em socialheaders.go. A âncora inclui `const`
+# para que uma menção da constante em comentário ou em teste não seja lida como
+# declaração — é o mesmo cuidado que já custou uma sessão em quem procurava
+# `location ^~ /redesocial/` e achou a prosa sobre ela.
+RE_PREFIXO_DE_ESTILO = re.compile(r'^\s*const\s+PrefixoDeEstilo\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def caminhos_servidos_pela_rede_social(fonte: str | None = None) -> tuple[list[str], str | None]:
+    """Paths que o processo da 8091 serve pelo NOME, derivados do repositório.
+
+    Devolve `(caminhos, erro)`. Erro não-None significa que a derivação falhou —
+    e isso é reprovação, não indisponibilidade: a fonte é um arquivo versionado
+    desta árvore, não a rede. Gate que continuasse verde sem conseguir derivar
+    voltaria a medir só o `public/` em silêncio, que é o defeito de origem.
+    """
+    caminho_da_fonte = fonte or FONTE_DA_FOLHA_SOCIAL
+    relativo = os.path.relpath(caminho_da_fonte, RAIZ)
+    try:
+        with open(caminho_da_fonte, encoding="utf-8") as fh:
+            texto = fh.read()
+    except OSError as exc:
+        return [], f"nao consegui ler {relativo}: {exc}"
+
+    achado = RE_PREFIXO_DE_ESTILO.search(texto)
+    if achado is None:
+        return [], (
+            f"{relativo} nao declara `const PrefixoDeEstilo = \"...\"`: ou a constante foi "
+            "renomeada, ou a folha da rede social passou a ser nomeada em outro lugar"
+        )
+
+    url = achado.group(1)
+    caminho = urllib.parse.urlsplit(url).path
+    if not caminho.startswith(PREFIXO_DE_ASSETS_SOCIAL):
+        return [], (
+            f"PrefixoDeEstilo = {url!r} nao fica sob {PREFIXO_DE_ASSETS_SOCIAL}: a location "
+            "`^~ /redesocial/assets/` nao serviria a folha, e a exclusao que este gate confere "
+            "deixaria de proteger o caminho que a CSP autoriza"
+        )
+    if caminho == PREFIXO_DE_ASSETS_SOCIAL:
+        return [], (
+            f"PrefixoDeEstilo = {url!r} e a RAIZ dos assets, nao um arquivo: com escopo de "
+            "diretorio em style-src, qualquer arquivo gravado ali seria interpretado como folha"
+        )
+    return [caminho], None
+
+
+def carrega_declarado(caminho: str | None = None):
+    with open(caminho or DECLARADO, encoding="utf-8") as fh:
+        return json.load(fh).get("rules") or []
+
+
+def normaliza(regra: dict) -> dict:
+    """Compara o que muda comportamento, não a decoração que a API acrescenta
+    (id, version, ref, last_updated são atribuídos pela Cloudflare)."""
+    return {
+        "action": regra.get("action"),
+        "expression": " ".join((regra.get("expression") or "").split()),
+        "enabled": bool(regra.get("enabled", True)),
+        "action_parameters": regra.get("action_parameters"),
+    }
+
+
+def le_zona():
+    """(regras_vivas, erro). Erro não-None significa 'não consegui medir'."""
+    try:
+        import cloudflare_auth as ca
+    except ImportError as exc:
+        # Falta do helper é indisponibilidade de medição, não reprovação — o
+        # chamador transforma isto em exit 2. `ImportError` é o único erro que
+        # esta linha produz, e nomeá-lo dispensa supressor de diagnóstico.
+        return None, f"helper de credencial indisponivel: {exc}"
+    zid, erro = ca.zona_id(DOMINIO)
+    if erro:
+        return None, f"zona: {erro}"
+    # Escopo "firewall" = sempre Global API Key. O token de zona NAO le a fase
+    # de rulesets: devolve 403, medido em 2026-09-04. Pedir "leitura" aqui
+    # funcionava por acaso -- so porque, sem `env` explicito, o helper nao
+    # achava o token de zona e caia na chave global. Depender disso e depender
+    # de qual arquivo de ambiente foi carregado.
+    url = f"{ca.API}/zones/{zid}/rulesets/phases/{FASE}/entrypoint"
+    dados, erro = ca.pega(url, "firewall")
+    if erro:
+        return None, f"fase {FASE}: {erro}"
+    return (dados.get("result") or {}).get("rules") or [], None
+
+
+def analisa_argumentos(argv=None) -> argparse.Namespace:
+    analisador = argparse.ArgumentParser(
+        description="Confere a regra de barra final contra o que o portal serve pelo nome, "
+        "e contra a fase viva na zona.",
+    )
+    analisador.add_argument(
+        "--regras",
+        default=None,
+        metavar="ARQUIVO",
+        help="mede este arquivo de regra em vez de ops/cloudflare/dynamic-redirect-rules.json. "
+        "Existe para provar o gate por mutacao (copia sem a exclusao de assets, por exemplo); "
+        "nada e escrito em nenhum dos dois casos",
+    )
+    return analisador.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = analisa_argumentos(argv)
+    declaradas = carrega_declarado(args.regras)
+    falhas = []
+
+    # (1) Estrutural, sem rede: a regra declarada quebraria algo que já é servido?
+    #
+    # O INVENTARIO TEM DUAS FONTES, e a segunda existe porque a primeira e cega
+    # para metade do portal: `public/` cobre o acervo estatico, e a rede social
+    # nao tem um byte la. Somar as duas antes do laco e o que impede o gate de
+    # anunciar "nenhum arquivo seria redirecionado" tendo olhado so uma delas.
+    publicos = arquivos_servidos_pelo_nome()
+    sociais, erro_da_derivacao = caminhos_servidos_pela_rede_social()
+    if erro_da_derivacao is not None:
+        falhas.append(
+            f"nao consegui derivar do repositorio o caminho que a rede social serve pelo nome "
+            f"({erro_da_derivacao}). Sem ele este gate volta a medir apenas o public/, e "
+            f"{PREFIXO_DE_ASSETS_SOCIAL} — servido pelo nome, e excluido da regra de barra final "
+            "justamente por isso — fica fora da verificacao em silencio"
+        )
+    servidos = publicos + sociais
+    for regra in declaradas:
+        if not regra.get("enabled", True):
+            continue
+        expressao = regra.get("expression") or ""
+        quebrados = [p for p in servidos if seria_redirecionado(p, expressao)]
+        if quebrados:
+            amostra = ", ".join(sorted(quebrados)[:5])
+            falhas.append(
+                f"a regra declarada redirecionaria {len(quebrados)} arquivo(s) que o nginx serve "
+                f"pelo nome — 301 para o mesmo path com barra, que nao existe. Amostra: {amostra}"
+            )
+
+    # (2) Deriva: o que esta vivo e o que esta versionado sao a mesma coisa?
+    vivas, erro = le_zona()
+    if erro is not None:
+        for falha in falhas:
+            print(f"check-edge-redirect-drift: {falha}", file=sys.stderr)
+        if falhas:
+            return 1
+        print(f"check-edge-redirect-drift: estrutura OK; zona nao medida ({erro})")
+        return 2
+
+    if len(vivas) != len(declaradas):
+        falhas.append(
+            f"a zona tem {len(vivas)} regra(s) na fase {FASE} e o repositorio declara {len(declaradas)}. "
+            "Regra declarada e nunca aplicada e um contrato que ninguem cumpre; regra viva e nao "
+            "versionada muda o trafego sem revisao"
+        )
+    else:
+        for indice, (viva, declarada) in enumerate(zip(vivas, declaradas)):
+            if normaliza(viva) != normaliza(declarada):
+                falhas.append(
+                    f"regra {indice} diverge entre a zona e o repositorio.\n"
+                    f"  viva:      {json.dumps(normaliza(viva), ensure_ascii=False)}\n"
+                    f"  declarada: {json.dumps(normaliza(declarada), ensure_ascii=False)}"
+                )
+
+    if falhas:
+        for falha in falhas:
+            print(f"check-edge-redirect-drift: {falha}", file=sys.stderr)
+        return 1
+
+    print(
+        f"check-edge-redirect-drift: {len(declaradas)} regra(s) conferem com a zona; "
+        f"nenhum dos {len(servidos)} arquivos servidos pelo nome seria redirecionado "
+        f"({len(publicos)} em public/ + {len(sociais)} da rede social)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

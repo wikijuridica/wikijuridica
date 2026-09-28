@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Mede se as normas oficiais que o acervo CITA continuam sendo o texto que
+estava lá quando a citação foi escrita, e quantas páginas cada divergência
+alcança.
+
+POR QUE ISTO EXISTE, com o número que o originou.
+
+`tools/generate-normative-fingerprint-baseline-20260812` tem o modo
+`reconferencia` desde 2026-08-12, e ele nunca rodou: `grep` em `tools/`,
+`ops/systemd/` e no runner da bancada diária em 2026-09-10 achou a string
+`--modo reconferencia` **só dentro do próprio gerador**. O que a bancada roda é o
+`check-normative-fingerprint-selftest`, que prova as propriedades do INSTRUMENTO
+— determinismo, fail-closed, colisão — e não emite veredito nenhum sobre o
+acervo.
+
+Resultado medido no dia em que este arquivo nasceu, reconferindo a coleta de
+2026-09-10 contra a linha de base de 2026-08-12: **113 documentos com impressão
+normativa diferente**, 17 deles do Planalto. E o alcance desses 17 no acervo
+publicado, contado por URL oficial no HTML servido (não por nome de lei, que
+teria falso positivo em menção de passagem):
+
+    /ccivil_03/_ato2015-2018/2015/lei/l13105.htm            3.502 páginas
+    /ccivil_03/leis/l8213cons.htm                           1.071 páginas
+    /ccivil_03/leis/l5172compilado.htm                        141 páginas
+    /ccivil_03/leis/l5172.htm                                 139 páginas
+    …                                             total: 4.995 citações
+
+O CPC foi alterado por norma de 2026 e o acervo o cita em 3.502 páginas. Nada
+acusava.
+
+O QUE ESTE GERADOR DECIDE, E O QUE ELE SE RECUSA A DECIDIR.
+
+"Impressão diferente" mistura duas coisas com consequência editorial oposta:
+alteração legislativa e mudança de marcação do próprio Planalto. A separação usa
+a preimagem da impressão, que é um JSON canônico
+`{anc_norm_b2, anc_norm_n, ano_max, midia, normas}`:
+
+  - `ano_max` SUBIU, ou apareceu norma alteradora que não estava na lista:
+    ALTERAÇÃO LEGISLATIVA. Uma norma nova alterou aquele diploma, e as páginas
+    que o citam podem estar afirmando texto superado.
+  - só `anc_norm_n` mudou: MARCAÇÃO. O Planalto reeditou o HTML; o texto
+    normativo é o mesmo.
+
+Ele NÃO decide se a alteração atinge o artigo que a página cita — isso é leitura
+jurídica, e inventá-la seria pior que não medir. O que ele entrega é a lista
+ordenada por alcance, para que a decisão editorial seja tomada sobre número.
+
+Uso:
+    tools/generate-normative-freshness                 # offline, pelo cache
+    tools/generate-normative-freshness --rede          # recoleta o que faltar
+    tools/generate-normative-freshness --sem-alcance   # pula a varredura de public/
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+RAIZ = Path(__file__).resolve().parent.parent
+GERADOR = RAIZ / "tools/generate-normative-fingerprint-baseline-20260812"
+BASELINE = RAIZ / "data/ops/official_source_normative_fingerprint_baseline.jsonl"
+SERIE = RAIZ / "data/ops/normative_freshness_daily.jsonl"
+ESQUEMA = "normative_freshness_v1"
+
+# O Planalto serve o mesmo documento em maiúscula e minúscula, e com e sem
+# "www.". Sem colapsar as variantes a mesma norma aparece duas vezes com metade
+# do alcance cada — foi assim que a primeira contagem viu 17 documentos onde há
+# 16.
+def canonica(url: str) -> str:
+    partes = urlparse(url)
+    return partes.netloc.lower().removeprefix("www.") + partes.path.lower()
+
+
+def preimagem(registro: dict) -> dict:
+    bruto = registro.get("preimagem_impressao")
+    if not bruto:
+        return {}
+    try:
+        return json.loads(bruto)
+    except (ValueError, TypeError):
+        return {}
+
+
+def carrega_documentos(caminho: Path) -> dict:
+    saida = {}
+    if not caminho.exists():
+        return saida
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        registro = json.loads(linha)
+        if registro.get("tipo") == "documento" and registro.get("url"):
+            saida[registro["url"]] = registro
+    return saida
+
+
+def classifica(antes: dict, depois: dict) -> tuple[str, dict]:
+    """Devolve (classe, detalhe) para um documento cuja impressão mudou."""
+    a, d = preimagem(antes), preimagem(depois)
+    ano_a, ano_d = a.get("ano_max"), d.get("ano_max")
+    normas_a = set(a.get("normas") or [])
+    normas_d = set(d.get("normas") or [])
+    novas = sorted(normas_d - normas_a)
+    detalhe = {
+        "ano_max_anterior": ano_a,
+        "ano_max_atual": ano_d,
+        "ancoras_anterior": a.get("anc_norm_n"),
+        "ancoras_atual": d.get("anc_norm_n"),
+        "normas_novas": novas[:8],
+        "normas_novas_total": len(novas),
+    }
+    if isinstance(ano_a, int) and isinstance(ano_d, int) and ano_d > ano_a:
+        return "alteracao_legislativa", detalhe
+    if novas:
+        return "alteracao_legislativa", detalhe
+    if a.get("anc_norm_n") != d.get("anc_norm_n"):
+        return "marcacao", detalhe
+    return "indeterminado", detalhe
+
+
+def alcance_no_acervo(canonicas: set[str]) -> collections.Counter:
+    """Conta as páginas publicadas que trazem um link para cada documento.
+
+    Conta por URL OFICIAL no HTML servido, que é o que o autolinkador e o bloco
+    de Proveniência emitem. Contar por nome de lei traria menção de passagem, que
+    não é citação com link e não leva o leitor a lugar nenhum.
+    """
+    alcance: collections.Counter = collections.Counter()
+    padrao = re.compile(r'href="(https://[^"]*planalto\.gov\.br[^"]*)"')
+    for caminho in glob.glob(str(RAIZ / "public/**/index.html"), recursive=True):
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            html = arquivo.read()
+        for href in set(padrao.findall(html)):
+            chave = canonica(href.split("#", 1)[0])
+            if chave in canonicas:
+                alcance[chave] += 1
+    return alcance
+
+
+def roda_reconferencia(rede: bool, saida: Path, contra: Path) -> int:
+    comando = [str(GERADOR), "--modo", "reconferencia",
+               "--baseline", str(contra), "--saida", str(saida)]
+    if rede:
+        comando.append("--rede")
+    concluido = subprocess.run(comando, cwd=str(RAIZ), capture_output=True, text=True)
+    if concluido.returncode != 0:
+        sys.stderr.write(concluido.stdout[-2000:])
+        sys.stderr.write(concluido.stderr[-2000:])
+    return concluido.returncode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rede", action="store_true",
+                        help="recoleta pela rede o que não estiver em cache")
+    parser.add_argument("--sem-alcance", action="store_true",
+                        help="não varre public/ (mais rápido, sem o número que decide)")
+    parser.add_argument("--contra", default="",
+                        help="linha de base a comparar. Por padrão é a vigente "
+                             "(data/ops/…_baseline.jsonl), e aí a medição é "
+                             "'o que mudou desde a última vez que o baseline foi "
+                             "gravado'. Aponte para uma referência preservada "
+                             "para medir uma janela anterior — foi assim que a "
+                             "primeira linha desta série nasceu, comparando a "
+                             "coleta de 2026-09-10 com a base de 2026-08-12.")
+    argumentos = parser.parse_args()
+
+    if not GERADOR.exists():
+        print("gerador ausente: %s" % GERADOR, file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(dir=str(RAIZ / ".agents/runtime")) as temporario:
+        recheck = Path(temporario) / "recheck.jsonl"
+        contra = Path(argumentos.contra).resolve() if argumentos.contra else BASELINE
+        if not contra.exists():
+            print("linha de base ausente: %s" % contra, file=sys.stderr)
+            return 2
+        codigo = roda_reconferencia(argumentos.rede, recheck, contra)
+        if codigo != 0 or not recheck.exists():
+            print("reconferencia falhou (exit %d)" % codigo, file=sys.stderr)
+            return 2
+
+        vereditos = collections.Counter()
+        mudaram = []
+        for linha in recheck.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            if registro.get("tipo") != "reconferencia":
+                continue
+            vereditos[registro.get("veredito")] += 1
+            if registro.get("veredito") == "mudou":
+                mudaram.append(registro["url"])
+
+        antes = carrega_documentos(contra)
+        depois = carrega_documentos(BASELINE)
+
+        por_documento = {}
+        for url in mudaram:
+            classe, detalhe = classifica(antes.get(url, {}), depois.get(url, {}))
+            chave = canonica(url)
+            atual = por_documento.get(chave)
+            # Variantes do mesmo documento colapsam, e a classe mais grave vence:
+            # se uma variante acusa alteração legislativa, o documento acusa.
+            if atual is None or (classe == "alteracao_legislativa"
+                                 and atual["classe"] != "alteracao_legislativa"):
+                por_documento[chave] = {"classe": classe, "detalhe": detalhe,
+                                        "urls": [url]}
+            elif url not in atual["urls"]:
+                atual["urls"].append(url)
+
+        alcance = collections.Counter()
+        if not argumentos.sem_alcance:
+            alcance = alcance_no_acervo(set(por_documento))
+
+    documentos = []
+    for chave, dados in sorted(por_documento.items()):
+        documentos.append({
+            "documento": chave,
+            "classe": dados["classe"],
+            "paginas_que_citam": alcance.get(chave, 0),
+            "urls": sorted(dados["urls"]),
+            **dados["detalhe"],
+        })
+    documentos.sort(key=lambda d: (-d["paginas_que_citam"], d["documento"]))
+
+    legislativas = [d for d in documentos if d["classe"] == "alteracao_legislativa"]
+    linha = {
+        "schema": ESQUEMA,
+        "date": datetime.date.today().isoformat(),
+        "gerado_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "ferramenta": "tools/generate-normative-freshness",
+        "comparado_com": str(contra.relative_to(RAIZ)) if contra.is_relative_to(RAIZ) else str(contra),
+        "counts_as_audience": False,
+        "vereditos": dict(vereditos),
+        "documentos_com_impressao_diferente": len(por_documento),
+        "alteracao_legislativa": len(legislativas),
+        "marcacao": sum(1 for d in documentos if d["classe"] == "marcacao"),
+        "paginas_alcancadas_por_alteracao": sum(d["paginas_que_citam"] for d in legislativas),
+        "alcance_medido": not argumentos.sem_alcance,
+        "documentos": documentos,
+    }
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(SERIE.parent),
+                                     prefix=".tmp-", delete=False) as temporario:
+        anterior = SERIE.read_text(encoding="utf-8") if SERIE.exists() else ""
+        # Uma linha por dia: reexecutar no mesmo dia SUBSTITUI, nunca duplica.
+        preservadas = [l for l in anterior.splitlines()
+                       if l.strip() and json.loads(l).get("date") != linha["date"]]
+        temporario.write("\n".join(preservadas + [json.dumps(linha, ensure_ascii=False)]) + "\n")
+        temporario.flush()
+        os.fsync(temporario.fileno())
+        caminho = temporario.name
+    os.replace(caminho, SERIE)
+
+    print("vereditos da reconferencia: %s" % dict(vereditos))
+    print("documentos com impressao diferente: %d (alteracao legislativa %d, marcacao %d)"
+          % (len(por_documento), len(legislativas), linha["marcacao"]))
+    if not argumentos.sem_alcance:
+        print("paginas alcancadas por alteracao legislativa: %d"
+              % linha["paginas_alcancadas_por_alteracao"])
+    print()
+    for documento in documentos:
+        if documento["classe"] != "alteracao_legislativa":
+            continue
+        print("  %-56s %5d pagina(s)  ano_max %s->%s  %s" % (
+            documento["documento"][:56], documento["paginas_que_citam"],
+            documento["ano_max_anterior"], documento["ano_max_atual"],
+            ", ".join(documento["normas_novas"][:2]) or ""))
+    print()
+    print("gravado: %s" % SERIE.relative_to(RAIZ))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

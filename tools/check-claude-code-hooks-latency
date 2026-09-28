@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""check-claude-code-hooks-latency — mede o custo real dos hooks do Claude Code.
+
+READ-ONLY. Nao escreve JSONL, manifesto, sitemap, content/, public/ nem dado
+permanente: so le configuracao e transcript e imprime a medicao. Nasceu em
+2026-09-08, quando um `true` (comando que nao faz nada) levou 13,97 s e 15,70 s
+nesta maquina, e a causa era um plugin rodando `npx ... @latest` em PreToolUse e
+PostToolUse de todo Bash.
+
+O que mede, nesta ordem:
+
+  1. INVENTARIO  quantos hooks estao registrados, por evento e por plugin, e
+                 quantos processos disparam por chamada de cada ferramenta.
+  2. TRANSCRIPT  o custo observado in-harness, pelos timestamps de tool_use ->
+                 tool_result do jsonl da sessao. E a unica medida que inclui o
+                 que o harness faz entre os hooks.
+  3. BENCH       (--bench) cronometra cada hook isolado, com payload sintetico.
+
+Por que as tres: o inventario nao mede tempo, o transcript nao separa hook de
+comando, e o bench nao ve a serializacao do harness. Uma so mente.
+
+CUIDADO com --bench: ele executa os hooks de verdade, com um payload que carrega
+`session_id` sintetico. Hook que persiste estado (memoria, worklog, ledger) grava
+esse id. Por isso o default e nao rodar bench, e o payload usa um id fixo e
+reconhecivel (`hooks-latency-probe`) que da para localizar e remover depois.
+
+Uso:
+    tools/check-claude-code-hooks-latency
+    tools/check-claude-code-hooks-latency --tool Bash --bench
+    tools/check-claude-code-hooks-latency --transcript <caminho.jsonl>
+    tools/check-claude-code-hooks-latency --json
+
+Exit: 0 sempre que conseguiu medir. 2 se nao achou configuracao para ler.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import tempfile
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+SESSION_ID_SONDA = "hooks-latency-probe"
+EVENTOS_POR_CHAMADA = ("PreToolUse", "PostToolUse")
+
+
+def cfg_dir() -> Path:
+    d = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    return Path(d).expanduser() if d else Path.home() / ".claude"
+
+
+def carrega_json(p: Path):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def coleta_hooks(projeto: Path):
+    """Devolve [(fonte, evento, matcher, comando, timeout, plugin_root)].
+
+    O conjunto que importa é o EFETIVO neste projeto, não o global: o
+    `enabledPlugins` do projeto sobrepõe o do usuário, e um plugin desligado
+    aqui não registra hook nenhum. Medir só o global infla a conta — foi o que
+    aconteceu na primeira versão desta ferramenta, que contou 48 plugins onde o
+    efetivo era 44.
+    """
+    home = cfg_dir()
+    settings = carrega_json(home / "settings.json")
+    instalados = carrega_json(home / "plugins" / "installed_plugins.json")
+    habilitados = {k for k, v in settings.get("enabledPlugins", {}).items() if v}
+    for nome in ("settings.json", "settings.local.json"):
+        do_projeto = carrega_json(projeto / ".claude" / nome).get("enabledPlugins", {})
+        for chave, ligado in do_projeto.items():
+            if ligado:
+                habilitados.add(chave)
+            else:
+                habilitados.discard(chave)
+
+    achados: list[tuple] = []
+
+    def junta(fonte, bloco, root=None):
+        for evento, matchers in (bloco or {}).items():
+            if not isinstance(matchers, list):
+                continue
+            for m in matchers:
+                if not isinstance(m, dict):
+                    continue
+                for h in m.get("hooks", []):
+                    if h.get("type") != "command":
+                        continue
+                    achados.append((fonte, evento, m.get("matcher", ""),
+                                    h.get("command", ""), h.get("timeout"), root))
+
+    junta("global", settings.get("hooks"))
+    for nome in ("settings.json", "settings.local.json"):
+        junta(f"projeto/{nome}", carrega_json(projeto / ".claude" / nome).get("hooks"))
+
+    for chave in sorted(habilitados):
+        curto = chave.split("@")[0]
+        for entrada in instalados.get("plugins", {}).get(chave, []):
+            raiz = entrada.get("installPath")
+            if not raiz:
+                continue
+            hj = Path(raiz) / "hooks" / "hooks.json"
+            if hj.exists():
+                d = carrega_json(hj)
+                junta(curto, d.get("hooks", d), raiz)
+            # ponytail e caveman declaram os hooks pelo plugin.json
+            for pj in ((Path(raiz) / ".claude-plugin" / "plugin.json"), (Path(raiz) / "plugin.json")):
+                if not pj.exists():
+                    continue
+                d = carrega_json(pj)
+                h = d.get("hooks")
+                if isinstance(h, str):
+                    alt = Path(raiz) / h.lstrip("./")
+                    if alt.exists():
+                        dd = carrega_json(alt)
+                        junta(curto, dd.get("hooks", dd), raiz)
+                elif isinstance(h, dict):
+                    junta(curto, h.get("hooks", h), raiz)
+                break
+            break
+    return achados, len(habilitados)
+
+
+def casa(matcher: str | None, ferramenta: str) -> bool:
+    if matcher in (None, "", "*"):
+        return True
+    try:
+        return re.search(matcher, ferramenta) is not None
+    except re.error:
+        return matcher == ferramenta
+
+
+def mede_transcript(caminho: Path):
+    """Custo observado por ferramenta, pelos timestamps do transcript."""
+    def quando(ts: str) -> datetime:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+    pendentes: dict[str, tuple] = {}
+    por_ferramenta: dict[str, list[float]] = defaultdict(list)
+    triviais: list[float] = []
+    try:
+        linhas = caminho.read_text(errors="replace").splitlines()
+    except Exception:
+        return {}, []
+    for linha in linhas:
+        try:
+            reg = json.loads(linha)
+        except Exception:
+            continue
+        ts = reg.get("timestamp")
+        conteudo = (reg.get("message") or {}).get("content")
+        if not ts or not isinstance(conteudo, list):
+            continue
+        for item in conteudo:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_use":
+                pendentes[item["id"]] = (item.get("name"), quando(ts), item.get("input") or {})
+            elif item.get("type") == "tool_result":
+                anterior = pendentes.get(item.get("tool_use_id"))
+                if not anterior:
+                    continue
+                nome, inicio, entrada = anterior
+                dt = (quando(ts) - inicio).total_seconds()
+                por_ferramenta[nome].append(dt)
+                cmd = (entrada.get("command") or "").strip()
+                if nome == "Bash" and cmd in ("true", ":", "echo", "pwd"):
+                    triviais.append(dt)
+    return por_ferramenta, triviais
+
+
+def bench(achados, ferramenta: str, projeto: Path, repeticoes: int, teto_s: float):
+    payloads = {
+        "PreToolUse": {"hook_event_name": "PreToolUse", "tool_name": ferramenta,
+                       "tool_input": {"command": "true", "description": "sonda de latencia"}},
+        "PostToolUse": {"hook_event_name": "PostToolUse", "tool_name": ferramenta,
+                        "tool_input": {"command": "true"},
+                        "tool_response": {"stdout": "", "stderr": "", "interrupted": False}},
+    }
+    base = {"session_id": SESSION_ID_SONDA, "transcript_path": "/dev/null", "cwd": str(projeto)}
+    linhas = []
+    for fonte, evento, matcher, cmd, _timeout, root in achados:
+        if evento not in payloads or not casa(matcher, ferramenta):
+            continue
+        env = dict(os.environ)
+        if root:
+            env["CLAUDE_PLUGIN_ROOT"] = root
+            env["CLAUDE_PLUGIN_DATA"] = str(cfg_dir() / "plugins" / "data" / Path(root).name)
+        env["CLAUDE_PROJECT_DIR"] = str(projeto)
+        # O bench roda o audit-log.sh de verdade; sem isto cada rodada da suite
+        # diaria gravaria linhas sinteticas no ~/.claude/audit-log.txt real.
+        env["AUDIT_LOG_FILE"] = str(Path(tempfile.gettempdir()) / "hooks-latency-bench-audit.log")
+        corpo = json.dumps({**base, **payloads[evento]})
+        tempos, rc = [], None
+        for _ in range(repeticoes):
+            t0 = time.perf_counter()
+            try:
+                p = subprocess.run(["bash", "-c", cmd], input=corpo, capture_output=True,
+                                   text=True, timeout=teto_s, env=env, cwd=str(projeto))
+                rc = p.returncode
+            except subprocess.TimeoutExpired:
+                rc = "TIMEOUT"
+                tempos.append(teto_s * 1000)
+                break
+            tempos.append((time.perf_counter() - t0) * 1000)
+        mediana = sorted(tempos)[len(tempos) // 2] if tempos else 0.0
+        linhas.append({"ms": round(mediana, 1), "fonte": fonte, "evento": evento,
+                       "rc": rc, "comando": cmd[:90]})
+    linhas.sort(key=lambda r: -r["ms"])
+    return linhas
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tool", default="Bash", help="ferramenta a analisar (default: Bash)")
+    ap.add_argument("--projeto", default=os.environ.get("CLAUDE_PROJECT_DIR", "/opt/wiki"))
+    ap.add_argument("--transcript", help="jsonl de sessao; default: o mais recente do projeto")
+    ap.add_argument("--bench", action="store_true",
+                    help="executa cada hook isolado e cronometra (grava estado sintetico)")
+    ap.add_argument("--repeticoes", type=int, default=3)
+    ap.add_argument("--teto", type=float, default=30.0, help="teto por hook no bench, em segundos")
+    ap.add_argument("--max-ms", type=float, default=None,
+                    help="regua do bench: hook acima de N ms, com rc != 0 ou TIMEOUT reprova (exit 1). Exige --bench")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    projeto = Path(args.projeto)
+    achados, n_plugins = coleta_hooks(projeto)
+    if not achados:
+        print("nenhum hook encontrado — verifique CLAUDE_CONFIG_DIR", file=sys.stderr)
+        return 2
+
+    por_evento: dict[str, int] = defaultdict(int)
+    por_plugin: dict[str, int] = defaultdict(int)
+    for fonte, evento, _m, _c, _t, _r in achados:
+        por_evento[evento] += 1
+        por_plugin[fonte] += 1
+
+    por_chamada = {}
+    for f in ("Bash", "Edit", "Write", "Read", "Grep", "Task"):
+        pre = sum(1 for _s, e, m, _c, _t, _r in achados if e == "PreToolUse" and casa(m, f))
+        post = sum(1 for _s, e, m, _c, _t, _r in achados if e == "PostToolUse" and casa(m, f))
+        por_chamada[f] = {"pre": pre, "post": post, "total": pre + post}
+
+    transcript = Path(args.transcript) if args.transcript else None
+    if transcript is None:
+        d = cfg_dir() / "projects" / str(projeto).replace("/", "-")
+        jsonls = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if d.exists() else []
+        transcript = jsonls[0] if jsonls else None
+    observado, triviais = mede_transcript(transcript) if transcript else ({}, [])
+
+    if args.max_ms is not None and not args.bench:
+        print("--max-ms so faz sentido com --bench", file=sys.stderr)
+        return 2
+    linhas_bench = bench(achados, args.tool, projeto, args.repeticoes, args.teto) if args.bench else []
+    # Regua (2026-09-08): a ferramenta nasceu so para medir; sem regua ela nao
+    # entra em suite nenhuma e o defeito volta em silencio. Reprova hook lento,
+    # hook que falha (rc != 0: um hook de guarda que morre nao guarda nada) e
+    # hook morto por timeout. Vermelho diz QUAL hook, nao so "reprovou".
+    ofensores = []
+    if args.max_ms is not None:
+        for r in linhas_bench:
+            motivo = []
+            if r["rc"] == "TIMEOUT":
+                motivo.append("timeout")
+            elif r["rc"] != 0:
+                motivo.append(f"rc={r['rc']}")
+            if r["ms"] > args.max_ms:
+                motivo.append(f"{r['ms']:.0f}ms > {args.max_ms:.0f}ms")
+            if motivo:
+                ofensores.append({**r, "motivo": ", ".join(motivo)})
+
+    if args.json:
+        print(json.dumps({
+            "plugins_habilitados": n_plugins,
+            "hooks_total": len(achados),
+            "hooks_por_evento": dict(por_evento),
+            "hooks_por_plugin": dict(por_plugin),
+            "processos_por_chamada": por_chamada,
+            "transcript": str(transcript) if transcript else None,
+            "observado_s": {k: sorted(v)[len(v) // 2] for k, v in observado.items()},
+            "bash_trivial_s": triviais,
+            "bench": linhas_bench,
+            "max_ms": args.max_ms,
+            "ofensores": ofensores,
+        }, ensure_ascii=False, indent=2))
+        return 1 if ofensores else 0
+
+    print(f"plugins habilitados: {n_plugins}   hooks registrados: {len(achados)}\n")
+    print("hooks por evento")
+    for ev, n in sorted(por_evento.items(), key=lambda x: -x[1]):
+        print(f"  {ev:<22} {n:>4}")
+    print("\nprocessos disparados por chamada de ferramenta")
+    for f, v in por_chamada.items():
+        print(f"  {f:<6} Pre={v['pre']:>3}  Post={v['post']:>3}  ->  {v['total']:>3}")
+    print("\nos 10 plugins com mais hooks")
+    for nome, n in sorted(por_plugin.items(), key=lambda x: -x[1])[:10]:
+        print(f"  {nome:<26} {n:>4}")
+
+    if observado:
+        print(f"\nobservado no transcript {transcript.name}")
+        for nome, ds in sorted(observado.items(), key=lambda x: -len(x[1])):
+            ds = sorted(ds)
+            print(f"  {nome:<14} n={len(ds):<4} min={ds[0]:6.2f}s  mediana={ds[len(ds)//2]:6.2f}s  max={ds[-1]:7.2f}s")
+    if triviais:
+        print("\n  Bash com comando trivial (custo puro de hook):")
+        for t in triviais:
+            print(f"    {t:6.2f}s")
+    elif observado:
+        print("\n  (nenhum Bash trivial na sessao; rode `true` duas vezes para ter o custo puro)")
+
+    if linhas_bench:
+        print(f"\nbench por hook, ferramenta {args.tool} (mediana de {args.repeticoes})")
+        print(f"  {'ms':>9}  {'fonte':<24} {'evento':<13} rc     comando")
+        soma = defaultdict(float)
+        for r in linhas_bench:
+            soma[r["evento"]] += r["ms"]
+            print(f"  {r['ms']:>9.1f}  {r['fonte']:<24} {r['evento']:<13} {str(r['rc']):<6} {r['comando']}")
+        for ev, s in soma.items():
+            print(f"  soma {ev}: {s/1000:.2f}s (serial; o harness pode paralelizar)")
+    if args.max_ms is not None:
+        if ofensores:
+            print(f"\nREPROVADO: {len(ofensores)} hook(s) fora da regua de {args.max_ms:.0f} ms")
+            for r in ofensores:
+                print(f"  {r['fonte']:<24} {r['evento']:<13} {r['motivo']:<28} {r['comando']}")
+            return 1
+        print(f"\nOK: todos os {len(linhas_bench)} hooks de {args.tool} dentro de {args.max_ms:.0f} ms e rc=0")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

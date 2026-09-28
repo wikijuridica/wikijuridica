@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""generate-v2-rescued-pages — integra ao acervo v2 as paginas que sobreviveram
+apenas no resgate de /tmp.
+
+Por que existe: em 2026-08-06, ao blindar o trabalho untracked, apareceram
+1.087 intent_ids em .agents/runtime/tmp_rescue/ que nao existem em
+data/editorial/v2_pages/. Sao paginas redigidas por agentes cujo resultado
+nunca voltou para o repo — exatamente o precedente que originou a regra
+"produto nunca mora em /tmp". Descartar seria jogar fora trabalho pago.
+
+Criterio de integracao (uma pagina so entra se estiver INTEIRA):
+  title, meta_description, h1 e opening preenchidos
+  >= 3 secoes com heading e texto
+  word_count declarado >= 350
+  >= 1 fonte oficial com URL
+  intent_id ainda ausente do acervo canonico
+
+Quando o mesmo intent_id aparece em varios arquivos do resgate, vence a
+versao com mais secoes, depois maior word_count, depois mais fontes.
+
+O que NAO entra fica registrado em data/ops/v2_rescue_incomplete.jsonl como
+fila de refinamento — nao se perde, so nao publica.
+
+Uso:
+    tools/generate-v2-rescued-pages            # relatorio, nao escreve
+    tools/generate-v2-rescued-pages --write    # grava os shards
+"""
+import json
+import glob
+import os
+import sys
+import collections
+import unicodedata
+import re
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from audit_v2_pages import body_word_count  # noqa: E402  (precisa do ROOT acima)
+
+CANON_GLOB = os.path.join(ROOT, "data/editorial/v2_pages/*.jsonl")
+RESCUE_GLOB = os.path.join(ROOT, ".agents/runtime/tmp_rescue/**/*.jsonl")
+OUT_DIR = os.path.join(ROOT, "data/editorial/v2_pages_rescued")
+INCOMPLETE_OUT = os.path.join(ROOT, "data/ops/v2_rescue_incomplete.jsonl")
+SHARD_PREFIX = "resgatadas-20260806"
+SHARD_SIZE = 50
+
+MIN_SECTIONS = 3
+MIN_WORDS = 350
+
+
+def load_canonical_ids():
+    ids = set()
+    for path in sorted(glob.glob(CANON_GLOB)):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                intent = record.get("intent_id")
+                if intent:
+                    ids.add(intent)
+    return ids
+
+
+def rank(record):
+    """Ordena versoes concorrentes do mesmo intent_id: mais completa vence."""
+    sections = record.get("sections") or []
+    return (
+        len(sections),
+        record.get("word_count") or 0,
+        len(record.get("official_sources") or []),
+    )
+
+
+def collect_rescued(canonical_ids):
+    best = {}
+    origin = {}
+    for path in glob.glob(RESCUE_GLOB, recursive=True):
+        try:
+            handle = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                intent = record.get("intent_id")
+                if not intent or intent in canonical_ids:
+                    continue
+                if intent not in best or rank(record) > rank(best[intent]):
+                    best[intent] = record
+                    origin[intent] = os.path.relpath(path, ROOT)
+    return best, origin
+
+
+def has_encoding_defect(record):
+    """Soft-hyphen e mojibake corrompem o texto visivel — nunca publicavel."""
+    blob = json.dumps(record, ensure_ascii=False)
+    if "­" in blob:
+        return "soft_hyphen"
+    if "�" in blob:
+        return "replacement_char"
+    if re.search(r"[ÃÂ][-¿]", blob):
+        return "mojibake"
+    return ""
+
+
+def completeness_issues(record):
+    issues = []
+    for field in ("title", "meta_description", "h1", "opening"):
+        if not (record.get(field) or "").strip():
+            issues.append("missing_" + field)
+    sections = [
+        section
+        for section in (record.get("sections") or [])
+        if (section.get("heading") or "").strip() and (section.get("text") or "").strip()
+    ]
+    if len(sections) < MIN_SECTIONS:
+        issues.append("sections_below_%d" % MIN_SECTIONS)
+    if (record.get("word_count") or 0) < MIN_WORDS:
+        issues.append("word_count_below_%d" % MIN_WORDS)
+    sources = [
+        source
+        for source in (record.get("official_sources") or [])
+        if (source.get("url") or "").strip()
+    ]
+    if not sources:
+        issues.append("no_official_source")
+    defect = has_encoding_defect(record)
+    if defect:
+        issues.append("encoding_" + defect)
+    return issues
+
+
+def normalize(record, origin_path):
+    """Alinha o registro ao contrato do acervo, sem inventar conteudo."""
+    out = dict(record)
+    out.setdefault("faq", [])
+    out.setdefault("internal_link_topics", [])
+    out.setdefault("lane", "informativa")
+    # Bloqueio de publicacao e o default do acervo — quem libera e o promotor.
+    out["publication_allowed"] = False
+    out["render_allowed"] = False
+    out["sitemap_allowed"] = False
+    out["approval"] = False
+    out["index_policy"] = "noindex"
+    out["public_path"] = ""
+    out["rescued_from"] = origin_path
+    out["rescued_at"] = "2026-08-06"
+    # word_count declarado tem que refletir o corpo real (regra do gerador datado),
+    # e "corpo real" e o que o gate de ingestao conta: bodyWordCount em
+    # internal/v2ingest/validate.go — abertura, HEADING e texto de cada secao, e
+    # pergunta/resposta de cada FAQ, tokenizando em letra/digito.
+    #
+    # A versao anterior errava nas DUAS pontas (BUG-048, medido em 2026-08-29):
+    # somava so abertura + sections[].text (sem heading, sem FAQ) e tokenizava
+    # com str.split(), que conta "Lei 9.494/97" como UMA palavra. Uma pagina
+    # integrada por aqui nascia com o campo abaixo do corpo, e desde hoje isso
+    # reprova em tools/check-body-word-count-formula. Chamar a formula do auditor
+    # e o que impede este gerador de reabrir a divergencia que acabou de fechar.
+    out["word_count"] = body_word_count(out)
+    return out
+
+
+def main():
+    write = "--write" in sys.argv
+    canonical_ids = load_canonical_ids()
+    best, origin = collect_rescued(canonical_ids)
+
+    complete = {}
+    incomplete = []
+    reasons = collections.Counter()
+    for intent, record in best.items():
+        issues = completeness_issues(record)
+        if issues:
+            for issue in issues:
+                reasons[issue] += 1
+            incomplete.append(
+                {
+                    "intent_id": intent,
+                    "issues": issues,
+                    "rescued_from": origin[intent],
+                    "word_count": record.get("word_count") or 0,
+                    "sections": len(record.get("sections") or []),
+                }
+            )
+            continue
+        complete[intent] = normalize(record, origin[intent])
+
+    print("acervo canonico          : %d intent_ids" % len(canonical_ids))
+    print("resgatados fora do acervo: %d" % len(best))
+    print("  COMPLETAS (integraveis): %d" % len(complete))
+    print("  incompletas (fila)     : %d" % len(incomplete))
+    print("\nmotivos de incompletude:")
+    for reason, count in reasons.most_common():
+        print("  %-32s %d" % (reason, count))
+
+    if complete:
+        words = sorted(record["word_count"] for record in complete.values())
+        print(
+            "\npalavras nas completas: min %d | mediana %d | max %d"
+            % (words[0], words[len(words) // 2], words[-1])
+        )
+        areas = collections.Counter(intent.split("-")[0] for intent in complete)
+        print("prefixos:", dict(areas.most_common(10)))
+
+    if not write:
+        print("\nrelatorio apenas. rode com --write para gravar.")
+        return 0
+
+    ordered = sorted(complete.items())
+    shards = 0
+    for start in range(0, len(ordered), SHARD_SIZE):
+        chunk = ordered[start : start + SHARD_SIZE]
+        shards += 1
+        path = os.path.join(OUT_DIR, "%s-%02d.jsonl" % (SHARD_PREFIX, shards))
+        with open(path, "w", encoding="utf-8") as handle:
+            for _, record in chunk:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print("gravado %s (%d paginas)" % (os.path.relpath(path, ROOT), len(chunk)))
+
+    os.makedirs(os.path.dirname(INCOMPLETE_OUT), exist_ok=True)
+    with open(INCOMPLETE_OUT, "w", encoding="utf-8") as handle:
+        for entry in sorted(incomplete, key=lambda item: item["intent_id"]):
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(
+        "gravado %s (%d na fila de refinamento)"
+        % (os.path.relpath(INCOMPLETE_OUT, ROOT), len(incomplete))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

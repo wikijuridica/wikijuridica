@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""check-social-units-enabled — `enabled` de verdade, não `linked`, nas quatro units do portal.
+
+READ-ONLY. Sai 1 quando uma unit do portal está instalada mas NÃO habilitada, ou
+quando o symlink que o `[Install]` promete não existe no disco. Sai 2 quando não
+consegue medir (sem `systemctl`, sem `ops/systemd`) — indisponibilidade de
+ambiente nunca é reprovação neste repositório.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTE GATE EXISTE, e por que `check-units-instaladas` não bastava
+
+`check-units-instaladas` confere o symlink em `/etc/systemd/system/<unit>`. Esse
+symlink é o estado `linked`: o systemd CONHECE a unit, e `systemctl start` a
+sobe. Ele não diz nada sobre o boot. Quem sobe no boot é o symlink em
+`<target>.wants/`, que só o `systemctl enable` cria.
+
+Medido neste host em 2026-09-05, com os dois symlinks datados:
+
+    /etc/systemd/system/wikijuridica-social.service       set  5 00:03  (linked)
+    …/multi-user.target.wants/wikijuridica-social.service set  5 02:52  (enabled)
+
+Entre 00:03 e 02:52 `check-units-instaladas` deu OK — e um reboot nessa janela
+teria derrubado a rede social sem ela voltar. Já havia visitante real em
+`/redesocial/` (`data/ops/access/nginx-2026-09-05.jsonl`: GET /redesocial/ 200,
+HIT de borda, Android/Chrome via Cloudflare). `WantedBy=` no arquivo prova que a
+unit PODE ser habilitada, nunca que FOI: o arquivo está no repositório, os
+symlinks de `.wants/` estão fora dele, onde nenhum gate olhava.
+
+A segunda regra é o incidente de 01–02/09/2026 virando trava. O journal:
+
+    set 01 18:37:00 wikijuridica-server.service: Main process exited, status=1
+    set 01 18:37:05 wikijuridica-server.service: Failed to schedule restart job:
+                    Unit wikijuridica-server.socket not found
+
+O serviço caiu por outro motivo (manifesto incoerente, `log.Fatal` no boot), mas
+quem transformou uma falha de 5 s em 16 h fora do ar foi o `Requires=` de um
+socket que o systemd não tinha: com a dependência ausente, `Restart=always` nem
+consegue AGENDAR a volta. Por isso: todo `.service` do projeto que declara
+`Requires=`/`BindsTo=` de um `.socket` exige aquele socket **também habilitado**.
+Socket meramente `linked` sobrevive enquanto ninguém reinicia a máquina, e é
+justamente no boot que a conta chega.
+
+────────────────────────────────────────────────────────────────────────────
+AS REGRAS
+
+  habilitada     `systemctl is-enabled <unit>` tem de devolver exatamente
+                 `enabled`. `linked` (arquivo conhecido, boot descoberto),
+                 `enabled-runtime`/`linked-runtime` (vivem em /run e somem no
+                 reboot), `disabled`, `static` e `not-found` reprovam, com a
+                 palavra real impressa.
+  install_link   para cada `WantedBy=`/`RequiredBy=` do arquivo do repositório,
+                 o symlink `<target>.wants|.requires/<unit>` tem de existir e
+                 apontar (por realpath) para o arquivo do repositório. É o que
+                 `is-enabled` sozinho não vê: unit habilitada apontando para
+                 cópia velha continua dizendo `enabled`.
+  socket_do_requires
+                 varre TODO `.service` de `ops/systemd`; cada `Requires=`/
+                 `BindsTo=` de `.socket` do projeto obriga aquele socket a estar
+                 `enabled`. É a receita do laço de 01/09.
+
+O gate não instala, não habilita e não reinicia nada.
+
+Uso:
+    tools/check-social-units-enabled
+    tools/check-social-units-enabled --json
+    tools/check-social-units-enabled --units wikijuridica-social.socket   # núcleo alternativo
+    tools/check-social-units-enabled --dir X --etc Y                      # teste
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR_UNITS = os.path.join(RAIZ, "ops/systemd")
+DIR_ETC = "/etc/systemd/system"
+
+# AS QUATRO UNITS DO PORTAL, lidas de ops/systemd (o gate confere abaixo que cada
+# nome tem arquivo lá; nome que sumir do repositório reprova em vez de sumir da
+# vigilância). Dois pares socket+service, porque é o par que o `Requires=` acopla:
+#   acervo      — 127.0.0.1:8089, gêmeas Markdown, /mcp, /a2a, /api/v1, busca
+#   rede social — 127.0.0.1:8091, /redesocial/
+NUCLEO = (
+    "wikijuridica-server.socket",
+    "wikijuridica-server.service",
+    "wikijuridica-social.socket",
+    "wikijuridica-social.service",
+)
+
+PREFIXOS_PROJETO = ("wikijuridica-", "cloudflared-wikijuridica")
+CHAVES_INSTALL = ("WantedBy", "RequiredBy")
+CHAVES_SOCKET = ("Requires", "BindsTo")
+
+# Um parser de unit só no repositório: o de check-units-alarme, que rastreia
+# seção e ignora comentário. Um segundo parser envelheceria sozinho.
+_alarme = SourceFileLoader("check_units_alarme", os.path.join(RAIZ, "tools/check-units-alarme")).load_module()
+le_unit = _alarme.le_unit
+
+
+def e_do_projeto(nome):
+    return nome.startswith(PREFIXOS_PROJETO)
+
+
+def is_enabled(unit):
+    """Palavra literal do systemd, ou None quando `systemctl` não responde.
+
+    `is-enabled` sai != 0 para disabled/not-found e ainda assim imprime a
+    palavra: o que interessa é o stdout, não o código.
+    """
+    try:
+        r = subprocess.run(["systemctl", "is-enabled", "--", unit],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    palavra = (r.stdout or r.stderr).strip().splitlines()
+    return palavra[-1].strip() if palavra else ""
+
+
+def alvos_de_install(diretivas):
+    """(chave, target) de cada WantedBy=/RequiredBy= da seção [Install]."""
+    for d in diretivas:
+        if d["secao"] != "Install" or d["chave"] not in CHAVES_INSTALL:
+            continue
+        for alvo in d["valor"].split():
+            if "%" in alvo:
+                continue
+            yield d["chave"], alvo
+
+
+def sockets_exigidos(diretivas):
+    """(chave, socket, linha) de cada Requires=/BindsTo= que nomeia um .socket do projeto."""
+    for d in diretivas:
+        if d["secao"] != "Unit" or d["chave"] not in CHAVES_SOCKET:
+            continue
+        for alvo in d["valor"].split():
+            if "%" in alvo or not alvo.endswith(".socket") or not e_do_projeto(alvo):
+                continue
+            yield d["chave"], alvo, d["linha"]
+
+
+def link_de_install(dir_etc, target, chave, unit):
+    """Onde o `enable` grava o symlink, e para onde ele aponta HOJE.
+
+    Procura em /etc e em /run: `enabled-runtime` grava em /run e some no reboot,
+    e o gate precisa poder DIZER isso em vez de só não achar o symlink.
+    """
+    sufixo = ".wants" if chave == "WantedBy" else ".requires"
+    candidatos = [os.path.join(dir_etc, target + sufixo, unit)]
+    if dir_etc == DIR_ETC:
+        candidatos.append(os.path.join("/run/systemd/system", target + sufixo, unit))
+    for caminho in candidatos:
+        if os.path.islink(caminho) or os.path.exists(caminho):
+            return caminho, os.path.realpath(caminho)
+    return candidatos[0], None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reprova unit do portal instalada e nao habilitada.")
+    ap.add_argument("--dir", default=DIR_UNITS, help="diretorio das units do repositorio")
+    ap.add_argument("--etc", default=DIR_ETC, help="diretorio de instalacao do systemd")
+    ap.add_argument("--units", default="",
+                    help="substitui o nucleo por esta lista separada por virgula (teste do vermelho)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.dir):
+        print("INCONCLUSIVO: %s nao existe" % args.dir, file=sys.stderr)
+        return 2
+    if is_enabled("basic.target") is None:
+        print("INCONCLUSIVO: systemctl indisponivel", file=sys.stderr)
+        return 2
+
+    nucleo = tuple(n.strip() for n in args.units.split(",") if n.strip()) if args.units else NUCLEO
+
+    problemas, medidas = [], []
+
+    def reprova(unit, regra, detalhe):
+        problemas.append({"unit": unit, "regra": regra, "detalhe": detalhe})
+
+    # ── regra `habilitada` + `install_link` sobre o nucleo ────────────────────
+    for unit in nucleo:
+        caminho_repo = os.path.join(args.dir, unit)
+        if not os.path.isfile(caminho_repo):
+            reprova(unit, "habilitada",
+                    "sem arquivo em %s: o nucleo do portal aponta para unit que o repositorio "
+                    "nao declara (renomeada? removida?)" % args.dir)
+            medidas.append({"unit": unit, "is_enabled": is_enabled(unit), "arquivo_no_repo": False})
+            continue
+        estado = is_enabled(unit)
+        medidas.append({"unit": unit, "is_enabled": estado, "arquivo_no_repo": True})
+        if estado != "enabled":
+            reprova(unit, "habilitada",
+                    "systemctl is-enabled devolveu `%s`, nao `enabled`. `linked` sobe com "
+                    "`systemctl start` e NAO sobe no boot; `*-runtime` vive em /run e some no "
+                    "reboot. Remedio: sudo systemctl enable %s" % (estado, caminho_repo))
+
+        _linhas, diretivas = le_unit(caminho_repo)
+        alvos = list(alvos_de_install(diretivas))
+        if not alvos:
+            reprova(unit, "install_link",
+                    "sem WantedBy=/RequiredBy= em [Install]: a unit nao pode ser habilitada, "
+                    "e nada a sobe no boot")
+            continue
+        for chave, target in alvos:
+            caminho, aponta = link_de_install(args.etc, target, chave, unit)
+            if aponta is None:
+                reprova(unit, "install_link",
+                        "%s=%s prometido no arquivo, e %s nao existe: o boot nao sobe esta unit. "
+                        "Remedio: sudo systemctl enable %s" % (chave, target, caminho, caminho_repo))
+            elif aponta != os.path.realpath(caminho_repo):
+                reprova(unit, "install_link",
+                        "%s aponta para %s, nao para %s: o boot subiria OUTRO arquivo, e "
+                        "is-enabled diria `enabled` do mesmo jeito"
+                        % (caminho, aponta, os.path.realpath(caminho_repo)))
+
+    # ── regra `socket_do_requires` sobre todos os .service do repositorio ─────
+    servicos = sorted(f for f in os.listdir(args.dir) if f.endswith(".service") and "@" not in f)
+    pares = []
+    for servico in servicos:
+        _linhas, diretivas = le_unit(os.path.join(args.dir, servico))
+        for chave, socket, linha in sockets_exigidos(diretivas):
+            estado = is_enabled(socket)
+            pares.append({"service": servico, "socket": socket, "chave": chave,
+                          "linha": linha, "socket_is_enabled": estado})
+            if estado != "enabled":
+                reprova(servico, "socket_do_requires",
+                        "linha %d: %s=%s, e o socket esta `%s`. Com a dependencia fora do boot o "
+                        "systemd nem AGENDA o restart (`Failed to schedule restart job: Unit %s "
+                        "not found`, 01/09/2026, 16 h fora do ar). Remedio: sudo systemctl enable %s"
+                        % (linha, chave, socket, estado, socket, os.path.join(args.dir, socket)))
+
+    veredito = "FAIL" if problemas else "OK"
+    if args.json:
+        print(json.dumps({"veredito": veredito, "nucleo": list(nucleo), "medidas": medidas,
+                          "pares_service_socket": pares, "problemas": problemas},
+                         ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if problemas else 0
+
+    print("nucleo do portal: %d unit(s) · pares service->socket varridos: %d"
+          % (len(nucleo), len(pares)))
+    for m in medidas:
+        print("  %-42s is-enabled=%s" % (m["unit"], m["is_enabled"]))
+    for p in pares:
+        print("  %-42s Requires-> %-34s is-enabled=%s"
+              % (p["service"], p["socket"], p["socket_is_enabled"]))
+
+    if problemas:
+        print("\ncheck-social-units-enabled: FAIL")
+        for p in problemas:
+            print("  - [%s] %s" % (p["regra"], p["unit"]))
+            print("      %s" % p["detalhe"])
+        print("\n  `WantedBy=` no arquivo prova que a unit PODE ser habilitada, nunca que FOI.")
+        print("  Os symlinks de .wants/ ficam fora do repositorio: sem este gate, nao ha prova.")
+        return 1
+
+    print("\ncheck-social-units-enabled: OK (as %d units do nucleo estao `enabled` com o symlink "
+          "de [Install] apontando para o repositorio, e todo socket exigido por Requires=/BindsTo= "
+          "esta habilitado)" % len(nucleo))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

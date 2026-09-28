@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Guarda o CUSTO DE DESCOBERTA do sitemap: coorte de navegacao reservada e
+Cache-Control coerente com a cadencia real de publicacao.
+
+O QUE ELE EXISTE PARA IMPEDIR (medido em 2026-08-27, log vivo do nginx)
+----------------------------------------------------------------------
+Entre 20 e 27/08 o Googlebot gastou 65 requisicoes na arvore de sitemap contra
+44 em pagina — mais da metade do orcamento dele em MAPA, e nesse periodo baixou
+os 32 shards inteiros. As 3.054 URLs que ele nunca pediu NAO sao inalcancaveis:
+estao 100% no sitemap, todas tem link interno de entrada (mediana 6, zero
+orfas) e a distribuicao de profundidade a partir da home e indistinguivel da
+das URLs ja pedidas (82% a 3 saltos contra 84%). Elas sao a cauda de um
+orcamento que a arvore de sitemap consome.
+
+Duas causas medidas, e este check guarda as duas correcoes:
+
+1. CHURN DE ORDINAL. A particao agrupa por (data de revisao, area). As hubs de
+   area e a paginacao sao re-datadas TODO DIA por construcao — a hub muda porque
+   OUTRA pagina mudou —, entao cada onda diaria criava uma coorte nova com as
+   ~218 rotas sinteticas, drenava as coortes do dia anterior, empurrava algumas
+   abaixo de `minCohortURLs` e deslocava o ordinal do plano inteiro. Medido entre
+   as publicacoes de 26 e 27/08: 35 shards viraram 32, pages-0034 virou
+   pages-0018 (-16), pages-0035 virou pages-0027 (-8), a home saiu de pages-0033
+   para pages-0003, e 30 dos 32 shards mudaram de bytes — 1,53 MB de sitemap
+   re-anunciados por causa de ~15 paginas novas. O shard que mais deslocou
+   (pages-0018) e justamente o que o Googlebot nunca pediu: 258 de 259 URLs sem
+   uma unica requisicao. A correcao e a coorte RESERVADA na cabeca do plano
+   (internal/sitemap/shard_partition.go: splitNavigationCohort).
+
+2. CACHE-CONTROL DE 5 MINUTOS num artefato que muda 1x/dia — 288 janelas de
+   revalidacao por mudanca real. A sonda de superficie mediu
+   `cf-cache-status: MISS` no indice e no shard: com TTL tao curto e o trafego
+   de crawler que o portal tem, o objeto nunca esta quente e toda visita vira
+   requisicao na origem. A correcao e `httpserver.SitemapCacheControl`, e o
+   valor tem de ser IDENTICO nas tres camadas (Go, as duas copias do nginx e a
+   resposta real da origem) — divergencia entre copias do mesmo recurso ja
+   serviu robots.txt de dias de idade na borda em 2026-08-13.
+
+READ-ONLY: le o disco publicado, o codigo e as confs, e opcionalmente sonda a
+origem local. Nao escreve, nao publica, nao purga.
+
+Uso:
+    tools/check-sitemap-discovery-cost
+    tools/check-sitemap-discovery-cost --raiz /tmp/copia   # teste de falso positivo
+    tools/check-sitemap-discovery-cost --sem-sonda
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import json
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.request
+
+# Ordinal reservado a navegacao. Espelha a cabeca do plano em
+# planAreaRevisionShards: a coorte reservada e empacotada ANTES de qualquer
+# coorte datada, entao ela ocupa pages-0001.xml.
+SHARD_RESERVADO = "pages-0001.xml"
+
+# Piso de minCohortURLs (internal/sitemap/shard_partition.go). Abaixo dele a
+# coorte reservada NAO nasce, de proposito, e a navegacao volta para as coortes
+# datadas — o check nao pode acusar esse caso.
+MIN_COHORT_URLS = 50
+
+# Sonda propria, nunca User-Agent de bot real.
+PROBE_UA = "wikijuridica-superficie-probe/1.0"
+ORIGEM_PADRAO = "http://127.0.0.1:8088"
+
+MARCA_CARENCIA = "sitemap-shard-em-carencia"
+
+
+def base_url(raiz: pathlib.Path) -> str:
+    try:
+        site = json.loads((raiz / "content" / "site.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "https://wikijuridica.com.br"
+    return str(site.get("base_url") or site.get("baseURL") or "https://wikijuridica.com.br").rstrip("/")
+
+
+def shards_do_indice(raiz: pathlib.Path) -> list[str]:
+    """Os shards que o INDICE anuncia, na ordem em que ele os anuncia.
+
+    O disco tem mais arquivos que o plano (os shards em carencia continuam
+    servidos de proposito). Quem manda e o indice: e ele que o crawler le.
+    """
+    try:
+        indice = (raiz / "public" / "sitemap.xml").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return re.findall(r"<loc>[^<]*?/sitemaps/(pages-\d+\.xml)</loc>", indice)
+
+
+def locs_por_shard(raiz: pathlib.Path, shards: list[str]) -> dict[str, list[str]]:
+    base = base_url(raiz)
+    mapa: dict[str, list[str]] = {}
+    for nome in shards:
+        try:
+            texto = (raiz / "public" / "sitemaps" / nome).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if MARCA_CARENCIA in texto:
+            # Shard em carencia dentro do indice seria outro defeito, e nao e
+            # deste check: check-sitemap-shard-grace ja cuida disso.
+            continue
+        mapa[nome] = [loc.replace(base, "") for loc in re.findall(r"<loc>([^<]+)</loc>", texto)]
+    return mapa
+
+
+def rotas_editoriais(raiz: pathlib.Path) -> set[str]:
+    """Paths de content/pages.json. O complemento, dentro do sitemap, e a
+    navegacao sintetica — derivacao ESTRUTURAL, nunca regex de path.
+
+    A hub e mantida FORA de content/pages.json de proposito (o comentario de
+    internal/build/build.go diz "Elas NAO entram em repo.Pages"), e o Go a
+    discrimina por PageType == "hub-area". O XML publicado nao carrega o campo,
+    entao a diferenca de conjuntos e o equivalente disponivel a um leitor
+    read-only. Conferido no acervo vivo de 2026-08-27: a diferenca da 218 rotas
+    e coincide URL a URL com o shard que o Go reservou.
+    """
+    try:
+        registros = json.loads((raiz / "content" / "pages.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {p["path"] for p in registros if isinstance(p, dict) and p.get("path")}
+
+
+def cache_control_do_go(raiz: pathlib.Path) -> str | None:
+    fonte = raiz / "internal" / "httpserver" / "httpserver.go"
+    try:
+        texto = fonte.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    achado = re.search(r'SitemapCacheControl\s*=\s*"([^"]+)"', texto)
+    return achado.group(1) if achado else None
+
+
+def blocos_de_location(texto: str) -> dict[str, str]:
+    """Corpo de cada `location <alvo> { ... }`, por casamento de chaves.
+
+    Casamento de chaves e nao regex de linha unica: o corpo tem varias
+    diretivas, e um `\\bCache-Control[^\\n]*` solto casaria com o bloco vizinho.
+    """
+    blocos: dict[str, str] = {}
+    for m in re.finditer(r"location\s+(=\s*)?(\S+)\s*\{", texto):
+        alvo = m.group(2)
+        profundidade = 1
+        i = m.end()
+        while i < len(texto) and profundidade > 0:
+            if texto[i] == "{":
+                profundidade += 1
+            elif texto[i] == "}":
+                profundidade -= 1
+            i += 1
+        chave = ("= " if m.group(1) else "") + alvo
+        blocos[chave] = texto[m.end():i]
+    return blocos
+
+
+def cache_control_do_nginx(caminho: pathlib.Path) -> dict[str, str | None]:
+    try:
+        texto = caminho.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    # Comentario nao e diretiva: uma linha comentada citando o valor antigo nao
+    # pode ser lida como configuracao.
+    sem_comentario = "\n".join(linha for linha in texto.splitlines() if not linha.lstrip().startswith("#"))
+    resultado: dict[str, str | None] = {}
+    for chave, corpo in blocos_de_location(sem_comentario).items():
+        if chave not in ("= /sitemap.xml", "/sitemaps/"):
+            continue
+        achado = re.search(r"Cache-Control:\s*([^']+)'", corpo)
+        resultado[chave] = achado.group(1).strip() if achado else None
+    return resultado
+
+
+def sonda(origem: str, caminho: str) -> str | None:
+    pedido = urllib.request.Request(
+        origem.rstrip("/") + caminho,
+        method="HEAD",
+        headers={"User-Agent": PROBE_UA, "X-Warming-Request": "true"},
+    )
+    try:
+        with urllib.request.urlopen(pedido, timeout=4) as resposta:
+            return resposta.headers.get("Cache-Control")
+    except (urllib.error.URLError, OSError):
+        return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--raiz", default=str(pathlib.Path(__file__).resolve().parent.parent),
+                    help="raiz do repositorio a inspecionar (para teste de falso positivo em copia)")
+    ap.add_argument("--origem", default=ORIGEM_PADRAO, help="origem local a sondar")
+    ap.add_argument("--sem-sonda", action="store_true", help="nao sonda a origem (ambiente sem servidor no ar)")
+    args = ap.parse_args()
+
+    raiz = pathlib.Path(args.raiz).resolve()
+    falhas: list[str] = []
+    avisos: list[str] = []
+
+    shards = shards_do_indice(raiz)
+    if not shards:
+        print(f"check-sitemap-discovery-cost: FAIL\n  - nenhum shard lido do indice em {raiz / 'public' / 'sitemap.xml'}")
+        return 1
+    mapa = locs_por_shard(raiz, shards)
+    editoriais = rotas_editoriais(raiz)
+
+    total_locs = sum(len(v) for v in mapa.values())
+    bytes_shards = sum(
+        (raiz / "public" / "sitemaps" / nome).stat().st_size
+        for nome in mapa
+        if (raiz / "public" / "sitemaps" / nome).exists()
+    )
+    print(f"  indice: {len(shards)} shards | {total_locs} locs | {bytes_shards} bytes descomprimidos")
+
+    if not editoriais:
+        avisos.append("content/pages.json ausente ou ilegivel: a coorte de navegacao nao pode ser derivada")
+    else:
+        navegacao = {loc for locs in mapa.values() for loc in locs if loc not in editoriais}
+        print(f"  navegacao sintetica (loc do sitemap fora de content/pages.json): {len(navegacao)} rotas")
+
+        if len(navegacao) < MIN_COHORT_URLS:
+            avisos.append(
+                f"navegacao com {len(navegacao)} rotas, abaixo do piso de {MIN_COHORT_URLS}: "
+                "a coorte reservada nao nasce de proposito, e nao ha o que conferir")
+        else:
+            # (i) toda a navegacao num shard so, e (ii) nesse shard so ha navegacao.
+            por_shard = collections.Counter(
+                nome for nome, locs in mapa.items() for loc in locs if loc in navegacao)
+            if len(por_shard) != 1:
+                detalhe = ", ".join(f"{nome}={n}" for nome, n in sorted(por_shard.items()))
+                falhas.append(
+                    f"a navegacao esta espalhada por {len(por_shard)} shards ({detalhe}); "
+                    "ela tem de viver numa coorte reservada so")
+            else:
+                (nome_reservado, quantas), = por_shard.items()
+                if nome_reservado != SHARD_RESERVADO:
+                    falhas.append(
+                        f"a coorte de navegacao esta em {nome_reservado}, e nao em {SHARD_RESERVADO}: "
+                        "na cauda o ordinal anda junto com as datas, e foi isso que deslocou "
+                        "pages-0034 para pages-0018 numa unica onda diaria")
+                intrusas = [loc for loc in mapa.get(nome_reservado, []) if loc in editoriais]
+                if intrusas:
+                    falhas.append(
+                        f"o shard reservado {nome_reservado} tem {len(intrusas)} rota(s) editorial(is), "
+                        f"a comecar por {intrusas[0]}: pagina editorial datada dentro da coorte "
+                        "reservada devolve a ela o churn que a reserva veio tirar")
+                if quantas != len(navegacao):
+                    falhas.append(
+                        f"o shard reservado tem {quantas} rotas de navegacao de {len(navegacao)}")
+
+            # (iii) toda area com pagina editorial no sitemap tem hub.
+            areas_editoriais = {
+                loc.strip("/").split("/")[0]
+                for locs in mapa.values() for loc in locs
+                if loc in editoriais and loc.strip("/") and "/" in loc.strip("/")
+            }
+            sem_hub = sorted(a for a in areas_editoriais if f"/{a}/" not in navegacao)
+            if sem_hub:
+                falhas.append(
+                    f"{len(sem_hub)} area(s) com pagina no sitemap e sem hub proprio: {sem_hub[:8]} — "
+                    "hub e por onde o crawler alcanca os filhos")
+
+    # Cache-Control coerente entre as tres camadas.
+    do_go = cache_control_do_go(raiz)
+    if not do_go:
+        falhas.append("httpserver.SitemapCacheControl nao encontrado em internal/httpserver/httpserver.go")
+    else:
+        print(f"  Cache-Control do sitemap (constante Go): {do_go}")
+        for conf in ("ops/nginx/wikijuridica.conf", "ops/nginx/standalone/nginx.conf"):
+            valores = cache_control_do_nginx(raiz / conf)
+            if not valores:
+                avisos.append(f"{conf}: nenhuma location de sitemap lida")
+                continue
+            for alvo, valor in sorted(valores.items()):
+                if valor != do_go:
+                    falhas.append(
+                        f"{conf} serve '{alvo}' com Cache-Control {valor!r}, e o Go declara {do_go!r}: "
+                        "as duas camadas do MESMO recurso divergem")
+        if not args.sem_sonda:
+            for caminho in ("/sitemap.xml", "/sitemaps/" + shards[0]):
+                servido = sonda(args.origem, caminho)
+                if servido is None:
+                    avisos.append(f"origem {args.origem}{caminho} nao respondeu a sonda; conferencia so no codigo")
+                    continue
+                print(f"  Cache-Control servido em {caminho}: {servido}")
+                if servido != do_go:
+                    falhas.append(
+                        f"a origem serve {caminho} com {servido!r}, e o Go declara {do_go!r}")
+
+    for aviso in avisos:
+        print(f"  AVISO: {aviso}")
+    if falhas:
+        print("check-sitemap-discovery-cost: FAIL")
+        for f in falhas:
+            print(f"  - {f}")
+        return 1
+    print("check-sitemap-discovery-cost: pass")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

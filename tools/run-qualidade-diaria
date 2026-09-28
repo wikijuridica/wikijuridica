@@ -1,0 +1,1427 @@
+#!/usr/bin/env bash
+# tools/run-qualidade-diaria — dá EXECUTOR à camada de qualidade do projeto.
+#
+# ★ POR QUE EXISTE (2026-08-29, BUG-066 e BUG-108 da caça)
+#
+# Medido: o projeto tem 23 timers systemd e NENHUM invoca gate de qualidade. O
+# único arquivo do repo que menciona `cmd/check` fora de tools/ o faz num
+# comentário. `grep -cE '\bgo test\b' .githooks/pre-commit` devolve 0. E o
+# runner de suíte, tools/check-all, chamava `go test ./...` — padrão que NÃO
+# EXPANDE aqui (var/nginx/* é 0700 e aborta o caminhador), logo testava ZERO
+# pacote e reportava sucesso.
+#
+# Some-se a isso o que a mesma caça mediu: `sca-staticcheck` vermelho há 32
+# dias, `sca-gosec` há 32 dias, `sca-osv` e `sca-sbom` há semanas — todos
+# invisíveis, porque ninguém os executava. Gate que existe e não roda é igual a
+# gate que não existe; este repositório já aprendeu isso com os 311 check-*
+# órfãos, e a lição não tinha chegado à camada de qualidade do próprio código.
+#
+# ★ DESENHO
+#
+# Roda FORA do pre-commit, de propósito: a DEC-002 fixa o pré-commit leve, e
+# encher o caminho do commit com suíte integral é o oposto do que ela decidiu.
+# Aqui o custo cabe porque roda uma vez ao dia, em horário de baixa, com nice,
+# ionice e flock — a mesma serialização que o repo já usa para comando pesado.
+#
+# NÃO aborta na primeira falha: o valor é o MAPA de quem está vermelho hoje, não
+# o primeiro vermelho. Cada etapa tem timeout próprio e vira uma linha do ledger
+# data/ops/qualidade_diaria.jsonl, para que a série mostre há quantos dias cada
+# gate está caído — que é a informação que faltava para todos eles.
+#
+# Exit 0 = tudo verde. Exit 1 = há gate vermelho (o alerta ao dono sai pela
+# unit, via OnFailure). Exit 2 = o próprio runner não conseguiu rodar.
+
+set -u -o pipefail
+
+# ---- PROTECAO CRASH->2 (2026-09-16). A unit que chama este script mascara
+# exit 1 (`SuccessExitStatus=0 1`), porque 1 aqui e VEREDITO MEDIDO. Sem esta
+# protecao, um script que MORRE com 1 — violacao de `set -u`, comando ausente —
+# entrega o numero de quem mediu, a mascara o converte em `Result=success` e o
+# OnFailure nunca dispara.
+#
+# `medidor_protege_exit` (e nao a trap ERR) porque este script NAO usa `set -e`:
+# medido em 2026-09-16, a trap ERR nao dispara na violacao de `set -u`, e a trap
+# EXIT dispara. Acrescentar `set -e` aqui mudaria a semantica de falha de todo
+# comando do script, que e regressao proibida.
+#
+# Todo ponto de saida DELIBERADO com codigo 1 passa a chamar `medidor_sai 1`: e
+# assim que a trap distingue "o autor decidiu sair com 1" de "o shell morreu".
+. "$(dirname "${BASH_SOURCE[0]}")/lib/saida_de_medidor.sh"
+medidor_protege_exit
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$RAIZ" || exit 2
+
+LEDGER="$RAIZ/data/ops/qualidade_diaria.jsonl"
+# ★ A SAIDA DO GATE VERMELHO PRECISA SOBREVIVER (2026-09-05).
+#
+# `roda` captura a saida inteira em $saida e o ledger guarda `tail -3` cortado em
+# 300 chars. Medido: `journalctl -u wikijuridica-qualidade-diaria --since '8 days
+# ago' | grep -c -- '--- FAIL'` devolve ZERO -- a saida nunca chegou ao journal,
+# porque a substituicao de comando a desvia do stdout. Efeito: `suite-completa`
+# esta vermelha em 7 de 7 execucoes e o detalhe registrado termina em "... ok
+# portaljuridico/cmd/websub-ping 0.042s FAIL", sem o nome do pacote nem do teste.
+# Sete dias de vermelho que ninguem consegue diagnosticar: o vigia media e jogava
+# a prova fora, que e a mesma doenca dos 311 check-* orfaos que este arquivo
+# existe para curar, agora sobre a propria evidencia.
+GO_MODERN="$RAIZ/tools/go-modern"
+NICE_LEVEL="${WIKI_QUALIDADE_NICE:-19}"
+# ★ POR QUE NAO SE LIMITA O PARALELISMO DO `go test` AQUI (medido em 2026-09-05).
+#
+# A tentacao e' obvia: `go test` com varios pacotes executa GOMAXPROCS deles ao
+# mesmo tempo (8 nesta maquina), e foi isso que levou o load a 24 na execucao de
+# 01:43. `-p 4` pareceria a correcao cirurgica. NAO CABE, e a conta esta no
+# proprio ledger data/ops/qualidade_diaria.jsonl:
+#
+#   suite-completa, com o -p padrao: 1.665 s (30/08), 1.612 s (01/09),
+#   1.165 s (04/09), 1.134 s, 1.058 s, 844 s. PIOR CASO: 1.665 s.
+#
+# O `-timeout` interno desta etapa e' 1.800 s. A folga ja e' de 135 s -- 8%. Com
+# -p 6 a estimativa vai a ~2.000 s e com -p 4 a ~2.500 s: as duas ESTOURAM, e
+# estourar aqui e' pior que demorar, porque `roda()` classifica o estouro como
+# "timeout", categoria que por desenho NAO entra na conta de vermelhos. Trocar
+# pico de CPU por um gate que some do alerta e' o negocio errado, e afrouxar o
+# `-timeout` para acomodar e' o que o contrato proibe.
+#
+# O mesmo raciocinio ja tinha derrubado `CPUQuota=` na unit, por simetria: la o
+# estrangulado seria `checks-race-real-corpus` (1.301 s medidos contra teto de
+# 1.650 s). As duas etapas mais caras desta varredura vivem perto do proprio
+# teto; ela nao tem folga para ser estrangulada por nenhum instrumento.
+#
+# O QUE DE FATO RESOLVEU o incomodo do dono foi o HORARIO: o timer dizia
+# `04:40 UTC` e rodava 01:40 local, em cima da madrugada de trabalho dele. Com
+# `04:40` local (commit 3dd631b0) o pico acontece com a maquina ociosa, que e'
+# a premissa sob a qual `nice -n 19` e `IOSchedulingClass=idle` funcionam.
+AGORA="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DIA="$(date -u +%Y-%m-%d)"
+# DIA precisa nascer ANTES de ser usado abaixo: com `set -u` (linha 34), ler
+# $DIA nesta mesma posição antes da atribuição original (medido nesta sessão,
+# 2026-09-05) matava o script em "DIA: variável não associada" antes do
+# primeiro gate — nenhuma linha no ledger, nenhum gate medido, o mesmo defeito
+# que este arquivo inteiro existe para curar (gate que não roda = gate que não
+# existe), agora dentro do próprio vigia.
+DIAGNOSTICO="$RAIZ/.agents/runtime/qualidade-diaria/$DIA"
+
+vermelhos=""
+# Gate que ESTOUROU o relogio nao deu veredito nenhum. Ate 2026-09-04 ele saia
+# da conta: `registra` so' somava a `vermelhos` o status "vermelho", entao um
+# gate com status "timeout" desaparecia do alerta e o runner ainda imprimia
+# "tudo verde" com exit 0. No limite, TODOS os 40+ gates podiam estourar e a
+# saida seria "tudo verde" -- a mesma doenca dos 311 check-* orfaos que este
+# arquivo inteiro existe para curar, agora por dentro do proprio vigia.
+#
+# Nao vira "vermelho" de proposito: o ramo do `panic: test timed out` acima
+# documenta, com medicao, que relogio nao e' defeito, e chamar maquina lenta de
+# pacote quebrado ja custou tres falsos vermelhos em internal/v2ingest. Entao
+# ganha categoria propria: nao mede nada, nao acusa defeito, e IMPEDE que o
+# runner afirme "tudo verde" sobre o que nao chegou a ser medido.
+nao_medidos=""
+etapas_json=""
+
+# Pacotes-vitrine: os que servem a produção e os que guardam contrato. Rodam
+# PRIMEIRO para que a falha mais cara apareça cedo — mas eles NÃO são o escopo,
+# são a ordem.
+LOTES_TESTE=(
+	"./internal/render/ ./internal/seo/ ./internal/sitemap/ ./internal/htmlcontract/"
+	"./internal/crawl/ ./internal/httpserver/ ./internal/publishedmanifest/"
+	"./internal/checks/ ./internal/quality/ ./internal/publicrelease/"
+	"./internal/webanalytics/ ./internal/pageinline/ ./internal/agentsurface/ ./internal/accessibilityaudit/"
+)
+
+# ★ POR QUE A SUÍTE COMPLETA VEM DEPOIS DOS LOTES (2026-08-29)
+#
+# A primeira versão deste script listava só os pacotes-vitrine, e essa lista
+# envelheceu no MESMO DIA em que foi escrita: das dez áreas corrigidas na caça
+# aos bugs, SEIS ficaram fora da lista — termpromotion, v2supersessionintegrity,
+# legalsignature, proc, checkperformance e cmd/generate-noticia-pages. Teste
+# escrito e não executado é exatamente o defeito que este repositório já
+# catalogou nos 311 check-* órfãos: quem corrige um bug hoje deixa a prova
+# cega para quem vier amanhã.
+#
+# Lista fixa de pacotes é dívida garantida. O escopo passa a ser DESCOBERTO:
+# ./internal/... ./cmd/... cobre os 760 pacotes do módulo, e nenhum teste novo
+# precisa ser inscrito à mão para ser executado. Os lotes acima continuam
+# existindo pela ORDEM (falhar cedo no que mais dói), não pelo alcance.
+
+registra() {
+	local nome="$1" status="$2" exit_code="$3" ms="$4" detalhe="$5"
+	[ "$status" = "vermelho" ] && vermelhos="$vermelhos $nome"
+	[ "$status" = "timeout" ] && nao_medidos="$nao_medidos $nome"
+	# `infra` (exit 75 = EX_TEMPFAIL) entra na MESMA coluna que timeout, e por
+	# identidade de significado: nenhum dos dois mediu coisa alguma. Sem isto
+	# um teste que sai 75 por falta de unit ou de rede vira etapa sem
+	# categoria — nao conta como verde, nao aparece no alerta, nao entra em
+	# nao_medidos: some. `cmd/wiki-ops` conta verdes e reconstroi nao_medidos
+	# so quando o campo esta ausente, entao escrever a coluna aqui basta e o
+	# leitor Go continua correto sem precisar aprender um status novo.
+	[ "$status" = "infra" ] && nao_medidos="$nao_medidos $nome"
+	local linha
+	# O SANEAMENTO DO `detalhe` PRECISA COBRIR TODO BYTE DE CONTROLE, NAO SO' \n.
+	#
+	# Ate 2026-09-04 esta linha fazia `tr -d '"' | tr '\n' ' '`: tirava aspas e
+	# quebra de linha, e deixava passar TAB (0x09) e os demais controles, que
+	# `detalhe` recebe crus da saida do gate. Resultado medido: as SETE linhas
+	# do ledger eram JSON INVALIDO -- `encoding/json` e `json.loads` recusam as
+	# sete. A serie existe para responder "ha quantos dias este gate esta
+	# caido", e um leitor honesto respondia "a serie esta vazia" sobre sete dias
+	# de historia. O vigia registrava em cima do proprio ponto cego.
+	#
+	# Barra invertida tambem sai: `\` cru dentro de string JSON so' e' valido
+	# como inicio de escape, e a saida de gate traz caminho do Windows e regex.
+	# `tr '\000-\037' ' '` troca TODO controle por espaco -- inclusive \n, que
+	# por isso nao precisa mais de regra propria.
+	linha=$(printf '{"etapa":"%s","status":"%s","exit_code":%s,"duration_ms":%s,"detalhe":"%s"}' \
+		"$nome" "$status" "$exit_code" "$ms" \
+		"$(printf '%s' "$detalhe" | tr -d '"\\' | tr '\000-\037' ' ' | cut -c1-300)")
+	etapas_json="${etapas_json:+$etapas_json,}$linha"
+	printf 'qualidade-diaria: %-28s %-8s exit=%s %sms\n' "$nome" "$status" "$exit_code" "$ms"
+}
+
+# CARDINALIDADE ANTES DA AMOSTRA (2026-09-10). O teto de linhas por diagnostico
+# existe para que uma saida degenerada nao encha o disco, e ate hoje o comentario
+# de `roda()` afirmava que "o corte avisa que cortou". Ele nao avisava: `tail -N`
+# imprime as ultimas N linhas em silencio, e o leitor do log nao tem como saber se
+# esta vendo a saida inteira ou o rabo dela. Comentario que mente e bug (R1).
+#
+# E o corte e no COMECO, que e o pior lado para este runner: o `go test` despeja o
+# stack de TODAS as goroutines quando o -timeout dispara, e a primeira falha — a
+# que diz qual teste travou — fica no alto. Quem le 4000 linhas de stack sem saber
+# que faltam 12.000 acima conclui sobre a amostra achando que e a populacao.
+#
+# Tres instrumentos deste repositorio erraram nisso no mesmo dia (`max_errors=200`,
+# este `tail`, e o `--cobertura` invertido do rodizio de gates). A regra saiu dai:
+# quem corta, declara quanto cortou, ANTES da amostra.
+TETO_DE_DIAGNOSTICO=4000
+
+corpo_com_corte() {
+	# $1 = saida completa da etapa. Imprime a declaracao do corte e o rabo.
+	local saida="$1" total omitidas
+	total=$(printf '%s\n' "$saida" | wc -l)
+	omitidas=0
+	if [ "$total" -gt "$TETO_DE_DIAGNOSTICO" ]; then
+		omitidas=$((total - TETO_DE_DIAGNOSTICO))
+	fi
+	printf '# linhas_totais=%s omitidas=%s (corte no COMECO, tail -%s)\n' \
+		"$total" "$omitidas" "$TETO_DE_DIAGNOSTICO"
+	printf '%s\n' "$saida" | tail -"$TETO_DE_DIAGNOSTICO"
+}
+
+roda() {
+	local nome="$1" limite="$2"
+	shift 2
+	local inicio fim rc saida
+	inicio=$(date +%s%3N)
+	saida=$(timeout "$limite" nice -n "$NICE_LEVEL" ionice -c3 "$@" 2>&1)
+	rc=$?
+	fim=$(date +%s%3N)
+	local ms=$((fim - inicio))
+	# PROVA NO DISCO ANTES DE CLASSIFICAR. Vale para vermelho E para timeout: o
+	# passo que estoura o relogio tambem deixa rastro (o `go test` despeja o stack
+	# de todas as goroutines quando o -timeout dele dispara, e e' assim que se
+	# descobre QUAL teste travou). Teto de 4000 linhas por etapa para que uma
+	# saida degenerada nao encha o disco; `corpo_com_corte` declara quanto cortou.
+	if [ "$rc" -ne 0 ]; then
+		mkdir -p "$DIAGNOSTICO" 2>/dev/null
+		{
+			printf '# etapa=%s exit=%s duracao_ms=%s\n' "$nome" "$rc" "$ms"
+			printf '# comando: %s\n' "$*"
+			printf '# gravado em %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			corpo_com_corte "$saida"
+		} >"$DIAGNOSTICO/$nome.log" 2>/dev/null
+	fi
+	if [ "$rc" -eq 0 ]; then
+		registra "$nome" verde 0 "$ms" ""
+	elif [ "$rc" -eq 124 ]; then
+		registra "$nome" timeout 124 "$ms" "estourou ${limite}"
+	elif [ "$rc" -eq 75 ]; then
+		# EX_TEMPFAIL: "nao consegui medir", nunca "o produto esta quebrado".
+		# A convencao ja e usada no repositorio inteiro, e ate 2026-09-05 este
+		# runner nao a conhecia: um gate sem cache, sem rede ou sem unit
+		# instalada virava VERMELHO e ia para o alerta do dono como defeito.
+		# Medido no mesmo dia: check-normative-fingerprint-selftest passa em 57
+		# propriedades e nao exercita duas porque o cache do Planalto mora em
+		# /tmp e nao sobrevive ao reboot — a "falha" era o disco vazio.
+		#
+		# Mesma categoria de timeout, e pelo mesmo motivo: nao mede nada, nao
+		# acusa defeito, e IMPEDE que o runner afirme "tudo verde" sobre o que
+		# nao chegou a ser medido.
+		registra "$nome" infra 75 "$ms" "$(printf '%s' "$saida" | tail -2)"
+	elif printf '%s' "$saida" | grep -q "panic: test timed out"; then
+		# RELÓGIO NÃO É DEFEITO, e até 2026-08-29 este ledger não sabia disso.
+		#
+		# O `-timeout` do próprio `go test` é MENOR que a parede do `timeout`
+		# (600s dentro de 900s; 1800s dentro de 2400s), de propósito: quando ele
+		# dispara, o Go despeja o stack de todas as goroutines, que é como se
+		# descobre QUAL teste travou. A parede não faz isso — ela mata e pronto.
+		#
+		# O preço era a classificação. O go test sai com rc=1 DENTRO da parede,
+		# então o ramo de baixo registrava "vermelho" com as três últimas linhas
+		# do stack como se fossem um defeito — e o ledger passava a acusar falha
+		# onde só houve máquina lenta. Medido nesta sessão: internal/v2ingest
+		# estourou 600s três vezes seguidas enquanto um deploy ocupava a máquina,
+		# e as três apareceram como pacote quebrado.
+		#
+		# Agora o stack continua sendo produzido (o `-timeout` menor fica) e a
+		# classificação passa a dizer a verdade: é tempo, não defeito. O nome do
+		# teste travado entra na mensagem, porque é a única coisa acionável.
+		local travado
+		travado=$(printf '%s' "$saida" | grep -oE "^[a-zA-Z0-9_/.]+\.Test[A-Za-z0-9_]+" | head -1)
+		registra "$nome" timeout 124 "$ms" "go test estourou o proprio -timeout (relogio, nao defeito)${travado:+; travado em $travado}"
+	else
+		registra "$nome" vermelho "$rc" "$ms" "$(printf '%s' "$saida" | tail -3)"
+	fi
+}
+
+# `finaliza` PRECISA estar definida ANTES do branch `somente_longas` logo
+# abaixo, que a chama em curto-circuito (`exit 0` no fim de si mesma). Bash
+# não pré-varre definições de função: ele as declara na ordem em que as
+# linhas são executadas. Até 2026-09-10 esta função vivia perto do fim do
+# arquivo (seção 6f), e a chamada em `somente_longas` (escopo=longo, unit
+# wikijuridica-qualidade-longa) rodava ANTES de a função existir —
+# `linha 292: finaliza: comando não encontrado`, medido no journal de
+# 2026-09-10 (execução das 02:10, PID 3211385). O erro não é fatal sob
+# `set -u -o pipefail` sem `-e`, então o script seguia para o `exit 0` do
+# próprio branch e mascarava dois defeitos de uma vez: nenhuma linha ia para
+# o ledger na execução "longa" do dia, e o exit code ignorava
+# suite-completa ter estourado o timeout (vermelho/nao_medido não
+# classificado) — a unit reportava sucesso ao systemd mesmo com gate sem
+# veredito. Definir aqui, logo após `roda()`/`registra()` e antes de
+# qualquer chamador, é o que garante a função disponível nos três escopos
+# (tudo, curto, longo) sem duplicar corpo nem reordenar por acaso de novo.
+finaliza() {
+	# 5. Ledger: a série é o produto. Sem ela não se sabe HÁ QUANTOS DIAS um gate
+	#    está caído, que é exatamente a informação que faltava.
+	mkdir -p "$(dirname "$LEDGER")"
+	printf '{"data":"%s","checked_at":"%s","vermelhos":"%s","nao_medidos":"%s","etapas":[%s]}\n' \
+		"$DIA" "$AGORA" "$(printf '%s' "$vermelhos" | sed 's/^ //')" \
+		"$(printf '%s' "$nao_medidos" | sed 's/^ //')" "$etapas_json" >>"$LEDGER"
+
+	if [ -n "$vermelhos" ]; then
+		echo "qualidade-diaria: VERMELHO em:$vermelhos" >&2
+		echo "qualidade-diaria: saida completa de cada etapa que falhou em $DIAGNOSTICO/" >&2
+		[ -n "$nao_medidos" ] && echo "qualidade-diaria: NAO MEDIDO (relogio ou infra ausente) em:$nao_medidos" >&2
+		echo "qualidade-diaria: série em $LEDGER" >&2
+		medidor_sai 1
+	fi
+	if [ -n "$nao_medidos" ]; then
+		# Nenhum gate acusou defeito, mas alguns nao chegaram a responder. Dizer
+		# "tudo verde" aqui seria afirmar sobre o que nao foi medido.
+		#
+		# A coluna tem DUAS causas desde 2026-09-05 e a mensagem precisa dizer as
+		# duas: relogio (timeout, exit 124) e infra ausente (EX_TEMPFAIL, exit 75 --
+		# cache vazio, unit nao instalada, rede fora). Chamar de "estourou o
+		# relogio" um cache vazio manda procurar lentidao onde nao ha.
+		#
+		# Este exit 1 NAO alerta o dono: a unit declara SuccessExitStatus=1, entao o
+		# OnFailure so dispara em exit 2 (o runner nao conseguiu rodar). Verificado
+		# em 2026-09-05, ao ligar os selftests. Na primeira passada completa saiu UM
+		# `infra`, nao dois: `check-normative-fingerprint-selftest` (cache do
+		# Planalto vazio, /tmp nao sobrevive ao reboot). O da atestacao do grafo
+		# passou verde, porque a frente do v2ingest reatestou antes da varredura --
+		# a guarda de pre-condicao que ele ganhou hoje so entra em cena enquanto o
+		# worktree estiver com v2ingest modificado sem reatestar, que e estado de
+		# trabalho e nao permanente. Transformar `infra` em alerta diario seria a
+		# mordaca que test_notify_owner_mordaca.sh existe para travar.
+		echo "qualidade-diaria: NAO MEDIDO (relogio ou infra ausente) em:$nao_medidos" >&2
+		echo "qualidade-diaria: nenhum gate acusou defeito, mas os acima nao responderam" >&2
+		echo "qualidade-diaria: série em $LEDGER" >&2
+		medidor_sai 1
+	fi
+	echo "qualidade-diaria: tudo verde"
+	exit 0
+}
+
+# ESCOPO: as tres etapas longas saem do caminho critico (2026-09-09).
+#
+# MEDIDO em 2026-09-09, journal da unit: a passada morreu em
+# TimeoutStartSec=90min (04:46:05 -> 06:16:05) logo depois de `sca-gosec`, e 43
+# das 55 etapas nomeadas NUNCA executaram — o maior "skip" da suite, e ele nao
+# aparecia como skip em lugar nenhum. As tres mais lentas somam 54,6 min dos
+# 68,7 medidos: suite-completa 2.400 s, teste-lote-3 609 s, sca-staticcheck
+# 264 s. Sem elas sobram 14,1 min, folga de sobra para as 43 que morriam.
+#
+# NAO se aumenta o TimeoutStartSec (contrato, secao 4): reparticiona-se. O
+# escopo padrao continua "tudo" para quem roda a mao; a unit diaria passa
+# WIKI_QUALIDADE_ESCOPO=curto e a unit irma passa longo. Escopo desconhecido
+# aborta em vez de silenciosamente rodar tudo — teto que ninguem le e teto que
+# nao existe.
+ESCOPO="${WIKI_QUALIDADE_ESCOPO:-tudo}"
+case "$ESCOPO" in
+tudo | curto | longo) ;;
+*)
+	echo "qualidade-diaria: WIKI_QUALIDADE_ESCOPO invalido: $ESCOPO (use tudo|curto|longo)" >&2
+	exit 2
+	;;
+esac
+
+# roda_longa e roda() com a regua do escopo. A etapa pulada e REGISTRADA como
+# pulada, com o motivo: etapa que some sem linha no ledger e a cegueira que esta
+# mudanca veio corrigir.
+roda_longa() {
+	local nome="$1"
+	if [ "$ESCOPO" = "curto" ]; then
+		registra "$nome" pulada 0 0 "fora do caminho critico: WIKI_QUALIDADE_ESCOPO=curto (roda em wikijuridica-qualidade-longa)"
+		echo "qualidade-diaria: $nome PULADA (escopo=curto)"
+		return 0
+	fi
+	roda "$@"
+}
+
+# No escopo "longo" roda-se SO as tres longas: as demais etapas ficam com a unit
+# curta, e duplicar aqui seria pagar duas vezes pelo mesmo verde.
+somente_longas() { [ "$ESCOPO" = "longo" ]; }
+
+# teste-lote-3 e a unica etapa longa cujo nome depende do indice do laco; o
+# helper mantem a regua num lugar so.
+roda_longa_se_lote3() {
+	local indice="$1" lote="$2"
+	if [ "$indice" = "3" ]; then
+		# shellcheck disable=SC2086
+		roda_longa "teste-lote-$indice" 900 "$GO_MODERN" test -count=1 -timeout=600s $lote
+		return
+	fi
+	# shellcheck disable=SC2086
+	roda "teste-lote-$indice" 900 "$GO_MODERN" test -count=1 -timeout=600s $lote
+}
+
+echo "qualidade-diaria: início $AGORA (nice=$NICE_LEVEL, escopo=$ESCOPO)"
+
+if somente_longas; then
+	roda go-build-check 900 "$RAIZ/tools/go-build-check"
+	i=0
+	for lote in "${LOTES_TESTE[@]}"; do
+		i=$((i + 1))
+		[ "$i" = "3" ] || continue
+		# shellcheck disable=SC2086
+		roda "teste-lote-$i" 900 "$GO_MODERN" test -count=1 -timeout=600s $lote
+	done
+	roda suite-completa 2400 "$GO_MODERN" test -count=1 -timeout=1800s ./internal/... ./cmd/...
+	roda "sca-staticcheck" 900 "$GO_MODERN" run ./cmd/check sca-staticcheck
+	# PRODUCAO SAUDAVEL (2026-09-11). A bateria das tres audiencias era ORFA:
+	# `grep -rn check-producao-saudavel tools/ ops/ docs/ .claude/` devolvia zero
+	# chamadores fora dela mesma, e sendo orfa levava junto NOVE gates que
+	# nenhum timer, unit, onda, deploy ou hook executava — entre eles
+	# `check-http-smoke`, `check-arquitetura-fiel` e `cmd/check contrato-dado-real`,
+	# os dois ultimos nomeados por extenso na tabela de leitura obrigatoria do
+	# CLAUDE.md secao 2. A apuracao esta em
+	# .agents/runtime/medicao-bancada/20260911-gates-que-o-contrato-nomeia-e-ninguem-executa.md.
+	#
+	# O QUE A PRIMEIRA EXECUCAO ACHOU, e e a resposta a "vale a pena ligar":
+	# 45 verdes e DOIS vermelhos que ninguem via — `check-internal-link-block`
+	# com paginas sem ponte cross-area em 160 contra baseline de 23, e
+	# `social-indexavel` com /redesocial/feed/ servindo `noindex, nofollow`
+	# quando o `follow` e o que preserva os links para o acervo e para a fonte
+	# oficial.
+	#
+	# AQUI E NAO NA UNIT CURTA, por tres razoes medidas: a bateria leva 182,74 s
+	# (modo completo, maquina livre) contra o teto de 90 s da varredura; a unit
+	# curta roda 04:41 e a onda publica das 04:20 as ~04:35, e sondar producao
+	# em publicacao mede a transacao; e cinco dos gates dela ja rodam na curta
+	# (ancora-redesocial, social-cache, social-csp, social-rate-bypass,
+	# social-units-enabled) — pagariam duas vezes.
+	#
+	# TETO DE 420 s sobre 182,74 s medidos: 2,3x. A folga nao e arredondamento —
+	# parede medida sob carga sai inflada (170,15 s contra 133,85 s no modo
+	# rapido, load1 22,39 contra maquina livre), e teto derivado de janela limpa
+	# sem folga reprova por relogio no dia em que houver concorrencia.
+	roda "producao-saudavel" 420 "$RAIZ/tools/check-producao-saudavel"
+	finaliza
+	exit 0
+fi
+
+# 1. Compila e type-checa TUDO, com o cache-buster que o BUG-107 provou
+#    necessário — sem ele, `go vet` devolve verde para pacote com diagnóstico.
+roda go-build-check 900 "$RAIZ/tools/go-build-check"
+
+# 2. Testes dos pacotes-vitrine, em lotes nomeados.
+i=0
+for lote in "${LOTES_TESTE[@]}"; do
+	i=$((i + 1))
+	# shellcheck disable=SC2086
+	roda_longa_se_lote3 "$i" "$lote"
+done
+
+# 2b. SUÍTE COMPLETA — descoberta, não listada. É o que garante que nenhum teste
+#     novo nasça cego. Roda depois dos lotes porque os lotes já derrubaram o que
+#     é mais caro, e antes dos SCA porque teste vermelho é sinal mais forte.
+roda_longa suite-completa 2400 "$GO_MODERN" test -count=1 -timeout=1800s ./internal/... ./cmd/...
+
+# 2b-wj. A ARVORE wj/ (EnaEval, F0.O7) fica fora de ./internal/... ./cmd/... e de
+#     todo outro executor: tools/wj-ci roda wj-depcheck, vet e testes de ./wj/....
+#     Sem headroom de carga ele sai 75 e a etapa vira "infra", nunca vermelho.
+roda "wj-ci" 600 "$RAIZ/tools/wj-ci"
+
+# 2c. TESTES PYTHON DE tools/ — 93 arquivos test_*.py que, até 2026-08-29, NENHUM
+#     runner executava. O repositório tem 450 scripts de bancada em Python e a
+#     suíte que os cobre estava tão órfã quanto os gates que ela deveria vigiar.
+#     Descoberta por glob, mesmo motivo dos pacotes Go.
+testes_python=0
+python_vermelhos=""
+# Defesa em profundidade para o mesmo defeito: PYTHONDONTWRITEBYTECODE
+# impede que ESTA execucao grave bytecode, mas nao apaga o que uma execucao
+# manual anterior deixou. Um .pyc degenerado ja no disco continua sendo
+# revalidado por (mtime, tamanho) e volta a dar veredito por codigo morto.
+# O glob isola exatamente os de arquivo SEM extensao .py (sem o ponto antes
+# de "cpython") e nao toca o cache legitimo dos modulos .py: medido em
+# 2026-09-05, 115 degenerados contra 56 legitimos. Cache regenerado ao
+# primeiro import; o .gitignore ja o ignora.
+find "$RAIZ/tools/__pycache__" -maxdepth 1 -name '*[!.]cpython-*.pyc' -delete 2>/dev/null || true
+
+for teste in "$RAIZ"/tools/test_*.py; do
+	[ -f "$teste" ] || continue
+	testes_python=$((testes_python + 1))
+	nome="$(basename "$teste")"
+	# PYTHONPATH na raiz: os testes importam `from tools import ...`, e sem isso
+	# falham com ModuleNotFoundError — que é como quatro deles apareceram
+	# "vermelhos" na primeira execução. Não era defeito de produto: era
+	# invocação errada, e ninguém percebeu porque ninguém os executava. Com o
+	# path certo, test_audit_v2_pages_aereo01.py sozinho roda 17 asserções.
+	# ★ RELOGIO NAO E' DEFEITO — E A ETAPA PYTHON NAO SABIA DISSO (2026-09-05).
+	#
+	# `roda()` aprendeu em 2026-08-29 a separar "estourou o relogio" de "acusou
+	# defeito", com categoria propria que nao entra na conta de vermelhos. Esta
+	# etapa nunca recebeu a correcao: o `if !` capturava QUALQUER exit != 0 e
+	# gravava `vermelho` com exit_code 1 fixo, entao um `timeout` (que sai 124)
+	# virava "teste quebrado" no ledger e no alerta.
+	#
+	# Nao e' hipotese. Medido em 2026-09-05: test_pre_commit_product_gates.py
+	# roda em 59,9 s e sai 0 quando executado sozinho, e mesmo assim aparece
+	# vermelho no ledger de 2026-09-04 — 60 s de trabalho contra uma parede de
+	# 180 s some quando a varredura ja ocupa a maquina. E o `CPUQuota=400%` que
+	# esta unit passou a ter aperta exatamente essa margem: sem esta distincao, a
+	# quota FABRICARIA vermelhos de teste que nunca falharam.
+	#
+	# A duracao tambem passa a ser medida. Ate aqui `registra` recebia ms=0 fixo
+	# para todo teste Python, e serie sem duracao nao mostra o teste que esta
+	# ficando lento antes de ele estourar.
+	inicio_py=$(date +%s%3N)
+	# ★ PYTHONDONTWRITEBYTECODE: SEM ELE ESTA SUITE DA VEREDITO POR CODIGO
+	#   QUE JA NAO EXISTE (2026-09-05).
+	#
+	# Os 49 testes que carregam ferramenta usam SourceFileLoader, e as
+	# ferramentas de tools/ nao tem extensao .py. O CPython grava bytecode
+	# para elas assim mesmo, com nome degenerado
+	# (generate-...-censuscpython-311.pyc, sem o ponto), e revalida esse
+	# .pyc por (mtime em segundos, tamanho em bytes). Edicao que PERMUTA
+	# linhas preserva o tamanho; caindo no mesmo segundo, o par bate e o
+	# loader executa o bytecode ANTIGO enquanto inspect.getsource devolve o
+	# arquivo NOVO.
+	#
+	# Nao e hipotese: aconteceu numa prova por mutacao de
+	# generate-writing-queue-blocker-census. O arquivo foi restaurado byte a
+	# byte, `diff` disse identico, e o teste continuou reprovando. Aceitar
+	# aquele vermelho teria levado a "corrigir" codigo que estava certo.
+	# Travado por tools/test_bytecode_obsoleto_cega_teste_de_ferramenta.py.
+	# TETO POR ARQUIVO, MEDIDO — nao um teto geral inflado (2026-09-05).
+	#
+	# Os 180 s valem para a esmagadora maioria. Mas `test_run_go_cmd_cached.py`
+	# tem 60 testes de integracao de shell, cada um montando um repo falso em
+	# tmpdir e executando o wrapper de verdade. Medido nesta maquina, no mesmo
+	# dia, com o mesmo codigo: 93,3 s ociosa e 136,6 s carregada — 76% do teto
+	# so pela carga. E a carga e a regra as 04:40, quando esta varredura sobe
+	# junto com a suite Go.
+	#
+	# Nao ha desperdicio a cortar: o custo fixo do setUp e 7,8 s e cada teste
+	# custa ~2,2 s de processo real; os tres testes de regressao que entraram
+	# hoje custam 0,8 s, 2,1 s e 9,6 s proprios. Um teto que o arquivo raspa e
+	# cegueira agendada — no primeiro dia ruim ele vira "nao medido" e ninguem
+	# le 60 testes por causa do relogio.
+	#
+	# Subir o teto de TODOS seria esconder lentidao futura de todo o resto. O
+	# teto sobe so para quem foi medido, com o numero no comentario, e volta a
+	# 180 s no dia em que o arquivo emagrecer.
+	teto_py=180
+	case "$nome" in
+	test_run_go_cmd_cached.py) teto_py=420 ;;
+	# test_bootstrap_chain.py: 152,2 s medidos em 2026-09-10 com a maquina
+	# ociosa, 25 casos, todos verdes — 15% abaixo do teto de 180 s, e foi essa
+	# folga estreita que o matou com exit 124 na suite das 04:57, onde a maquina
+	# roda a ~290% de CPU. O custo NAO e sleep de fixture: medi caso a caso e os
+	# quatro mais caros somam 97,8 s de cadeia real com receipts
+	# (term_stops 28,4 s, one_lock_covers_preflight 25,3 s,
+	# resume_rejects_tampered 24,8 s, resume_final_source_aggregate 19,3 s). O
+	# unico sleep desperdicado era BOOTSTRAP_TEST_SLEEP_SECONDS=10 no caso do
+	# TERM, ja cortado para 2 s no proprio teste — rendeu 8,3 s, nao os 28 que
+	# faltavam. Teto medido, pela regra escrita acima; volta a 180 s no dia em
+	# que a cadeia de fixture ficar mais barata.
+	test_bootstrap_chain.py) teto_py=420 ;;
+	esac
+	saida=$(cd "$RAIZ" && PYTHONPATH="$RAIZ" PYTHONDONTWRITEBYTECODE=1 timeout "$teto_py" nice -n "$NICE_LEVEL" python3 "$teste" 2>&1)
+	rc_py=$?
+	ms_py=$(($(date +%s%3N) - inicio_py))
+	if [ "$rc_py" -eq 124 ]; then
+		mkdir -p "$DIAGNOSTICO" 2>/dev/null
+		corpo_com_corte "$saida" >"$DIAGNOSTICO/py-$nome.timeout.log" 2>/dev/null
+		registra "py:$nome" timeout 124 "$ms_py" "estourou ${teto_py}s (relogio, nao defeito)"
+	elif [ "$rc_py" -ne 0 ]; then
+		python_vermelhos="$python_vermelhos $nome"
+		# A PROVA DO PYTHON TAMBEM PRECISA SOBREVIVER. Esta etapa nao passa por
+		# `roda()`, entao a gravacao de diagnostico dali nao a alcanca: o ledger
+		# guardava `tail -2` cortado em 300 chars e o traceback morria na variavel.
+		# Medido em 2026-09-05: 16 a 18 arquivos vermelhos TODO DIA desde 30/08,
+		# nenhum com causa registrada. Traceback de Python tem a linha util no fim,
+		# mas o `File "..."` que diz ONDE fica acima — e era ele que se perdia.
+		mkdir -p "$DIAGNOSTICO" 2>/dev/null
+		{
+			printf '# etapa=py:%s duracao_ms=nao_medida\n' "$nome"
+			printf '# comando: PYTHONPATH=%s PYTHONDONTWRITEBYTECODE=1 python3 %s\n' "$RAIZ" "$teste"
+			printf '# gravado em %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			corpo_com_corte "$saida"
+		} >"$DIAGNOSTICO/py-$nome.log" 2>/dev/null
+		registra "py:$nome" vermelho "$rc_py" "$ms_py" "$(printf '%s' "$saida" | tail -2)"
+	fi
+done
+if [ -z "$python_vermelhos" ]; then
+	registra "testes-python" verde 0 0 "$testes_python arquivos"
+else
+	echo "qualidade-diaria: python vermelho em:$python_vermelhos" >&2
+fi
+
+# 2c-bis. TESTES EM SHELL DE tools/ — DESCOBERTA, NAO LISTA (2026-09-05). O glob
+#     do 2c so alcanca `tools/test_*.py`; teste em shell precisava de linha
+#     propria mais abaixo, e a conta dessa lista manual foi medida hoje: dos 10
+#     arquivos `tools/test_*.sh`, QUATRO nunca rodaram em suite nenhuma —
+#     test_alerta_carrega_veredito.sh, test_deploy_nao_engole_recusa.sh,
+#     test_paridade_bidirecional.sh e test_run_go_cmd_cached_heartbeat_mutacao.sh.
+#     O proprio arquivo ja registrava o defeito em 6b-bis ("teste em shell precisa
+#     de linha propria, e duas ficaram de fora") e a correcao de la foi acrescentar
+#     mais duas linhas — tratar o sintoma, com a lista intacta. A causa e a lista.
+#     Aqui ela morre: quem escrever `tools/test_*.sh` novo entra na suite no mesmo
+#     dia, como ja acontece com Python e com os pacotes Go.
+#
+#     Teto de 600 s por arquivo, nao os 120 s das linhas antigas: a prova por
+#     mutacao do heartbeat do build lock roda o MESMO teste duas vezes (o mutante
+#     da ancora e o codigo atual), cada uma com build Go de verdade, e 120 s a
+#     cortariam pelo relogio — que este runner ja aprendeu a nao chamar de defeito.
+#
+#     Exit 75 e EX_TEMPFAIL: infra ausente (unit nao instalada, ancora ilegivel,
+#     rede fora), nunca veredito sobre o produto. Entra no ledger com categoria
+#     propria e fora da conta de vermelhos, porque `registra` so soma em
+#     `vermelhos` e `nao_medidos` os dois status que conhece.
+testes_shell=0
+shell_vermelhos=""
+for teste in "$RAIZ"/tools/test_*.sh; do
+	[ -f "$teste" ] || continue
+	testes_shell=$((testes_shell + 1))
+	nome="$(basename "$teste" .sh)"
+	inicio_sh=$(date +%s%3N)
+	saida=$(cd "$RAIZ" && timeout 600 nice -n "$NICE_LEVEL" ionice -c3 bash "$teste" 2>&1)
+	rc_sh=$?
+	ms_sh=$(($(date +%s%3N) - inicio_sh))
+	mkdir -p "$DIAGNOSTICO" 2>/dev/null
+	if [ "$rc_sh" -eq 124 ]; then
+		corpo_com_corte "$saida" >"$DIAGNOSTICO/sh-$nome.timeout.log" 2>/dev/null
+		registra "sh:$nome" timeout 124 "$ms_sh" "estourou 600s (relogio, nao defeito)"
+	elif [ "$rc_sh" -eq 75 ]; then
+		corpo_com_corte "$saida" >"$DIAGNOSTICO/sh-$nome.infra.log" 2>/dev/null
+		registra "sh:$nome" infra 75 "$ms_sh" "$(printf '%s' "$saida" | tail -2)"
+	elif [ "$rc_sh" -ne 0 ]; then
+		shell_vermelhos="$shell_vermelhos $nome"
+		{
+			printf '# etapa=sh:%s duracao_ms=%s\n' "$nome" "$ms_sh"
+			printf '# comando: bash %s\n' "$teste"
+			printf '# gravado em %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			corpo_com_corte "$saida"
+		} >"$DIAGNOSTICO/sh-$nome.log" 2>/dev/null
+		registra "sh:$nome" vermelho "$rc_sh" "$ms_sh" "$(printf '%s' "$saida" | tail -2)"
+	fi
+done
+if [ -z "$shell_vermelhos" ]; then
+	registra "testes-shell" verde 0 0 "$testes_shell arquivos"
+else
+	echo "qualidade-diaria: shell vermelho em:$shell_vermelhos" >&2
+fi
+
+# 2c-ter. OS SELFTESTS DE DETECTOR — DESCOBERTA (2026-09-05). Um `*-selftest` e
+#     a prova de falso positivo e falso negativo de um gate: e o que separa
+#     "detector acusou" de "detector funciona". Medido hoje: existem ONZE e
+#     apenas UM rodava. Os outros dez nunca foram executados por runner nenhum,
+#     e o proprio arquivo ja registrava a causa na linha do unico agendado —
+#     "a descoberta automatica alcanca ./internal/... ./cmd/... e tools/test_*.py,
+#     e nenhum dos dois padroes pega um `tools/check-*-selftest`". A correcao de
+#     entao foi uma linha manual; a causa era o padrao que faltava. Aqui ele entra.
+#
+#     Dos dez cegos, TRES estavam vermelhos, e nenhum por defeito de produto:
+#     um exigia que a divida de outra frente continuasse existindo (teto
+#     invertido), um dependia de cache em /tmp morto pelo reboot, e um contava
+#     com o worktree ter o atestado fresco. Os tres foram corrigidos na mesma
+#     sessao em que rodaram pela primeira vez.
+testes_selftest=0
+selftest_vermelhos=""
+for teste in "$RAIZ"/tools/*-selftest; do
+	[ -x "$teste" ] || continue
+	testes_selftest=$((testes_selftest + 1))
+	nome="$(basename "$teste")"
+	inicio_st=$(date +%s%3N)
+	# PYTHONDONTWRITEBYTECODE pelo mesmo motivo do passo 2c: o selftest carrega
+	# o gate por SourceFileLoader a partir de arquivo SEM extensao .py, que e
+	# exatamente o caso do .pyc degenerado revalidado por (mtime, tamanho). O
+	# `find -delete` do 2c limpa o que ja esta no disco; isto impede que ESTA
+	# passada crie mais.
+	saida=$(cd "$RAIZ" && PYTHONDONTWRITEBYTECODE=1 timeout 300 nice -n "$NICE_LEVEL" ionice -c3 "$teste" 2>&1)
+	rc_st=$?
+	ms_st=$(($(date +%s%3N) - inicio_st))
+	mkdir -p "$DIAGNOSTICO" 2>/dev/null
+	if [ "$rc_st" -eq 124 ]; then
+		corpo_com_corte "$saida" >"$DIAGNOSTICO/selftest-$nome.timeout.log" 2>/dev/null
+		registra "selftest:$nome" timeout 124 "$ms_st" "estourou 300s (relogio, nao defeito)"
+	elif [ "$rc_st" -eq 75 ]; then
+		corpo_com_corte "$saida" >"$DIAGNOSTICO/selftest-$nome.infra.log" 2>/dev/null
+		registra "selftest:$nome" infra 75 "$ms_st" "$(printf '%s' "$saida" | tail -2)"
+	elif [ "$rc_st" -ne 0 ]; then
+		selftest_vermelhos="$selftest_vermelhos $nome"
+		{
+			printf '# etapa=selftest:%s duracao_ms=%s\n' "$nome" "$ms_st"
+			printf '# comando: %s\n' "$teste"
+			printf '# gravado em %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			corpo_com_corte "$saida"
+		} >"$DIAGNOSTICO/selftest-$nome.log" 2>/dev/null
+		registra "selftest:$nome" vermelho "$rc_st" "$ms_st" "$(printf '%s' "$saida" | tail -2)"
+	fi
+done
+if [ -z "$selftest_vermelhos" ]; then
+	registra "selftests-de-detector" verde 0 0 "$testes_selftest arquivos"
+else
+	echo "qualidade-diaria: selftest vermelho em:$selftest_vermelhos" >&2
+fi
+
+# 2c-quater. AS BANCADAS DOS HOOKS DE .claude/hooks/ — DESCOBERTA, NAO LISTA (2026-09-22). O
+#     glob do 2c/2c-bis alcanca tools/test_*.py e tools/test_*.sh; nenhum runner rodava as
+#     bancadas que moram JUNTO do hook, em .claude/hooks/*.test.py. Sao elas que provam que a
+#     guarda de Haiku, a guarda de escrita do Sonnet e o registrador de modelo fazem o que
+#     dizem, e que a prova por mutacao de cada uma mata os mutantes. Descoberta por glob, pelo
+#     mesmo motivo dos pacotes Go: quem escrever .claude/hooks/*.test.py novo entra na suite no
+#     mesmo dia, sem tocar aqui.
+testes_hook=0
+hook_vermelhos=""
+for teste in "$RAIZ"/.claude/hooks/*.test.py; do
+	[ -f "$teste" ] || continue
+	testes_hook=$((testes_hook + 1))
+	nome="$(basename "$teste")"
+	inicio_hk=$(date +%s%3N)
+	saida=$(cd "$RAIZ" && PYTHONDONTWRITEBYTECODE=1 timeout 300 nice -n "$NICE_LEVEL" python3 "$teste" 2>&1)
+	rc_hk=$?
+	ms_hk=$(($(date +%s%3N) - inicio_hk))
+	mkdir -p "$DIAGNOSTICO" 2>/dev/null
+	if [ "$rc_hk" -eq 124 ]; then
+		corpo_com_corte "$saida" >"$DIAGNOSTICO/hook-$nome.timeout.log" 2>/dev/null
+		registra "hook:$nome" timeout 124 "$ms_hk" "estourou 300s (relogio, nao defeito)"
+	elif [ "$rc_hk" -ne 0 ]; then
+		hook_vermelhos="$hook_vermelhos $nome"
+		{
+			printf '# etapa=hook:%s duracao_ms=%s\n' "$nome" "$ms_hk"
+			printf '# comando: python3 %s\n' "$teste"
+			printf '# gravado em %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			corpo_com_corte "$saida"
+		} >"$DIAGNOSTICO/hook-$nome.log" 2>/dev/null
+		registra "hook:$nome" vermelho "$rc_hk" "$ms_hk" "$(printf '%s' "$saida" | tail -2)"
+	fi
+done
+if [ -z "$hook_vermelhos" ]; then
+	registra "bancadas-de-hook" verde 0 0 "$testes_hook arquivos"
+else
+	echo "qualidade-diaria: bancada de hook vermelha em:$hook_vermelhos" >&2
+fi
+
+# 2d. QUASE-DUPLICATA DE CORPO SOBRE O ESTOQUE v2 — o detector existia, era
+#     read-only, e NINGUEM o executava. O proprio cmd registra isso no cabecalho
+#     ("NÃO está wired em cmd/check all"), e o efeito era medir a saude do corpus
+#     por artefato de OUTRA lane: data/editorial/semantic_cluster_index.jsonl,
+#     que alimenta o filtro anti-doorway da malha, deriva de
+#     authorial_mass_global_similarity_audit.jsonl (1 linha) e
+#     authorial_mass_refinement_quality_report.jsonl (124) — nao das 10.116
+#     paginas publicadas.
+#
+#     Medido em 2026-08-29: 876 shards, 10.122 paginas, ZERO pares acima de 0,70
+#     em 8,8 s. O filtro anti-doorway estar vazio e LEGITIMO, e agora e um fato
+#     medido diariamente, nao uma suposicao. Se um par aparecer, aparece aqui.
+roda "v2-body-near-duplicates" 600 "$GO_MODERN" run -tags devcmds "$RAIZ/cmd/check-v2-body-near-duplicates"
+
+# 2d-bis. LATENCIA DOS HOOKS DO CLAUDE CODE (2026-09-08). Medido no dia: um
+#     `Bash true` custava 13,97 s por um plugin rodando `npx ... @latest` em
+#     todo Bash, e depois 1,45 s por um PostToolUse de 1.261 ms. O medidor
+#     existia e ninguem o rodava — a mesma doenca dos check-* orfaos. A regua
+#     e' 300 ms por hook, rc=0 e sem timeout; vermelho diz qual hook.
+roda "claude-code-hooks-latency" 120 python3 "$RAIZ/tools/check-claude-code-hooks-latency" --bench --repeticoes 3 --max-ms 300
+
+# 2d-bis. O MODO OPERACIONAL — os mecanismos que impoem a regra em vez de escreve-la.
+#
+#     Irmao do medidor de latencia acima, e pelo mesmo motivo: um gate que
+#     ninguem chama e o check-* orfao que esta etapa existe para matar. Seria
+#     ironico o gate do MODO OPERACIONAL nascer orfao.
+#
+#     O que ele cobra: os hooks de `.claude/hooks/` existem, estao REGISTRADOS
+#     no settings.json (mecanismo no disco sem registro nao impoe nada),
+#     bloqueiam o payload que devem bloquear, ENSINAM o comando certo na
+#     mensagem, deixam passar a forma correta e a prosa que so cita o comando, e
+#     custam abaixo de 300 ms. Mais o frontmatter de rules, skills e agents.
+#
+#     `--provar-mutacao` e o que separa "verde" de "provado": para cada hook ele
+#     monta uma copia com AQUELE hook neutralizado e exige que o teste fique
+#     vermelho nomeando-o. Sem isso, um verde nao distingue "o hook bloqueou" de
+#     "o payload nunca bloquearia".
+roda "modo-operacional" 180 python3 "$RAIZ/tools/check-modo-operacional" --provar-mutacao --repeticoes 5 --max-ms 300
+
+# 2d-ter. As units de ops: caminho absoluto repetido que pode divergir em silencio.
+#
+#     Duplicacao em unit e pior que em codigo — nao ha compilador, o erro so
+#     aparece no proximo boot do servico, e as units sao SYMLINK de
+#     /etc/systemd/system/ para este repositorio. Ele prova que as quatro units
+#     de PATH nao divergiram, que as duas do cloudflared nomeiam o MESMO binario
+#     e que todo caminho declarado existe no disco.
+roda "ops-unit-hardcode" 60 "$RAIZ/tools/check-ops-unit-hardcode"
+
+# 2e. A CORRIDA REAL MUDOU-SE PARA UNIT PROPRIA (2026-09-05).
+#
+#     `checks-race-real-corpus` rodava aqui e era a etapa mais cara desta
+#     varredura: no pior caso 1.665 s dos 3.900 s totais, ou seja 72% do
+#     TimeoutStartSec=90min da unit gastos numa etapa so'. Sem ela o pior caso
+#     cai para 2.200 s — 41% da janela.
+#
+#     E ela nao entregava: em 7 execucoes (30/08 a 04/09), QUATRO estouraram o
+#     relogio sem veredito e uma morreu por sinal; so' duas concluiram, em
+#     1.301 s e 1.359 s contra um teto de 1.650 s que nunca veio de medicao
+#     nenhuma — veio de caber nos 1.800 s que `roda()` dava a etapa. Folga de
+#     21% sobre a pior conclusao, insuficiente para variacao de carga.
+#
+#     Reduzir o custo DENTRO do teste foi tentado tres vezes e medido tres vezes
+#     (o registro esta no cabecalho de
+#     internal/checks/run_context_parallel_test.go): o teste nao e' caro por
+#     defeito proprio, e' caro porque o RunAll e' caro. Entao o custo se resolve
+#     no escalonamento.
+#
+#     Agora vive em tools/run-qualidade-race, disparado por
+#     wikijuridica-qualidade-race.timer, com envelope dimensionado pela medicao,
+#     ledger proprio (data/ops/qualidade_race.jsonl, com a coluna `paginas` que
+#     faltava para prever o estouro) e alerta proprio — antes, "a varredura
+#     falhou" nao distinguia um gate de SEO reprovado de uma sonda que nao
+#     respondeu. As duas units compartilham /tmp/opt-wiki-agent-heavy.lock,
+#     entao NUNCA rodam ao mesmo tempo.
+#
+#     A cadencia continua diaria, e nao semanal, porque o vetor de risco e'
+#     diario: `internal/checks` teve 52 commits e 32 checks novos em 30 dias
+#     (medido em 2026-09-05). Semanal acumularia sete checks novos por execucao.
+
+# 2f. AUDITORIA DE LEVEZA E DE REDESIGN — mesma familia de defeito do BUG-129,
+#     achada em internal/render (2026-09-05): TestZTmpLightnessCorpus e
+#     TestZTmpLightnessDeep (ztmp_lightness_measure_test.go) e as cinco provas
+#     de TestZZAudit* em zzaudit_verify_test.go (contrato de HTML leve,
+#     estrutura de acessibilidade, contraste do indicador de foco, sanitizador
+#     e SEO no acervo INTEIRO) so' rodavam atras de WIKI_LIGHTNESS_MEASURE=1 e
+#     WIKI_AUDIT_VERIFY=1 — variaveis que ate aqui NENHUM runner, timer ou hook
+#     definia. Gate que existe e nao roda e' igual a gate que nao existe.
+#
+#     Medido em 2026-09-05, isolado (`-run` por familia, load1 6-8 de 8
+#     nucleos): TestZTmpLightnessCorpus 56,2s (10.141 paginas, amostra de 406
+#     contra htmlcontract, 0 falha) e TestZTmpLightnessDeep 54,8s (8 areas +
+#     pagina mais pesada + home + hub, prova de completude no primeiro
+#     response). As duas SAO leves o bastante para um passo proprio aqui, longe
+#     do teto de 1.800s de `suite-completa` (que ja esta a 92% do orcamento
+#     medido e nao pode acomodar mais 110s).
+roda "lightness-corpus" 200 env WIKI_LIGHTNESS_MEASURE=1 "$GO_MODERN" test -count=1 -timeout=180s \
+	-run 'TestZTmpLightnessCorpus' ./internal/render/
+roda "lightness-deep" 200 env WIKI_LIGHTNESS_MEASURE=1 "$GO_MODERN" test -count=1 -timeout=180s \
+	-run 'TestZTmpLightnessDeep' ./internal/render/
+#     TestZZAuditDump so' grava HTML em disco para o vnu, sem asserção — fica
+#     de fora de proposito (nao e' gate). As cinco com asserção real, medidas
+#     JUNTAS em 2026-09-05 (load1 10-28 de 8 nucleos, maquina concorrida por
+#     outras sessoes): 89,9s reais, com TestZZAuditContract em 44,9s e
+#     TestZZAuditSEO (acervo INTEIRO) em 40,8s — as tres do meio usam o cache
+#     de documentos das duas e custam sub-segundo.
+#
+#     ACHADO real desta medicao, ja corrigido: as cinco reprovavam ao rodar
+#     pela primeira vez, e nao por defeito do HTML servido — por TRES
+#     alteracoes deliberadas e datadas do proprio contrato que este teste,
+#     orfao, nunca tinha visto: folha de estilo externa (2026-09-03, contra o
+#     allowlist de <link rel> que so' aceitava metadado pre-migracao),
+#     script de analytics autorizado (2026-08-27, contra a regra "so' JSON-LD")
+#     e target="_blank" preservado pelo sanitizador (2026-08-29, contra o
+#     controle que ainda esperava remocao). As tres foram atualizadas para
+#     refletir o contrato VIGENTE, com a checagem de seguranca real intacta —
+#     ver zzaudit_verify_test.go.
+roda "audit-verify" 240 env WIKI_AUDIT_VERIFY=1 "$GO_MODERN" test -count=1 -timeout=220s \
+	-run 'TestZZAudit(Contract|AccessibilityStructure|FocusIndicatorContrast|SanitizerRoundTrip|SEO)$' ./internal/render/
+
+# 3. Análise estática e cadeia de suprimento — os quatro que estavam vermelhos
+#    e invisíveis há mais de um mês.
+# ★ O NOME DO GATE E VALIDADO ANTES DE RODAR.
+#
+# `cmd/check` responde "unknown_check=<nome>" com exit 1 quando o nome nao
+# existe -- e exit 1 e indistinguivel de "o gate reprovou". Medido em
+# 2026-08-29: este proprio runner chamava `sca-osv-scan`, e o gate se chama
+# `sca-osv`. Ele nunca rodou; aparecia como VERMELHO no ledger todo dia, e o
+# vermelho era de nome errado, nao de vulnerabilidade. Um erro de digitacao
+# virava relatorio de seguranca falso, nos dois sentidos: escondia o resultado
+# real e enchia a serie de alarme que ninguem investigava.
+#
+# ★ A LISTA DE NOMES SE PEDE UMA VEZ, E PEDIR NUNCA EXECUTA GATE.
+#
+# Ate 2026-08-29 este bloco chamava `cmd/check <gate> --lista-nomes` por gate
+# para validar o nome -- e a flag NAO EXISTIA: o parse devolvia exit 2, o `if`
+# caia no fallback e o fallback rodava `cmd/check <gate>` INTEIRO so para ler a
+# mensagem de erro. Os quatro gates de SCA (ate 900 s cada) eram executados DUAS
+# VEZES por dia, e o dobro era invisivel porque a segunda execucao acontecia
+# dentro de uma conferencia anunciada como "barata e nao roda o gate" (BUG-083
+# da caca). A flag agora existe de verdade (cmd/check/main.go) e responde a lista
+# completa, uma linha por nome, com exit 0 e sem executar check nenhum -- entao
+# UMA invocacao valida os quatro nomes, em vez de quatro (ou oito) processos.
+SCA_GATES="sca-govulncheck-evidence sca-staticcheck sca-gosec sca-osv"
+NOMES_DE_GATE="$("$GO_MODERN" run ./cmd/check --lista-nomes 2>/dev/null || true)"
+if [ -z "$NOMES_DE_GATE" ]; then
+	# Sem a lista nao ha como distinguir "nome invalido" de "gate reprovou".
+	# A degradacao correta e rodar cada gate UMA vez e dizer que a validacao de
+	# nome nao aconteceu -- nunca rodar o gate duas vezes para descobrir.
+	echo "qualidade-diaria: AVISO: cmd/check --lista-nomes nao respondeu; nomes de gate nao validados" >&2
+fi
+for gate in $SCA_GATES; do
+	if [ -n "$NOMES_DE_GATE" ] && ! printf '%s\n' "$NOMES_DE_GATE" | grep -qx "$gate"; then
+		echo "qualidade-diaria: NOME DE GATE INVALIDO: $gate (cmd/check nao o conhece)" >&2
+		vermelhos="$vermelhos $gate(nome-invalido)"
+		continue
+	fi
+	if [ "$gate" = "sca-staticcheck" ]; then
+		roda_longa "$gate" 900 "$GO_MODERN" run ./cmd/check "$gate"
+		continue
+	fi
+	roda "$gate" 900 "$GO_MODERN" run ./cmd/check "$gate"
+done
+
+# 4. Superfície de máquina CONTRA O SERVIDOR VIVO.
+#
+#    Este é o gate que enxerga o que o teste em memória não vê. Medido em
+#    2026-08-29: três dos treze archives de /.well-known/agent-skills/ estavam
+#    anunciados no índice e devolviam 404 na origem E na borda -- 23% da
+#    superfície pela qual os agentes entram. O Go servia os três com 200 no
+#    :8089; quem os engolia era uma allowlist de extensão do nginx, que não
+#    conhecia `.gz`. NENHUM teste de pacote podia ver isso, porque o defeito
+#    estava entre as camadas.
+#
+#    `check-agent-skills-discovery` (o gate de DISCO) passava verde o tempo
+#    todo, porque confere o manifesto contra content/. Era o par clássico de
+#    "gate de disco verde × produção vermelha" que o BUG-016 catalogou -- e o
+#    gate que enxergava a verdade não estava em gatilho nenhum. Agora está.
+roda "agent-surface-live" 300 "$RAIZ/tools/check-agent-surface-live"
+
+#    A DIVIDA DE REFINO tem de ser medida, senao "publicar e corrigir" vira
+#    "publicar". A fila data/ops/refinement_queue.jsonl registrava fielmente e
+#    NAO tinha leitor -- uma unica referencia no repo, a de escrita.
+roda "refinamento-tendencia" 120 "$RAIZ/tools/check-refinamento-tendencia"
+
+#    O GUARDIAO DA REDE SOCIAL (ordem do dono, 2026-09-04) confere que toda
+#    entrega marcada "entregue" em content/redesocial_entregas.json tem a prova
+#    no disco: pacote com fonte, arquivo nao vazio, gate com `case` no switch,
+#    testes com corpo, e nenhum marcador de stub.
+#
+#    Ele ja roda no pre-commit quando o commit toca Go, ingress ou os JSON da
+#    rede social. Roda AQUI TAMBEM porque o pre-commit so ve o que entra pelo
+#    commit: uma entrega pode ser quebrada por mudanca em OUTRO lugar -- um
+#    pacote renomeado, um gate removido da lista, um arquivo de prova apagado
+#    por outra frente. O gatilho do commit pega quem escreve; o diario pega
+#    quem quebra de longe.
+#
+#    Pendencia declarada nao reprova aqui (DEC-045): quem cobra o que falta e
+#    tools/check-redesocial-entrega-final, rodado ao declarar o plano pronto.
+roda "redesocial-completude" 120 "$RAIZ/tools/check-redesocial-completude"
+
+#    A SERIE DE TRANSPARENCIA DA MODERACAO tem timer proprio
+#    (wikijuridica-moderacao-transparencia.timer), e mesmo assim entra aqui: o
+#    timer prova que o gerador rodou, este gate prova que o que ele gravou
+#    continua agregado, sem identificador e dentro do piso. Sao coisas
+#    diferentes, e a segunda e a que protege quem denunciou -- a serie alimenta
+#    o relatorio anual que o STF passou a exigir em 26/06/2025, e relatorio
+#    publico e onde um vazamento por agregacao vira dano irreversivel.
+roda "moderacao-transparencia-serie" 120 "$RAIZ/tools/check-moderacao-transparencia-serie"
+
+#    A SERIE DE CARENCIA DE SITEMAP tem um gerador que ESCREVE num ledger
+#    compartilhado com a publicacao (data/ops/sitemap_shard_grace.jsonl, onde
+#    cmd/publish-v2-direct anexa os eventos "removido" que o deploy transforma em
+#    purga de borda). Escritor de ledger compartilhado sem teste e a receita do
+#    evento perdido: nome que escapa da purga = shard 200 quente na borda por ate
+#    sete dias contra uma origem que responde 410.
+#
+#    O selftest cobre append-only, guarda de duplicata e sobrevivencia byte a byte
+#    das linhas "removido", com o ledger de teste em tempfile. Ele entrava AQUI
+#    por uma linha manual, porque a descoberta desta suite alcancava
+#    ./internal/... ./cmd/... e tools/test_*.py e nenhum dos dois padroes pega um
+#    `tools/check-*-selftest`. Desde 2026-09-05 o padrao existe: passo 2c-ter,
+#    glob `tools/*-selftest`, que alcanca este e os outros dez.
+
+#    O "VERIFICADO EM" DE CADA FONTE nao pode ser mais novo que a conferencia
+#    que o sustenta (verified_at no estoque v2), com tolerancia zero. O gate Go
+#    source-verification-evidence so confere EXISTENCIA de lastro por URL e so
+#    le o published_manifest: em 2026-09-01, 10 rotulos em paginas institucionais
+#    fora do manifesto (/sobre/, /termos/, /privacidade/, /metodologia/,
+#    /aviso-legal/) diziam 04/08/2026 sobre fontes conferidas ate 21/07/2026 ou
+#    nunca -- e passavam verdes em todo gate existente. A prova sintetica
+#    (caso ruim reprovando) esta em tools/test_check_checked_at_coerente.py, que
+#    a etapa 2c ja descobre; esta linha roda o gate sobre o ACERVO REAL, que a
+#    descoberta por glob nao alcanca. Le pages.json (78 MB) e 876 shards em ~2,5 s.
+roda "checked-at-coerente" 120 "$RAIZ/tools/check-checked-at-coerente"
+
+#    METADE DAS REFERENCIAS DAS FRONTIERS ESTA MORTA (2026-09-05). As duas
+#    frontiers do codex2 apontam 4.800 opportunity_ids cada; medido hoje, 2.407 e
+#    2.389 deles nao existem mais em demand_expansion_records. Quem denunciava
+#    isso era codex2sourceauditqueue.Generate, que ABORTA no primeiro orfao
+#    (queue.go:136) e nomeia UM -- entao o operador via um id, corrigia um id, e
+#    o gate voltava a apontar o proximo. O mesmo pacote acumula issues em
+#    Validate (queue.go:243-259): a assimetria e do autor, nao desenho declarado.
+#    O commit que a introduziu (44569741, 15/06) tem mensagem de uma linha.
+#    Este gate mede os DOIS artefatos por inteiro e devolve a fracao. Ele ja
+#    pagou por si: foi medindo com ele, em ensaio isolado, que se descobriu que
+#    a SOURCE frontier se recompoe com dois comandos (2.389 orfaos -> 0) e que os
+#    cinco artefatos que eu temia quebrar referenciam a COVERAGE frontier, nao a
+#    source. A source foi recomposta em 2026-09-05. Segue vermelho pela coverage,
+#    que sai de outra fonte e mantem 2.407 -- frente propria, com o numero na mao.
+roda "frontier-opportunity-refs" 60 "$RAIZ/tools/check-frontier-opportunity-refs"
+
+#    O TEXTO DE LEI QUE O PORTAL SERVE BATE COM O OFICIAL? (2026-09-05)
+#    check-legal-corpus-extractor existe desde agosto, tem 11 casos de acusacao
+#    falsa ja ocorrida e NENHUM runner o executava. No dia em que foi lido pela
+#    primeira vez, ele passava APROVADO com o art. 1o da CLT trazendo o texto do
+#    ATO QUE A APROVA -- porque a lista dele e nominal e ninguem havia escrito
+#    esse caso nela. Agora ele tambem varre os 29 diplomas cobrando que nenhum
+#    art. 1o case a forma do ato aprovador, e roda todo dia: citacao legal mal
+#    atribuida e a unica classe de defeito com risco real sob a OAB, e a que
+#    nenhuma medicao de audiencia denuncia.
+roda "legal-corpus-extractor" 120 "$RAIZ/tools/check-legal-corpus-extractor"
+
+#    E O DADO GRAVADO SAIU DESSE EXTRATOR? (2026-09-10)
+#    O gate acima prova o EXTRATOR contra fixtures de HTML oficial e confere uma
+#    lista NOMINAL de dispositivos no disco. Nenhum dos dois alcanca a pergunta
+#    de depois da regeneracao: os 8.854 artigos gravados agora sairam do extrator
+#    como ele e hoje? Foi essa lacuna que deixou contaminacao a montante passar
+#    verde por um mes -- 1.542 de 8.851 artigos com cabecalho de divisao dentro
+#    do corpo, 25 com assinatura presidencial, 25 com o JavaScript do WAF, 162
+#    com controle C1 no lugar do travessao -- em dado que internal/legalcorpusindex
+#    usa para decidir se uma citacao do acervo aponta para artigo existente.
+#    O criterio nao tem numero magico: para cada corpo gravado o gate reaplica
+#    `fim_do_dispositivo` do PROPRIO extrator, e corpo que ainda tem o que cortar
+#    nao e ponto fixo -- ou o dado esta velho, ou o extrator regrediu. Nos dois
+#    casos a resposta e regenerar, nunca afrouxar a regua.
+roda "legal-corpus-contamination" 60 "$RAIZ/tools/check-legal-corpus-contamination"
+
+#    OS 356 GATES DE cmd/check FINALMENTE TEM QUEM OS EXECUTE (2026-09-05).
+#    Medido: internal/checks/checks.go registra 356 gates, e o wrapper que os roda
+#    todos de uma vez NAO e acionado por unit systemd nenhuma -- nem em
+#    ops/systemd/ nem em ~/.config/systemd/user/ -- alem de ser desaconselhado
+#    pelo proprio contrato por ser pesado. Este runner invoca 5 deles por nome.
+#    Os outros 351 existiam, mediam coisa real, e so rodavam se alguem lembrasse:
+#    a mesma doenca dos check-* orfaos, um degrau acima.
+#    A rodada e uma FILA COM RETOMADA, nao uma fatia por dia: a medicao derrubou
+#    o desenho de fatia antes de ele nascer (12 gates estouraram 4 min, com
+#    p0-pipeline-integration comendo o orcamento sozinho). Os de risco juridico,
+#    publicacao, indexacao e identidade tem PRIORIDADE e orcamento reservado --
+#    nao "rodam sempre": sao 87 e nem todos cabem. TUDO entra pela ordem de quem
+#    esta ha mais tempo sem rodar, fixos inclusive, com reserva de orcamento para
+#    a fila andar de verdade; fixo que nao coube sai como AVISO no resumo. O ledger data/ops/gates_rotativos.jsonl e o que PROVA a
+#    cobertura -- `--cobertura` responde "quem nunca rodou" e "qual a idade
+#    maxima". A rodada se autolimita pelo --orcamento, e a etapa tem folga sobre
+#    ele.
+roda "gates-rotativos" 1500 "$RAIZ/tools/run-gates-rotativos" --orcamento 1200
+
+#    IDENTIDADE DE SAIDA. Dezesseis pontos em tools/ falavam com orgao publico
+#    sob cinco nomes diferentes do MESMO portal -- e o operador do outro lado
+#    decide pelo nome se bloqueia. O lado Go ja cobrava a forma unica; este
+#    cobra o lado Python, e le a lista de pinados de
+#    internal/wikijuridicabot.SegundaIdentidadeConhecida em vez de manter copia.
+#    Verde hoje: o que ele passa a pegar e ponto NOVO.
+roda "identidade-de-saida" 180 python3 "$RAIZ/tools/check-identidade-de-saida"
+
+#    O CORPUS-ORACULO ESTAVA VERMELHO E INVISIVEL (2026-09-04). `source-snapshot-corpus`
+#    e um dos 330 gates de cmd/check e nao estava em gatilho nenhum -- a mesma
+#    doenca dos 311 check-* orfaos catalogada acima, so que sobre a camada que
+#    sustenta TODA afirmacao juridica do acervo.
+#
+#    Medido hoje (2-3 s, conforme o cache do Go): 6.775 linhas de manifesto, 281 candidatos de reparo,
+#    281 em quarentena, e dentro disso 121 `revoked_head_marked_vigente` --
+#    dispositivo REVOGADO gravado como vigente. Some 58 cabecas-placeholder, 53
+#    versoes encerradas ainda marcadas vigentes e 48 divergencias de dispositivo.
+#    Enquanto o gate nao rodava, nada disso aparecia: o grounding continuava
+#    respondendo sobre um corpus vencido desde 21/07 e as paginas herdavam a
+#    vigencia errada sem nenhum vermelho no painel.
+#
+#    Entra aqui, junto dos outros gates de fonte, porque o que ele mede -- "a
+#    norma que eu cito ainda esta em vigor?" -- e' da mesma familia do checked-at.
+#
+#    TETO DE 900 s, NAO 120 (corrigido na revisao adversarial de 04/09). O gate
+#    custa 3 s com cache quente, mas o que o `timeout` cronometra aqui NAO e' o
+#    gate: e' o `go run`, que antes precisa COMPILAR ./cmd/check. Com GOCACHE
+#    frio -- toolchain nova, cache limpo, ou primeira execucao depois de mexer
+#    num pacote-base -- a compilacao e' o custo dominante e 120 s deixa de ser
+#    folga. Os unicos outros `go run ./cmd/check` deste arquivo (os quatro gates
+#    SCA da etapa 3) usam 900 pelo mesmo motivo; teto e' limite superior, nao
+#    espera, entao alinhar nao custa um segundo no caso normal.
+#
+#    Errar esse teto tem preco ASSIMETRICO: `registra` so' soma a `vermelhos`
+#    quem tem status "vermelho", e estourar o `timeout` classifica como
+#    "timeout" -- que NAO entra na conta. Um gate que estoura, portanto, some do
+#    alerta e o runner ainda imprime "tudo verde". Gate que sustenta afirmacao
+#    de vigencia nao pode ter esse modo de falha por um teto apertado demais.
+#
+#    O nome vai VALIDADO contra --lista-nomes, como a etapa 3 ja faz: `cmd/check`
+#    sai com 1 tanto para "gate reprovou" quanto para "nome que eu nao conheco",
+#    entao sem validar, um erro de digitacao viraria vermelho FALSO no painel --
+#    licao que o proprio runner escreveu poucas dezenas de linhas acima.
+if [ -n "$NOMES_DE_GATE" ] && ! printf '%s\n' "$NOMES_DE_GATE" | grep -qx "source-snapshot-corpus"; then
+	echo "qualidade-diaria: NOME DE GATE INVALIDO: source-snapshot-corpus (cmd/check nao o conhece)" >&2
+	vermelhos="$vermelhos source-snapshot-corpus(nome-invalido)"
+else
+	roda "source-snapshot-corpus" 900 "$GO_MODERN" run ./cmd/check source-snapshot-corpus
+fi
+
+#    O KPI QUE REAGE EM DIAS: data/ops/time_to_first_crawl_daily.jsonl e escrita
+#    todo dia desde 2026-08-28 e NENHUM gate a lia (BUG-076). Enquanto isso o
+#    Googlebot fez 13,9 paginas/dia, a cobertura acumulada travou em 70,5% e
+#    3.057 paginas nunca foram pedidas -- com todos os vigias verdes. A
+#    cobertura acumulada acusa em semanas; a mediana de dias ate a primeira
+#    requisicao acusa em dias. Primeira execucao real, 2026-09-01: bingbot com
+#    mediana 19 contra teto 7, FAIL -- e o correto.
+roda "time-to-first-crawl" 60 "$RAIZ/tools/check-time-to-first-crawl"
+# Roda LOGO DEPOIS de propósito: quando o de cima reprova por mediana, este
+# diz se algum canal NOSSO de descoberta quebrou ou se e ritmo do Bing. Sem
+# ele, a lista de suspeitos que aquele gate imprime (sitemap, robots, orfas,
+# IndexNow) e hipotese, e ja custou uma sessao perseguindo a errada.
+roda "descoberta-do-bing" 120 "$RAIZ/tools/check-descoberta-do-bing"
+# Logo abaixo do de cima porque responde a pergunta que ele nao faz: o IndexNow
+# esta ANUNCIANDO o acervo? Em 2026-09-08, 6.803 das 10.181 URLs no ar estavam
+# sem recibo de aceite e o servico diario imprimia "nada a submeter" -- o delta
+# compara hash com hash e nunca ve a URL semeada. O gate le o estado vivo:
+# codigo certo com timer parado produz o mesmo silencio.
+roda "indexnow-backlog" 60 "$RAIZ/tools/check-indexnow-backlog"
+
+#    O 404 ERA A UNICA SUPERFICIE SERVIDA SEM MEDICAO (BUG-127): a pagina 404
+#    nao carrega o script de analytics, e nenhuma serie dizia, por dia e por
+#    crawler, quanto do que ele pediu recebeu 404. O gerador deriva
+#    data/ops/serie_404_bots.jsonl de edge_bot_status_daily (borda = acervo
+#    inteiro, agente verificado, SEM rota — as ~10,5 mil `.br` que respondem 404
+#    por acerto NAO saem do denominador, e a linha diz isso) e complementa com
+#    o ledger do Go via accessledger (so rota dinamica e @fallback, UA
+#    declarado: diz QUAIS caminhos, nunca cobertura). Gerador ANTES do gate, de
+#    proposito: o gate le a serie, e serie ausente e NAO RODOU (exit 2), nunca
+#    pass. Medido em 2026-09-01 sobre 11 dias fechados: o unico dia acima de 5%
+#    num bot valioso foi bingbot em 2026-08-21 (31 de 324 = 9,6%); na janela de
+#    7 dias os quatro passam (googlebot 2 de 308 = 0,6%). O gerador le ~240 MB
+#    do ledger de origem com o --dias-origem 3 padrao (9,7 s a prioridade
+#    normal; o backfill de 11 dias levou 26 s), e roda aqui sob nice 19 +
+#    ionice idle, atras da suite inteira: por isso 300 s.
+roda "serie-404-bots" 300 "$RAIZ/tools/generate-serie-404-bots"
+roda "check-serie-404-bots" 60 "$RAIZ/tools/check-serie-404-bots"
+
+# 6a-bis. BYTE DE CONTROLE INVISIVEL EM ARQUIVO VERSIONADO (2026-09-10)
+#    O defeito de origem: um 0x08 LITERAL dentro de uma crase em
+#    internal/legalfacts/norma.go, entre `(?i)` e `arts`. A regex passou a
+#    exigir um backspace antes de "arts." e casou ZERO vezes desde 2026-09-06 —
+#    557 das 1.144 ocorrencias plurais do acervo deixaram de virar fato de
+#    artigo. Ele sobreviveu a TODO instrumento daqui: compila, passa no gofmt,
+#    passa no go vet, e' invisivel no diff, e o teste que o cobriria foi escrito
+#    com o MESMO byte no dado de entrada — verde provando nada.
+#    O unico lugar onde ele nao se esconde e' o byte, e e' onde este gate olha:
+#    varre `git ls-files` (nunca a arvore), 18.323 arquivos / 2,6 GiB em ~26 s.
+#    As 9 capturas de evidencia que legitimamente carregam byte de controle
+#    estao em data/ops/caracteres_de_controle_declarados.jsonl, cada uma com
+#    sha256 fixado: mudou o conteudo, a declaracao morre e o gate reprova.
+#    120 s cobre com folga sob carga alta — e' I/O-bound.
+roda "caracteres-de-controle" 120 "$RAIZ/tools/check-caracteres-de-controle"
+
+# 6b. O SYSTEMD HONRA O QUE ops/systemd DECLARA? (2026-09-02, incidente de 01-02/09)
+#    A unit do servidor ganhou Requires=wikijuridica-server.socket sem a .socket ser
+#    instalada nem o binario recompilado; o systemd carregou a unit nova no reboot
+#    e o servico ficou 17 h em failed ("Unit ... not found"), com toda rota dinamica
+#    em 503 para todo bot. Nenhum gate lia /etc/systemd/system nem LoadState — e
+#    check-units-alarme (unit que falha em silencio) e check-binario-vs-fonte
+#    (binario no ar defasado do fonte) EXISTIAM e nao estavam agendados aqui: gate
+#    orfao e gate cego. Os tres entram juntos; os testes de falso positivo deles
+#    (test_units_alarme.sh, test_units_instaladas.sh) sairam daqui em 2026-09-05
+#    e entram pela descoberta do passo 2c-bis, que alcanca todo `tools/test_*.sh`.
+roda "units-alarme" 60 "$RAIZ/tools/check-units-alarme"
+roda "units-instaladas" 120 "$RAIZ/tools/check-units-instaladas"
+# 6b-ter. INSTALADA NAO E HABILITADA (2026-09-05). check-units-instaladas confere
+#    o symlink em /etc/systemd/system — o estado `linked`, que faz `systemctl
+#    start` funcionar e NAO faz a unit subir no boot. Quem sobe no boot e o
+#    symlink de <target>.wants, e ele fica fora do repositorio. Medido: as duas
+#    units da rede social ficaram `linked` entre 00:03 e 02:52 de 05/09 com o
+#    gate acima verde, e ja havia visitante real em /redesocial/. O teste de
+#    mutacao ao lado prova que o reparo do vigia HABILITA a unit ausente em vez
+#    de repetir o restart — os 493 "Unit ... not found" de 01-02/09.
+roda "social-units-enabled" 60 "$RAIZ/tools/check-social-units-enabled"
+# 6b-quater. O NGINX DEDICADO AINDA RESPONDE COMO O VHOST VIVO? (2026-09-05)
+#    check-nginx-standalone-parity existia desde 13/08, era citado por
+#    generate-nginx-standalone, check-cabecalhos-no-fio e
+#    check-bot-allowlist-derivada — e NENHUM runner o executava. Gate orfao,
+#    como units-alarme e binario-vs-fonte foram ate 04/09. Ele compara os dois
+#    lados por location, nos dois sentidos, e le o que a instancia carrega de
+#    verdade seguindo os `include`; entra aqui para que divergencia entre o
+#    vhost hospedado e a instancia propria apareca no dia em que nasce, e nao
+#    no cutover.
+roda "nginx-standalone-parity" 60 "$RAIZ/tools/check-nginx-standalone-parity"
+roda "binario-vs-fonte" 180 "$RAIZ/tools/check-binario-vs-fonte"
+# 6b-bis. A PRODUCAO SOBREVIVE A FALTA DE MEMORIA? (2026-09-04) Auditoria achou
+#    tres defesas de OOM ausentes ou inertes AO MESMO TEMPO, nenhuma com gate:
+#    vm.overcommit_memory=1 declarado sem medicao (desarma a recusa pre-OOM do
+#    kernel), o SIGKILL do earlyoom preso atras de `swap <= 50%` por causa de
+#    `-s 100` (o minimo historico de swap livre e 77,34%: nunca dispararia), e as
+#    units criticas com OOMScoreAdjust=0 -- o --avoid do earlyoom governa a
+#    escolha DO EARLYOOM, nao a do OOM killer do kernel. Nenhuma das tres produz
+#    log; todas so aparecem no dia em que a memoria acaba. O teste do detector e
+#    descoberto pelo glob tools/test_*.py e reconstroi os tres estados quebrados.
+roda "oom-protecao" 60 "$RAIZ/tools/check-oom-protecao"
+# 6b-ter. OS TRES TESTES DO CANAL DE ALERTA (2026-09-05). Eles tinham linha
+#    propria aqui — `test_notify_owner_aberto_desde.sh`,
+#    `test_notify_owner_escalada.sh` (existia desde 03/09 e passou dias sem
+#    rodar) e `test_notify_owner_mordaca.sh`, que trava dois defeitos medidos no
+#    ledger: a escalada que rompia o cooldown TODA vez (152 eventos `escalado`
+#    na chave `rede-banda`, os 152 entregues ao desktop) e o `--cooldown` sem
+#    teto, que calava alta/critica e congelava junto o contador de que a
+#    escalada depende. Continuam valendo exatamente pelo mesmo motivo; o que
+#    mudou e que nao dependem mais de alguem lembrar de acrescentar a linha:
+#    entram pela descoberta do passo 2c-bis. Teste que ninguem roda nao esta no
+#    projeto — e a lista manual era o que fazia teste novo nascer cego.
+# 6c. A BORDA E O QUE O REPOSITORIO DECLARA? (2026-09-02) As 2 regras WAF estavam
+#    versionadas sem gate; o Bot Management (tudo desligado, DEC-023) nao estava
+#    versionado. Um clique no painel que ligasse "bloquear bots de IA" apagaria os
+#    crawlers de IA sem sinal na origem. Le com o token de zona e cai para a chave
+#    global existente so para leitura.
+roda "edge-waf-drift" 120 "$RAIZ/tools/check-edge-waf-drift"
+# 6c-bis. AS QUATRO TRAVAS DE BORDA DA REDE SOCIAL (2026-09-04, entrega
+#    F1-gates-borda). A rede social e a primeira superficie deste projeto com
+#    COOKIE DE SESSAO, e as quatro travas existem porque o acervo nunca precisou
+#    delas: cache que guarda resposta autenticada e entrega ao proximo anonimo;
+#    CSP do acervo (com googletagmanager) servida sobre conteudo de usuario;
+#    endpoint de login herdando a pista livre que o acervo da a bot valioso; e
+#    CORS permissivo numa rota com sessao, que e o par exato que deixa qualquer
+#    pagina ler o conteudo autenticado da vitima.
+#
+#    Cada um roda duas metades: a asserçao sobre a CONFIGURACAO em Go
+#    (internal/socialborda, via cmd/check) e a sonda do que a borda DE FATO
+#    devolve. Servico fora do ar sai 2 (INCONCLUSIVO), nunca 1 -- a mesma
+#    distincao de check-edge-waf-drift sem credencial. Enquanto o ingress do
+#    /redesocial/ nao existir no nginx, os tres primeiros REPROVAM dizendo qual
+#    elo falta: passar verde por ausencia afirmaria propriedade sobre superficie
+#    que ninguem configurou.
+# 6c-ter. O DESCRITOR PROMETE ROTA QUE O INGRESS ENTREGA? (2026-09-06) Um agente
+#    le /openapi.json ou /.well-known/ai-catalog.json e chama o que estiver la.
+#    internal/agentsurface ja e a fonte unica e ja sabe disso -- o comentario
+#    dele diz que rota fica FORA da lista anunciada enquanto nao existir. A
+#    disciplina estava certa e o defeito veio por onde nenhum teste olhava:
+#    medido em 2026-09-06, /api/v1/redesocial/lote respondia 200 no Go e 404 pelo
+#    nginx, porque `location ^~ /api/v1/redesocial/` mandava o prefixo inteiro
+#    para o cmd/social (8091) e essa rota e servida pelo cmd/server (8089).
+#    Colisao de location, nao erro de logica -- e invisivel para quem sonda o
+#    handler em memoria ou o Go direto. A pergunta que faltava nao e "o servidor
+#    serve?", e "quem chega de fora alcanca?".
+roda "rotas-anunciadas-alcancaveis" 180 "$RAIZ/tools/check-rotas-anunciadas-alcancaveis"
+# 6c-quater. A ANCORA SAI UMA VEZ POR PAGINA? (2026-09-06) O gate media so
+#    COBERTURA, com `grep -rl`, que lista o arquivo e nao conta ocorrencias --
+#    e por isso aprovou um public/ em que 10.141 das 10.370 paginas traziam a
+#    ancora repetida. O leitor via o paragrafo duas vezes, e a copia extra caia
+#    fora do bloco neutralizado, re-datando o acervo inteiro sem uma palavra de
+#    texto ter mudado. Ele agora mede tambem CARDINALIDADE.
+roda "ancora-redesocial" 120 "$RAIZ/tools/check-ancora-redesocial"
+roda "social-cache" 120 "$RAIZ/tools/check-social-cache"
+roda "social-csp" 120 "$RAIZ/tools/check-social-csp"
+roda "social-rate-bypass" 120 "$RAIZ/tools/check-social-rate-bypass"
+roda "social-sem-cors" 120 "$RAIZ/tools/check-social-sem-cors"
+#    O mesmo furo existia para os REDIRECTS, e por mais tempo: nenhuma
+#    ferramenta lia dynamic-redirect-rules.json. A expressao versionada nao
+#    excluia .css nem .js, entao aplica-la mandaria a folha das 10.141 paginas
+#    para 301; e a fase viva na zona estava com zero regras, o que e por que
+#    ninguem descobriu. Verifica os dois lados: se a regra declarada quebraria
+#    algum arquivo que public/ ja serve pelo nome (sem rede), e se o que esta
+#    vivo e o que esta versionado sao a mesma coisa.
+roda "edge-redirect-drift" 120 "$RAIZ/tools/check-edge-redirect-drift"
+roda "test-edge-redirect-drift" 60 python3 "$RAIZ/tools/test_check_edge_redirect_drift.py"
+#    E a guarda do APPLY, que e o que impede a proxima edicao distraida da
+#    expressao de chegar a zona: ela recusa aplicar regra que redirecionaria
+#    arquivo servido. Guarda que so foi vista aprovar nunca foi vista guardar.
+roda "test-apply-redirect-guarda" 60 python3 "$RAIZ/tools/test_apply_dynamic_redirect_rules.py"
+roda "nginx-runtime-dirs" 30 "$RAIZ/tools/check-nginx-runtime-dirs"
+roda "test-origin-access-ledger" 60 python3 "$RAIZ/tools/test_generate_origin_access_ledger.py"
+# 6c-quinquies. OS DOIS DERIVADOS DO CEREBRO AINDA FALAM PELA FONTE? (2026-09-11)
+#     `data/ai/grafo.sqlite` e uma FUNCAO PURA de `extracoes_dispositivos.jsonl`, e
+#     `dispositivos_promovidos.jsonl` tambem. Em 2026-09-10 as revisoes v7 e v8
+#     retiraram `acordao:STJ:1444372 -> 13105!art253` (artigo do RISTJ que herdara a
+#     norma do CPC por quebra de lista); o writeback ficou correto no mesmo minuto e
+#     o GRAFO — regenerado antes das duas passadas — serviu a aresta errada por 15 h,
+#     com `impacto` e `contexto_juridico` respondendo com ela. Nenhum gate via isso:
+#     a licao estava na mensagem de commit da regeneracao anterior, nao na sequencia.
+#     O primeiro mede a IDADE do pendente mais antigo (backlog nao e defeito: o
+#     cerebro trabalha 24/7 e a onda promove 1x/dia); o segundo separa ACRESCIMO de
+#     CORRECAO e so reprova quando o grafo serve URN que a fonte ja retirou.
+roda "writeback-do-cerebro" 120 "$RAIZ/tools/check-writeback-do-cerebro-nao-atrasa"
+roda "grafo-fresco-contra-correcao" 120 "$RAIZ/tools/check-grafo-fresco-contra-correcao"
+# 6c-septies. O PARSER AINDA APARECE NO ARQUIVO? (2026-09-16, §P10 item 1)
+#     O plano mandava registrar "os 4 checks Python orfaos". Sao DOIS: os dois
+#     acima ja estavam aqui. Dos dois que faltavam, `check-extracoes-dispositivos`
+#     NAO ENTRA — ele imprime JSON e sai 0 SEMPRE, e gate que nunca pode ficar
+#     vermelho e pior que gate nenhum, porque ocupa a linha do painel e vende
+#     sensacao de cobertura. O motivo inteiro esta no docstring dele, e quem da
+#     veredito automatico sobre aquele arquivo e o gate Go `extracao-do-cerebro`.
+#     Este aqui entra com `--so-cardinalidade`, que NAO abre a fila de 133 MB nem
+#     o corpus: mede uma coisa so — o artefato do parser existe e nao esta vazio.
+#     VERMELHO AQUI LE-SE: `data/ai/extracoes_dispositivos.jsonl` sumiu, ou
+#     nenhuma linha dele e do executor `parser` com URN LexML — o produtor que
+#     ancora 100% e nao custa LLM parou de aparecer. Vermelho aqui NAO le-se
+#     "a atribuicao esta errada": isso so a leitura da amostra decide, e nenhum
+#     exit code deste programa jamais vai dize-lo (o proprio docstring avisa).
+#     Ate hoje `--so-cardinalidade` devolvia 0 antes de olhar a populacao, entao
+#     registra-lo como estava teria criado a etapa decorativa que este comentario
+#     recusa; a ordem das duas verificacoes foi invertida no proprio programa.
+roda "extracao-por-parser-presente" 120 "$RAIZ/tools/check-extracao-por-parser-amostra" --so-cardinalidade
+# 6c-octies. O GATE GO DO PRODUTO DO CEREBRO (2026-09-16, §P10 item 2 e B20).
+#     Ate hoje NENHUM gate lia extracoes_dispositivos.jsonl nem
+#     dispositivos_promovidos.jsonl, e grafo_manifest.json — produzido todo dia
+#     as 06:51 — tinha UM leitor, que era um teste. Tres predicados: ancora
+#     literal em 100,0000%, promocao sem URN que a extracao nao ancorou, e os
+#     quatro do manifesto do grafo (coerencia interna, tamanhos declarados x
+#     disco, acordaos_fora_do_grafo == 0, frescor de 30 h).
+#     ELE ENTRA AQUI, E NAO SO NO cmd/check, PORQUE E AQUI QUE EXISTE LEDGER DE
+#     VEREDITO: `roda` grava etapa, status, exit_code e duration_ms em
+#     data/ops/qualidade_diaria.jsonl. Gate rodado so por `cmd/check <nome>` nao
+#     deixa linha nenhuma, e a unica evidencia dele e o journal do systemd, que
+#     retem ~17 h. Medido no dia: 3.546 ms sobre 56 MB de JSONL, exit 0.
+roda "extracao-do-cerebro" 300 "$RAIZ/tools/check-extracao-do-cerebro"
+# 6c-sexies. AS DUAS SERIES DE ADOCAO POR AGENTE (2026-09-11). As duas nasceram
+#     no mesmo dia, das duas pontas da mesma pergunta do §12 ("retorno e citacao
+#     POR AGENTE, nao cobertura de rastreio"), e as duas nasceram ORFAS —
+#     `grep -rn` em tools/ e ops/ devolvia so o proprio arquivo e o teste. Produtor
+#     que ninguem chama nao mede nada: foi assim que o writeback do cerebro
+#     congelou em 214 promocoes por um dia inteiro.
+#     `funil-de-maquina` mede o que acontece DENTRO das portas (initialize ->
+#     tools/list -> tools/call, com `mcp_method`, que so existe no ledger do Go);
+#     `escolha-de-serializacao` mede o DENOMINADOR que falta a ele — de tudo o que
+#     o agente pede, quanto ele escolhe pedir em formato de maquina, com o HTML
+#     dentro. Medido na primeira passada (2026-09-08..11): gptbot 61,06% nao-HTML
+#     (13.792 `.md`), perplexitybot 0,07%, chatgpt-user 0,00%.
+roda "funil-de-maquina" 300 "$RAIZ/tools/generate-funil-de-maquina"
+roda "escolha-de-serializacao" 300 "$RAIZ/tools/generate-escolha-de-serializacao"
+# 6d. A REGUA DE QUALIDADE DO ACERVO (2026-09-03). Sem serie por pagina, "reparar
+#     o pior decil" e conversa: nao ha decil. Ela mede corpo, estrutura, fonte
+#     com data, ancora por fonte e molde por 5-gramas dentro da area, e nao
+#     reprova ninguem — quem decide o reparo e o plano editorial.
+roda "qualidade-por-decil" 420 "$RAIZ/tools/generate-qualidade-por-decil"
+# 6e. A sonda de superficie por CLASSE de bot voltou a ser agendada (2026-09-03):
+#     ela existia desde 26/08 e nao gravava seu ledger desde 26/08 16:45 porque
+#     ninguem a disparava — sonda que ninguem roda nao mede nada.
+roda "superficie-bots-live" 300 "$RAIZ/tools/check-superficie-bots-live" --gravar qualidade-diaria
+# 6e-bis. AS OUTRAS TRES SONDAS DE BOT, agendadas em 2026-09-03 depois de medir
+#     o que cada uma faz. O plano desta sessao mandava CONSOLIDAR as cinco numa
+#     so, por suspeita de duplicacao; a leitura do codigo refutou a suspeita:
+#     check-what-bots-see (499 linhas) mede o que cada perfil recebe DA ORIGEM,
+#     check-what-bots-see-externo (199) compara BORDA contra ORIGEM cabecalho a
+#     cabecalho, check-perfil-por-bot (439) levanta o perfil individual de cada
+#     agente, e superficie-bots-live cobre a superficie por CLASSE. Sao quatro
+#     lentes distintas — fundi-las destruiria capacidade de medicao.
+#
+#     O defeito real era outro e e o mesmo de 6e: tres das quatro nunca eram
+#     disparadas. Sonda que ninguem roda nao mede nada, e o custo de agendar e
+#     de segundos.
+#
+#     SEGURANCA DE UA CONFERIDA ANTES DE AGENDAR: cabecalhos_para() decide pelo
+#     ALVO, nao pela flag — UA de bot real so sai contra 127.0.0.1 (que le
+#     X-Bot-Simulation e exclui a visita do trafego real); contra a borda o UA e
+#     sempre proprio e declarado. Agendar sonda que mandasse UA de bot real ao
+#     dominio publico seria a fraude que o CLAUDE.md proibe.
+roda "what-bots-see" 300 "$RAIZ/tools/check-what-bots-see"
+roda "what-bots-see-externo" 300 "$RAIZ/tools/check-what-bots-see-externo"
+roda "perfil-por-bot" 300 "$RAIZ/tools/check-perfil-por-bot"
+# 6e-ter. O LEVANTAMENTO DE CANDIDATOS A REGISTRO (Fase 3.2 do plano de
+#     2026-09-03). O gerador nasceu nesta sessao e ja achou 24 candidatos reais
+#     em 2 dias de log — entre eles o Cloudflare-AI-Search, que veio 139 vezes
+#     em 02/09 e resolveu sozinho a URL da doc do operador. Ele so tem valor se
+#     rodar TODO DIA: bot novo aparece na borda sem avisar, e o registro
+#     manual so acontece se alguem for informado de que ha o que registrar.
+#
+#     Aqui, e nao num timer proprio: `wikijuridica-bot-telemetry` roda a cada
+#     30 min, cadencia errada para um levantamento que faz sonda de rede por
+#     candidato; esta rotina ja e diaria e ja depende do ledger de origem que
+#     ele consome.
+roda "bot-registry-candidates" 300 "$RAIZ/tools/generate-bot-registry-candidates"
+#     E O CONSUMIDOR, QUE FALTAVA ATE 2026-09-16. O gerador acima rodava todo dia
+#     e ninguem lia o que ele escrevia: 375 linhas, 48 tokens, 26 dias, e
+#     `grep -rln bot_registry_candidates` devolvia so o proprio gerador. O custo
+#     medido na borda, janela de 24h encerrada em 2026-09-16T16:00:00Z: 12.741
+#     de 30.115 requisicoes liquidas (42,3%) eram agente que SE DECLARA e o
+#     registro nao conhecia. O gate roda LOGO DEPOIS do gerador de proposito — o candidato
+#     encontrado hoje ja e cobrado hoje, e nao no dia seguinte.
+roda "bot-registry-decidido" 60 "$RAIZ/tools/check-bot-registry-decidido"
+roda "test-bot-registry-decidido" 60 python3 "$RAIZ/tools/test_check_bot_registry_decidido.py"
+roda "test-bot-registry-candidates" 60 python3 "$RAIZ/tools/test_generate_bot_registry_candidates.py"
+# 6f. GATES QUE EXISTIAM E NINGUEM DISPARAVA (2026-09-03). Gate orfao nao e gate
+#     morto (docs/OPERACAO_COMANDOS_E_CAMINHOS.md 8d) — mas gate que ninguem roda
+#     tambem nao mede nada. Estes quatro rodam em segundos, ja passam hoje, e
+#     cobrem risco real: tier declarado sem aplicacao no nginx, rota do acervo
+#     inalcancavel por link, honestidade da serie de cobertura e frescor das
+#     faixas de IP oficiais (que a lane de identidade por IP passou a usar).
+roda "bot-rate-tiers-aplicados" 120 "$RAIZ/tools/check-bot-rate-tiers-aplicados"
+roda "crawl-reachability" 300 "$RAIZ/tools/check-crawl-reachability"
+roda "edge-cache-coverage-honesty" 120 "$RAIZ/tools/check-edge-cache-coverage-honesty"
+roda "bot-ip-ranges-frescor" 120 "$RAIZ/tools/check-bot-ip-ranges-frescor"
+
+# 6g. TRAVESSIA E DETECTOR ORFAO — a familia que teste de unidade nao alcanca
+#     (2026-09-16).
+#
+# O CENSO QUE MOTIVOU ESTE BLOCO, medido por `tools/check-detector-orfao`:
+#
+#   958 detectores em tools/check-* e tools/generate-*
+#   499 com executor alcancavel de raiz real (unit, hook, glob do vigia, teste)
+#   166 wrappers de gate Go cujo predicado roda em `gates-rotativos`
+#   293 ORFAOS: 81 check-* e 212 generate-* que NENHUM executor alcanca
+#
+# Nao e' contagem de mencao: e' alcancabilidade num grafo dirigido. Mencao em
+# comentario nao vira aresta (o precedente e' `run-daily-content:446-447`, cujos
+# dois comentarios davam a impressao de que o writeback rodava), e ser chamado
+# por quem tambem nao roda nao e' rodar.
+#
+# AS QUATRO ETAPAS QUE ENTRAM AQUI ERAM ORFAS, E TODAS MEDEM O ARTEFATO SERVIDO
+# — a familia do defeito de 2026-09-16 (942 paginas com cronologia impossivel no
+# ar porque a regra existia em `publish-v2-direct` e ninguem a conferia sobre
+# public/). Custo medido nesta maquina, hoje, com o load entre 2 e 9:
+#
+#   detector-orfao                   2,2 s
+#   gemea-espelha-public             0,7 s (ocioso) a 6,1 s (carregado)
+#   sitemap-lastmod-vs-mtime         0,08 s
+#   lastmod-por-evento               3,2 s
+#   contagens-publicas-reconciliam   1,0 s
+#   og-image-existe                  0,8 s
+#   identidade-da-home               0,04 s
+#   area-label-cobertura             0,8 s
+#   social-temas-404-tardio          0,2 s
+#   accessibility-html               58,7 s  <- a caro do bloco, e a razao esta
+#                                              abaixo
+#
+# Soma: ~68 s no caminho critico, contra as etapas de 73,8 s (lightness-corpus)
+# e 119,7 s (audit-verify) que ja vivem nele. `accessibility-html` audita 11.366
+# documentos de public/ e e' o unico instrumento do repositorio que le o HTML
+# servido pela regua WCAG; 58,7 s por dia e' o preco de nao descobrir uma
+# regressao de acessibilidade por relato de visitante.
+#
+# ★ `social-temas-404-tardio` NASCE VERMELHO, e isso e' deliberado. Ele mede o
+#   RASTRO de 404 sob /redesocial/ nos ultimos 7 dias, e o incidente de
+#   2026-09-10..16 (1.194 respostas 404, 877 caminhos, GPTBot 867) esta dentro
+#   da janela: rodado hoje, exit 1 com 21 rotas. A janela rola, e o gate fica
+#   verde sozinho quando o rastro sai dela — e' gate de FLUXO, e vermelho de
+#   fluxo e' o incidente falando, nao divida acumulada. O irmao de CONJUNTO
+#   (`check-social-temas-espelhados`) mede zero diferenca hoje e nunca veria
+#   isso.
+#
+# ★ POR QUE `check-public-body-sections` NAO ENTRA, com o numero: rodado hoje
+#   ele sai 1 com 17 paginas de /imobiliario/ marcando `estoque=0 html=9` —
+#   divergencia real entre o estoque e o HTML servido, em territorio de outra
+#   frente (v2_pages/ingest). Ligar gate que nasce vermelho por divida alheia
+#   ensina a equipe a ignorar o alerta; o achado esta registrado em
+#   `ops/detectores-decididos.jsonl` com destino e evidencia, e a etapa entra no
+#   dia em que as 17 fecharem.
+roda "detector-orfao" 120 "$RAIZ/tools/check-detector-orfao"
+roda "gemea-espelha-public" 180 "$RAIZ/tools/check-gemea-espelha-public"
+roda "sitemap-lastmod-vs-mtime" 120 "$RAIZ/tools/check-sitemap-lastmod-vs-mtime"
+roda "lastmod-por-evento" 180 "$RAIZ/tools/check-lastmod-por-evento"
+roda "contagens-publicas-reconciliam" 120 "$RAIZ/tools/check-contagens-publicas-reconciliam"
+roda "og-image-existe" 120 "$RAIZ/tools/check-og-image-existe"
+roda "identidade-da-home" 120 "$RAIZ/tools/check-identidade-da-home"
+roda "area-label-cobertura" 120 "$RAIZ/tools/check-area-label-cobertura"
+roda "social-temas-404-tardio" 120 "$RAIZ/tools/check-social-temas-404-tardio"
+roda "accessibility-html" 180 "$RAIZ/tools/check-accessibility-html"
+
+# `finaliza` está definida logo após roda()/registra() (ver o comentário lá) —
+# aqui só a chamada final do caminho "tudo"/"curto".
+finaliza

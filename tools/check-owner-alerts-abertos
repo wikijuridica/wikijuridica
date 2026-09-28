@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""check-owner-alerts-abertos — o alerta que ninguém consumiu vira falha visível.
+
+READ-ONLY. Sai != 0 quando existe alerta cuja severidade exige ação e que já
+passou do prazo de escalada sem ser resolvido.
+
+POR QUE EXISTE, e por que o diagnóstico corrente estava pela metade: o
+PLANO_SUPERFICIE_BOTS_20260826 registrava que o canal de alerta era "write-only"
+e que "a detecção funcionou, ninguém consumiu". **Medido em 2026-08-26, o
+diagnóstico é mais fino que isso** — e a diferença decide o desenho deste gate:
+
+    1.043 linhas · 25 chaves distintas · 16 abertas · 89 resoluções REAIS,
+    a mais recente no próprio dia da medição.
+
+Ou seja: o ciclo FECHA para a condição que se auto-normaliza. `rede-uplink` foi
+resolvida 42 vezes, `rede-indefinido` 16, `borda-cobertura` 9 — os monitores
+detectam a volta ao normal e chamam `notify-owner --resolvido` sozinhos.
+
+O que NUNCA fecha é o que depende de ação de engenharia: `borda-cache-regra`
+(a Cache Rule da borda apagada em 2026-08-22, aberta desde 21/08),
+`borda-origem`, `tunel-uplink` e a família `onda-diaria-*`. Para essas, não
+existia leitor nenhum — os únicos consumidores do ledger eram `tools/notify-owner`
+e a unit de alerta, **os dois PRODUTORES**.
+
+Este gate é o consumidor que faltava. Ele não conserta nada: ele impede que o
+defeito estrutural envelheça em silêncio, que é o que aconteceu por cinco dias.
+
+────────────────────────────────────────────────────────────────────────────
+DUAS ARMADILHAS QUE ESTE GATE DESARMA POR CONSTRUÇÃO
+
+A5 — o ledger é CUMULATIVO. Contar linhas dá 1.043; contar chaves com "alguma
+linha aberta na história" dá 25 e é TAUTOLÓGICO, porque todo alerta nasce
+`resolvido: false`. O estado real é a ÚLTIMA linha de cada chave — e só ela. Esta
+sessão errou esse número três vezes antes de acertar (48 → 839/118 → 25/7 → 16).
+
+CHAVE COM DATA DENTRO — `onda-diaria-2026-08-21`, `-22`, `-23`… A mesma falha
+reincidente cria uma chave NOVA por dia, então nenhuma delas envelhece e o
+alarme nunca escala. Medido: SETE chaves `onda-diaria-*` abertas, uma por dia,
+para UM defeito. O gate agrupa por prefixo declarado na política e mede a
+REINCIDÊNCIA, que é o sinal que a chave datada destrói.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE NÃO PODE SER CHAMADO PELO RUNNER DA ONDA
+
+O runner falha exatamente quando os alertas nascem. Ligar um ao outro é
+dependência circular: o gate só rodaria quando já fosse tarde. Roda por timer
+próprio ou a mão. Está escrito também na política, para quem for ligá-lo.
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+# WIKI_OWNER_ALERTS_LEDGER existe para TESTE, e o default nao muda: sem a
+# variavel, o gate le exatamente o mesmo caminho de sempre. Sem esse gancho
+# nao ha como exercitar o ramo de ledger ausente sem apagar o ledger real —
+# e um gate anti-fraude cujo ramo critico nunca foi exercitado e um gate que
+# ninguem provou que funciona (2026-08-29, BUG-069 da caca).
+LEDGER = os.environ.get("WIKI_OWNER_ALERTS_LEDGER") or os.path.join(RAIZ, "data/ops/owner_alerts.jsonl")
+POLITICA = os.path.join(RAIZ, "content/alert_policy.json")
+
+
+INCIDENTES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data/ops/incidents.jsonl")
+
+
+def carrega_politica() -> dict:
+    with open(POLITICA, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def estado_por_chave(caminho: str) -> tuple[dict, int, int]:
+    """ÚLTIMA linha de cada chave — o único estado que significa alguma coisa
+    num ledger append-only. Devolve (estado, total_linhas, linhas_corrompidas)."""
+    ultimo: dict[str, dict] = {}
+    total = corrompidas = 0
+    with open(caminho, encoding="utf-8") as f:
+        for bruta in f:
+            bruta = bruta.strip()
+            if not bruta:
+                continue
+            total += 1
+            try:
+                o = json.loads(bruta)
+            except Exception:
+                corrompidas += 1
+                continue
+            chave = o.get("chave")
+            if not chave:
+                corrompidas += 1
+                continue
+            ultimo[chave] = o
+    return ultimo, total, corrompidas
+
+
+def horas_desde(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    try:
+        t = datetime.fromisoformat(iso)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds() / 3600
+    except Exception:
+        return None
+
+
+def main() -> int:
+    if not os.path.exists(LEDGER):
+        # LEDGER AUSENTE E ANOMALIA, NAO ESTADO INICIAL (2026-08-29, BUG-069).
+        #
+        # O canal de alerta grava desde julho de 2026. Se o arquivo sumiu, o que
+        # se perdeu foi o historico de alertas — e aprovar com exit 0 nesse caso
+        # significa que APAGAR o ledger silencia o canal inteiro, com o gate
+        # dizendo que esta tudo bem. Essa e a definicao de porta dos fundos num
+        # verificador anti-fraude.
+        print(f"check-owner-alerts-abertos: ledger AUSENTE em {LEDGER} — o canal grava desde 2026-07; verifique caminho, permissao ou disco", file=sys.stderr)
+        return 2
+    pol = carrega_politica()
+    prazos = pol["prazo_de_escalada_horas"]
+    ignorar = set(pol.get("ignorar_severidades", []))
+    fam = pol.get("chaves_com_data_embutida", {})
+    prefixos = fam.get("prefixos", [])
+    reincidencia_limite = fam.get("reincidencia_que_escala", 2)
+
+    ultimo, total, corrompidas = estado_por_chave(LEDGER)
+    abertas = {k: o for k, o in ultimo.items() if not o.get("resolvido")}
+
+    problemas: list[str] = []
+    avisos: list[str] = []
+
+    if corrompidas:
+        avisos.append(f"{corrompidas} linha(s) do ledger nao parsearam — a contagem pode estar incompleta")
+
+    # Famílias de chave datada: a reincidência é o sinal, não a idade.
+    familias: dict[str, list[str]] = {}
+    for k in list(abertas):
+        for p in prefixos:
+            if k.startswith(p):
+                familias.setdefault(p, []).append(k)
+                break
+
+    for p, chaves in familias.items():
+        if len(chaves) >= reincidencia_limite:
+            sev = abertas[chaves[0]].get("severidade", "?")
+            problemas.append(
+                f"[{sev}] {p}* — {len(chaves)} ocorrencias abertas da MESMA falha, "
+                f"uma por dia ({min(chaves)} .. {max(chaves)})"
+            )
+            problemas.append(
+                "      a chave carrega a data, entao cada dia parece alerta novo e nada escala; "
+                "a reincidencia e o defeito"
+            )
+
+    em_familia = {k for chaves in familias.values() for k in chaves}
+    for chave, o in sorted(abertas.items()):
+        if chave in em_familia:
+            continue
+        sev = (o.get("severidade") or "?").lower()
+        if sev in ignorar:
+            continue
+        prazo = prazos.get(sev)
+        if prazo is None:
+            continue
+        # Idade do INCIDENTE, nao da ultima linha: `aberto_desde` e gravado pelo
+        # notify-owner desde 2026-09-02 (linha silenciada por cooldown tambem o
+        # carrega). Linha antiga sem o campo cai no `alertado_em` de antes.
+        idade = horas_desde(o.get("aberto_desde") or o.get("alertado_em"))
+        if idade is None:
+            avisos.append(f"{chave}: sem `aberto_desde`/`alertado_em` legivel — nao da para medir a idade")
+            continue
+        if idade > prazo:
+            problemas.append(
+                f"[{sev}] {chave} — aberta ha {idade:.0f}h (prazo {prazo}h): "
+                f"{(o.get('titulo') or '').strip()[:70]}"
+            )
+            problemas.append(f"      evidencia: {o.get('evidencia', '?')} · origem: {o.get('origem', '?')}")
+
+    print(f"ledger: {total} linhas · {len(ultimo)} chaves · {len(abertas)} abertas "
+          f"(estado = ULTIMA linha por chave, nunca contagem de linhas)")
+
+    # INCIDENTES ABERTOS — o ledger que a escalada de notify-owner passou a
+    # gravar em 2026-09-03. Uma serie sem consumidor nao mede nada: o incidente
+    # existe justamente para o alerta que ja provou que nao se resolve sozinho,
+    # e ele so cumpre esse papel se aparecer aqui, ao lado das chaves abertas.
+    #
+    # Incidente cuja chave JA FOI RESOLVIDA nao e problema: a linha do
+    # incidente e imutavel por desenho (append-only), e quem diz se o assunto
+    # segue vivo e o estado da chave, nao a existencia da linha.
+    incidentes_vivos = []
+    try:
+        with open(INCIDENTES, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                try:
+                    incidente = json.loads(linha)
+                except ValueError:
+                    continue
+                chave = incidente.get("chave")
+                atual = ultimo.get(chave) or {}
+                if atual.get("resolvido") or not atual.get("aberto_desde"):
+                    continue
+                if atual.get("aberto_desde") != incidente.get("aberto_desde"):
+                    continue
+                incidentes_vivos.append(incidente)
+    except OSError:
+        pass
+    if incidentes_vivos:
+        print(f"incidentes ABERTOS: {len(incidentes_vivos)} "
+              f"(alerta que cruzou o limiar de ops/alert_policy.json e nao se resolveu)")
+        for incidente in incidentes_vivos:
+            idade_inc = horas_desde(incidente.get("aberto_desde"))
+            problemas.append(
+                f"[INCIDENTE] {incidente.get('chave')} — {incidente.get('ocorrencias')} ocorrencias, "
+                f"aberto ha {idade_inc:.0f}h" if idade_inc is not None else
+                f"[INCIDENTE] {incidente.get('chave')} — {incidente.get('ocorrencias')} ocorrencias"
+            )
+    for a in avisos:
+        print(f"  info: {a}")
+
+    if problemas:
+        print("check-owner-alerts-abertos: FAIL")
+        for p in problemas:
+            print(f"  - {p}" if not p.startswith("      ") else p)
+        print("  Resolva a causa e marque: tools/notify-owner --chave <chave> --resolvido "
+              "--titulo '<o que mudou>' --mensagem '<evidencia>'")
+        print("  Alerta que nao se resolve sozinho e trabalho de engenharia, nao ruido a silenciar.")
+        return 1
+    print("check-owner-alerts-abertos: OK (nenhum alerta acionavel alem do prazo)")
+    return 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

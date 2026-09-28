@@ -1,0 +1,4 @@
+- [Auditar o estado final com agentes concorrentes](auditar-estado-final-com-agentes-concorrentes.md) — bancada verde às HH:MM e âncoras "conferidas" envelhecem em minutos; re-rode e re-derive no disco atual
+- [Provar instalador com bwrap e HOME falso](provar-instalador-com-bwrap-home-falso.md) — / ro-bind + /home tmpfs + md5 antes/depois; --seco, aplicar 2x, .bak por mv
+- [apt indextargets só lista repo cacheado](apt-indextargets-so-lista-repo-cacheado.md) — vazio para repo novo não é defeito; prove a restrição com repo cacheado; dir de arquivo compartilhado entre kits
+- [Migração torre: túnel reverso e briefing stale](migracao-torre-tunel-reverso-e-estado-stale.md) — banner-exchange timeout em 2222 = listener zumbi; pós-cutover: ssh direto 192.168.1.10 c/ UserKnownHostsFile=/dev/null; uutils 0.10.0 + dash

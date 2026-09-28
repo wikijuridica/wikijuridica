@@ -1,0 +1,1777 @@
+#!/bin/sh
+# shellcheck disable=SC2317
+set -eu
+
+if [ "$#" -eq 0 ]; then
+	echo "usage: run-heavy-throttled COMMAND [ARGS...]" >&2
+	exit 2
+fi
+
+script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+
+# Go 1.25+ already derives GOMAXPROCS from affinity/cgroup quota and updates it
+# while the process runs.  Exporting a guessed value disables that adaptation.
+# Preserve an inherited value and support only an explicit operator override.
+if [ -n "${WIKI_HEAVY_GOMAXPROCS+x}" ]; then
+	case "$WIKI_HEAVY_GOMAXPROCS" in
+	'' | *[!0-9]* | 0 | ???????????*)
+		echo "run-heavy-throttled: WIKI_HEAVY_GOMAXPROCS must be a positive integer" >&2
+		exit 2
+		;;
+	esac
+	if [ "$WIKI_HEAVY_GOMAXPROCS" -gt 2147483647 ]; then
+		echo "run-heavy-throttled: WIKI_HEAVY_GOMAXPROCS exceeds the runtime integer range" >&2
+		exit 2
+	fi
+	export GOMAXPROCS="$WIKI_HEAVY_GOMAXPROCS"
+fi
+
+# Neutral scheduling is the scalable default.  Throttling is an explicit,
+# measured operator choice rather than a permanent penalty on every producer.
+nice_level="${WIKI_HEAVY_NICE:-0}"
+case "$nice_level" in
+'' | *[!0-9]* | ???*)
+	echo "run-heavy-throttled: WIKI_HEAVY_NICE must be an integer between 0 and 19" >&2
+	exit 2
+	;;
+esac
+if [ "$nice_level" -gt 19 ]; then
+	echo "run-heavy-throttled: WIKI_HEAVY_NICE must be an integer between 0 and 19" >&2
+	exit 2
+fi
+# ★ DEFAULT `ionice -c2 -n7`, E ELE VOLTOU EM 2026-08-30 (BUG-188).
+#
+# Ao parametrizar classe e nivel, o default da CLASSE ficou VAZIO — e como o
+# bloco de aplicacao e `if [ -n "$ionice_class" ]`, o efeito pratico foi
+# desligar a despriorizacao de I/O por padrao. Comando pesado voltou a disputar
+# disco em pe de igualdade com quem esta trabalhando ao lado, que e exatamente o
+# que este wrapper existe para impedir.
+#
+# `TestHeavyCommandThrottleWrapperExistsForAgentUse` cobra o literal
+# `ionice -c2 -n7` desde que o wrapper nasceu; ele estava vermelho e ninguem o
+# executava (commit acima de seis pacotes pula o teste focado em silencio). O
+# gate estava certo e o wrapper e que tinha regredido.
+#
+# A parametrizacao FICA — ela e util e `WIKI_HEAVY_IONICE_CLASS=3` continua
+# dando idle real. O que muda e o default: classe 2 (best-effort), nivel 7 (o
+# mais baixo dela).
+ionice_class="${WIKI_HEAVY_IONICE_CLASS:-2}"
+ionice_level="${WIKI_HEAVY_IONICE_LEVEL:-7}"
+case "$ionice_class" in
+'' | 1 | 2 | 3) ;;
+*)
+	echo "run-heavy-throttled: WIKI_HEAVY_IONICE_CLASS must be 1, 2, 3 or unset" >&2
+	exit 2
+	;;
+esac
+if [ -n "$ionice_class" ]; then
+	case "$ionice_level" in
+	'' | *[!0-7]* | ??*)
+		echo "run-heavy-throttled: WIKI_HEAVY_IONICE_LEVEL must be an integer between 0 and 7" >&2
+		exit 2
+		;;
+	esac
+fi
+if [ -n "${WIKI_HEAVY_LOCK_DIR:-}" ]; then
+	lock_root_explicit=1
+	lock_root="$WIKI_HEAVY_LOCK_DIR"
+else
+	lock_root_explicit=0
+	lock_repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel 2>/dev/null || printf '%s' "$script_dir/..")"
+	lock_repo_root="$(realpath -e -- "$lock_repo_root" 2>/dev/null || true)"
+	lock_repo_identity="$(stat -Lc '%d:%i' -- "$lock_repo_root" 2>/dev/null || true)"
+	lock_uid="$(id -u 2>/dev/null || true)"
+	if [ -z "$lock_repo_root" ] || [ -z "$lock_repo_identity" ] || [ -z "$lock_uid" ]; then
+		echo "run-heavy-throttled: cannot derive stable repository lock identity" >&2
+		exit 75
+	fi
+	lock_repo_key="$(printf '%s\n' "$lock_repo_identity" | sha256sum | awk '{print $1}')"
+	if [ -d "/run/user/$lock_uid" ] && [ ! -L "/run/user/$lock_uid" ] &&
+		[ "$(stat -Lc '%u' -- "/run/user/$lock_uid" 2>/dev/null || true)" = "$lock_uid" ]; then
+		lock_runtime_root="/run/user/$lock_uid"
+	else
+		lock_runtime_root="/tmp"
+	fi
+	lock_root="$lock_runtime_root/portaljuridico-heavy-$lock_uid-$lock_repo_key"
+fi
+command_identity="$(
+	{
+		printf 'argc:%s\n' "$#"
+		for arg in "$@"; do
+			printf 'arg:%s\n' "$arg"
+		done
+	}
+)"
+command_text="$*"
+if [ -n "${WIKI_HEAVY_LOCK_SCOPE:-}" ]; then
+	lock_scope="scope:${WIKI_HEAVY_LOCK_SCOPE}"
+else
+	lock_scope="command:${command_identity}"
+fi
+lock_key="$(
+	printf '%s\n' "$lock_scope" | sha256sum | awk '{print $1}'
+)"
+lock_dir="$lock_root/$lock_key.lock"
+lock_meta="$lock_dir/meta"
+lock_wait_seconds="${WIKI_HEAVY_LOCK_WAIT_SECONDS:-600}"
+lock_wait_notice_seconds="${WIKI_HEAVY_LOCK_WAIT_NOTICE_SECONDS:-30}"
+lock_stale_seconds="${WIKI_HEAVY_LOCK_STALE_SECONDS:-21600}"
+lock_heartbeat_seconds="${WIKI_HEAVY_LOCK_HEARTBEAT_SECONDS:-30}"
+lock_heartbeat_stale_seconds="${WIKI_HEAVY_LOCK_HEARTBEAT_STALE_SECONDS:-180}"
+command_timeout_seconds="${WIKI_HEAVY_TIMEOUT_SECONDS:-540}"
+command_timeout_kill_after_seconds="${WIKI_HEAVY_TIMEOUT_KILL_AFTER_SECONDS:-30}"
+repo_awareness_timeout="${WIKI_REPO_AWARENESS_TIMEOUT:-2s}"
+repo_awareness_timeout_explicit=0
+progress_monitor_mode="${WIKI_HEAVY_PROGRESS_MONITOR:-auto}"
+progress_monitor_window_seconds="${WIKI_HEAVY_PROGRESS_WINDOW_SECONDS:-}"
+progress_monitor_alert_windows="${WIKI_HEAVY_PROGRESS_ALERT_WINDOWS:-2}"
+progress_monitor_tool="$script_dir/check-command-progress"
+progress_watchdog_tool="$script_dir/run-heavy-progress-watchdog"
+process_tree_supervisor="$script_dir/supervise-process-tree"
+progress_monitor_pid=""
+progress_expected_duration_ms=""
+progress_monitor_initial_delay_seconds=0
+if [ -n "${WIKI_REPO_AWARENESS_TIMEOUT+x}" ]; then
+	repo_awareness_timeout_explicit=1
+fi
+
+case "$lock_wait_notice_seconds" in
+'' | *[!0-9]* | ??????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_LOCK_WAIT_NOTICE_SECONDS must be numeric seconds or 0" >&2
+	exit 2
+	;;
+esac
+case "$lock_wait_seconds" in
+'' | *[!0-9]* | ??????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_LOCK_WAIT_SECONDS must be numeric seconds or 0" >&2
+	exit 2
+	;;
+esac
+case "$lock_stale_seconds" in
+'' | *[!0-9]* | ???????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_LOCK_STALE_SECONDS must be numeric seconds" >&2
+	exit 2
+	;;
+esac
+case "$lock_heartbeat_seconds" in
+'' | *[!0-9]* | ??????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_LOCK_HEARTBEAT_SECONDS must be numeric seconds" >&2
+	exit 2
+	;;
+esac
+case "$lock_heartbeat_stale_seconds" in
+'' | *[!0-9]* | ???????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_LOCK_HEARTBEAT_STALE_SECONDS must be numeric seconds" >&2
+	exit 2
+	;;
+esac
+case "$command_timeout_seconds" in
+'' | *[!0-9]* | ??????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+if [ "$command_timeout_seconds" -le 0 ]; then
+	echo "run-heavy-throttled: WIKI_HEAVY_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+	exit 2
+fi
+if [ "$command_timeout_seconds" -gt 86400 ]; then
+	echo "run-heavy-throttled: WIKI_HEAVY_TIMEOUT_SECONDS must not exceed 86400 seconds" >&2
+	exit 2
+fi
+case "$command_timeout_kill_after_seconds" in
+'' | *[!0-9]* | ????*)
+	echo "run-heavy-throttled: WIKI_HEAVY_TIMEOUT_KILL_AFTER_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+if [ "$command_timeout_kill_after_seconds" -le 0 ]; then
+	echo "run-heavy-throttled: WIKI_HEAVY_TIMEOUT_KILL_AFTER_SECONDS must be a positive integer seconds" >&2
+	exit 2
+fi
+if [ "$command_timeout_kill_after_seconds" -gt 300 ]; then
+	echo "run-heavy-throttled: WIKI_HEAVY_TIMEOUT_KILL_AFTER_SECONDS must not exceed 300 seconds" >&2
+	exit 2
+fi
+if [ ! -f "$process_tree_supervisor" ] || [ ! -x "$process_tree_supervisor" ] || [ -L "$process_tree_supervisor" ]; then
+	echo "run-heavy-throttled: bounded process-tree supervisor missing, non-executable or symlink: $process_tree_supervisor" >&2
+	exit 2
+fi
+
+positive_integer() {
+	case "$1" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	awk -v value="$1" 'BEGIN {
+		exit !(value ~ /^[0-9]+$/ && (value + 0) >= 1 && (value + 0) <= 9000000000000000)
+	}'
+}
+
+process_start_ticks() {
+	process_identity_pid="$1"
+	case "$process_identity_pid" in
+	'' | *[!0-9]* | 0) return 1 ;;
+	esac
+	process_identity_stat="$(cat "/proc/$process_identity_pid/stat" 2>/dev/null || true)"
+	case "$process_identity_stat" in
+	*') '*) ;;
+	*) return 1 ;;
+	esac
+	# /proc/PID/stat field 2 is parenthesized and may itself contain ')' or
+	# spaces.  Removing through the last ") " leaves field 3 first; starttime
+	# (field 22) is therefore the twentieth token in the remaining payload.
+	process_identity_tail="${process_identity_stat##*) }"
+	set -- $process_identity_tail
+	if [ "$#" -lt 20 ]; then
+		return 1
+	fi
+	shift 19
+	case "$1" in
+	'' | *[!0-9]* | 0) return 1 ;;
+	esac
+	printf '%s' "$1"
+}
+
+process_identity_active_or_unknown() {
+	process_identity_pid="$1"
+	process_identity_expected_start="$2"
+	if ! kill -0 "$process_identity_pid" 2>/dev/null; then
+		process_identity_state=dead
+		return 1
+	fi
+	case "$process_identity_expected_start" in
+	exited_before_identity_pin)
+		process_identity_state=exited_before_identity_pin
+		return 1
+		;;
+	'' | *[!0-9]* | 0)
+		# Compatibility for a lock written by an already-running older wrapper:
+		# never reclaim a numerically live but unpinned legacy PID.
+		process_identity_state=alive_unpinned
+		return 0
+		;;
+	esac
+	process_identity_current_start="$(process_start_ticks "$process_identity_pid" || true)"
+	case "$process_identity_current_start" in
+	'' | *[!0-9]* | 0)
+		# Procfs becoming unreadable must fail safe rather than release a live
+		# writer's lock.
+		process_identity_state=alive_identity_unreadable
+		return 0
+		;;
+	esac
+	if [ "$process_identity_current_start" = "$process_identity_expected_start" ]; then
+		process_identity_state=alive_identity_match
+		return 0
+	fi
+	process_identity_state=pid_reused
+	return 1
+}
+
+positive_duration() {
+	case "$1" in
+	*ms) duration_number="${1%ms}" ;;
+	*s) duration_number="${1%s}" ;;
+	*m) duration_number="${1%m}" ;;
+	*h) duration_number="${1%h}" ;;
+	*) return 1 ;;
+	esac
+	positive_integer "$duration_number"
+}
+
+valid_stop_condition() {
+	case "$1" in
+	'' | *'
+'*) return 1 ;;
+	esac
+	stop_condition_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	case "$stop_condition_lower" in
+	placeholder | later | todo | unknown | absent | missing | ausente | desconhecido | \
+		*placeholder* | *todo*)
+		return 1
+		;;
+	esac
+	printf '%s' "$stop_condition_lower" | grep -Eq '[[:alnum:]]'
+}
+
+valid_throughput_expected() {
+	throughput_key="${1%%=*}"
+	throughput_value="${1#*=}"
+	if [ "$throughput_key" = "$1" ]; then
+		return 1
+	fi
+	case "$throughput_key" in
+	records_per_second | pages_per_second | urls_per_second | items_per_second | records/s | pages/s | throughput) ;;
+	*) return 1 ;;
+	esac
+	case "$throughput_value" in
+	'' | *[!0-9.]* | *.*.*) return 1 ;;
+	esac
+	awk -v value="$throughput_value" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0) }'
+}
+
+duration_to_ms() {
+	duration_value="$1"
+	positive_duration "$duration_value" || return 1
+	case "$duration_value" in
+	*ms)
+		duration_number="${duration_value%ms}"
+		duration_factor=1
+		;;
+	*s)
+		duration_number="${duration_value%s}"
+		duration_factor=1000
+		;;
+	*m)
+		duration_number="${duration_value%m}"
+		duration_factor=60000
+		;;
+	*h)
+		duration_number="${duration_value%h}"
+		duration_factor=3600000
+		;;
+	esac
+	# 9e15 ms keeps integer conversion exact in awk and is far beyond any
+	# practical wrapper timeout, while rejecting arithmetic overflow inputs.
+	awk -v number="$duration_number" -v factor="$duration_factor" 'BEGIN {
+		milliseconds = number * factor
+		if (milliseconds < 1 || milliseconds > 9000000000000000) exit 1
+		printf "%.0f", milliseconds
+	}'
+}
+
+shared_artifact_claim_path() {
+	path="$1"
+	case "$path" in
+	data/* | ./data/* | content/* | ./content/* | public/* | ./public/* | .agents/* | ./.agents/* | .release-staging/* | ./.release-staging/*)
+		return 0
+		;;
+	esac
+	repo_root_for_claim="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+	case "$path" in
+	"$repo_root_for_claim"/data/* | "$repo_root_for_claim"/content/* | "$repo_root_for_claim"/public/* | "$repo_root_for_claim"/.agents/* | "$repo_root_for_claim"/.release-staging/*)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+artifact_claim_resolved_path() {
+	path="$1"
+	repo_root_for_claim="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+	case "$path" in
+	/*) printf '%s\n' "$path" ;;
+	./*) printf '%s/%s\n' "$repo_root_for_claim" "${path#./}" ;;
+	*) printf '%s/%s\n' "$repo_root_for_claim" "$path" ;;
+	esac
+}
+
+artifact_claim_path_exists() {
+	path="$1"
+	[ -n "$path" ] || return 1
+	resolved_path="$(artifact_claim_resolved_path "$path")"
+	[ -e "$resolved_path" ]
+}
+
+contains_shell_wrapped_direct_generate() {
+	case "$1" in
+	*"go run ./cmd/generate-"* | *"go run cmd/generate-"* | \
+		*"go-modern run ./cmd/generate-"* | *"go-modern run cmd/generate-"*)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+validate_heavy_project_command_contract() {
+	project_heavy_command=0
+	explicit_heavy_monitor_contract=0
+	project_heavy_cached_runner=0
+	project_direct_generate_command=0
+	project_cached_generate_command=0
+	project_shell_direct_generate_command=0
+	has_timings=0
+	has_supervisor_wall_clock=0
+	has_budget=0
+	has_expected_duration=0
+	has_stop_condition=0
+	has_throughput_expected=0
+	has_explicit_artifact_claim=0
+	expect_budget_value=0
+	expect_duration_value=0
+	argument_expected_duration_ms=0
+	previous_arg=""
+	previous_base=""
+	previous2_base=""
+	# COMPILAR OU TESTAR UM GERADOR NAO E EXECUTAR UM GERADOR, e a diferenca
+	# nao cabia na janela de dois argumentos que o resto deste laco usa:
+	# `go-modern test -count=1 ./internal/x/ ./cmd/generate-y/` chega no
+	# caminho do gerador com o subcomando ja tres posicoes atras. Sem este
+	# estado, o catch-all abaixo classificava a passada como execucao de
+	# gerador e exigia `cached_runner`, que `go test` nao tem como
+	# satisfazer -- entao NENHUM teste de `cmd/generate-*` podia rodar
+	# dentro do envelope, e o envelope e obrigatorio para suite pesada.
+	# `go generate` fica DE FORA da lista de proposito: aquilo escreve.
+	visto_toolchain_go=0
+	subcomando_apenas_analisa=0
+
+	if [ -n "${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-}" ] &&
+		[ -n "${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-}" ] &&
+		[ -n "${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-}" ]; then
+		has_explicit_artifact_claim=1
+	fi
+	case "${WIKI_HEAVY_TIMING_MODE:-}" in
+	'') ;;
+	supervisor_wall_clock_v1) has_supervisor_wall_clock=1 ;;
+	child_flag_v1) ;;
+	*)
+		echo "run-heavy-throttled: WIKI_HEAVY_TIMING_MODE must be supervisor_wall_clock_v1 or child_flag_v1" >&2
+		exit 2
+		;;
+	esac
+
+	for arg in "$@"; do
+		base="${arg##*/}"
+		parent="${arg%/*}"
+		parent_base="${parent##*/}"
+		if contains_shell_wrapped_direct_generate "$arg"; then
+			project_heavy_command=1
+			project_direct_generate_command=1
+			project_shell_direct_generate_command=1
+		fi
+		if [ "$expect_budget_value" = "1" ]; then
+			if positive_integer "$arg"; then
+				has_budget=1
+			fi
+			expect_budget_value=0
+		fi
+		if [ "$expect_duration_value" = "1" ]; then
+			if converted_duration_ms="$(duration_to_ms "$arg")"; then
+				has_expected_duration=1
+				argument_expected_duration_ms="$converted_duration_ms"
+			fi
+			expect_duration_value=0
+		fi
+
+		case "$base" in
+		go-modern | go) visto_toolchain_go=1 ;;
+		esac
+		if [ "$visto_toolchain_go" = 1 ]; then
+			case "$arg" in
+			test | build | vet) subcomando_apenas_analisa=1 ;;
+			esac
+		fi
+		case "$base" in
+		run-check)
+			project_heavy_command=1
+			project_heavy_cached_runner=1
+			;;
+		esac
+		if [ "$previous_base" = "run-go-cmd-cached" ]; then
+			case "$arg" in
+			./cmd/check | ./cmd/check-* | ./cmd/generate | ./cmd/generate-* | ./cmd/probe-* | cmd/generate | cmd/probe-*)
+				project_heavy_command=1
+				project_heavy_cached_runner=1
+				case "$arg" in
+				./cmd/generate | ./cmd/generate-* | cmd/generate | cmd/generate-*) project_cached_generate_command=1 ;;
+				esac
+				;;
+			esac
+		fi
+		if { [ "$previous2_base" = "go-modern" ] || [ "$previous2_base" = "go" ]; } && [ "$previous_arg" = "run" ]; then
+			case "$arg" in
+			./cmd/check | ./cmd/check-* | ./cmd/generate | ./cmd/generate-* | ./cmd/probe-* | cmd/generate | cmd/probe-*)
+				project_heavy_command=1
+				case "$arg" in
+				./cmd/generate | ./cmd/generate-* | cmd/generate | cmd/generate-*) project_direct_generate_command=1 ;;
+				esac
+				;;
+			esac
+		fi
+		case "$arg" in
+		./cmd/generate | ./cmd/generate-* | cmd/generate | cmd/generate-*)
+			if [ "$subcomando_apenas_analisa" != 1 ] &&
+				[ "$previous_base" != "run-go-cmd-cached" ] &&
+				! { { [ "$previous2_base" = "go-modern" ] || [ "$previous2_base" = "go" ]; } && [ "$previous_arg" = "run" ]; }; then
+				project_heavy_command=1
+				project_direct_generate_command=1
+			fi
+			;;
+		esac
+		case "$parent_base/$base" in
+		generate-*/generate-*)
+			project_heavy_command=1
+			project_direct_generate_command=1
+			;;
+		esac
+
+		case "$arg" in
+		--timings)
+			has_timings=1
+			;;
+		--budget-ms=*)
+			if positive_integer "${arg#--budget-ms=}"; then
+				has_budget=1
+			fi
+			;;
+		--max-duration=*)
+			if converted_duration_ms="$(duration_to_ms "${arg#--max-duration=}")"; then
+				has_expected_duration=1
+				argument_expected_duration_ms="$converted_duration_ms"
+			fi
+			;;
+		--budget-ms | --max-duration)
+			if [ "$arg" = "--budget-ms" ]; then
+				expect_budget_value=1
+			else
+				expect_duration_value=1
+			fi
+			;;
+		esac
+
+		previous2_base="$previous_base"
+		previous_arg="$arg"
+		previous_base="$base"
+	done
+
+	if [ -n "${WIKI_HEAVY_BUDGET_MS:-}" ] && positive_integer "$WIKI_HEAVY_BUDGET_MS"; then
+		has_budget=1
+	fi
+	if [ -n "${WIKI_HEAVY_EXPECTED_DURATION_MS:-}" ] && positive_integer "$WIKI_HEAVY_EXPECTED_DURATION_MS"; then
+		has_expected_duration=1
+	fi
+	if valid_stop_condition "${WIKI_HEAVY_STOP_CONDITION:-}"; then
+		has_stop_condition=1
+	fi
+	if valid_throughput_expected "${WIKI_HEAVY_THROUGHPUT_EXPECTED:-}"; then
+		has_throughput_expected=1
+	fi
+	if [ "$has_budget" = "1" ] &&
+		[ "$has_expected_duration" = "1" ] &&
+		[ "$has_stop_condition" = "1" ] &&
+		[ "$has_throughput_expected" = "1" ]; then
+		explicit_heavy_monitor_contract=1
+	fi
+	if [ "$project_heavy_command" != "1" ]; then
+		return 0
+	fi
+
+	missing=""
+	if [ "$project_heavy_cached_runner" != "1" ]; then
+		missing="${missing} cached_runner"
+	fi
+	if { [ "$project_direct_generate_command" = "1" ] || [ "$project_cached_generate_command" = "1" ]; } &&
+		[ "$has_explicit_artifact_claim" != "1" ]; then
+		missing="${missing} artifact_claim(./cmd/generate-* shared artifact)"
+	fi
+	if { [ "$project_direct_generate_command" = "1" ] || [ "$project_cached_generate_command" = "1" ]; } &&
+		[ "$has_explicit_artifact_claim" = "1" ] &&
+		! shared_artifact_claim_path "$WIKI_HEAVY_ARTIFACT_CLAIM_PATH"; then
+		missing="${missing} artifact_claim(./cmd/generate-* shared artifact)"
+	fi
+	if { [ "$project_direct_generate_command" = "1" ] || [ "$project_cached_generate_command" = "1" ]; } &&
+		[ "$has_explicit_artifact_claim" = "1" ] &&
+		shared_artifact_claim_path "$WIKI_HEAVY_ARTIFACT_CLAIM_PATH" &&
+		! artifact_claim_path_exists "$WIKI_HEAVY_ARTIFACT_CLAIM_PATH"; then
+		# Cold start (ULTRAPLAN E3/E5): o generate-* e o PRODUTOR do artefato
+		# reivindicado — a ausencia do arquivo e o estado inicial legitimo da
+		# regeneracao do zero (DEC-015 moveu o stale para o lado). O que
+		# precisa existir e o diretorio de destino.
+		if [ -d "$(dirname "$(artifact_claim_resolved_path "$WIKI_HEAVY_ARTIFACT_CLAIM_PATH")")" ]; then
+			echo "run-heavy-throttled: artifact_claim_path_cold_start path=$WIKI_HEAVY_ARTIFACT_CLAIM_PATH producer_will_create=1 command=$*" >&2
+		else
+			echo "run-heavy-throttled: work_reuse_artifact_claim_path_missing path=$WIKI_HEAVY_ARTIFACT_CLAIM_PATH action=create_or_correct_artifact_claim_path_before_run command=$*" >&2
+			exit 2
+		fi
+	fi
+	if [ "$project_shell_direct_generate_command" = "1" ]; then
+		missing="${missing} direct go run ./cmd/generate-* shell-wrapper-bypass"
+	fi
+	if [ "$has_timings" != "1" ] && [ "$has_supervisor_wall_clock" != "1" ]; then
+		missing="${missing} timing_evidence(--timings or supervisor_wall_clock_v1) throughput"
+	fi
+	if [ "${WIKI_HEAVY_TIMING_MODE:-}" = "child_flag_v1" ] && [ "$has_timings" != "1" ]; then
+		missing="${missing} --timings(child_flag_v1 capability)"
+	fi
+	if [ "$has_budget" != "1" ]; then
+		missing="${missing} budget_ms"
+	fi
+	if [ "$has_expected_duration" != "1" ]; then
+		missing="${missing} expected_duration_ms"
+	fi
+	if [ "$has_stop_condition" != "1" ]; then
+		missing="${missing} stop_condition"
+	fi
+	if [ "$has_throughput_expected" != "1" ]; then
+		missing="${missing} throughput_expected(WIKI_HEAVY_THROUGHPUT_EXPECTED numeric)"
+	fi
+	if [ -n "$missing" ]; then
+		echo "run-heavy-throttled: heavy project 10k command requires cached runner, real child --timings capability or supervisor wall-clock timing, explicit numeric throughput_expected via WIKI_HEAVY_THROUGHPUT_EXPECTED, budget_ms/expected_duration_ms and stop_condition before lock/run; missing:$missing command=$*" >&2
+		exit 2
+	fi
+}
+
+validate_heavy_project_command_contract "$@"
+
+material_artifact_ledger_command() {
+	# DEC-002: the command ledger is frozen. There is deliberately no runtime
+	# override; lock metadata and product artifacts carry live evidence.
+	return 1
+}
+
+budget_ms_from_args() {
+	expect_budget_value=0
+	for arg in "$@"; do
+		if [ "$expect_budget_value" = "1" ]; then
+			if positive_integer "$arg"; then
+				printf '%s' "$arg"
+				return 0
+			fi
+			expect_budget_value=0
+		fi
+		case "$arg" in
+		--budget-ms=*)
+			value="${arg#--budget-ms=}"
+			if positive_integer "$value"; then
+				printf '%s' "$value"
+				return 0
+			fi
+			;;
+		--budget-ms)
+			expect_budget_value=1
+			;;
+		esac
+	done
+	printf '0'
+}
+
+timeout_seconds_from_budget_ms() {
+	budget_ms="$1"
+	seconds=$(((budget_ms + 999) / 1000))
+	if [ "$seconds" -lt 1 ]; then
+		seconds=1
+	fi
+	printf '%s' "$seconds"
+}
+
+budget_timeout_candidate="${WIKI_HEAVY_BUDGET_MS:-}"
+if ! positive_integer "$budget_timeout_candidate"; then
+	budget_timeout_candidate="$(budget_ms_from_args "$@")"
+fi
+# O timeout efetivo é o MENOR entre WIKI_HEAVY_BUDGET_MS e
+# WIKI_HEAVY_TIMEOUT_SECONDS. O clamp é correto (budget é o contrato de custo),
+# mas era SILENCIOSO: ~97 wrappers em tools/ declaram os dois e o
+# TIMEOUT_SECONDS explícito quase nunca está em vigor. Guardamos aqui o valor
+# sobrescrito para orientar o operador NA HORA DO TIMEOUT (fim do script) —
+# sem ruído no caminho de sucesso, onde o clamp é esperado e irrelevante.
+budget_clamped_from_timeout_seconds=""
+if positive_integer "$budget_timeout_candidate"; then
+	budget_timeout_seconds="$(timeout_seconds_from_budget_ms "$budget_timeout_candidate")"
+	if [ "$budget_timeout_seconds" -lt "$command_timeout_seconds" ]; then
+		if [ -n "${WIKI_HEAVY_TIMEOUT_SECONDS:-}" ]; then
+			budget_clamped_from_timeout_seconds="$command_timeout_seconds"
+		fi
+		command_timeout_seconds="$budget_timeout_seconds"
+	fi
+fi
+
+if [ -z "${WIKI_REPO_AWARENESS_TIMEOUT+x}" ]; then
+	budget_candidate="${WIKI_HEAVY_BUDGET_MS:-}"
+	if ! positive_integer "$budget_candidate"; then
+		budget_candidate="$(budget_ms_from_args "$@")"
+	fi
+	expected_candidate="${WIKI_HEAVY_EXPECTED_DURATION_MS:-}"
+	if { positive_integer "$budget_candidate" && [ "$budget_candidate" -le 2000 ]; } ||
+		{ positive_integer "$expected_candidate" && [ "$expected_candidate" -le 2000 ]; }; then
+		repo_awareness_timeout=0.2s
+	fi
+fi
+
+configure_progress_monitor() {
+	case "$progress_monitor_mode" in
+	auto | off) ;;
+	*)
+		echo "run-heavy-throttled: WIKI_HEAVY_PROGRESS_MONITOR must be auto or off" >&2
+		exit 2
+		;;
+	esac
+	case "$progress_monitor_alert_windows" in
+	'' | *[!0-9]* | 0 | ????????*)
+		echo "run-heavy-throttled: WIKI_HEAVY_PROGRESS_ALERT_WINDOWS must be a positive integer" >&2
+		exit 2
+		;;
+	esac
+	if [ "$progress_monitor_alert_windows" -gt 1000000 ]; then
+		echo "run-heavy-throttled: WIKI_HEAVY_PROGRESS_ALERT_WINDOWS must not exceed 1000000" >&2
+		exit 2
+	fi
+	if [ -n "$progress_monitor_window_seconds" ]; then
+		case "$progress_monitor_window_seconds" in
+		'' | *[!0-9]* | 0 | ???*)
+			echo "run-heavy-throttled: WIKI_HEAVY_PROGRESS_WINDOW_SECONDS must be an integer from 1 to 60" >&2
+			exit 2
+			;;
+		esac
+		if [ "$progress_monitor_window_seconds" -gt 60 ]; then
+			echo "run-heavy-throttled: WIKI_HEAVY_PROGRESS_WINDOW_SECONDS must be an integer from 1 to 60" >&2
+			exit 2
+		fi
+	fi
+
+	if [ "${project_heavy_command:-0}" != "1" ] &&
+		[ "${explicit_heavy_monitor_contract:-0}" != "1" ]; then
+		echo "run-heavy-throttled: progress_monitor=off reason=no_explicit_heavy_contract command=$*" >&2
+		progress_monitor_mode=off
+		progress_monitor_window_seconds=0
+		progress_monitor_initial_delay_seconds=0
+		return 0
+	fi
+	if [ "$progress_monitor_mode" = "off" ]; then
+		echo "run-heavy-throttled: progress_monitor=off explicit diagnostic opt-out command=$*" >&2
+		progress_monitor_window_seconds=0
+		progress_monitor_initial_delay_seconds=0
+		return 0
+	fi
+	if [ ! -f "$progress_monitor_tool" ] || [ ! -x "$progress_monitor_tool" ] || [ -L "$progress_monitor_tool" ]; then
+		echo "run-heavy-throttled: progress monitor missing, non-executable or symlink: $progress_monitor_tool" >&2
+		exit 2
+	fi
+	if [ ! -f "$progress_watchdog_tool" ] || [ ! -x "$progress_watchdog_tool" ] || [ -L "$progress_watchdog_tool" ]; then
+		echo "run-heavy-throttled: progress watchdog missing, non-executable or symlink: $progress_watchdog_tool" >&2
+		exit 2
+	fi
+	progress_expected_duration_ms="${WIKI_HEAVY_EXPECTED_DURATION_MS:-}"
+	if ! positive_integer "$progress_expected_duration_ms"; then
+		progress_expected_duration_ms="${argument_expected_duration_ms:-0}"
+	fi
+	if ! positive_integer "$progress_expected_duration_ms"; then
+		progress_expected_duration_ms="$budget_timeout_candidate"
+	fi
+	if ! positive_integer "$progress_expected_duration_ms"; then
+		progress_expected_duration_ms=$((command_timeout_seconds * 1000))
+	fi
+	progress_timeout_ms=$((command_timeout_seconds * 1000))
+	if [ "$progress_expected_duration_ms" -gt "$progress_timeout_ms" ]; then
+		echo "run-heavy-throttled: expected duration must not exceed effective command timeout (${progress_timeout_ms}ms)" >&2
+		exit 2
+	fi
+	if [ -z "$progress_monitor_window_seconds" ]; then
+		# ceil(expected/4) converted to seconds, clamped to 1..30. The first
+		# observation finishes only when the declared expected duration is due.
+		progress_monitor_window_seconds=$(((progress_expected_duration_ms + 3999) / 4000))
+		if [ "$progress_monitor_window_seconds" -lt 1 ]; then
+			progress_monitor_window_seconds=1
+		elif [ "$progress_monitor_window_seconds" -gt 30 ]; then
+			progress_monitor_window_seconds=30
+		fi
+	fi
+	progress_expected_duration_seconds=$(((progress_expected_duration_ms + 999) / 1000))
+	progress_monitor_initial_delay_seconds=$((progress_expected_duration_seconds - progress_monitor_window_seconds))
+	if [ "$progress_monitor_initial_delay_seconds" -lt 0 ]; then
+		progress_monitor_initial_delay_seconds=0
+	fi
+}
+
+configure_progress_monitor "$@"
+
+inline_token() {
+	printf '%s' "$1" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/_/g'
+}
+
+sha256_token() {
+	case "$1" in
+	sha256:????????????????????????????????????????????????????????????????)
+		printf '%s' "$1"
+		return 0
+		;;
+	esac
+	printf '%s' "$1" | sha256sum | awk '{print "sha256:" $1}'
+}
+
+repo_metric_for() {
+	tmp="$(mktemp "${TMPDIR:-/tmp}/wiki-repo-awareness.XXXXXX" 2>/dev/null || printf '')"
+	if [ -z "$tmp" ]; then
+		printf 'unavailable'
+		return 0
+	fi
+	if command -v timeout >/dev/null 2>&1; then
+		if timeout "$repo_awareness_timeout" "$@" >"$tmp" 2>/dev/null; then
+			metric="$(cksum "$tmp" 2>/dev/null | awk '{print "cksum:" $1 ":bytes:" $2}')"
+		else
+			if [ "$repo_awareness_timeout_explicit" = "1" ]; then
+				metric=unavailable
+			else
+				metric="$(
+					printf 'timed_out:%s\n' "$*" |
+						cksum 2>/dev/null | awk '{print "timed_out:cksum:" $1 ":bytes:" $2}'
+				)"
+			fi
+		fi
+	else
+		if "$@" >"$tmp" 2>/dev/null; then
+			metric="$(cksum "$tmp" 2>/dev/null | awk '{print "cksum:" $1 ":bytes:" $2}')"
+		else
+			metric=unavailable
+		fi
+	fi
+	rm -f "$tmp"
+	if [ -z "$metric" ]; then
+		metric=unavailable
+	fi
+	printf '%s' "$metric"
+}
+
+repo_head_show_metric() {
+	repo_metric_for git -c core.pager=cat -c diff.renames=false --no-pager show --no-ext-diff --stat=80,60,200 --oneline --summary HEAD
+}
+
+emit_repo_awareness_and_artifact_claim() {
+	inside_git=false
+	# ULTRAPLAN E2/DEC-016: awareness completa (7 comandos git, ~5s CPU por
+	# invocacao) so com WIKI_REPO_AWARENESS_FULL=1; default e o modo rapido.
+	if [ "${WIKI_REPO_AWARENESS_FULL:-0}" != "1" ]; then
+		repo_root="$(git rev-parse --show-toplevel 2>/dev/null || printf 'unknown')"
+		worktree_filesystem=skipped_fast_default
+		status_short=skipped_fast_default
+		unstaged_diff=skipped_fast_default
+		staged_diff=skipped_fast_default
+		untracked_files=skipped_fast_default
+		committed_history=skipped_fast_default
+		head_show=skipped_fast_default
+	elif command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		inside_git=true
+		repo_root="$(git rev-parse --show-toplevel 2>/dev/null || printf 'unknown')"
+		worktree_filesystem="$(repo_metric_for git status --porcelain=v1 -z -uall)"
+		status_short="$(repo_metric_for git status --short)"
+		unstaged_diff="$(repo_metric_for git diff --name-status)"
+		staged_diff="$(repo_metric_for git diff --cached --name-status)"
+		untracked_files="$(repo_metric_for git ls-files --others --exclude-standard)"
+		committed_history="$(repo_metric_for git log --oneline -5)"
+		head_show="$(repo_head_show_metric)"
+	else
+		repo_root=unavailable
+		worktree_filesystem=unavailable
+		status_short=unavailable
+		unstaged_diff=unavailable
+		staged_diff=unavailable
+		untracked_files=unavailable
+		committed_history=unavailable
+		head_show=unavailable
+	fi
+	if [ "$inside_git" = true ]; then
+		for required_metric in "$worktree_filesystem" "$status_short" "$unstaged_diff" "$staged_diff" "$untracked_files" "$committed_history" "$head_show"; do
+			if [ "$required_metric" = unavailable ]; then
+				echo "run-heavy-throttled: repo_awareness_unavailable required_git_metric_failed timeout=$repo_awareness_timeout" >&2
+				exit 75
+			fi
+		done
+	fi
+
+	repo_fingerprint="$(
+		sha256_token "$(
+			printf '%s\n' \
+				"$worktree_filesystem" "$status_short" "$unstaged_diff" "$staged_diff" \
+				"$untracked_files" "$committed_history" "$head_show"
+		)"
+	)"
+	if [ -z "$repo_fingerprint" ]; then
+		repo_fingerprint=unavailable
+	fi
+	claim_budget_ms="${WIKI_HEAVY_BUDGET_MS:-$((command_timeout_seconds * 1000))}"
+	claim_stop_condition="${WIKI_HEAVY_STOP_CONDITION:-command_exits_or_timeout_or_lock_wait_timeout}"
+	claim_path="${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-.agents/runtime/command-ledger.jsonl}"
+	claim_producer="${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/run-heavy-throttled}"
+	claim_output="${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-command_status_and_lock_release}"
+	claim_output_fingerprint="$(sha256_token "$claim_output")"
+
+	echo "run-heavy-throttled: repo_awareness data_read_paths=worktree_filesystem;git status --short;git diff;git diff --cached;git ls-files --others --exclude-standard;git log;git show --stat HEAD;committed_history;staged;unstaged;untracked repo_root=$(inline_token "$repo_root") worktree_filesystem=$worktree_filesystem status=$status_short diff=$unstaged_diff diff_cached=$staged_diff untracked=$untracked_files committed_history=$committed_history log=$committed_history show=$head_show timeout=$(inline_token "$repo_awareness_timeout") timeout_explicit=$repo_awareness_timeout_explicit input_fingerprint=$repo_fingerprint" >&2
+	echo "run-heavy-throttled: artifact_claim path=$(inline_token "$claim_path") producer=$(inline_token "$claim_producer") input_fingerprint=$repo_fingerprint output_fingerprint_expected=$claim_output_fingerprint output_fingerprint_description=$(inline_token "$claim_output") lock_scope=$(inline_token "$lock_scope") budget_ms=$(inline_token "$claim_budget_ms") stop_condition=$(inline_token "$claim_stop_condition")" >&2
+}
+
+emit_repo_awareness_and_artifact_claim "$@"
+
+start_epoch="$(date +%s 2>/dev/null || printf '0')"
+owner_start_ticks="$(process_start_ticks "$$" || true)"
+case "$owner_start_ticks" in
+'' | *[!0-9]* | 0)
+	echo "run-heavy-throttled: cannot pin wrapper process identity in procfs" >&2
+	exit 75
+	;;
+esac
+
+# DEC-002 freezes .agents/runtime/command-ledger.jsonl.  The legacy append
+# helpers below remain temporarily readable for worktree-forward compatibility,
+# but the execution and signal paths deliberately never invoke them.
+append_running_ledger_record() {
+	if ! material_artifact_ledger_command; then
+		return 0
+	fi
+	if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		return 0
+	fi
+	ledger_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+	append_tool="$ledger_repo_root/tools/append-running-heavy-command-ledger"
+	if [ ! -x "$append_tool" ]; then
+		echo "run-heavy-throttled: running ledger append tool missing or not executable: $append_tool" >&2
+		exit 75
+	fi
+	started_rfc3339="$(date -u -d "@$start_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	lease_epoch=$((start_epoch + command_timeout_seconds + command_timeout_kill_after_seconds + 60))
+	lease_rfc3339="$(date -u -d "@$lease_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	claim_budget_ms="${WIKI_HEAVY_BUDGET_MS:-$((command_timeout_seconds * 1000))}"
+	claim_expected_ms="${WIKI_HEAVY_EXPECTED_DURATION_MS:-$((command_timeout_seconds * 1000))}"
+	claim_stop_condition="${WIKI_HEAVY_STOP_CONDITION:-command_exits_or_timeout_or_lock_release}"
+	claim_path="${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-.agents/runtime/command-ledger.jsonl}"
+	claim_producer="${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/run-heavy-throttled}"
+	claim_output="${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-command_status_and_lock_release}"
+	claim_output_fingerprint="$(sha256_token "$claim_output")"
+	if material_artifact_ledger_command; then
+		throughput_expected="${WIKI_HEAVY_THROUGHPUT_EXPECTED:?run-heavy-throttled requires WIKI_HEAVY_THROUGHPUT_EXPECTED numeric before appending running ledger}"
+	else
+		throughput_expected="${WIKI_HEAVY_THROUGHPUT_EXPECTED:-non_project_heavy_command_runtime_guard}"
+	fi
+	command_kind="heavy_project_command"
+	if [ "${project_heavy_command:-0}" != "1" ]; then
+		command_kind="material_artifact_command"
+	fi
+	command_id="run-heavy-${start_epoch}-$$-${lock_key}"
+	if ! "$append_tool" \
+		--root "$ledger_repo_root" \
+		--run-id "run-heavy-throttled-$start_epoch" \
+		--command-id "$command_id" \
+		--command "$*" \
+		--command-kind "$command_kind" \
+		--owner "${WIKI_HEAVY_LEDGER_OWNER:-tools/run-heavy-throttled}" \
+		--lock-scope "$lock_scope" \
+		--hypothesis "registered running heavy command before execution to prevent concurrent Codex collision" \
+		--expected-output "$claim_output" \
+		--expected-output-fingerprint "$claim_output_fingerprint" \
+		--stop-condition "$claim_stop_condition" \
+		--budget-ms "$claim_budget_ms" \
+		--expected-duration-ms "$claim_expected_ms" \
+		--throughput-expected "$throughput_expected" \
+		--started-at "$started_rfc3339" \
+		--lease-expires-at "$lease_rfc3339" \
+		--artifact-path "$claim_path" \
+		--producer "$claim_producer" \
+		--pid "$$" \
+		--elapsed-ms 1 \
+		--throughput "initializing_before_first_timing_sample" \
+		--bottleneck-hypothesis "throughput ausente antes da primeira amostra; possivel gargalo sera medido por timings" \
+		--next-action "capturar timings e materializar profile evidence, probe, cache ou patch se o budget expirar" \
+		--architecture-read "AGENTS.md" \
+		--architecture-read ".agents/contracts/p0-work-reuse-command-ledger.md" \
+		--data-read ".agents/runtime/command-ledger.jsonl" \
+		--function-read "tools/run-heavy-throttled" >&2; then
+		echo "run-heavy-throttled: failed to append running command ledger record before executing: $*" >&2
+		exit 75
+	fi
+}
+
+append_terminal_ledger_record() {
+	command_exit_code="$1"
+	if ! material_artifact_ledger_command; then
+		return 0
+	fi
+	if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		return 0
+	fi
+	ledger_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+	append_tool="$ledger_repo_root/tools/append-heavy-command-terminal-ledger"
+	if [ ! -x "$append_tool" ]; then
+		echo "run-heavy-throttled: terminal ledger append tool missing or not executable: $append_tool" >&2
+		return 75
+	fi
+	if [ -z "${command_id:-}" ]; then
+		echo "run-heavy-throttled: terminal ledger append missing running command_id for $*" >&2
+		return 75
+	fi
+	completed_epoch="$(date +%s 2>/dev/null || printf '0')"
+	completed_rfc3339="$(date -u -d "@$completed_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	duration_ms=1
+	if [ "$completed_epoch" -gt 0 ] && [ "$start_epoch" -gt 0 ] && [ "$completed_epoch" -ge "$start_epoch" ]; then
+		duration_ms=$(((completed_epoch - start_epoch) * 1000))
+		if [ "$duration_ms" -le 0 ]; then
+			duration_ms=1
+		fi
+	fi
+	terminal_status=failed
+	if [ "$command_exit_code" -eq 0 ]; then
+		terminal_status=completed
+	fi
+	claim_budget_ms="${WIKI_HEAVY_BUDGET_MS:-$((command_timeout_seconds * 1000))}"
+	claim_expected_ms="${WIKI_HEAVY_EXPECTED_DURATION_MS:-$((command_timeout_seconds * 1000))}"
+	claim_stop_condition="${WIKI_HEAVY_STOP_CONDITION:-command_exits_or_timeout_or_lock_release}"
+	claim_path="${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-.agents/runtime/command-ledger.jsonl}"
+	claim_producer="${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/run-heavy-throttled}"
+	claim_output="${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-command_status_and_lock_release}"
+	claim_output_fingerprint="$(sha256_token "$claim_output")"
+	throughput_expected="${WIKI_HEAVY_THROUGHPUT_EXPECTED:-records_per_second=1 terminal_wrapper_default}"
+	terminal_throughput="${WIKI_HEAVY_TERMINAL_THROUGHPUT:-}"
+	if [ -z "$terminal_throughput" ]; then
+		terminal_throughput="$(terminal_throughput_from_artifact "$claim_path" "$duration_ms" 2>/dev/null || true)"
+	fi
+	command_kind="heavy_project_command"
+	if [ "${project_heavy_command:-0}" != "1" ]; then
+		command_kind="material_artifact_command"
+	fi
+	if ! "$append_tool" \
+		--root "$ledger_repo_root" \
+		--run-id "run-heavy-throttled-$start_epoch" \
+		--command-id "$command_id" \
+		--command "$command_text" \
+		--command-kind "$command_kind" \
+		--owner "${WIKI_HEAVY_LEDGER_OWNER:-tools/run-heavy-throttled}" \
+		--lock-scope "$lock_scope" \
+		--hypothesis "terminal heavy command record appended immediately after supervised process exit to prevent stale running ledger" \
+		--expected-output "$claim_output" \
+		--expected-output-fingerprint "$claim_output_fingerprint" \
+		--stop-condition "$claim_stop_condition" \
+		--budget-ms "$claim_budget_ms" \
+		--expected-duration-ms "$claim_expected_ms" \
+		--throughput-expected "$throughput_expected" \
+		--started-at "$(date -u -d "@$start_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+		--completed-at "$completed_rfc3339" \
+		--status "$terminal_status" \
+		--exit-code "$command_exit_code" \
+		--duration-ms "$duration_ms" \
+		--terminal-throughput "$terminal_throughput" \
+		--artifact-path "$claim_path" \
+		--producer "$claim_producer" \
+		--architecture-read "AGENTS.md" \
+		--architecture-read ".agents/contracts/p0-work-reuse-command-ledger.md" \
+		--data-read ".agents/runtime/command-ledger.jsonl" \
+		--function-read "tools/run-heavy-throttled" \
+		--function-read "AppendHeavyCommandTerminalRecord" >&2; then
+		echo "run-heavy-throttled: failed to append terminal command ledger record command_id=$command_id status=$terminal_status exit_code=$command_exit_code" >&2
+		return 75
+	fi
+}
+
+# O umask 077 protege APENAS os artefatos do proprio wrapper (locks, ledgers,
+# meta). O COMANDO supervisionado herda o umask ORIGINAL do chamador — vazar
+# 077 para binarios de teste quebrava todo pacote com assercao de modo de
+# arquivo (fixtures 0644 viravam 0600; causa-raiz do cluster de ~80 falsos-FAIL
+# em v2ingest, 2026-07-21). Captura antes do aperto; run_supervised restaura.
+WIKI_HEAVY_CHILD_UMASK="${WIKI_HEAVY_CHILD_UMASK:-$(umask)}"
+export WIKI_HEAVY_CHILD_UMASK
+umask 077
+if [ "$lock_root_explicit" = "1" ]; then
+	if [ -L "$lock_root" ] || ! mkdir -p -- "$lock_root"; then
+		echo "run-heavy-throttled: cannot create explicit private lock root: $lock_root" >&2
+		exit 75
+	fi
+else
+	if ! mkdir -- "$lock_root" 2>/dev/null && { [ ! -d "$lock_root" ] || [ -L "$lock_root" ]; }; then
+		echo "run-heavy-throttled: cannot create stable private lock root: $lock_root" >&2
+		exit 75
+	fi
+fi
+if [ -L "$lock_root" ] || [ ! -d "$lock_root" ] ||
+	[ "$(stat -Lc '%u' -- "$lock_root" 2>/dev/null || true)" != "$(id -u)" ]; then
+	echo "run-heavy-throttled: lock root is not a private directory owned by the current user: $lock_root" >&2
+	exit 75
+fi
+chmod 0700 -- "$lock_root"
+
+write_lock_meta() {
+	child_pid_value="${1:-}"
+	child_start_ticks_value=""
+	if [ -n "$child_pid_value" ]; then
+		child_start_ticks_value="$(process_start_ticks "$child_pid_value" || true)"
+		case "$child_start_ticks_value" in
+		'' | *[!0-9]* | 0)
+			if kill -0 "$child_pid_value" 2>/dev/null; then
+				# An apparently live child without a pinned procfs identity cannot
+				# be represented safely in reclaimable lock metadata.
+				return 1
+			fi
+			child_start_ticks_value=exited_before_identity_pin
+			;;
+		esac
+	fi
+	{
+		printf 'pid:%s\n' "$$"
+		printf 'pid_start_ticks:%s\n' "$owner_start_ticks"
+		if [ -n "$child_pid_value" ]; then
+			printf 'child_pid:%s\n' "$child_pid_value"
+			printf 'child_pid_start_ticks:%s\n' "${child_start_ticks_value:-missing}"
+			printf 'child_command:%s\n' "$command_text"
+		fi
+		printf 'started_epoch:%s\n' "$start_epoch"
+		printf 'heartbeat_seconds:%s\n' "$lock_heartbeat_seconds"
+		printf 'heartbeat_stale_seconds:%s\n' "$lock_heartbeat_stale_seconds"
+		printf 'timeout_seconds:%s\n' "$command_timeout_seconds"
+		printf 'budget_ms:%s\n' "${WIKI_HEAVY_BUDGET_MS:-missing}"
+		printf 'expected_duration_ms:%s\n' "${WIKI_HEAVY_EXPECTED_DURATION_MS:-missing}"
+		printf 'stop_condition:%s\n' "$(printf '%s' "${WIKI_HEAVY_STOP_CONDITION:-missing}" | tr '\n' ' ')"
+		printf 'artifact_claim_path:%s\n' "$(printf '%s' "${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-.agents/runtime/command-ledger.jsonl}" | tr '\n' ' ')"
+		printf 'artifact_claim_producer:%s\n' "$(printf '%s' "${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/run-heavy-throttled}" | tr '\n' ' ')"
+		printf 'artifact_claim_output_fingerprint_expected:%s\n' "$(sha256_token "${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-command_status_and_lock_release}")"
+		printf 'progress_monitor_mode:%s\n' "$progress_monitor_mode"
+		printf 'progress_monitor_window_seconds:%s\n' "$progress_monitor_window_seconds"
+		printf 'progress_monitor_alert_windows:%s\n' "$progress_monitor_alert_windows"
+		printf 'progress_monitor_expected_duration_ms:%s\n' "${progress_expected_duration_ms:-missing}"
+		printf 'progress_monitor_initial_delay_seconds:%s\n' "$progress_monitor_initial_delay_seconds"
+		printf 'scope:%s\n' "$lock_scope"
+		printf 'command:%s\n' "$command_text"
+	} >"$lock_meta" 2>/dev/null
+}
+
+write_provisional_lock_meta() {
+	{
+		printf 'pid:%s\n' "$$"
+		printf 'pid_start_ticks:%s\n' "$owner_start_ticks"
+		printf 'started_epoch:%s\n' "$start_epoch"
+		printf 'timeout_seconds:%s\n' "$command_timeout_seconds"
+		printf 'budget_ms:%s\n' "${WIKI_HEAVY_BUDGET_MS:-missing}"
+		printf 'expected_duration_ms:%s\n' "${WIKI_HEAVY_EXPECTED_DURATION_MS:-missing}"
+		printf 'stop_condition:%s\n' "$(printf '%s' "${WIKI_HEAVY_STOP_CONDITION:-missing}" | tr '\n' ' ')"
+		printf 'artifact_claim_path:%s\n' "$(printf '%s' "${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-.agents/runtime/command-ledger.jsonl}" | tr '\n' ' ')"
+		printf 'artifact_claim_producer:%s\n' "$(printf '%s' "${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/run-heavy-throttled}" | tr '\n' ' ')"
+		printf 'artifact_claim_output_fingerprint_expected:%s\n' "$(sha256_token "${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-command_status_and_lock_release}")"
+		printf 'progress_monitor_mode:%s\n' "$progress_monitor_mode"
+		printf 'progress_monitor_window_seconds:%s\n' "$progress_monitor_window_seconds"
+		printf 'progress_monitor_alert_windows:%s\n' "$progress_monitor_alert_windows"
+		printf 'progress_monitor_expected_duration_ms:%s\n' "${progress_expected_duration_ms:-missing}"
+		printf 'progress_monitor_initial_delay_seconds:%s\n' "$progress_monitor_initial_delay_seconds"
+		printf 'scope:%s\n' "$lock_scope"
+		printf 'command:%s\n' "$command_text"
+		printf 'lifecycle:%s\n' "lock_acquired_before_supervised_command"
+	} >"$lock_meta" 2>/dev/null
+}
+
+lock_dir_mtime_epoch() {
+	stat -c %Y "$lock_dir" 2>/dev/null || printf '0'
+}
+
+lock_meta_mtime_epoch() {
+	stat -c %Y "$lock_meta" 2>/dev/null || printf '0'
+}
+
+lock_holder_summary() {
+	if [ ! -f "$lock_meta" ]; then
+		printf 'holder=metadata_missing'
+		return 0
+	fi
+	holder_pid="$(sed -n 's/^pid://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	holder_started="$(sed -n 's/^started_epoch://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	case "$holder_pid" in
+	'' | *[!0-9]*) holder_pid=unknown ;;
+	esac
+	case "$holder_started" in
+	'' | *[!0-9]*) holder_started=unknown ;;
+	esac
+	printf 'holder_pid=%s holder_started_epoch=%s' "$holder_pid" "$holder_started"
+}
+
+lock_meta_first() {
+	lock_meta_key="$1"
+	sed -n "s/^${lock_meta_key}://p" "$lock_meta" 2>/dev/null | sed -n '1p'
+}
+
+lock_wait_budget_ms() {
+	case "$lock_wait_seconds" in
+	'' | *[!0-9]*) printf 'missing' ;;
+	*) printf '%s' "$((lock_wait_seconds * 1000))" ;;
+	esac
+}
+
+lock_holder_active_analysis() {
+	waiter_budget_ms="$(lock_wait_budget_ms)"
+	if [ ! -f "$lock_meta" ]; then
+		echo "run-heavy-throttled: analise_comando_ativo pid=unknown command=unknown artifact=.agents/runtime/command-ledger.jsonl lock_scope=$lock_scope elapsed_ms=0 cpu_percent=unknown throughput=absent owner_budget_ms=missing waiter_budget_ms=$waiter_budget_ms stop_condition=lock_wait_timeout_or_lock_released hypothesis=lock_metadata_missing next_action=reorient_to_independent_p0_or_wait_only_if_critical_dependency" >&2
+		return 0
+	fi
+	holder_pid="$(lock_meta_first pid)"
+	holder_child_pid="$(lock_meta_first child_pid)"
+	holder_started="$(lock_meta_first started_epoch)"
+	holder_command="$(lock_meta_first command)"
+	holder_timeout_seconds="$(lock_meta_first timeout_seconds)"
+	holder_budget_ms="$(lock_meta_first budget_ms)"
+	holder_stop_condition="$(lock_meta_first stop_condition)"
+	holder_artifact_claim_path="$(lock_meta_first artifact_claim_path)"
+	case "$holder_pid" in
+	'' | *[!0-9]*) holder_pid=unknown ;;
+	esac
+	case "$holder_child_pid" in
+	'' | *[!0-9]*) holder_child_pid=unknown ;;
+	esac
+	case "$holder_started" in
+	'' | *[!0-9]*) holder_started=0 ;;
+	esac
+	if [ -z "$holder_command" ]; then
+		holder_command=unknown
+	fi
+	case "$holder_budget_ms" in
+	'' | *[!0-9]*) owner_budget_ms=missing ;;
+	*) owner_budget_ms="$holder_budget_ms" ;;
+	esac
+	if [ -z "$holder_stop_condition" ]; then
+		holder_stop_condition=missing
+	fi
+	if [ -z "$holder_artifact_claim_path" ]; then
+		holder_artifact_claim_path=.agents/runtime/command-ledger.jsonl
+	fi
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	elapsed_ms=0
+	if [ "$holder_started" -gt 0 ] && [ "$now_epoch" -gt 0 ] && [ "$now_epoch" -ge "$holder_started" ]; then
+		elapsed_ms=$(((now_epoch - holder_started) * 1000))
+	fi
+	cpu_percent=unknown
+	tree_processes=unknown
+	analysis_pid="$holder_child_pid"
+	if [ "$analysis_pid" = "unknown" ]; then
+		analysis_pid="$holder_pid"
+	fi
+	if [ "$analysis_pid" != "unknown" ] && [ -x "$progress_monitor_tool" ]; then
+		analysis_output="$({
+			"$process_tree_supervisor" \
+				--timeout-seconds 3 \
+				--kill-after-seconds 1 \
+				--term-grace-seconds 1 \
+				--kill-grace-seconds 1 \
+				--fail-on-descendant-cleanup \
+				--close-fd8 \
+				-- "$progress_monitor_tool" "$analysis_pid" --window-seconds 1
+		} 2>/dev/null 8>&- || true)"
+		analysis_schema="$(printf '%s\n' "$analysis_output" | sed -n 's/.* schema=\([^ ]*\).*/\1/p' | tail -n 1)"
+		if [ "$analysis_schema" = "command-progress/v4" ]; then
+			cpu_percent="$(printf '%s\n' "$analysis_output" | sed -n 's/.* cpu_percent=\([^ ]*\).*/\1/p' | tail -n 1)"
+			tree_processes="$(printf '%s\n' "$analysis_output" | sed -n 's/.* tree_processes_after=\([^ ]*\).*/\1/p' | tail -n 1)"
+			[ -n "$cpu_percent" ] || cpu_percent=unknown
+			[ -n "$tree_processes" ] || tree_processes=unknown
+		fi
+	fi
+	echo "run-heavy-throttled: analise_comando_ativo pid=$analysis_pid owner_pid=$holder_pid command=$holder_command artifact=$holder_artifact_claim_path lock_scope=$lock_scope elapsed_ms=$elapsed_ms cpu_percent=$cpu_percent tree_processes=$tree_processes throughput=absent owner_budget_ms=$owner_budget_ms owner_timeout_seconds=$holder_timeout_seconds waiter_budget_ms=$waiter_budget_ms stop_condition=$holder_stop_condition hypothesis=active_heavy_command_or_stale_lock next_action=reorient_to_independent_p0_or_wait_only_if_critical_dependency" >&2
+}
+
+validate_lock_wait_classification_or_exit() {
+	classification="${WIKI_HEAVY_WAIT_CLASSIFICATION:-}"
+	case "$classification" in
+	non_critical_wait)
+		echo "run-heavy-throttled: non_critical_wait forbids passive lock sleep; reorient to independent P0 front lock_scope=$lock_scope command=$*" >&2
+		exit 75
+		;;
+	critical_dependency)
+		missing=""
+		case "${WIKI_HEAVY_DEPENDENCY_ID:-}" in '' | *placeholder* | *later*) missing="${missing} dependency_id" ;; esac
+		case "${WIKI_HEAVY_OWNER_PID:-}" in '' | *[!0-9]*) missing="${missing} owner_pid" ;; esac
+		case "${WIKI_HEAVY_WAIT_TIMEOUT_MS:-}" in '' | *[!0-9]* | 0) missing="${missing} timeout_ms" ;; esac
+		case "${WIKI_HEAVY_LAST_EVIDENCE:-}" in '' | *placeholder* | *later*) missing="${missing} ultima_evidencia" ;; esac
+		case "${WIKI_HEAVY_REORIENTATION_COMMAND:-}" in '' | *placeholder* | *later*) missing="${missing} comando_reorientacao" ;; esac
+		if [ -z "$missing" ]; then
+			dependency_wait_seconds="$(awk -v milliseconds="$WIKI_HEAVY_WAIT_TIMEOUT_MS" 'BEGIN {
+				if (milliseconds !~ /^[0-9]+$/ || milliseconds < 1 || milliseconds > 86400000) exit 1
+				printf "%.0f", int((milliseconds + 999) / 1000)
+			}' 2>/dev/null || true)"
+			case "$dependency_wait_seconds" in
+			'' | *[!0-9]* | 0) missing="${missing} timeout_ms_bounded" ;;
+			esac
+		fi
+		if [ -z "$missing" ]; then
+			holder_owner_pid="$(lock_meta_first pid)"
+			holder_child_pid="$(lock_meta_first child_pid)"
+			case "$holder_owner_pid" in '' | *[!0-9]*) holder_owner_pid=unknown ;; esac
+			case "$holder_child_pid" in '' | *[!0-9]*) holder_child_pid=unknown ;; esac
+			if [ "${WIKI_HEAVY_OWNER_PID:-}" != "$holder_owner_pid" ] &&
+				[ "${WIKI_HEAVY_OWNER_PID:-}" != "$holder_child_pid" ]; then
+				missing="${missing} owner_pid_matches_active_lock"
+			fi
+		fi
+		if [ -n "$missing" ]; then
+			echo "run-heavy-throttled: critical_dependency lock wait missing structured fields:$missing lock_scope=$lock_scope command=$*" >&2
+			exit 75
+		fi
+		if [ "$dependency_wait_seconds" -lt "$lock_wait_seconds" ]; then
+			lock_wait_seconds="$dependency_wait_seconds"
+		fi
+		;;
+	*)
+		echo "run-heavy-throttled: active lock requires WIKI_HEAVY_WAIT_CLASSIFICATION=critical_dependency with dependency_id/owner_pid/timeout_ms/ultima_evidencia/comando_reorientacao or non_critical_wait reorientation; refusing passive sleep lock_scope=$lock_scope command=$*" >&2
+		exit 75
+		;;
+	esac
+}
+
+reclaim_missing_meta_lock() {
+	if [ -f "$lock_meta" ] || [ ! -d "$lock_dir" ]; then
+		return 1
+	fi
+	case "$lock_stale_seconds" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	meta_started="$(lock_dir_mtime_epoch)"
+	if [ "$now_epoch" -le 0 ]; then
+		return 1
+	fi
+	if [ "$meta_started" -le 0 ]; then
+		return 1
+	fi
+	age=$((now_epoch - meta_started))
+	if [ "$age" -lt "$lock_stale_seconds" ]; then
+		return 1
+	fi
+	rmdir "$lock_dir" >/dev/null 2>&1 || return 1
+	echo "run-heavy-throttled: reclaimed stale heavy lock with missing metadata scope=$lock_scope age=${age}s" >&2
+	return 0
+}
+
+reclaim_stale_lock() {
+	if [ ! -f "$lock_meta" ]; then
+		reclaim_missing_meta_lock
+		return $?
+	fi
+	meta_pid="$(sed -n 's/^pid://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	meta_pid_start_ticks="$(sed -n 's/^pid_start_ticks://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	meta_child_pid="$(sed -n 's/^child_pid://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	meta_child_pid_start_ticks="$(sed -n 's/^child_pid_start_ticks://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	meta_started="$(sed -n 's/^started_epoch://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	meta_heartbeat_seconds="$(sed -n 's/^heartbeat_seconds://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	meta_heartbeat_stale_seconds="$(sed -n 's/^heartbeat_stale_seconds://p' "$lock_meta" 2>/dev/null | sed -n '1p')"
+	case "$meta_pid" in
+	'' | *[!0-9]*) meta_pid=0 ;;
+	esac
+	case "$meta_child_pid" in
+	'' | *[!0-9]*) meta_child_pid=0 ;;
+	esac
+	case "$meta_started" in
+	'' | *[!0-9]*) meta_started="$(lock_dir_mtime_epoch)" ;;
+	esac
+	case "$meta_heartbeat_seconds" in
+	'' | *[!0-9]*) meta_heartbeat_seconds=0 ;;
+	esac
+	case "$meta_heartbeat_stale_seconds" in
+	'' | *[!0-9]*) meta_heartbeat_stale_seconds="$lock_heartbeat_stale_seconds" ;;
+	esac
+	case "$lock_stale_seconds" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	meta_pid_identity_state=absent
+	if [ "$meta_pid" -gt 0 ] && process_identity_active_or_unknown "$meta_pid" "$meta_pid_start_ticks"; then
+		meta_pid_identity_state="$process_identity_state"
+		if [ "$meta_heartbeat_seconds" -gt 0 ] && [ "$meta_heartbeat_stale_seconds" -gt 0 ]; then
+			now_epoch="$(date +%s 2>/dev/null || printf '0')"
+			meta_mtime="$(lock_meta_mtime_epoch)"
+			if [ "$now_epoch" -gt 0 ] && [ "$meta_mtime" -gt 0 ]; then
+				age=$((now_epoch - meta_mtime))
+				if [ "$age" -ge "$meta_heartbeat_stale_seconds" ]; then
+					echo "run-heavy-throttled: active_pid_expired_heartbeat scope=$lock_scope pid=$meta_pid age=${age}s; refusing to reclaim active lock" >&2
+					return 1
+				fi
+			fi
+		fi
+		return 1
+	fi
+	if [ "$meta_pid" -gt 0 ]; then
+		meta_pid_identity_state="$process_identity_state"
+	fi
+	meta_child_pid_identity_state=absent
+	if [ "$meta_child_pid" -gt 0 ] && process_identity_active_or_unknown "$meta_child_pid" "$meta_child_pid_start_ticks"; then
+		meta_child_pid_identity_state="$process_identity_state"
+		echo "run-heavy-throttled: owner_dead_child_active scope=$lock_scope owner_pid=$meta_pid owner_identity=$meta_pid_identity_state child_pid=$meta_child_pid child_identity=$meta_child_pid_identity_state; refusing to reclaim active child lock" >&2
+		return 1
+	fi
+	if [ "$meta_child_pid" -gt 0 ]; then
+		meta_child_pid_identity_state="$process_identity_state"
+	fi
+	if [ "$meta_pid" -gt 0 ]; then
+		dead_pid_heartbeat_age=0
+		rm -f "$lock_meta" >/dev/null 2>&1 || return 1
+		rmdir "$lock_dir" >/dev/null 2>&1 || return 1
+		echo "run-heavy-throttled: reclaimed stale heavy lock with dead pid and expired heartbeat scope=$lock_scope pid=$meta_pid owner_identity=$meta_pid_identity_state child_identity=$meta_child_pid_identity_state age=${dead_pid_heartbeat_age}s" >&2
+		return 0
+	fi
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	if [ "$now_epoch" -le 0 ]; then
+		return 1
+	fi
+	if [ "$meta_heartbeat_seconds" -gt 0 ] && [ "$meta_heartbeat_stale_seconds" -gt 0 ]; then
+		meta_mtime="$(lock_meta_mtime_epoch)"
+		if [ "$meta_mtime" -gt 0 ]; then
+			dead_pid_heartbeat_age=$((now_epoch - meta_mtime))
+			if [ "$dead_pid_heartbeat_age" -ge "$meta_heartbeat_stale_seconds" ]; then
+				rm -f "$lock_meta" >/dev/null 2>&1 || return 1
+				rmdir "$lock_dir" >/dev/null 2>&1 || return 1
+				echo "run-heavy-throttled: reclaimed stale heavy lock with dead pid and expired heartbeat scope=$lock_scope pid=$meta_pid age=${dead_pid_heartbeat_age}s" >&2
+				return 0
+			fi
+		fi
+	fi
+	if [ "$meta_started" -le 0 ]; then
+		return 1
+	fi
+	age=$((now_epoch - meta_started))
+	if [ "$age" -lt "$lock_stale_seconds" ]; then
+		return 1
+	fi
+	rm -f "$lock_meta" >/dev/null 2>&1 || return 1
+	rmdir "$lock_dir" >/dev/null 2>&1 || return 1
+	echo "run-heavy-throttled: reclaimed stale heavy lock scope=$lock_scope pid=$meta_pid age=${age}s" >&2
+	return 0
+}
+
+last_lock_wait_notice_epoch="$start_epoch"
+active_lock_analysis_emitted=0
+while ! mkdir "$lock_dir" 2>/dev/null; do
+	if reclaim_stale_lock; then
+		continue
+	fi
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	if [ "$active_lock_analysis_emitted" = "0" ]; then
+		lock_holder_active_analysis
+		active_lock_analysis_emitted=1
+		validate_lock_wait_classification_or_exit "$@"
+	fi
+	if [ "$start_epoch" -gt 0 ] && [ "$now_epoch" -gt 0 ]; then
+		elapsed=$((now_epoch - start_epoch))
+		if [ "$elapsed" -ge "$lock_wait_seconds" ]; then
+			echo "run-heavy-throttled: identical heavy command already running or shared heavy scope blocked after ${lock_wait_seconds}s: $lock_scope: $*" >&2
+			exit 75
+		fi
+	fi
+	if [ "$lock_wait_notice_seconds" -gt 0 ] && [ "$now_epoch" -gt 0 ] && [ "$last_lock_wait_notice_epoch" -gt 0 ]; then
+		notice_elapsed=$((now_epoch - last_lock_wait_notice_epoch))
+		if [ "$notice_elapsed" -ge "$lock_wait_notice_seconds" ]; then
+			echo "run-heavy-throttled: waiting for heavy lock scope=$lock_scope elapsed=${elapsed:-0}s wait_limit=${lock_wait_seconds}s $(lock_holder_summary)" >&2
+			lock_holder_active_analysis
+			last_lock_wait_notice_epoch="$now_epoch"
+		fi
+	fi
+	sleep 2 8>&-
+done
+
+if ! chmod 0700 "$lock_dir"; then
+	rmdir "$lock_dir" >/dev/null 2>&1 || true
+	echo "run-heavy-throttled: failed to make progress/lock directory private: $lock_dir" >&2
+	exit 75
+fi
+
+write_provisional_lock_meta || {
+	rm -f "$lock_meta" >/dev/null 2>&1 || true
+	rmdir "$lock_dir" >/dev/null 2>&1 || true
+	echo "run-heavy-throttled: failed to write provisional heavy lock metadata for $lock_scope" >&2
+	exit 75
+}
+
+write_lock_meta "" || {
+	rm -f "$lock_meta" >/dev/null 2>&1 || true
+	rmdir "$lock_dir" >/dev/null 2>&1 || true
+	echo "run-heavy-throttled: failed to write heavy lock metadata for $lock_scope" >&2
+	exit 75
+}
+
+lock_heartbeat_pid=""
+
+wait_owned_child_bounded() {
+	wait_owned_pid="$1"
+	wait_owned_grace_seconds="$2"
+	case "$wait_owned_pid" in
+	'' | *[!0-9]*) return 0 ;;
+	esac
+	if ! kill -0 "$wait_owned_pid" 2>/dev/null; then
+		if wait "$wait_owned_pid" 2>/dev/null; then
+			wait_owned_status=0
+		else
+			wait_owned_status=$?
+		fi
+		return "$wait_owned_status"
+	fi
+	wait_owned_timer_timeout=$((wait_owned_grace_seconds + 3))
+	# A raw background subshell around `sleep` is not sufficient: killing that
+	# shell can orphan the external sleep process with the caller's output FDs
+	# open, making an already-finished command appear hung for the whole grace
+	# period.  Supervise the timer tree too and disconnect all of its streams.
+	"$process_tree_supervisor" \
+		--timeout-seconds "$wait_owned_timer_timeout" \
+		--kill-after-seconds 1 \
+		--term-grace-seconds 1 \
+		--kill-grace-seconds 1 \
+		--fail-on-descendant-cleanup \
+		--close-fd8 \
+		-- sh -c '
+			target_pid=$1
+			grace_seconds=$2
+			sleep "$grace_seconds"
+			if kill -0 "$target_pid" 2>/dev/null; then
+				kill -TERM "$target_pid" 2>/dev/null || true
+				sleep 1
+				kill -KILL "$target_pid" 2>/dev/null || true
+			fi
+		' run-heavy-owned-timer "$wait_owned_pid" "$wait_owned_grace_seconds" \
+		</dev/null >/dev/null 2>&1 8>&- &
+	wait_owned_watchdog_pid=$!
+	# The background fork briefly inherits this wrapper's TERM trap before
+	# exec resets signal dispositions.  Do not send the cancellation signal in
+	# that window: the inherited trap could consume it and leave the full grace
+	# timer running.  A changed /proc/PID/exe proves that exec has happened.
+	wait_owned_parent_exe="$(readlink -f "/proc/$$/exe" 2>/dev/null || true)"
+	wait_owned_timer_ready=0
+	wait_owned_timer_ready_attempt=0
+	while [ "$wait_owned_timer_ready_attempt" -lt 50 ]; do
+		wait_owned_timer_exe="$(readlink -f "/proc/$wait_owned_watchdog_pid/exe" 2>/dev/null || true)"
+		if [ -n "$wait_owned_timer_exe" ] && [ "$wait_owned_timer_exe" != "$wait_owned_parent_exe" ]; then
+			wait_owned_timer_ready=1
+			break
+		fi
+		if ! kill -0 "$wait_owned_watchdog_pid" 2>/dev/null; then
+			break
+		fi
+		sleep 0.01 8>&-
+		wait_owned_timer_ready_attempt=$((wait_owned_timer_ready_attempt + 1))
+	done
+	if [ "$wait_owned_timer_ready" != "1" ]; then
+		kill -KILL "$wait_owned_watchdog_pid" >/dev/null 2>&1 || true
+		wait "$wait_owned_watchdog_pid" >/dev/null 2>&1 || true
+		kill -KILL "$wait_owned_pid" >/dev/null 2>&1 || true
+	fi
+	if wait "$wait_owned_pid" 2>/dev/null; then
+		wait_owned_status=0
+	else
+		wait_owned_status=$?
+	fi
+	kill -TERM "$wait_owned_watchdog_pid" >/dev/null 2>&1 || true
+	wait "$wait_owned_watchdog_pid" >/dev/null 2>&1 || true
+	return "$wait_owned_status"
+}
+
+start_lock_heartbeat() {
+	if [ "$lock_heartbeat_seconds" -le 0 ]; then
+		return 0
+	fi
+	heartbeat_timeout_seconds=$((command_timeout_seconds + command_timeout_kill_after_seconds + 60))
+	if [ "$heartbeat_timeout_seconds" -gt 86400 ]; then
+		heartbeat_timeout_seconds=86400
+	fi
+	"$process_tree_supervisor" \
+		--timeout-seconds "$heartbeat_timeout_seconds" \
+		--kill-after-seconds 2 \
+		--term-grace-seconds 1 \
+		--kill-grace-seconds 2 \
+		--fail-on-descendant-cleanup \
+		--close-fd8 \
+		-- sh -c '
+			meta=$1
+			interval=$2
+			while :; do
+				remaining=$interval
+				while [ "$remaining" -gt 0 ]; do
+					sleep 1
+					[ -f "$meta" ] || exit 0
+					remaining=$((remaining - 1))
+				done
+				touch "$meta" >/dev/null 2>&1 || exit 0
+			done
+		' run-heavy-heartbeat "$lock_meta" "$lock_heartbeat_seconds" 8>&- &
+	lock_heartbeat_pid=$!
+}
+
+stop_lock_heartbeat() {
+	if [ -n "$lock_heartbeat_pid" ]; then
+		kill "$lock_heartbeat_pid" >/dev/null 2>&1 || true
+		wait_owned_child_bounded "$lock_heartbeat_pid" 5 >/dev/null 2>&1 || true
+		lock_heartbeat_pid=""
+	fi
+}
+
+start_progress_monitor() {
+	if [ "$progress_monitor_mode" = "off" ] || [ -z "$child_pid" ]; then
+		return 0
+	fi
+	watchdog_deadline_seconds="$command_timeout_seconds"
+	watchdog_supervisor_deadline_seconds=$((watchdog_deadline_seconds + 5))
+	if [ "$watchdog_supervisor_deadline_seconds" -gt 86400 ]; then
+		watchdog_supervisor_deadline_seconds=86400
+	fi
+	"$process_tree_supervisor" \
+		--timeout-seconds "$watchdog_supervisor_deadline_seconds" \
+		--kill-after-seconds 2 \
+		--term-grace-seconds 1 \
+		--kill-grace-seconds 2 \
+		--fail-on-descendant-cleanup \
+		--close-fd8 \
+		-- "$progress_watchdog_tool" \
+		--target-pid "$child_pid" \
+		--check-command-progress "$progress_monitor_tool" \
+		--supervise-process-tree "$process_tree_supervisor" \
+		--lock-dir "$lock_dir" \
+		--lock-scope "$lock_scope" \
+		--initial-delay-seconds "$progress_monitor_initial_delay_seconds" \
+		--window-seconds "$progress_monitor_window_seconds" \
+		--alert-windows "$progress_monitor_alert_windows" \
+		--deadline-seconds "$watchdog_deadline_seconds" 8>&- &
+	progress_monitor_pid=$!
+}
+
+stop_progress_monitor() {
+	if [ -n "$progress_monitor_pid" ]; then
+		# Signal only the watchdog created by this wrapper, never the producer.
+		kill "$progress_monitor_pid" >/dev/null 2>&1 || true
+		wait_owned_child_bounded "$progress_monitor_pid" 8 >/dev/null 2>&1 || true
+		progress_monitor_pid=""
+	fi
+}
+
+cleanup_lock() {
+	set +e
+	stop_progress_monitor
+	stop_lock_heartbeat
+	rm -f "$lock_meta" >/dev/null 2>&1
+	rmdir "$lock_dir" >/dev/null 2>&1
+	cleanup_factory_chain_lock
+}
+
+cleanup_factory_chain_lock() {
+	factory_meta="${P0_FACTORY_CHAIN_LOCK_META_PATH:-}"
+	case "$factory_meta" in
+	'')
+		return 0
+		;;
+	esac
+	case "$factory_meta" in
+	*/portaljuridico-p0-factory-chain-v2-*/p0-factory-chain.lock.meta)
+		;;
+	*)
+		return 0
+		;;
+	esac
+	[ -f "$factory_meta" ] || return 0
+	factory_meta_pid="$(sed -n 's/^pid[:=]//p' "$factory_meta" 2>/dev/null | sed -n '1p')"
+	if [ "$factory_meta_pid" = "$$" ]; then
+		rm -f "$factory_meta" >/dev/null 2>&1 || true
+	fi
+}
+
+child_pid=""
+
+signal_child() {
+	signal_name="$1"
+	if [ -z "$child_pid" ]; then
+		return 0
+	fi
+	if ! kill -0 "$child_pid" 2>/dev/null; then
+		return 0
+	fi
+	kill "-$signal_name" "$child_pid" 2>/dev/null || true
+}
+
+wait_for_child_after_signal() {
+	if [ -z "$child_pid" ]; then
+		return 0
+	fi
+	fallback_kill_seconds=$((command_timeout_kill_after_seconds + 12))
+	wait_owned_child_bounded "$child_pid" "$fallback_kill_seconds" >/dev/null 2>&1 || true
+}
+
+forward_signal() {
+	signal_name="$1"
+	status="$2"
+	trap - HUP INT QUIT TERM
+	signal_child "$signal_name"
+	wait_for_child_after_signal
+	cleanup_lock
+	exit "$status"
+}
+
+run_supervised() {
+	child_pid=""
+	"$process_tree_supervisor" \
+		--timeout-seconds "$command_timeout_seconds" \
+		--kill-after-seconds "$command_timeout_kill_after_seconds" \
+		--term-grace-seconds 2 \
+		--kill-grace-seconds 5 \
+		--fail-on-descendant-cleanup \
+		--close-fd8 \
+		-- /bin/sh -c 'umask "$WIKI_HEAVY_CHILD_UMASK"; exec "$@"' sh "$@" &
+	child_pid=$!
+	if ! write_lock_meta "$child_pid"; then
+		echo "run-heavy-throttled: failed to write real child process metadata for $lock_scope child_pid=$child_pid" >&2
+		signal_child TERM
+		wait_for_child_after_signal
+		return 75
+	fi
+	start_progress_monitor
+	wait "$child_pid"
+	child_status=$?
+	stop_progress_monitor
+	child_pid=""
+	return "$child_status"
+}
+
+run_command() {
+	export WIKI_RUN_GO_CMD_CACHED_UNDER_HEAVY=1
+	if [ -n "$ionice_class" ]; then
+		if ! command -v ionice >/dev/null 2>&1; then
+			echo "run-heavy-throttled: ionice is required when WIKI_HEAVY_IONICE_CLASS is set" >&2
+			return 2
+		fi
+		if [ "$ionice_class" = "3" ]; then
+			if [ "$nice_level" -gt 0 ]; then
+				run_with_timeout ionice -c3 nice -n "$nice_level" "$@"
+			else
+				run_with_timeout ionice -c3 "$@"
+			fi
+		else
+			if [ "$nice_level" -gt 0 ]; then
+				run_with_timeout ionice -c"$ionice_class" -n"$ionice_level" nice -n "$nice_level" "$@"
+			else
+				run_with_timeout ionice -c"$ionice_class" -n"$ionice_level" "$@"
+			fi
+		fi
+		return $?
+	fi
+
+	if [ "$nice_level" -gt 0 ]; then
+		if ! command -v nice >/dev/null 2>&1; then
+			echo "run-heavy-throttled: nice is required when WIKI_HEAVY_NICE is positive" >&2
+			return 2
+		fi
+		run_with_timeout nice -n "$nice_level" "$@"
+		return $?
+	fi
+
+	run_with_timeout "$@"
+}
+
+run_with_timeout() {
+	run_supervised "$@"
+}
+
+trap cleanup_lock EXIT
+trap 'forward_signal HUP 129' HUP
+trap 'forward_signal INT 130' INT
+trap 'forward_signal QUIT 131' QUIT
+trap 'forward_signal TERM 143' TERM
+
+supervisor_timing_started_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s 2>/dev/null || printf '0')")"
+set +e
+start_lock_heartbeat
+run_command "$@"
+status=$?
+set -e
+if [ "${WIKI_HEAVY_TIMING_MODE:-}" = "supervisor_wall_clock_v1" ]; then
+	supervisor_timing_finished_ms="$(date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s 2>/dev/null || printf '0')")"
+	case "$supervisor_timing_started_ms:$supervisor_timing_finished_ms" in
+	*[!0-9:]*) supervisor_duration_ms=0 ;;
+	*) supervisor_duration_ms=$((supervisor_timing_finished_ms - supervisor_timing_started_ms)) ;;
+	esac
+	if [ "$supervisor_duration_ms" -lt 1 ]; then
+		supervisor_duration_ms=1
+	fi
+	echo "run-heavy-throttled: timing mode=supervisor_wall_clock_v1 duration_ms=$supervisor_duration_ms exit_code=$status lock_scope=$lock_scope" >&2
+fi
+# 124 = COMMAND_TIMEOUT do supervise-process-tree; 137 = SIGKILL do kill-after.
+# Sem esta linha o operador vê só "timeout" e sobe WIKI_HEAVY_TIMEOUT_SECONDS —
+# que NÃO tem efeito enquanto o budget for menor, gerando repetição do mesmo
+# comando sem progresso.
+case "$status" in
+124 | 137)
+	if [ -n "${budget_clamped_from_timeout_seconds:-}" ]; then
+		echo "run-heavy-throttled: timeout efetivo=${command_timeout_seconds}s vindo de WIKI_HEAVY_BUDGET_MS=${budget_timeout_candidate}; o WIKI_HEAVY_TIMEOUT_SECONDS=${budget_clamped_from_timeout_seconds} declarado NAO estava em vigor (vence o menor dos dois). Para dar mais tempo a este comando AUMENTE WIKI_HEAVY_BUDGET_MS — subir so WIKI_HEAVY_TIMEOUT_SECONDS nao muda nada." >&2
+	fi
+	;;
+esac
+cleanup_lock
+trap - EXIT HUP INT QUIT TERM
+exit "$status"

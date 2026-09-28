@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""check-v2-intent-collision-adjudication — READ-ONLY.
+
+Varre `data/editorial/v2_pages/*.jsonl` e ADJUDICA todo `intent_id` que aparece em
+mais de um registro do estoque canônico v2, dizendo qual repetição é dívida e qual
+é o desenho.
+
+Por que existe (e por que NÃO é o `v2-cross-shard-collision`):
+  - `internal/v2crossshardcollision` (gate `v2-cross-shard-collision`, wrapper em
+    `tools/check-v2-cross-shard-collision`) só olha páginas VIVAS: `live()` descarta
+    qualquer registro com `skipped=true` ou `superseded_by` preenchido. Isso está
+    certo para o gate de unicidade — mas significa que o conteúdo dos 121 registros
+    não-vivos nunca é auditado por ele.
+  - A DEC-020 define o contrato de supersessão (tombstone com
+    `skip_reason=duplicate_intent_consolidated`, `superseded_by=<shard>.jsonl`,
+    archive fora de `v2_pages` e SHA-256 do registro integral substituído). Um
+    tombstone que MENTE — aponta para shard sem vencedor vivo, perde o archive, ou
+    tem hash que não bate — fica invisível: o gate de colisão o ignora por não ser
+    vivo, e a página cheia continua no ar sem que ninguém prove que a consolidação
+    foi honesta.
+
+Este check fecha essa janela: classifica cada `intent_id` repetido e AUTENTICA a
+supersessão contra o archive real.
+
+Classificação (a saída nomeia sempre shard:linha de cada membro):
+  REPROVA (exit 1)
+    duplicata-cheia        dois ou mais registros VIVOS com corpo cheio -> exige
+                           adjudicação DEC-020 (um vencedor + tombstone autenticado);
+    colisao-com-stub       um vivo cheio e um vivo VAZIO (title/sections vazios ou
+                           word_count nulo) sem tombstone: o stub sombreia a página
+                           cheia em qualquer consumidor que indexe por intent_id;
+    colisao-de-stubs       dois ou mais vivos vazios com o mesmo intent_id;
+    supersessao-invalida   tombstone que não cumpre a DEC-020 (archive ausente,
+                           hash divergente, destino sem vencedor vivo, flags de
+                           publicação não explicitamente falsas...);
+    supersessao-sem-vivo   todas as ocorrências tombstonadas: o intent consolidou
+                           para lugar nenhum.
+  AVISA (exit 0)
+    duplicata-benigna      ocorrências byte-idênticas (mesma linha repetida);
+    supersessao-sancionada tombstone autenticado byte a byte contra o archive.
+
+NÃO reprova (por desenho): linha com `intent_id` único e corpo vazio é slot
+reservado — pulo honesto por fonte não resolvida (`skip_reason` próprio). O sumário
+conta esses slots para que um desvio futuro apareça em vez de passar batido.
+
+Desempenho: streaming linha a linha, nada carregado inteiro em memória. A primeira
+passada é só regex sobre a linha crua — nenhuma decodificação de JSON. A regex é
+tolerante às DUAS serializações reais do acervo (`"intent_id": "`, indentado pelos
+geradores Python, e `"intent_id":"`, compacto do `encoding/json` do Go) e, sempre
+que a linha tiver zero ou mais de uma ocorrência da chave, o veredito daquela linha
+passa para o decodificador JSON (autoridade), com o caso contabilizado no sumário
+como `intent_id_ambiguos`.
+
+A adjudicação em si (passada 2) decodifica apenas as linhas dos intents repetidos —
+19 linhas no acervo de hoje. A contagem de `slots_reservados`, porém, decodifica
+todas as linhas de intent único (9.722 hoje, ~1,5 s), porque só o JSON diz se o
+corpo está vazio; é o custo dominante do check e cresce linearmente com o estoque.
+Se isso virar gargalo em centenas de milhares de linhas, a saída é filtrar por
+regex de corpo vazio antes de decodificar, não aumentar timeout.
+
+Uso:
+    ./tools/check-v2-intent-collision-adjudication
+    ./tools/check-v2-intent-collision-adjudication --root /opt/wiki
+    ./tools/check-v2-intent-collision-adjudication --shards-dir /caminho/fixture
+    ./tools/check-v2-intent-collision-adjudication --report /caminho/relatorio.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import glob
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+
+DEFAULT_ROOT = "/opt/wiki"
+PAGES_REL_DIR = "data/editorial/v2_pages"
+SUPERSEDED_REL_DIR = "data/editorial/v2_superseded"
+SUPERSESSION_SKIP_REASON = "duplicate_intent_consolidated"
+
+# Tolerante às duas serializações presentes no acervo: `"intent_id": "x"` (indentado
+# pelos geradores Python) e `"intent_id":"x"` (compacto, encoding/json do Go).
+INTENT_ID_RE = re.compile(r'"intent_id"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+FAIL_KINDS = {
+    "duplicata-cheia",
+    "colisao-com-stub",
+    "colisao-de-stubs",
+    "supersessao-invalida",
+    "supersessao-sem-vivo",
+}
+WARN_KINDS = {"duplicata-benigna", "supersessao-sancionada"}
+
+
+class Occurrence:
+    __slots__ = ("shard", "line_no", "digest", "record", "raw")
+
+    def __init__(self, shard: str, line_no: int, digest: str) -> None:
+        self.shard = shard
+        self.line_no = line_no
+        self.digest = digest
+        self.record: dict | None = None
+        self.raw: str = ""
+
+    @property
+    def where(self) -> str:
+        return f"{self.shard}:{self.line_no}"
+
+    def tombstoned(self) -> bool:
+        record = self.record or {}
+        return bool(record.get("skipped")) or bool(str(record.get("superseded_by") or "").strip())
+
+    def empty_body(self) -> bool:
+        record = self.record or {}
+        if not str(record.get("title") or "").strip():
+            return True
+        if not record.get("sections"):
+            return True
+        word_count = record.get("word_count")
+        if word_count is None or (isinstance(word_count, (int, float)) and word_count <= 0):
+            return True
+        return False
+
+
+def shard_paths(pages_dir: pathlib.Path) -> list[str]:
+    # *.partial.jsonl é ruído gitignored de escrita em voo (mesma exclusão de
+    # internal/v2crossshardcollision.Scan).
+    return sorted(p for p in glob.glob(str(pages_dir / "*.jsonl")) if not p.endswith(".partial.jsonl"))
+
+
+def scan_shards(paths: list[str]) -> tuple[dict[str, list[Occurrence]], int, int, list[str]]:
+    """Passada 1: só regex. Devolve (ocorrências por intent, linhas, ambíguas, erros)."""
+    occurrences: dict[str, list[Occurrence]] = {}
+    total_lines = 0
+    ambiguous = 0
+    parse_errors: list[str] = []
+    for path in paths:
+        shard = os.path.basename(path)
+        with open(path, "r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                total_lines += 1
+                matches = INTENT_ID_RE.findall(stripped)
+                if len(matches) == 1:
+                    intent_id = matches[0]
+                else:
+                    # Zero ocorrências (chave ausente) ou mais de uma (a chave também
+                    # aparece dentro de string do corpo): o JSON é a autoridade.
+                    ambiguous += 1
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError as exc:
+                        parse_errors.append(f"{shard}:{line_no} json_invalido: {exc}")
+                        continue
+                    if not isinstance(record, dict):
+                        parse_errors.append(f"{shard}:{line_no} registro nao e objeto JSON")
+                        continue
+                    intent_id = str(record.get("intent_id") or "")
+                intent_id = intent_id.strip()
+                if not intent_id:
+                    parse_errors.append(f"{shard}:{line_no} intent_id ausente ou vazio")
+                    continue
+                digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+                occurrences.setdefault(intent_id, []).append(Occurrence(shard, line_no, digest))
+    return occurrences, total_lines, ambiguous, parse_errors
+
+
+def hydrate(pages_dir: pathlib.Path, groups: dict[str, list[Occurrence]], parse_errors: list[str]) -> None:
+    """Passada 2: decodifica o JSON só das linhas dos intents repetidos."""
+    wanted: dict[str, dict[int, Occurrence]] = {}
+    for members in groups.values():
+        for member in members:
+            wanted.setdefault(member.shard, {})[member.line_no] = member
+    for shard, by_line in wanted.items():
+        with open(pages_dir / shard, "r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                member = by_line.get(line_no)
+                if member is None:
+                    continue
+                stripped = line.strip()
+                member.raw = stripped
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    parse_errors.append(f"{shard}:{line_no} json_invalido: {exc}")
+                    continue
+                member.record = record if isinstance(record, dict) else {}
+
+
+@functools.lru_cache(maxsize=None)
+def archive_index(archive_path: str) -> dict[str, list[dict]]:
+    """Indexa um archive de supersessão por intent_id (carregado no máximo uma vez)."""
+    index: dict[str, list[dict]] = {}
+    with open(archive_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                index.setdefault(str(record.get("intent_id") or "").strip(), []).append(record)
+    return index
+
+
+def audit_tombstone(root: pathlib.Path, tomb: Occurrence, winner: Occurrence) -> list[str]:
+    """Confere o tombstone contra o contrato da DEC-020. Lista vazia = íntegro."""
+    record = tomb.record or {}
+    problems: list[str] = []
+
+    if not record.get("skipped"):
+        problems.append("skipped ausente/falso em registro com superseded_by")
+    skip_reason = str(record.get("skip_reason") or "").strip()
+    if skip_reason != SUPERSESSION_SKIP_REASON:
+        problems.append(f"skip_reason={skip_reason!r} (esperado {SUPERSESSION_SKIP_REASON!r})")
+    for flag in ("render_allowed", "sitemap_allowed", "publication_allowed"):
+        if record.get(flag) is not False:
+            problems.append(f"{flag} nao e explicitamente false")
+
+    target = str(record.get("superseded_by") or "").strip()
+    if not target:
+        problems.append("superseded_by vazio")
+    elif target == tomb.shard:
+        problems.append(f"superseded_by aponta para o proprio shard ({target})")
+    elif target != winner.shard:
+        problems.append(f"superseded_by={target} mas o vencedor vivo esta em {winner.shard}")
+
+    expected_digest = str(record.get("superseded_record_sha256") or "").strip()
+    if not expected_digest:
+        problems.append("superseded_record_sha256 ausente")
+
+    archive_rel = str(record.get("supersession_archive") or "").strip()
+    if not archive_rel:
+        problems.append("supersession_archive ausente")
+        return problems
+    if not archive_rel.startswith(SUPERSEDED_REL_DIR + "/"):
+        problems.append(f"supersession_archive fora de {SUPERSEDED_REL_DIR}/: {archive_rel}")
+        return problems
+    archive_path = root / archive_rel
+    if not archive_path.is_file():
+        problems.append(f"archive inexistente: {archive_rel}")
+        return problems
+
+    entries = archive_index(str(archive_path)).get(str((tomb.record or {}).get("intent_id") or "").strip(), [])
+    if not entries:
+        problems.append(f"archive {archive_rel} nao contem o intent substituido")
+        return problems
+    matched = False
+    for entry in entries:
+        original = str(entry.get("original_line") or "").strip()
+        digest = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        if expected_digest and digest != expected_digest:
+            continue
+        matched = True
+        source_shard = str(entry.get("source_shard") or "").strip()
+        if source_shard and source_shard != tomb.shard:
+            problems.append(f"archive registra source_shard={source_shard}, tombstone esta em {tomb.shard}")
+        canonical_shard = str(entry.get("canonical_shard") or "").strip()
+        if canonical_shard and canonical_shard != winner.shard:
+            problems.append(f"archive registra canonical_shard={canonical_shard}, vencedor vivo em {winner.shard}")
+        break
+    if not matched:
+        problems.append(
+            f"nenhum registro do archive {archive_rel} bate com superseded_record_sha256={expected_digest[:12]}…"
+        )
+    return problems
+
+
+def classify(root: pathlib.Path, intent_id: str, members: list[Occurrence]) -> dict:
+    detail: list[str] = []
+
+    if len({member.digest for member in members}) == 1:
+        return {
+            "intent_id": intent_id,
+            "kind": "duplicata-benigna",
+            "members": [member.where for member in members],
+            "detail": ["ocorrencias byte-identicas (sha256 igual)"],
+        }
+
+    live = [member for member in members if not member.tombstoned()]
+    tombstones = [member for member in members if member.tombstoned()]
+    live_full = [member for member in live if not member.empty_body()]
+    live_empty = [member for member in live if member.empty_body()]
+
+    if len(live_full) >= 2:
+        kind = "duplicata-cheia"
+        detail.append("dois ou mais registros vivos com corpo cheio; exige adjudicacao DEC-020")
+    elif live_full and live_empty:
+        kind = "colisao-com-stub"
+        detail.append(
+            "stub vivo (sem tombstone) convive com pagina cheia: "
+            f"cheio={live_full[0].where} vazio={','.join(m.where for m in live_empty)}"
+        )
+    elif len(live_empty) >= 2:
+        kind = "colisao-de-stubs"
+        detail.append("dois ou mais stubs vivos com o mesmo intent_id")
+    elif not live:
+        kind = "supersessao-sem-vivo"
+        detail.append("todas as ocorrencias tombstonadas: o intent consolidou para nenhum vencedor vivo")
+    else:
+        winner = live[0]
+        problems: list[str] = []
+        for tomb in tombstones:
+            for problem in audit_tombstone(root, tomb, winner):
+                problems.append(f"{tomb.where}: {problem}")
+        if problems:
+            kind = "supersessao-invalida"
+            detail.extend(problems)
+        else:
+            kind = "supersessao-sancionada"
+            detail.append(
+                f"vencedor vivo={winner.where}; tombstone(s) autenticado(s) contra o archive: "
+                + ", ".join(tomb.where for tomb in tombstones)
+            )
+
+    return {
+        "intent_id": intent_id,
+        "kind": kind,
+        "members": [member.where for member in members],
+        "detail": detail,
+    }
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="check-v2-intent-collision-adjudication",
+        description="Adjudica intent_id repetido no estoque v2 e autentica a supersessao (DEC-020).",
+    )
+    parser.add_argument("--root", default=DEFAULT_ROOT, help=f"raiz do repositorio (default: {DEFAULT_ROOT})")
+    parser.add_argument(
+        "--shards-dir",
+        default=None,
+        help=f"diretorio dos shards (default: <root>/{PAGES_REL_DIR}); util para fixture",
+    )
+    parser.add_argument("--report", default=None, help="grava relatorio JSONL no caminho indicado (opcional)")
+    args = parser.parse_args(argv)
+
+    root = pathlib.Path(args.root)
+    pages_dir = pathlib.Path(args.shards_dir) if args.shards_dir else root / PAGES_REL_DIR
+    if not pages_dir.is_dir():
+        print(f"check-v2-intent-collision-adjudication: diretorio de shards ausente: {pages_dir}", file=sys.stderr)
+        return 1
+
+    paths = shard_paths(pages_dir)
+    occurrences, total_lines, ambiguous, parse_errors = scan_shards(paths)
+    duplicated = {intent_id: members for intent_id, members in occurrences.items() if len(members) > 1}
+    hydrate(pages_dir, duplicated, parse_errors)
+
+    verdicts = [classify(root, intent_id, members) for intent_id, members in sorted(duplicated.items())]
+
+    # Slots reservados: intent_id unico com corpo vazio. Contados por amostragem
+    # direta das linhas unicas apenas quando o registro nao tem corpo — a leitura e
+    # barata porque so precisa do JSON dessas linhas.
+    reserved_slots = 0
+    unique_by_shard: dict[str, set[int]] = {}
+    for intent_id, members in occurrences.items():
+        if len(members) == 1:
+            unique_by_shard.setdefault(members[0].shard, set()).add(members[0].line_no)
+    for shard, lines in unique_by_shard.items():
+        with open(pages_dir / shard, "r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if line_no not in lines:
+                    continue
+                stripped = line.strip()
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                probe = Occurrence(shard, line_no, "")
+                probe.record = record
+                if probe.empty_body():
+                    reserved_slots += 1
+
+    failures = [verdict for verdict in verdicts if verdict["kind"] in FAIL_KINDS]
+    warnings = [verdict for verdict in verdicts if verdict["kind"] in WARN_KINDS]
+
+    for verdict in failures:
+        print(
+            f"FAIL v2_intent_collision_{verdict['kind'].replace('-', '_')}: intent_id={verdict['intent_id']} "
+            f"members={' | '.join(verdict['members'])}"
+        )
+        for line in verdict["detail"]:
+            print(f"    {line}")
+    for verdict in warnings:
+        print(
+            f"WARN v2_intent_collision_{verdict['kind'].replace('-', '_')}: intent_id={verdict['intent_id']} "
+            f"members={' | '.join(verdict['members'])}"
+        )
+        for line in verdict["detail"]:
+            print(f"    {line}")
+    for problem in parse_errors:
+        print(f"FAIL v2_intent_collision_parse_error: {problem}")
+
+    # O veredito entra na PRÓPRIA linha de sumário: quem raspa a saída (ou lê só a
+    # última linha) não pode ver "reprovacoes=0" num run que sai com exit 1 por erro
+    # de parse. Sumário verde em run vermelho é como se conclui errado.
+    reproved = len(failures) + len(parse_errors)
+    print(
+        "v2-intent-collision-adjudication: veredito={veredito} shards={shards} linhas={linhas} "
+        "intents={intents} repetidos={repetidos} reprovacoes={reprovacoes} colisoes_reprovadas={colisoes} "
+        "avisos={avisos} slots_reservados={slots} intent_id_ambiguos={ambiguos} parse_errors={erros}".format(
+            veredito="REPROVADO" if reproved else "APROVADO",
+            reprovacoes=reproved,
+            colisoes=len(failures),
+            shards=len(paths),
+            linhas=total_lines,
+            intents=len(occurrences),
+            repetidos=len(duplicated),
+            avisos=len(warnings),
+            slots=reserved_slots,
+            ambiguos=ambiguous,
+            erros=len(parse_errors),
+        )
+    )
+
+    if args.report:
+        report_path = pathlib.Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as handle:
+            for verdict in verdicts:
+                handle.write(json.dumps(verdict, ensure_ascii=False) + "\n")
+            for problem in parse_errors:
+                handle.write(
+                    json.dumps({"kind": "parse-error", "detail": [problem]}, ensure_ascii=False) + "\n"
+                )
+            handle.write(
+                json.dumps(
+                    {
+                        "kind": "sumario",
+                        "shards": len(paths),
+                        "linhas": total_lines,
+                        "intents": len(occurrences),
+                        "repetidos": len(duplicated),
+                        "reprovacoes": len(failures),
+                        "avisos": len(warnings),
+                        "slots_reservados": reserved_slots,
+                        "intent_id_ambiguos": ambiguous,
+                        "parse_errors": len(parse_errors),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        print(f"v2-intent-collision-adjudication: relatorio em {report_path}")
+
+    return 1 if (failures or parse_errors) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

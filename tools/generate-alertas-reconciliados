@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""generate-alertas-reconciliados — fecha alerta cuja condição JÁ se curou.
+
+★ POR QUE EXISTE (2026-08-29, BUG-018 da caça aos bugs)
+
+Todo vigia deste repo sabe ABRIR alerta. Fechar depende de o mesmo vigia rodar
+outra vez e observar a transição de ruim para bom. Quando a condição se cura por
+fora — outra frente conserta, a máquina se recupera sozinha, ou o próprio ledger
+já registrou o estado bom antes de alguém arrumar o mecanismo — a transição
+nunca acontece e a chave fica aberta para sempre.
+
+Medido: `borda-origem`, severidade CRÍTICA, ficou 38 horas aberta com /healthz
+devolvendo 200 na borda e na origem, `edge_live` com seis `ok:true` seguidos e
+`tunnel_health` declarando `degradado: false`. E ela não fecharia sozinha nem
+depois do conserto do BUG-060, porque o ledger já tinha registrado `ok=true`:
+não havia mais transição a observar.
+
+Alerta crítico falso não é ruído inofensivo. Ele treina o dono a ignorar o
+painel, e o custo aparece no dia em que o alerta é verdadeiro.
+
+★ O QUE ELE NUNCA FAZ
+
+Não fecha por opinião, por idade nem por "provavelmente já passou". Cada chave
+tem um VERIFICADOR próprio que consulta a série viva e exige um piso de amostras
+saudáveis consecutivas. Chave sem verificador declarado NÃO é tocada — silêncio
+por desconhecimento é melhor que fechamento por chute, que seria a fraude
+operacional que o contrato proíbe.
+
+Uso:
+    tools/generate-alertas-reconciliados            # aplica
+    tools/generate-alertas-reconciliados --ensaio   # só mostra o que faria
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import time
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ESTADO = os.path.join(RAIZ, "data/ops/owner_alerts_state.json")
+NOTIFY = os.path.join(RAIZ, "tools/notify-owner")
+
+AMOSTRAS_SAUDAVEIS = 3  # transitório não fecha alerta; três seguidas, sim
+
+
+def ultimas_linhas(rel, n):
+    caminho = os.path.join(RAIZ, rel)
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            linhas = fh.readlines()
+    except OSError:
+        return []
+    saida = []
+    for linha in linhas[-n:]:
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            saida.append(json.loads(linha))
+        except ValueError:
+            continue
+    return saida
+
+
+def unit_saudavel(unit):
+    """Result=success e ActiveState fora de failed, lido do systemd."""
+    try:
+        saida = subprocess.run(
+            ["systemctl", "show", unit, "-p", "Result", "-p", "ActiveState"],
+            capture_output=True, text=True, timeout=20, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, "systemctl indisponivel"
+    campos = dict(l.split("=", 1) for l in saida.strip().splitlines() if "=" in l)
+    ok = campos.get("Result") == "success" and campos.get("ActiveState") != "failed"
+    return ok, f"Result={campos.get('Result')} ActiveState={campos.get('ActiveState')}"
+
+
+def v_borda_origem():
+    eventos = ultimas_linhas("data/ops/edge_live.jsonl", AMOSTRAS_SAUDAVEIS)
+    if len(eventos) < AMOSTRAS_SAUDAVEIS:
+        return None, "serie curta demais para concluir"
+    ok = all(e.get("ok") is True for e in eventos)
+    return ok, f"ultimos {len(eventos)} eventos de edge_live: ok={[e.get('ok') for e in eventos]}"
+
+
+def v_portal_degradado():
+    eventos = ultimas_linhas("data/ops/portal_health.jsonl", AMOSTRAS_SAUDAVEIS)
+    if len(eventos) < AMOSTRAS_SAUDAVEIS:
+        return None, "serie curta demais para concluir"
+    ok = all(not e.get("problems") and not e.get("problemas") for e in eventos)
+    return ok, f"ultimos {len(eventos)} de portal_health sem problemas: {ok}"
+
+
+def v_untracked():
+    exe = os.path.join(RAIZ, "tools/check-untracked-product-inventory")
+    if not os.access(exe, os.X_OK):
+        return None, "gate ausente"
+    try:
+        rc = subprocess.run([exe], capture_output=True, text=True, timeout=180, check=False).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None, "gate nao executou"
+    return rc == 0, f"check-untracked-product-inventory exit={rc}"
+
+
+def v_unit(unit):
+    return lambda: unit_saudavel(unit)
+
+
+# ★ AS TRÊS CHAVES QUE FICAVAM ABERTAS PARA SEMPRE (2026-08-29, BUG-018)
+#
+# O reconciliador nasceu fechando o que tinha critério e deixando o resto
+# INTOCADO — decisão certa, porque fechar sem critério é pior que não fechar.
+# Mas três chaves nunca ganharam critério, e ficar aberto para sempre tem o
+# mesmo efeito que o alerta falso: o dono aprende a ignorar o canal, e o alerta
+# verdadeiro chega no meio do ruído. Cada uma abaixo fecha por evidência da
+# série viva, nunca por tempo decorrido.
+
+
+def v_onda_diaria():
+    """Fecha quando a última execução COMPLETA da onda não reprovou etapa.
+
+    A série `daily_content_runs.jsonl` grava uma linha por execução, com
+    `resultado` e `falhas`. `resultado: "parcial"` com `falhas: ["publicacao"]`
+    é exatamente o estado que abre o alerta — então o critério de fecho é o
+    inverso, lido do mesmo campo que o abriu.
+
+    ★ ENSAIO NÃO FECHA ALERTA (2026-08-29, achado do crítico adversarial).
+
+    A primeira versão lia UMA linha, apoiada em "a onda roda uma vez por dia".
+    Duas coisas derrubaram isso, e as duas foram medidas no dado vivo:
+
+      - `--seco` sai no passo 2/9, ANTES de preservação, commit e publicação, e
+        o trap grava a linha do mesmo jeito, com `resultado: "ok"`. Um ensaio
+        rodado por qualquer motivo fecharia o alerta de uma publicação que nunca
+        aconteceu.
+      - "uma vez por dia" é falso: 2026-08-26 tem NOVE execuções, seis
+        `parcial` com famílias de falha distintas e três `ok`.
+
+    O produtor passou a declarar `escopo` (`completa`/`ensaio`), e este
+    verificador só olha linha `completa`. Linha antiga não tem o campo — e
+    ausência é tratada como "não sei", nunca como "completa": chave sem
+    evidência fica ABERTA, que é o lado seguro para um canal de alerta.
+    """
+    linhas = ultimas_linhas("data/ops/daily_content_runs.jsonl", 40)
+    if not linhas:
+        return None, "serie de execucoes da onda ausente ou vazia"
+    completas = [x for x in linhas if str(x.get("escopo") or "").lower() == "completa"]
+    if not completas:
+        return None, (
+            "nenhuma execucao COMPLETA na serie recente; linha sem o campo `escopo` "
+            "e anterior a 2026-08-29 e nao prova publicacao"
+        )
+    ultima = completas[-1]
+    falhas = ultima.get("falhas")
+    # `falhas` e uma lista JSON em todas as 100% das linhas do ledger vivo
+    # (medido: `{type(json.loads(l)['falhas']).__name__}` devolve `{'list'}`),
+    # e o produtor sempre serializa lista. O ramo de string abaixo NAO descreve
+    # um formato observado -- ele existe porque tratar so a lista faria uma
+    # string nao-vazia parecer ausencia de falha, e o custo de mante-lo e uma
+    # linha. A primeira versao deste comentario afirmava que o produtor gravava
+    # `str(lista)` "em algumas passadas": isso era afirmacao sem medicao, e o
+    # dado a refuta.
+    if isinstance(falhas, str):
+        houve_falha = falhas.strip() not in ("", "[]", "None")
+    else:
+        houve_falha = bool(falhas)
+    resultado = str(ultima.get("resultado") or "").lower()
+    ok = not houve_falha and resultado not in ("parcial", "falha", "erro")
+    return ok, (
+        f"ultima onda COMPLETA {ultima.get('data')}: resultado={resultado!r} "
+        f"falhas={falhas!r} (de {len(linhas)} execucoes recentes, {len(completas)} completas)"
+    )
+
+
+def serie_fresca(rel, horas):
+    """A série foi atualizada nas últimas `horas`? (None quando não dá para saber)
+
+    ★ POR QUE EXISTE (2026-08-29, achado do crítico adversarial).
+
+    Verificador que só pergunta "o gate passou?" fecha alerta por DADO MORTO: se
+    o produtor da série parar, o gate avalia um fóssil, passa, e a chave fecha
+    justamente quando a observabilidade morreu. É o mesmo formato do gate que
+    aprovava com o manifesto vazio — aprovar por ausência de evidência.
+    """
+    caminho = os.path.join(RAIZ, rel)
+    try:
+        idade_h = (time.time() - os.path.getmtime(caminho)) / 3600.0
+    except OSError:
+        return None, f"{rel} ausente"
+    return idade_h <= horas, f"{rel} atualizada ha {idade_h:.1f}h (teto {horas}h)"
+
+
+def v_bot_abandono():
+    """Fecha quando o próprio gate de abandono volta a passar, com dado FRESCO.
+
+    Mesmo padrão de `v_untracked`: quem decide se a condição se curou é o
+    detector que a abriu, não uma segunda leitura da série que poderia
+    divergir dele. `exit 1` significa "há bot valioso em queda" e mantém aberto.
+
+    Duas guardas que a primeira versão não tinha, ambas fail-open apanhadas pelo
+    crítico: o gate sai 0 com o estado PRESENTE E VAZIO (`agentes: {}`), isto é,
+    fecha o alerta quando a observabilidade morreu; e nada exigia frescor, então
+    série parada há uma semana fechava a chave.
+    """
+    fresca, motivo = serie_fresca("data/ops/bot_return_state.json", 48)
+    if fresca is not True:
+        return None, f"nao da para concluir: {motivo}"
+    try:
+        with open(os.path.join(RAIZ, "data/ops/bot_return_state.json"), encoding="utf-8") as fh:
+            estado = json.load(fh)
+    except (OSError, ValueError) as erro:
+        return None, f"estado de retorno de bot ilegivel: {erro}"
+    if not estado.get("agentes"):
+        return None, "estado de retorno de bot PRESENTE e VAZIO — observabilidade morta, nao cura"
+    exe = os.path.join(RAIZ, "tools/check-bot-abandonment")
+    if not os.access(exe, os.X_OK):
+        return None, "gate ausente"
+    try:
+        rc = subprocess.run([exe], capture_output=True, text=True, timeout=300, check=False).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None, "gate nao executou"
+    return rc == 0, f"check-bot-abandonment exit={rc}; {motivo}"
+
+
+def v_rede():
+    """Fecha quando a rede local sai de degradada em N amostras seguidas.
+
+    Aqui N amostras importam, ao contrário da onda: a sonda de rede roda muitas
+    vezes ao dia e um único ciclo bom pode ser trégua entre duas quedas. É a
+    mesma régua de `v_borda_origem`.
+    """
+    fresca, motivo = serie_fresca("data/ops/network_health.jsonl", 6)
+    if fresca is not True:
+        # Sonda morta com tres linhas antigas e limpas fecharia a chave. Frescor
+        # antes de conteudo: sem sonda viva nao ha o que concluir.
+        return None, f"nao da para concluir: {motivo}"
+    eventos = ultimas_linhas("data/ops/network_health.jsonl", AMOSTRAS_SAUDAVEIS)
+    if len(eventos) < AMOSTRAS_SAUDAVEIS:
+        return None, "serie curta demais para concluir"
+    ok = all(not e.get("degradado") and not e.get("problemas") for e in eventos)
+    return ok, f"ultimos {len(eventos)} de network_health sem degradacao: {ok}; {motivo}"
+
+
+def v_tunel():
+    """Fecha a família `tunel-*` quando a saúde viva diz que o túnel está inteiro.
+
+    ★ POR QUE ESTAS CHAVES FICAVAM ABERTAS PARA SEMPRE (2026-09-05)
+
+    `check-tunnel-health` resolve a chave num `elif anterior.get("degradado")`:
+    só há resolução se a execução ANTERIOR tiver visto degradação. Basta o
+    estado do vigia se perder (arquivo novo, reinício, ciclo pulado) entre o
+    ciclo ruim e o bom para que a transição nunca seja observada — e a chave
+    fica aberta com o túnel medido saudável no mesmo instante.
+
+    Medido em 2026-09-05: `tunel-uplink`, severidade CRÍTICA, aberta desde
+    2026-09-04T13:33 e sem um único envio novo desde então, enquanto
+    `tunnel_health.jsonl` gravava a cada ~35 s `frota_vivas 5, frota_total 5,
+    ha_connections 4, degradado false, problemas []`. Alerta stale, não
+    incidente — exatamente o formato do `borda-origem` que fez este
+    reconciliador existir.
+
+    O CRITÉRIO É O INVERSO DO QUE ABRE, lido do mesmo campo: o vigia alerta
+    dentro de `if degradado:`, e `degradado = bool(problemas)` na origem. Por
+    isso aqui se exige `degradado is False` E `problemas` vazio — as duas
+    leituras do mesmo fato, para que um produtor que gravasse uma sem a outra
+    não fechasse a chave por meia evidência.
+
+    Frescor de 1 h porque a série é escrita a cada ~35 s: mais que isso já é
+    sonda morta, e gate que aprova fóssil fecha alerta justamente quando a
+    observabilidade morreu.
+    """
+    fresca, motivo = serie_fresca("data/ops/tunnel_health.jsonl", 1)
+    if fresca is not True:
+        return None, f"nao da para concluir: {motivo}"
+    eventos = ultimas_linhas("data/ops/tunnel_health.jsonl", AMOSTRAS_SAUDAVEIS)
+    if len(eventos) < AMOSTRAS_SAUDAVEIS:
+        return None, "serie curta demais para concluir"
+    ok = all(e.get("degradado") is False and not e.get("problemas") for e in eventos)
+    resumo = "; ".join(
+        f"{e.get('checked_at')}: degradado={e.get('degradado')} "
+        f"frota={e.get('frota_vivas')}/{e.get('frota_total')} "
+        f"ha={e.get('ha_connections')} problemas={e.get('problemas')}"
+        for e in eventos)
+    return ok, f"ultimos {len(eventos)} de tunnel_health: {resumo}; {motivo}"
+
+
+# Cada chave só fecha se o VERIFICADOR dela disser que a condição se curou.
+# Chave ausente daqui é deliberadamente intocada.
+VERIFICADORES = {
+    "borda-origem": v_borda_origem,
+    "portal-degradado": v_portal_degradado,
+    "portal-fora": v_portal_degradado,
+    "untracked-produto-esquecido": v_untracked,
+    "unit-falhou-wikijuridica-edge-warm": v_unit("wikijuridica-edge-warm.service"),
+    "unit-falhou-wikijuridica-daily-content": v_unit("wikijuridica-daily-content.service"),
+    "unit-falhou-wikijuridica-qualidade-diaria": v_unit("wikijuridica-qualidade-diaria.service"),
+    "onda-diaria": v_onda_diaria,
+    "bot-abandono": v_bot_abandono,
+    "bot-queda-de-volume": v_bot_abandono,
+    "rede-troca-banda": v_rede,
+    # As QUATRO classes que tools/check-tunnel-health emite. Estao listadas uma
+    # a uma por serem as medidas hoje, e `verificador_de` ainda deriva qualquer
+    # `tunel-*` nova pelo prefixo — foi a falta dessa derivacao na familia
+    # `unit-falhou-*` que deixou duas chaves 27 h e 44 h abertas em 2026-09-03.
+    "tunel-uplink": v_tunel,
+    "tunel-conexoes": v_tunel,
+    "tunel-frota": v_tunel,
+    "tunel-sinais": v_tunel,
+}
+
+
+LEDGER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data/ops/owner_alerts.jsonl")
+
+
+def ultima_linha_por_chave():
+    """Estado por chave segundo o LEDGER — a ultima linha vence, nunca a contagem.
+
+    Mesma leitura que tools/check-owner-alerts-abertos faz, e de proposito: o
+    reconciliador tem de enxergar exatamente o conjunto que o consumidor cobra,
+    senao um reprova pelo que o outro nao ve.
+    """
+    ultimo = {}
+    try:
+        with open(LEDGER, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                try:
+                    evento = json.loads(linha)
+                except ValueError:
+                    continue
+                chave = evento.get("chave")
+                if chave:
+                    ultimo[chave] = evento
+    except OSError:
+        return {}
+    return ultimo
+
+
+def verificador_de(chave):
+    """Resolve o verificador da chave, DERIVANDO o das units pelo nome.
+
+    O mapa acima listava `unit-falhou-*` uma a uma, e foi assim que o buraco
+    apareceu: em 2026-09-03 as chaves de `wikijuridica-crawler-error-budget` e
+    `wikijuridica-disk-headroom` estavam abertas ha 27 h e 44 h com as duas
+    units OK — nenhuma das duas constava do mapa, entao o reconciliador as
+    classificava como "sem criterio" e nao as tocava. Cada unit nova do
+    repositorio abriria o mesmo buraco de novo.
+    
+    A chave `unit-falhou-<nome>` ja CARREGA a unit no proprio nome — quem a
+    emite (tools/check-units-alarme) a monta assim. Derivar dai fecha a familia
+    inteira de uma vez, e uma entrada explicita no mapa continua tendo
+    precedencia, para o caso de alguma unit precisar de criterio proprio.
+    """
+    explicito = VERIFICADORES.get(chave)
+    if explicito is not None:
+        return explicito
+    if chave.startswith("unit-falhou-"):
+        nome = chave[len("unit-falhou-"):]
+        if nome and "/" not in nome and ".." not in nome:
+            return v_unit(nome if nome.endswith(".service") else nome + ".service")
+    # A familia do tunel tem UM criterio para todas as classes: o vigia so abre
+    # qualquer uma delas dentro de `if degradado:`, entao o inverso e o mesmo
+    # para as quatro. Classe nova em check-tunnel-health ja nasce reconciliavel.
+    if chave.startswith("tunel-"):
+        return v_tunel
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--ensaio", action="store_true", help="mostra sem aplicar")
+    args = ap.parse_args()
+
+    try:
+        with open(ESTADO, encoding="utf-8") as fh:
+            estado = json.load(fh)
+    except OSError as erro:
+        # Ledger ausente é anomalia, não estado inicial: o canal grava desde
+        # julho. Falhar alto, nunca aprovar por ausência de dado.
+        print(f"estado de alertas ilegivel em {ESTADO}: {erro}", file=sys.stderr)
+        return 2
+
+    abertas = {k: v for k, v in estado.items() if isinstance(v, dict) and v.get("aberto")}
+    # E TAMBEM as que o LEDGER mostra abertas, que e a fonte que o consumidor
+    # cobra. Medido em 2026-09-03: o estado trazia 1 chave aberta e o ledger 7 —
+    # `unit-falhou-wikijuridica-crawler-error-budget`,
+    # `unit-falhou-wikijuridica-disk-headroom`, `onda-diaria`,
+    # `untracked-produto-esquecido` e outras duas apareciam so no ledger. O
+    # `check-owner-alerts-abertos` reprovava por elas e este reconciliador nem
+    # as via, entao ninguem nunca as fechava: duas ficaram 27 h e 44 h abertas
+    # com a condicao ja curada.
+    #
+    # A CAUSA e que as duas fontes tem durabilidades diferentes: o estado e um
+    # JSON reescrito a cada envio (e chave podada some), o ledger e append-only.
+    # Reconciliar contra a fonte mais fraca deixava a mais forte acumulando
+    # divida. Aqui elas se juntam, e o estado tem precedencia quando as duas
+    # conhecem a chave, porque ele carrega `ocorrencias` e `aberto_desde`.
+    for chave, ultimo in ultima_linha_por_chave().items():
+        if chave in abertas or ultimo.get("resolvido"):
+            continue
+        abertas[chave] = {
+            "aberto": True,
+            "aberto_desde": ultimo.get("aberto_desde") or ultimo.get("alertado_em"),
+            "severidade": ultimo.get("severidade"),
+            "ocorrencias": ultimo.get("ocorrencias", 0),
+        }
+    if not abertas:
+        print("reconciliador: nenhuma chave aberta")
+        return 0
+
+    fechadas, mantidas, sem_criterio = [], [], []
+    for chave, registro in sorted(abertas.items()):
+        verificador = verificador_de(chave)
+        if verificador is None:
+            sem_criterio.append(chave)
+            continue
+        curada, evidencia = verificador()
+        if curada is not True:
+            mantidas.append((chave, evidencia))
+            continue
+        print(f"reconciliador: {chave} — condicao curada ({evidencia})")
+        if not args.ensaio:
+            subprocess.run(
+                [NOTIFY, "--chave", chave, "--resolvido",
+                 "--titulo", f"{chave}: condicao normalizada",
+                 "--mensagem", f"fechado por reconciliacao com a serie viva: {evidencia}"[:400]],
+                check=False, timeout=60,
+            )
+        fechadas.append(chave)
+
+    print(f"reconciliador: fechadas={len(fechadas)} mantidas={len(mantidas)} sem_criterio={len(sem_criterio)}")
+    for chave, evidencia in mantidas:
+        print(f"  MANTIDA  {chave}: {evidencia}")
+    for chave in sem_criterio:
+        print(f"  SEM CRITERIO (intocada) {chave}")
+    return 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16): excecao nao tratada saia 1, a unit mascara
+    # o 1 como veredito e o OnFailure ficava mudo. Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

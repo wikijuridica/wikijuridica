@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""measure-experimento — lê os desfechos REAIS do disco e devolve o veredito com intervalo.
+
+★ A REGRA QUE ESTA FERRAMENTA EXISTE PARA CUMPRIR
+**Nunca declarar vencedor sem intervalo de credibilidade.** Amostra pequena
+sai como `sem_decisao`, dizendo quantos eventos e quantos páginas×dias ainda
+faltam por braço. Um A/B que anuncia vencedor com dez eventos é pior que
+nenhum A/B: ele troca o texto do acervo com base em ruído, e a troca re-data a
+página no sitemap.
+
+★ O MODELO, E POR QUE NÃO É BETA-BERNOULLI
+O desfecho é CONTAGEM por página-dia (leituras de bot, impressões, sessões),
+não sucesso/fracasso por visita. O par natural é Poisson com prior Gama:
+
+    λ_braço | dados  ~  Gama(α₀ + Σ eventos,  taxa = Σ páginas×dias)
+
+com α₀ = 0,5 (Jeffreys). A razão de taxas tem forma FECHADA — se
+λ_v ~ Gama(a_v, b_v) e λ_c ~ Gama(a_c, b_c), então
+
+    λ_v/λ_c = (b_c/b_v)·(a_v/a_c)·F(2a_v, 2a_c)
+
+logo P(variante melhor) = F.sf((b_v/b_c)·(a_c/a_v); 2a_v, 2a_c) e o intervalo de
+95% sai de F.ppf. Nada de Monte Carlo com dois braços: o número é EXATO e
+reprodutível bit a bit, que é o que a regra R3 do contrato de dado real exige.
+Com três braços ou mais, aí sim há sorteio — e a semente vai gravada na linha.
+
+★ THOMPSON SAMPLING, NUM DESENHO EM QUE A PÁGINA NÃO PODE TROCAR DE BRAÇO
+Thompson aloca proporcionalmente à probabilidade de cada braço ser o melhor.
+Aqui a alocação NÃO se aplica de volta às páginas já sorteadas: mudar o braço
+de uma página no meio da janela reescreve o HTML, re-data o registro e
+reanuncia a URL ao buscador — o desfecho medido viraria uma mistura das duas
+variantes. Então o peso de Thompson governa a coorte SEGUINTE: é a fração de
+páginas novas que cada braço deve receber na próxima janela. O peso vai
+impresso e gravado; aplicá-lo é passar `--fracao`/`--paginas` ao
+`generate-experimento` da próxima leva.
+
+★ MEDIR ANTES DE APLICAR É UM A/A, E É DITO COM ESSA PALAVRA
+Enquanto `aplicado_em` for nulo, os dois braços servem o MESMO conteúdo. A
+medição continua valendo — ela mostra se o sorteio deixou os braços
+equilibrados na linha de base —, mas o veredito é `sem_decisao` com motivo
+`variante_nao_aplicada`, e a saída é 4. Contar esses dias como tratamento seria
+inventar efeito onde não houve intervenção.
+
+Saídas: 0 medição concluída · 2 fonte ausente · 3 experimento inexistente ·
+4 medição A/A (variante ainda não aplicada).
+"""
+import argparse
+import datetime as dt
+import importlib
+import json
+import math
+import os
+import sys
+
+import numpy as np
+from scipy import stats
+
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+X = importlib.import_module("experimentos")
+
+ALPHA0 = 0.5          # prior de Jeffreys para a taxa de Poisson
+NIVEL = 0.95
+SEMENTE_MC = 20260910  # só usada com três braços ou mais; vai gravada na linha
+
+
+def janela(registro, ate, desde, dias):
+    """Início e fim da janela de medição, em datas ISO."""
+    fim = ate or dt.date.today().isoformat()
+    if desde:
+        return desde, fim
+    aplicado = (registro.get("aplicado_em") or "")[:10]
+    largura = dias or registro.get("janela_dias") or X.JANELA_DIAS_PADRAO
+    partida = dt.date.fromisoformat(fim) - dt.timedelta(days=largura - 1)
+    if aplicado and aplicado > partida.isoformat():
+        return aplicado, fim
+    return partida.isoformat(), fim
+
+
+def eventos_por_braco(registro, desfecho, inicio, fim, raiz):
+    """Eventos e exposição por braço, mais o que a fonte declara sobre si.
+
+    A exposição é páginas × DIAS COM SÉRIE, nunca páginas × dias do calendário:
+    dia em que a coleta não rodou é dia ausente, e tratá-lo como zero inventaria
+    exposição que ninguém observou.
+    """
+    coorte = registro.get("coorte") or []
+    bracos = [b["nome"] for b in registro.get("bracos") or []]
+    por_path = {X.normaliza_path(item["path"]): item["braco"] for item in coorte}
+
+    if desfecho == "bot_ia_leituras":
+        contagem, meta = X.le_bot_ia_por_rota(raiz, inicio, fim)
+        dias = sorted({data for data, _ in contagem})
+        eventos = {nome: 0 for nome in bracos}
+        for (_data, caminho), quantas in contagem.items():
+            braco = por_path.get(caminho)
+            if braco:
+                eventos[braco] += quantas
+        cobertura = {"dias_com_serie": len(dias), "dias": dias}
+    elif desfecho in ("bing_impressoes", "bing_cliques"):
+        campo = "impressoes" if desfecho == "bing_impressoes" else "cliques"
+        contagem, meta = X.le_bing_por_pagina(raiz, inicio, fim)
+        dias = sorted({data for data, _ in contagem})
+        eventos = {nome: 0 for nome in bracos}
+        for (_data, caminho), valores in contagem.items():
+            braco = por_path.get(caminho)
+            if braco:
+                eventos[braco] += valores[campo]
+        cobertura = {"dias_com_serie": len(dias), "dias": dias,
+                     "paginas_dia_parciais": meta["parciais"]}
+    elif desfecho == "clarity_sessoes":
+        coletas, meta = X.le_clarity_por_url(raiz, inicio, fim)
+        eventos = {nome: 0 for nome in bracos}
+        # A exposição de cada coleta é pesada pela JANELA DELA: uma coleta de 3
+        # dias observa cerca de três vezes mais sessão que uma de 1 dia, e
+        # contar as duas como "uma observação" faria a taxa depender do tamanho
+        # da janela em vez do comportamento da página.
+        dias_com_serie = 0
+        for coleta in coletas:
+            dias_com_serie += int(coleta.get("janela_dias") or 1)
+            for caminho, sessoes in coleta["sessoes"].items():
+                braco = por_path.get(caminho)
+                if braco:
+                    eventos[braco] += sessoes
+        cobertura = {"coletas": meta["coletas"], "janelas_dias": meta["janelas"],
+                     "dias_com_serie": dias_com_serie,
+                     "observacoes_independentes": False,
+                     "por_que": ("as janelas do Clarity se sobrepõem (1 e 3 dias sobre o "
+                                 "mesmo período), então as observações são correlacionadas "
+                                 "e o intervalo sai OTIMISTA — motivo pelo qual este "
+                                 "desfecho informa e não decide")}
+    else:
+        raise ValueError(f"desfecho desconhecido: {desfecho}")
+
+    paginas = {nome: sum(1 for item in coorte if item["braco"] == nome) for nome in bracos}
+    dias_com_serie = cobertura["dias_com_serie"]
+    exposicao = {nome: paginas[nome] * dias_com_serie for nome in bracos}
+    return {"eventos": eventos, "paginas": paginas, "exposicao": exposicao,
+            "cobertura": cobertura, "fonte": X.DESFECHOS[desfecho]["fonte"],
+            "ressalvas": meta["ressalvas"]}
+
+
+def posterior(eventos, exposicao):
+    """Gama(α₀+Y, taxa=E) e o intervalo de 95% da taxa. Sem exposição, sem posterior."""
+    if exposicao <= 0:
+        return None
+    forma = ALPHA0 + eventos
+    taxa = float(exposicao)
+    baixo, alto = stats.gamma.ppf([(1 - NIVEL) / 2, 1 - (1 - NIVEL) / 2], forma, scale=1.0 / taxa)
+    return {"alpha": forma, "taxa_do_prior_mais_exposicao": taxa,
+            "media": forma / taxa, "ic95": [float(baixo), float(alto)]}
+
+
+def compara(post_v, post_c):
+    """P(variante > controle) e IC95 da razão de taxas — forma fechada, sem sorteio."""
+    a_v, b_v = post_v["alpha"], post_v["taxa_do_prior_mais_exposicao"]
+    a_c, b_c = post_c["alpha"], post_c["taxa_do_prior_mais_exposicao"]
+    limiar = (b_v / b_c) * (a_c / a_v)
+    p_melhor = float(stats.f.sf(limiar, 2 * a_v, 2 * a_c))
+    escala = (b_c / b_v) * (a_v / a_c)
+    baixo, alto = (float(escala * stats.f.ppf(q, 2 * a_v, 2 * a_c))
+                   for q in ((1 - NIVEL) / 2, 1 - (1 - NIVEL) / 2))
+    return {"p_variante_melhor": p_melhor,
+            "razao_de_taxas": post_v["media"] / post_c["media"],
+            "razao_ic95": [baixo, alto],
+            "metodo": "exato: (λv/λc) = (bc/bv)(av/ac)·F(2av,2ac)"}
+
+
+def pesos_thompson(posteriores, semente=SEMENTE_MC, sorteios=200000):
+    """P(cada braço ser o melhor) = peso de alocação da PRÓXIMA coorte.
+
+    Com dois braços o número sai da forma fechada de `compara`; com três ou
+    mais não há forma fechada e entra sorteio com semente FIXA e gravada, para
+    que a mesma linha do ledger dê sempre o mesmo peso.
+    """
+    nomes = list(posteriores)
+    if len(nomes) == 2:
+        comp = compara(posteriores[nomes[1]], posteriores[nomes[0]])
+        p = comp["p_variante_melhor"]
+        return {nomes[1]: p, nomes[0]: 1.0 - p}, {"metodo": "exato", "semente": None}
+    rng = np.random.default_rng(semente)
+    amostras = np.stack([rng.gamma(posteriores[n]["alpha"], 1.0 / posteriores[n]["taxa_do_prior_mais_exposicao"],
+                                   sorteios) for n in nomes])
+    vencedor = np.argmax(amostras, axis=0)
+    return ({nome: float((vencedor == i).mean()) for i, nome in enumerate(nomes)},
+            {"metodo": "monte carlo", "semente": semente, "sorteios": sorteios})
+
+
+def veredito(registro, medida, comp, aplicado):
+    """A regra fixada ANTES da medição, aplicada sem ajuste.
+
+    Ela mora no registro do experimento (`regra_de_veredito`), gravada no dia
+    em que ele nasceu. Ler a regra do registro, e não de um parâmetro desta
+    execução, é o que impede escolher o limiar depois de ver o resultado.
+    """
+    regra = registro.get("regra_de_veredito") or {}
+    piso_eventos = regra.get("piso_eventos_por_braco", 30)
+    piso_exposicao = regra.get("piso_page_days_por_braco", 100)
+    p_adotar = regra.get("p_variante_melhor_para_adotar", 0.95)
+    p_descartar = regra.get("p_variante_melhor_para_descartar", 0.05)
+
+    faltam = {}
+    for nome, quantos in medida["eventos"].items():
+        if quantos < piso_eventos:
+            faltam.setdefault("eventos", {})[nome] = piso_eventos - quantos
+    for nome, quanta in medida["exposicao"].items():
+        if quanta < piso_exposicao:
+            faltam.setdefault("page_days", {})[nome] = piso_exposicao - quanta
+
+    if not aplicado:
+        return ("sem_decisao", "variante_nao_aplicada: os dois braços servem o mesmo "
+                "conteúdo, então isto é um A/A de linha de base, não medição de efeito",
+                faltam)
+    if faltam:
+        return ("sem_decisao", "amostra abaixo do piso fixado antes da medição", faltam)
+    if comp is None:
+        return "sem_decisao", "sem exposição em algum braço", faltam
+
+    exclui_um = comp["razao_ic95"][0] > 1.0 or comp["razao_ic95"][1] < 1.0
+    if comp["p_variante_melhor"] >= p_adotar and exclui_um:
+        return "adotar", f"P(variante melhor)={comp['p_variante_melhor']:.3f} ≥ {p_adotar} e IC95 da razão exclui 1", faltam
+    if comp["p_variante_melhor"] <= p_descartar and exclui_um:
+        return "descartar", f"P(variante melhor)={comp['p_variante_melhor']:.3f} ≤ {p_descartar} e IC95 da razão exclui 1", faltam
+    return ("continuar",
+            f"P(variante melhor)={comp['p_variante_melhor']:.3f} e IC95 da razão "
+            f"[{comp['razao_ic95'][0]:.3f}, {comp['razao_ic95'][1]:.3f}] ainda não decide", faltam)
+
+
+def mede(registro, raiz, desfecho, inicio, fim):
+    medida = eventos_por_braco(registro, desfecho, inicio, fim, raiz)
+    bracos = [b["nome"] for b in registro.get("bracos") or []]
+    posteriores = {}
+    for nome in bracos:
+        post = posterior(medida["eventos"][nome], medida["exposicao"][nome])
+        if post is None:
+            posteriores = {}
+            break
+        posteriores[nome] = post
+    comp = compara(posteriores[bracos[1]], posteriores[bracos[0]]) if len(posteriores) >= 2 else None
+    pesos, como = pesos_thompson(posteriores) if posteriores else ({}, {"metodo": "sem exposição"})
+    return medida, posteriores, comp, pesos, como
+
+
+def principal(argv=None):
+    parser = argparse.ArgumentParser(
+        description="mede um experimento A/B por página e devolve o veredito com intervalo")
+    parser.add_argument("--experimento", default=None, help="id do experimento no ledger")
+    parser.add_argument("--ultimo", action="store_true", help="mede o experimento mais recente")
+    parser.add_argument("--desfecho", default=None, choices=sorted(X.DESFECHOS),
+                        help="padrão: o desfecho primário declarado no experimento")
+    parser.add_argument("--desde", default=None)
+    parser.add_argument("--ate", default=None)
+    parser.add_argument("--dias", type=int, default=None, help="largura da janela (padrão: a do experimento)")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--gravar", action="store_true",
+                        help="acrescenta a medição ao ledger; sem a bandeira nada é escrito")
+    parser.add_argument("--raiz", default=X.raiz_do_repo(__file__))
+    args = parser.parse_args(argv)
+
+    try:
+        registros = X.le_ledger(args.raiz)
+    except ValueError as erro:
+        print(f"ledger ilegível: {erro}", file=sys.stderr)
+        return 2
+    experimentos = [r for r in registros if r.get("tipo") == "experimento"]
+    if not experimentos:
+        print(f"nenhum experimento em {X.LEDGER_REL} — rode tools/generate-experimento --aplicar",
+              file=sys.stderr)
+        return 3
+    # O estado vivo vem DOBRADO sobre o ledger append-only: ler só a linha de
+    # criação devolveria `aplicado_em` nulo para sempre, e toda medição sairia
+    # como A/A mesmo com a variante no ar há semanas.
+    vivos = X.dobra_experimentos(registros)
+    if args.ultimo:
+        registro = vivos[experimentos[-1]["experimento_id"]]
+    else:
+        if not args.experimento:
+            print("erro: informe --experimento <id> ou --ultimo. Ids no ledger: "
+                  + ", ".join(sorted(vivos)), file=sys.stderr)
+            return 3
+        if args.experimento not in vivos:
+            print(f"erro: experimento {args.experimento} não está no ledger", file=sys.stderr)
+            return 3
+        registro = vivos[args.experimento]
+
+    desfecho = args.desfecho or registro.get("desfecho_primario") or X.DESFECHO_PRIMARIO_PADRAO
+    inicio, fim = janela(registro, args.ate, args.desde, args.dias)
+    aplicado = bool(registro.get("aplicado_em"))
+
+    try:
+        medida, posteriores, comp, pesos, como = mede(registro, args.raiz, desfecho, inicio, fim)
+        secundarios = {}
+        for nome in X.DESFECHOS:
+            if nome == desfecho:
+                continue
+            outra, post_s, comp_s, _p, _c = mede(registro, args.raiz, nome, inicio, fim)
+            secundarios[nome] = {"eventos": outra["eventos"], "exposicao": outra["exposicao"],
+                                 "cobertura": outra["cobertura"],
+                                 "p_variante_melhor": comp_s["p_variante_melhor"] if comp_s else None,
+                                 "decide": False}
+    except X.FonteAusente as erro:
+        print(f"fonte ausente: {erro}", file=sys.stderr)
+        return 2
+
+    primario_declarado = registro.get("desfecho_primario") or X.DESFECHO_PRIMARIO_PADRAO
+    if desfecho != primario_declarado:
+        # Anti-escolha-a-dedo: o desfecho que decide foi fixado quando o
+        # experimento nasceu. Medir outro é legítimo e informa; virar veredito,
+        # não — seria escolher a régua depois de ver o número.
+        decisao = "sem_decisao"
+        motivo = (f"o desfecho medido ({desfecho}) não é o primário declarado "
+                  f"({primario_declarado}); só o primário decide")
+        _d, _m, faltam = veredito(registro, medida, comp, aplicado)
+    else:
+        decisao, motivo, faltam = veredito(registro, medida, comp, aplicado)
+    agora = X.agora_utc()
+    linha = {
+        "schema_version": X.SCHEMA_VERSION,
+        "tipo": "medicao",
+        "experimento_id": registro["experimento_id"],
+        "date": agora[:10],
+        "gerado_em": agora,
+        "janela": {"inicio": inicio, "fim": fim, "dias_no_calendario":
+                   (dt.date.fromisoformat(fim) - dt.date.fromisoformat(inicio)).days + 1},
+        "aplicado_em": registro.get("aplicado_em"),
+        "estado_do_experimento": registro.get("estado"),
+        "desfecho_primario": desfecho,
+        "fonte": medida["fonte"],
+        "paginas_por_braco": medida["paginas"],
+        "eventos_por_braco": medida["eventos"],
+        "exposicao_page_days": medida["exposicao"],
+        "cobertura": medida["cobertura"],
+        "posterior": {nome: {"alpha": p["alpha"], "exposicao": p["taxa_do_prior_mais_exposicao"],
+                             "taxa_media": p["media"], "ic95": p["ic95"]}
+                      for nome, p in posteriores.items()},
+        "comparacao": comp,
+        "pesos_thompson_proxima_coorte": pesos,
+        "thompson": como,
+        "veredito": decisao,
+        "motivo": motivo,
+        "faltam": faltam,
+        "prior": {"familia": "gama-poisson", "alpha0": ALPHA0, "nivel": NIVEL},
+        "desfechos_secundarios": secundarios,
+        "ressalvas": medida["ressalvas"],
+    }
+
+    if args.json:
+        print(json.dumps(linha, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        imprime(registro, linha)
+
+    # Com --json o stdout é JSON e nada mais (ver o mesmo cuidado em
+    # generate-experimento): o aviso de estado sai pelo stderr.
+    aviso = sys.stderr if args.json else sys.stdout
+    if args.gravar:
+        caminho = X.acrescenta_ao_ledger(args.raiz, linha)
+        print(f"\nGRAVADO em {os.path.relpath(caminho, args.raiz)}", file=aviso)
+    else:
+        print("\nENSAIO — nada foi escrito. Use --gravar para registrar a medição.", file=aviso)
+    return 4 if not aplicado else 0
+
+
+def imprime(registro, linha):
+    print(f"experimento      {linha['experimento_id']}  ({registro.get('fator')})")
+    print(f"estado           {linha['estado_do_experimento']}   aplicado_em: {linha['aplicado_em'] or 'ainda não'}")
+    print(f"janela           {linha['janela']['inicio']} a {linha['janela']['fim']} "
+          f"({linha['janela']['dias_no_calendario']} dias de calendário)")
+    print(f"desfecho         {linha['desfecho_primario']}  <- {linha['fonte']}")
+    cobertura = linha["cobertura"]
+    print(f"cobertura        {cobertura}")
+    print()
+    print(f"{'braço':<20}{'páginas':>9}{'eventos':>9}{'page-days':>11}{'taxa':>12}   IC95 da taxa")
+    for nome, post in linha["posterior"].items():
+        print(f"{nome:<20}{linha['paginas_por_braco'][nome]:>9}{linha['eventos_por_braco'][nome]:>9}"
+              f"{linha['exposicao_page_days'][nome]:>11}{post['taxa_media']:>12.5f}   "
+              f"[{post['ic95'][0]:.5f}, {post['ic95'][1]:.5f}]")
+    print()
+    comp = linha["comparacao"]
+    if comp:
+        print(f"P(variante melhor)   {comp['p_variante_melhor']:.4f}   ({comp['metodo']})")
+        print(f"razão de taxas       {comp['razao_de_taxas']:.4f}   "
+              f"IC95 [{comp['razao_ic95'][0]:.4f}, {comp['razao_ic95'][1]:.4f}]")
+    else:
+        print("sem comparação: algum braço ficou sem exposição observada")
+    if linha["pesos_thompson_proxima_coorte"]:
+        pesos = ", ".join(f"{n}={p:.3f}" for n, p in linha["pesos_thompson_proxima_coorte"].items())
+        print(f"Thompson (próxima coorte)  {pesos}")
+    print()
+    print(f"VEREDITO         {linha['veredito'].upper()}")
+    print(f"motivo           {linha['motivo']}")
+    if linha["faltam"]:
+        for classe, quanto in linha["faltam"].items():
+            for nome, quantos in quanto.items():
+                print(f"    faltam       {quantos} {classe} no braço {nome}")
+    print()
+    print("DESFECHOS SECUNDÁRIOS (informam, não decidem)")
+    for nome, dados in linha["desfechos_secundarios"].items():
+        p = dados["p_variante_melhor"]
+        print(f"    {nome:<20} eventos={dados['eventos']}  "
+              f"P={'n/d' if p is None else format(p, '.3f')}  cobertura={dados['cobertura']}")
+    print()
+    for ressalva in linha["ressalvas"]:
+        print(f"ressalva         {ressalva}")
+
+
+if __name__ == "__main__":
+    sys.exit(principal())

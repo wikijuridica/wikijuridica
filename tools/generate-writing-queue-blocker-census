@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""generate-writing-queue-blocker-census — POR QUE cada lote está fora da fila.
+
+O DEFEITO QUE ESTA FERRAMENTA EXISTE PARA DESFAZER (medido em 2026-09-05).
+`tools/verify_v2_writing_queue_closure.py` percorre todo lote do inventário
+integral que NÃO está na fila `todo` e exige que o shard esteja completo. Quando
+o classificador recusa, a linha 891 levanta
+
+    ValueError("classificador não confirmou lote completo")
+
+e a 895 embrulha em
+
+    "lote omitido sem shard completo <slug>: ..."
+
+Essa frase é a MESMA para 86 lotes que não têm nada em comum, e ela mente duas
+vezes: "omitido" quer dizer *omitido da fila de escrita*, não *sem páginas*; e
+"sem shard completo" sugere falta de redação onde, na maioria dos casos, o texto
+está inteiro no disco. Foi essa frase que sustentou a leitura de que "86 lotes
+aguardam redação" — falso para 40 deles.
+
+O diagnóstico existe e é jogado fora. `classify_batch_completion`
+(`tools/generate_v2_review_queue.py:3350`) calcula `complete` como a conjunção
+de CINCO condições (linhas 3484-3489) e devolve um `BatchCompletion` que só
+carrega o booleano. Quem chama não tem como saber qual das cinco reprovou.
+
+O QUE ESTA FERRAMENTA MEDE. Reconstrói exatamente os argumentos que o
+verificador passa ao classificador — `expected` de `_expected_intents` sobre o
+portfólio, `winners` de `audit_v2_pages.validated_duplicate_supersession_winners`,
+o bloqueio semântico de `semantic_blocked_for_batch` — e, para cada lote
+recusado, apura a causa REAL numa das cinco classes abaixo. Nada é inferido do
+texto da mensagem: cada classe sai de comparação de conjuntos sobre os mesmos
+dados que o classificador leu.
+
+    shard_ausente        o arquivo do shard não existe. Falta redigir tudo.
+    linha_faltante       o shard existe e faltam N intenções esperadas.
+                         Falta redigir N páginas, não o lote.
+    bloqueio_semantico   todas as linhas estão lá, mas alguma intenção está
+                         semanticamente bloqueada: a fonte oficial não tem
+                         resolução exata ligando requisito e linha revisada.
+                         NÃO é redação — é catálogo de fontes.
+    ordem_divergente     mesmo conjunto, mesma cardinalidade, ordem diferente
+                         da do slice pinado. ZERO redação necessária: é o
+                         `intent_order_mismatch` que o lote existe para reparar.
+    corpo_nao_reusavel   as linhas existem e estão na ordem, mas ao menos uma
+                         não satisfaz `writing_reusable_page` (rascunho, corpo
+                         ausente, tombstone sem vencedor autenticado).
+
+Escreve `data/ops/writing_queue_blockers.jsonl`, uma linha por lote recusado,
+ordenada por slug para diff estável. É `generate-*` porque escreve; a leitura
+correspondente é `--dry-run`, que imprime o censo sem tocar o disco.
+
+USO
+    ./tools/generate-writing-queue-blocker-census
+    ./tools/generate-writing-queue-blocker-census --dry-run
+    ./tools/generate-writing-queue-blocker-census --classe ordem_divergente
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+from typing import Any, Iterable, Mapping
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+DESTINO_REL = "data/ops/writing_queue_blockers.jsonl"
+
+CLASSES = (
+    "shard_ausente",
+    "linha_faltante",
+    "bloqueio_semantico",
+    "ordem_divergente",
+    "corpo_nao_reusavel",
+    "excecao_estrutural",
+)
+
+
+def _modulos(raiz: pathlib.Path):
+    """Importa os módulos reais do pipeline, sem cópia da lógica.
+
+    A ferramenta não reimplementa o classificador: ela o chama. Uma segunda
+    implementação divergiria em silêncio do original — que é exatamente o
+    defeito de contrato que este censo existe para expor.
+    """
+    for caminho in (str(raiz), str(raiz / "tools")):
+        if caminho not in sys.path:
+            sys.path.insert(0, caminho)
+    import importlib
+
+    verificador = importlib.import_module("verify_v2_writing_queue_closure")
+    produtor = importlib.import_module("generate_v2_review_queue")
+    from tools import audit_v2_pages as auditor
+
+    return verificador, produtor, auditor
+
+
+def _slugs_da_fila(verificador, raiz: pathlib.Path) -> set[str]:
+    todo, _ = verificador._static_batches(
+        raiz / "scripts/workflows/writing-mass-todo.js",
+        max_bytes=verificador._MAX_TODO_WORKFLOW_BYTES,
+        require_nonempty=False,
+    )
+    slugs: set[str] = set()
+    for indice, lote in enumerate(todo, 1):
+        slugs.add(verificador._validate_base_batch(lote, f"fila todo lote {indice}"))
+    return slugs
+
+
+def _registros_do_shard(caminho: pathlib.Path) -> list[Mapping[str, Any]]:
+    registros: list[Mapping[str, Any]] = []
+    for numero, linha in enumerate(
+            caminho.read_text(encoding="utf-8").splitlines(), 1):
+        if not linha.strip():
+            continue
+        try:
+            registro = json.loads(linha)
+        except json.JSONDecodeError as erro:
+            raise ValueError(f"linha {numero} não é JSON em {caminho.name}") from erro
+        if not isinstance(registro, Mapping):
+            raise ValueError(f"linha {numero} não é objeto em {caminho.name}")
+        registros.append(registro)
+    return registros
+
+
+def _classifica(slug: str, esperado: list[str], registros: list[Mapping[str, Any]],
+                bloqueadas: Iterable[str]) -> dict[str, Any]:
+    """Apura a causa real a partir dos MESMOS dados que o classificador leu."""
+    observado = [registro.get("intent_id") for registro in registros]
+    conjunto_esperado, conjunto_observado = set(esperado), set(observado)
+    faltantes = [i for i in esperado if i not in conjunto_observado]
+    excedentes = [i for i in observado if i not in conjunto_esperado]
+    bloqueadas_presentes = sorted(set(bloqueadas) & conjunto_esperado)
+
+    if faltantes:
+        classe, detalhe = "linha_faltante", faltantes
+    elif bloqueadas_presentes:
+        classe, detalhe = "bloqueio_semantico", bloqueadas_presentes
+    elif tuple(observado) != tuple(esperado) + tuple(excedentes):
+        classe, detalhe = "ordem_divergente", []
+    else:
+        classe, detalhe = "corpo_nao_reusavel", []
+
+    linha: dict[str, Any] = {
+        "slug": slug,
+        "classe": classe,
+        "exige_redacao": classe in ("shard_ausente", "linha_faltante"),
+        "esperadas": len(esperado),
+        "no_shard": len(observado),
+    }
+    if classe == "linha_faltante":
+        linha["intents_faltantes"] = detalhe
+    elif classe == "bloqueio_semantico":
+        linha["intents_bloqueadas"] = detalhe
+    elif classe == "ordem_divergente":
+        divergencias = [
+            posicao for posicao, (visto, quer) in enumerate(zip(observado, esperado))
+            if visto != quer
+        ]
+        linha["posicoes_divergentes"] = len(divergencias)
+        if divergencias:
+            primeira = divergencias[0]
+            linha["primeira_divergencia"] = {
+                "posicao": primeira,
+                "no_shard": observado[primeira],
+                "no_slice": esperado[primeira],
+            }
+    if excedentes:
+        linha["intents_excedentes"] = excedentes
+    return linha
+
+
+def censo(raiz: pathlib.Path = RAIZ) -> list[dict[str, Any]]:
+    """Devolve uma linha por lote que o verificador recusa, com a causa real."""
+    verificador, produtor, auditor = _modulos(raiz)
+
+    with verificador._working_directory(raiz):
+        contrato_semantico = produtor.load_writing_semantic_contract(raiz)
+        vencedores, _ = auditor.validated_duplicate_supersession_winners(raiz)
+    vencedores = set(vencedores)
+
+    integral, _ = verificador._static_batches(
+        raiz / "scripts/workflows/writing-mass-full.js",
+        max_bytes=verificador._MAX_FULL_WORKFLOW_BYTES,
+        require_nonempty=True,
+    )
+    na_fila = _slugs_da_fila(verificador, raiz)
+
+    cache: dict[str, Any] = {}
+    linhas: list[dict[str, Any]] = []
+    for indice, lote in enumerate(integral, 1):
+        slug = verificador._validate_base_batch(lote, f"inventário lote {indice}")
+        if slug in na_fila:
+            continue
+        _, _, por_familia = verificador._portfolio_records(raiz, lote["file"], cache)
+        esperado = verificador._expected_intents(lote, por_familia)
+        shard = raiz / f"data/editorial/v2_pages/{slug}.jsonl"
+        if not shard.exists():
+            linhas.append({
+                "slug": slug,
+                "classe": "shard_ausente",
+                "exige_redacao": True,
+                "esperadas": len(esperado),
+                "no_shard": 0,
+            })
+            continue
+        try:
+            registros = _registros_do_shard(shard)
+            bloqueadas = produtor.semantic_blocked_for_batch(
+                esperado, contrato_semantico)
+            resultado = produtor.classify_batch_completion(
+                registros, esperado, f"{slug}.jsonl", vencedores,
+                semantically_blocked_intents=bloqueadas)
+        except (OSError, RuntimeError, ValueError) as erro:
+            linhas.append({
+                "slug": slug,
+                "classe": "excecao_estrutural",
+                "exige_redacao": False,
+                "esperadas": len(esperado),
+                "no_shard": -1,
+                "erro": f"{type(erro).__name__}: {erro}",
+            })
+            continue
+        if resultado.complete:
+            continue
+        linha = _classifica(slug, esperado, registros, bloqueadas)
+        # DUAS MEDIÇÕES INDEPENDENTES, LADO A LADO — de propósito.
+        #
+        # `classe` é INFERIDA aqui por comparação de conjuntos; `reasons` é LIDO
+        # do classificador, que sabe qual das cinco cláusulas reprovou. Trocar a
+        # inferência pela leitura pareceria mais limpo e seria pior: foi
+        # exatamente a coincidência entre as duas que autenticou o censo na
+        # refutação adversarial de 2026-09-05 (27/19/6/34 pelos dois caminhos).
+        # Uma implementação sozinha não tem com o que ser conferida.
+        #
+        # Quando divergirem, o censo NÃO escolhe: grava as duas e marca
+        # `divergencia`. Escolher em silêncio é como um número errado atravessa
+        # uma sessão inteira.
+        motivos = tuple(getattr(resultado, "reasons", ()) or ())
+        if motivos:
+            linha["motivo_do_classificador"] = list(motivos)
+            if not any(m.startswith(linha["classe"]) for m in motivos):
+                linha["divergencia"] = (
+                    f"inferi {linha['classe']}, o classificador diz "
+                    f"{motivos[0].split('=')[0].split(':')[0]}")
+        linhas.append(linha)
+
+    linhas.sort(key=lambda linha: linha["slug"])
+    return linhas
+
+
+def _resumo(linhas: list[dict[str, Any]]) -> dict[str, int]:
+    contagem = {classe: 0 for classe in CLASSES}
+    for linha in linhas:
+        contagem[linha["classe"]] += 1
+    return contagem
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="censo das causas reais por que um lote fica fora da fila")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="imprime o censo sem escrever o JSONL")
+    parser.add_argument("--classe", choices=CLASSES,
+                        help="lista os slugs de UMA classe e sai")
+    args = parser.parse_args(argv)
+
+    linhas = censo()
+    contagem = _resumo(linhas)
+
+    if args.classe:
+        for linha in linhas:
+            if linha["classe"] == args.classe:
+                print(json.dumps(linha, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    exigem = sum(1 for linha in linhas if linha["exige_redacao"])
+    print(f"lotes recusados pelo verificador: {len(linhas)}")
+    for classe in CLASSES:
+        if contagem[classe]:
+            print(f"  {contagem[classe]:4d}  {classe}")
+    print(f"exigem redacao de fato: {exigem}  "
+          f"(os outros {len(linhas) - exigem} tem o texto no disco)")
+
+    if args.dry_run:
+        return 0
+
+    destino = RAIZ / DESTINO_REL
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    corpo = "".join(
+        json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n"
+        for linha in linhas)
+    destino.write_text(corpo, encoding="utf-8")
+    print(f"gravado: {DESTINO_REL} ({len(linhas)} linhas)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

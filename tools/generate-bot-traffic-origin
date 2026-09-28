@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""generate-bot-traffic-origin — bot na ORIGEM, com IP real e autenticidade verificada.
+
+POR QUE EXISTE, ao lado da medição da borda: no plano Free da Cloudflare o campo
+`botScore`/`verifiedBotCategory` é negado (`code: authz`), então a borda dá
+volume mas não diz se o bot é autêntico. O log do nginx dá o IP real
+(`real_ip_header CF-Connecting-IP`) — e IP é a única coisa que um forjador não
+controla. Sem isso, "ClaudeBot fez 9.523 requisições" é alegação, não dado.
+
+POR QUE COM PRESSA: até 2026-08-11 o log vivia solto em
+`/var/log/nginx/wikijuridica.access.log` e caía no glob `*.log` de
+`/etc/logrotate.d/nginx` — que é do projeto VIZINHO `/opt/divorcio` (hourly +
+rotate 14 = 13h33min de histórico, medidos). O prejuízo era observável: a
+borda registrou 9.662 requisições do GPTBot num dia em que a origem guardava
+2. FASE 2 (2026-08-11, ver docs/plans/2026-08-11-recuperacao-crawl.md) moveu o
+log para `/var/log/nginx/wikijuridica/` (subdiretório próprio, fora do glob do
+vizinho) com `/etc/logrotate.d/wikijuridica` (daily, rotate 30) — a retenção
+real passa a ser de semanas. Este produtor lê TODAS as rotações que
+sobreviverem (incluindo `.gz`) e ACUMULA num ledger que não rotaciona; o
+caminho antigo continua sendo varrido por transição (ver `descobrir_logs`) até
+o vizinho expirar sozinho as últimas cópias.
+
+VERIFICAÇÃO, e o que ela NÃO afirma:
+  - faixa oficial publicada (data/ops/bot_ip_ranges/, 11 operadores) → verified
+  - Google/Bing/Apple/Amazon também aceitam rDNS confirmado nos dois sentidos
+  - operador sem faixa e sem PTR → `unverified`, NUNCA `spoofed`. Não saber não
+    é o mesmo que saber que é falso, e a série tem de preservar a diferença.
+
+Descarta `bot_sim=1` (a simulação que este repositório dispara para conferir o
+que o bot vê) e o warming interno: contá-los seria inflar a própria métrica.
+
+Precisa de leitura do log do nginx (`sudo -n`); sem permissão, falha dizendo.
+
+Uso:
+    tools/generate-bot-traffic-origin
+    tools/generate-bot-traffic-origin --json
+    tools/generate-bot-traffic-origin --reprocessar --dia 2026-08-11   # auditoria, nada grava
+"""
+import argparse
+import collections
+import datetime
+import glob
+import gzip
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+FAIXAS = os.path.join(ROOT, "data/ops/bot_ip_ranges")
+SERIE = os.path.join(ROOT, "data/ops/origin_bot_traffic_daily.jsonl")
+CURSOR = os.path.join(ROOT, "data/ops/origin_bot_traffic_cursor.json")
+
+# AS ROTAS QUE ESTE PRODUTOR JOGAVA FORA (corrigido em 2026-08-26).
+#
+# O agrupamento por (data, agente) sempre montou o conjunto das rotas pedidas —
+# e gravava apenas `distinct_routes_in_window`, a CONTAGEM. O conjunto morria com
+# o processo. A consequência não é teórica: ninguém neste projeto conseguia dizer
+# QUAL URL devolveu 404 para QUAL bot, e uma sessão inteira teve de reconstruir
+# isso à mão relendo o log cru.
+#
+# A FORMA FOI ESCOLHIDA PARA NÃO CRIAR A PRÓXIMA ARMADILHA A1. Uma linha por
+# (data, agente, rota) daria dezenas de milhares de linhas por dia — que é
+# exatamente o inchaço que o ledger de borda sofreu. Aqui a cardinalidade é a
+# MESMA da série principal: uma linha por (data, agente) por execução, carregando
+# as rotas como mapa.
+#
+# O QUE ENTRA INTEIRO E O QUE ENTRA TRUNCADO, e a truncagem é DECLARADA:
+#   - `routes_with_errors`: TODA rota com status fora de 2xx/3xx, sem teto. É a
+#     pergunta que originou a tarefa, e é naturalmente pequena;
+#   - `top_routes`: as mais pedidas, com teto. O teto e o total real vão na
+#     própria linha (`top_routes_cap`, `distinct_routes_in_window`), para que
+#     truncagem nunca se pareça com ausência.
+SERIE_ROTAS = os.path.join(ROOT, "data/ops/origin_bot_routes_daily.jsonl")
+SCHEMA_ROTAS = "origin_bot_routes_daily_v1"
+TETO_TOP_ROTAS = 200
+# v3 (2026-08-11, FASE 3 do plano de recuperacao de crawl): v2 somava TODA
+# linha com UA de bot em "requests", autentico ou forjado, e so repartia entre
+# requests_verified/requests_unverified — nunca descartava o forjado. Medido
+# sobre o log real: GPTBot e ClaudeBot "reais" eram 100% um scanner unico
+# (35.196.168.160, Google Cloud) trocando de User-Agent a cada requisicao. v3
+# separa requests_authentic / requests_forged / requests_unverifiable e marca
+# "requests" como NAO-metrica (requests_is_metric=false). Leitor antigo que so
+# soma "requests" continua lendo as linhas v2 gravadas antes desta data — elas
+# nao sao reescritas, so as novas linhas nascem em v3.
+SCHEMA = "origin_bot_traffic_daily_v3"
+
+# AS LINHAS SÃO DELTAS, E O CURSOR É O QUE TORNA ISSO CORRETO.
+#
+# Mesmo com retenção de semanas (FASE 2), a janela visível ainda pode ENCOLHER
+# — logrotate roda, `maxsize` estoura, disco lota. Se cada execução regravasse
+# o total do dia, uma execução posterior veria MENOS linhas para a mesma data e
+# a convenção "dedupe mantendo a última" passaria a SUBCONTAR — a série
+# mentiria para baixo, justamente no sentido que faria concluir que o bot
+# parou de vir.
+#
+# Então: o cursor guarda o instante da última linha já contada, cada execução
+# processa apenas o que veio depois, e as linhas do ledger são INCREMENTOS. Quem
+# consome SOMA por (date, agent_key), não pega a última.
+#
+# `distinct_ips` e `distinct_routes` são observações DA JANELA e não somam entre
+# execuções (o mesmo IP aparece em duas janelas). Estão gravados para leitura
+# qualitativa, e o campo `summable` diz isso em cada linha.
+
+# Caminho NOVO (FASE 2, 2026-08-11): subdiretório próprio, fora do glob
+# `/var/log/nginx/*.log` do logrotate do projeto vizinho. `access.log*` cobre
+# o arquivo vivo e toda rotação numerada, plana ou `.gz`.
+LOG_GLOB_NOVO = "/var/log/nginx/wikijuridica/access.log*"
+
+# Caminho ANTIGO, varrido só por TRANSIÇÃO: linhas gravadas ali entre a última
+# leitura anterior ao corte de caminho e o reload do nginx que passou a
+# escrever no diretório novo, mais o que ainda não expirou da retenção velha
+# (rotate 14 do vizinho). Glob que não casa nada não avisa erro — quando o
+# vizinho expirar as últimas rotações antigas, este padrão se autolimpa.
+LOG_GLOB_ANTIGO = "/var/log/nginx/wikijuridica.access.log*"
+
+
+def descobrir_logs():
+    """Todas as rotações disponíveis (novas e, por transição, antigas).
+
+    Antes lia só `.log` + `.log.1` (~2h de janela) enquanto o banner dizia
+    "~13h" — a ferramenta superestimava a própria janela em ~6x. Agora lê
+    TUDO que sobrou da rotação, e o banner em main() reporta o intervalo REAL
+    das linhas processadas nesta execução, nunca uma string fixa.
+    """
+    return sorted(set(glob.glob(LOG_GLOB_NOVO)) | set(glob.glob(LOG_GLOB_ANTIGO)))
+
+# Formato wj_main. `bot_sim` e `cf_ray` são opcionais porque o log_format mudou
+# de geração ao longo do lançamento e os arquivos rotacionados ainda têm a forma
+# antiga — casar só a nova descartaria em silêncio a metade mais velha da janela.
+LINHA = re.compile(
+    r'^(?P<ip>\S+) \S+ \[(?P<data>[^:]+):(?P<relogio>\d\d:\d\d:\d\d) [^\]]*\] '
+    r'host=(?P<host>\S+) "(?P<metodo>\S+) (?P<rota>\S+)[^"]*" '
+    r'(?P<status>\d{3}) (?P<bytes>\d+) "(?P<ua>[^"]*)"'
+    r'(?:.*?bot_sim=(?P<sim>\S+))?'
+)
+
+# `warm=` entrou no log_format em 2026-08-27, depois desta ferramenta, e por isso
+# fica em regex propria e tolerante: a metade rotacionada da janela nao tem o
+# campo. Ate 2026-08-29 o cabecalho deste arquivo AFIRMAVA descartar "o warming
+# interno" e o codigo nunca olhou para esse campo — o descarte funcionava por
+# acidente, porque o aquecedor usa User-Agent `wikijuridica-` e
+# `botagents.agente_de` devolve None para ele. Acidente nao e garantia: bastaria
+# um aquecimento com outro UA para a serie inflar em silencio.
+MARCA_WARM = re.compile(r"\bwarm=(?P<warm>\S*)")
+
+MES = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
+       "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
+
+# Sufixos de rDNS: fonte única em botagents.RDNS (movido de um dict local
+# duplicado aqui em 2026-08-11, FASE 3). A duplicação era o risco real: um
+# check de honestidade de telemetria precisa saber, para CADA agente, se existe
+# método de verificação disponível — e só pode saber isso se origem e o próprio
+# módulo de identidade falarem da mesma tabela.
+RDNS = botagents.RDNS
+
+
+def ler_faixas():
+    """agent_key -> lista de ip_network. Operador ausente simplesmente não
+    autentica ninguém — nunca vira 'não autêntico'."""
+    por_agente = collections.defaultdict(list)
+    if not os.path.isdir(FAIXAS):
+        return por_agente
+    for nome in sorted(os.listdir(FAIXAS)):
+        if not nome.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(FAIXAS, nome), encoding="utf-8") as handle:
+                dados = json.load(handle)
+        except Exception:
+            continue
+        redes = []
+        for bruto in dados.get("prefixes", []):
+            try:
+                redes.append(ipaddress.ip_network(bruto, strict=False))
+            except ValueError:
+                continue
+        for agente in dados.get("authenticates_agents", []):
+            por_agente[agente].extend(redes)
+    return por_agente
+
+
+def em_faixa(ip, redes):
+    try:
+        endereco = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(endereco in rede for rede in redes)
+
+
+def rdns_confirmado(ip, sufixos):
+    """PTR e volta. A implementação mora em `botagents.rdns_confirmado`, ao lado
+    da tabela `RDNS` que diz QUAIS sufixos cada operador documenta.
+
+    Ficou aqui até 2026-09-05, e a segunda medição de bot por outra fonte (o
+    ledger de origem em JSONL, `generate-social-bot-coverage`) precisaria copiá-la
+    — que é exatamente a divergência que a fonte única de identidade evita. O
+    comportamento é o mesmo, byte a byte: este nome continua existindo porque é
+    por ele que o corpo deste produtor chama.
+    """
+    return botagents.rdns_confirmado(ip, sufixos)
+
+
+def ler_logs():
+    linhas = []
+    faltando = []
+    for caminho in descobrir_logs():
+        try:
+            saida = subprocess.run(["sudo", "-n", "cat", caminho],
+                                   capture_output=True, timeout=120)
+        except Exception as erro:
+            faltando.append((caminho, str(erro)[:80]))
+            continue
+        if saida.returncode != 0:
+            faltando.append((caminho, saida.stderr.decode("utf-8", "replace").strip()[:80]))
+            continue
+        bruto = saida.stdout
+        if caminho.endswith(".gz"):
+            try:
+                bruto = gzip.decompress(bruto)
+            except OSError as erro:
+                faltando.append((caminho, "gzip invalido: %s" % str(erro)[:60]))
+                continue
+        linhas.extend(bruto.decode("utf-8", "replace").splitlines())
+    return linhas, faltando
+
+
+def formatar_janela(minimo, maximo):
+    """Descreve a janela REAL lida nesta execução (não uma estimativa fixa)."""
+    if not minimo or not maximo:
+        return "sem linhas reconhecidas"
+    try:
+        d1 = datetime.datetime.strptime(minimo, "%Y-%m-%dT%H:%M:%S")
+        d2 = datetime.datetime.strptime(maximo, "%Y-%m-%dT%H:%M:%S")
+        horas = (d2 - d1).total_seconds() / 3600.0
+        return "%s -> %s (~%.1fh)" % (minimo, maximo, horas)
+    except ValueError:
+        return "%s -> %s" % (minimo, maximo)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--sem-rdns", action="store_true",
+                        help="pula a confirmacao por DNS reverso (mais rapido, menos verificado)")
+    parser.add_argument("--reprocessar", action="store_true",
+                        help="dry-run: reclassifica a janela lida SEM tocar cursor nem serie "
+                             "(auditoria/verificacao — reprocessar com o cursor normal duplicaria "
+                             "incrementos, porque as linhas gravadas sao somaveis)")
+    parser.add_argument("--dia", help="com --reprocessar, restringe a saida a uma data (AAAA-MM-DD)")
+    args = parser.parse_args()
+
+    # --dia sem --reprocessar seria um jeito silencioso de perder dado: a
+    # filtragem por dia acontece DEPOIS de acumular tudo (linha 344), entao
+    # bot real de outros dias sairia do `acumulado`, o cursor avancaria sobre
+    # ele do mesmo jeito (o cursor nao respeita --dia) e o branch de
+    # "acumulado vazio" gravaria um marcador de ZERO com motivo falso por cima
+    # de trafego que na verdade existiu e nunca mais volta (o log rotaciona).
+    # --reprocessar existe exatamente para isolar essa consulta do efeito
+    # colateral em cursor/serie — usar --dia sem ele e erro de uso, nao caso
+    # valido.
+    if args.dia and not args.reprocessar:
+        print("generate-bot-traffic-origin: --dia so e valido junto com --reprocessar "
+              "(sem --reprocessar ele filtraria a gravacao e perderia trafego real "
+              "de outros dias, com cursor e marcador de zero por cima)", file=sys.stderr)
+        return 2
+
+    redes_por_agente = ler_faixas()
+    if not redes_por_agente:
+        print("generate-bot-traffic-origin: sem cache de faixas — rode "
+              "tools/generate-bot-ip-ranges antes", file=sys.stderr)
+        return 2
+
+    linhas, faltando = ler_logs()
+    for caminho, motivo in faltando:
+        print("  aviso: %s ilegivel (%s)" % (caminho, motivo), file=sys.stderr)
+    if not linhas:
+        print("generate-bot-traffic-origin: nenhum log legivel (precisa de sudo -n)",
+              file=sys.stderr)
+        return 2
+
+    cursor_anterior = ""
+    if not args.reprocessar:
+        try:
+            with open(CURSOR, encoding="utf-8") as handle:
+                cursor_anterior = json.load(handle).get("last_seen", "")
+        except Exception:
+            pass
+
+    # (data, agente) -> acumulado
+    acumulado = {}
+    simulacoes = collections.Counter()
+    descontadas_por_motivo = collections.Counter()
+    # Bruto = toda linha que casou o formato do log, antes de qualquer filtro de
+    # agente ou de tráfego interno. É o denominador que o BUG-070 exige publicar
+    # ao lado do líquido, para ninguém ler uma taxa sem saber sobre o quê.
+    bruto_no_formato = 0
+    # Linha externa que não é bot conhecido (navegador, agente sem tabela). Não
+    # é desconto: entra no líquido e sai nomeada, porque somá-la ao tráfego de
+    # bot é como um relatório de rastreio passa a medir audiência.
+    nao_bot_conhecido = 0
+    cache_rdns = {}
+    metodo_por_agente = {}
+    cursor_novo = cursor_anterior
+    ignoradas_pelo_cursor = 0
+    # Janela REAL lida nesta execução (min/max instante entre TODAS as linhas
+    # que casaram o formato, antes de qualquer filtro de cursor ou de agente) —
+    # é o que o banner declara. Antes disso o banner imprimia uma string fixa
+    # ("~13h por rotacao") desconectada do que `LOGS` de fato lia (~2h): a
+    # ferramenta superestimava a própria janela em ~6x.
+    janela_min = None
+    janela_max = None
+    for linha in linhas:
+        casou = LINHA.match(linha)
+        if not casou:
+            continue
+        dia_bruto = casou.group("data")  # dd/Mmm/aaaa
+        partes = dia_bruto.split("/")
+        if len(partes) != 3 or partes[1] not in MES:
+            continue
+        data = "%s-%s-%s" % (partes[2], MES[partes[1]], partes[0])
+        # Instante ordenável (o log é hora local do servidor, e a comparação é
+        # entre linhas do mesmo log — não precisa de fuso, precisa de ordem).
+        instante = data + "T" + casou.group("relogio")
+        if janela_min is None or instante < janela_min:
+            janela_min = instante
+        if janela_max is None or instante > janela_max:
+            janela_max = instante
+        if instante > cursor_novo:
+            cursor_novo = instante
+        if cursor_anterior and instante <= cursor_anterior:
+            ignoradas_pelo_cursor += 1
+            continue
+        ua = casou.group("ua")
+        ip_da_linha = casou.group("ip")
+        bruto_no_formato += 1
+
+        # A ORDEM IMPORTA, e inverter é o defeito que o BUG-070 descreve. O
+        # desconto do tráfego DESTA CASA vem ANTES de `agente_de`, porque o
+        # aquecedor usa User-Agent `wikijuridica-` e `agente_de` devolve None
+        # para ele: avaliado depois, ele sairia por "não é bot conhecido" e
+        # NUNCA apareceria no desconto. O par publicado diria 0,5% de tráfego
+        # interno numa janela em que a medição independente do mesmo log dá
+        # 96,1% — e um denominador que mente é pior que nenhum.
+        marca_warm = MARCA_WARM.search(linha)
+        motivo_interno = botagents.motivo_de_desconto(
+            bot_sim=casou.group("sim"),
+            warm=marca_warm.group("warm") if marca_warm else None,
+            ip=ip_da_linha,
+            user_agent=ua,
+        )
+        if motivo_interno:
+            descontadas_por_motivo[motivo_interno] += 1
+            agente_da_sonda = botagents.agente_de(ua)
+            if agente_da_sonda:
+                # Sonda que se identifica com o User-Agent de um bot real para
+                # auditar o que ele receberia. Fica nomeada por agente, que é o
+                # que permite ler "googlebot=34" como nossa sonda e não como
+                # rastreio.
+                simulacoes[agente_da_sonda] += 1
+            continue
+
+        agente = botagents.agente_de(ua)
+        if agente is None:
+            nao_bot_conhecido += 1
+            continue
+        ip = ip_da_linha
+        chave = (data, agente)
+        alvo = acumulado.setdefault(chave, {
+            "requests": 0, "bytes": 0, "ips": set(), "routes": set(),
+            "status": collections.Counter(),
+            "authentic": 0, "forged": 0, "unverifiable": 0,
+            # Ver SERIE_ROTAS: a rota pedida deixa de morrer com o processo.
+            "routes_count": collections.Counter(),
+            "routes_status": {},
+        })
+        alvo["requests"] += 1
+        try:
+            alvo["bytes"] += int(casou.group("bytes"))
+        except ValueError:
+            pass
+        alvo["ips"].add(ip)
+        rota = casou.group("rota")
+        if len(alvo["routes"]) < 20000:
+            alvo["routes"].add(rota)
+        status = casou.group("status")
+        alvo["status"][status] += 1
+        # O mesmo teto de 20.000 rotas distintas da linha acima, pelo mesmo
+        # motivo (um scanner varrendo espaço de URL não pode fazer o processo
+        # crescer sem limite). Rota que ERRA nunca é descartada por teto: é ela
+        # que responde à pergunta que este ledger existe para responder.
+        erro = not (status.startswith("2") or status.startswith("3"))
+        if erro or len(alvo["routes_count"]) < 20000:
+            alvo["routes_count"][rota] += 1
+        if erro:
+            alvo["routes_status"].setdefault(rota, collections.Counter())[status] += 1
+
+        # verification_method é propriedade do AGENTE (existe ou não faixa/rDNS
+        # publicado para ele), não do IP individual — por isso cacheado por
+        # agente, calculado uma vez. Com --sem-rdns, um agente cujo ÚNICO método
+        # é rDNS degrada para "none" NESTA execução: a checagem não rodou, então
+        # ele não pode virar "forjado" por uma verificação que foi pulada.
+        if agente not in metodo_por_agente:
+            if redes_por_agente.get(agente):
+                metodo_por_agente[agente] = "ip_range"
+            elif agente in RDNS and not args.sem_rdns:
+                metodo_por_agente[agente] = "rdns_fcrdns"
+            else:
+                metodo_por_agente[agente] = "none"
+        metodo = metodo_por_agente[agente]
+
+        cache_chave = (agente, ip)
+        if cache_chave not in cache_rdns:
+            autentico = em_faixa(ip, redes_por_agente.get(agente, []))
+            if not autentico and not args.sem_rdns and agente in RDNS:
+                autentico, _ = rdns_confirmado(ip, RDNS[agente])
+            cache_rdns[cache_chave] = autentico
+        # A distinção que o v2 não fazia: um agente SEM método de verificação
+        # disponível (semrushbot, ccbot, facebookexternalhit, ...) é NÃO
+        # VERIFICÁVEL — não sabemos, o que é diferente de saber que é falso. Só
+        # quando existe método E o IP falha nele é que a linha é FORJADA.
+        if metodo == "none":
+            alvo["unverifiable"] += 1
+        elif cache_rdns[cache_chave]:
+            alvo["authentic"] += 1
+        else:
+            alvo["forged"] += 1
+
+    if args.dia:
+        acumulado = {chave: dados for chave, dados in acumulado.items() if chave[0] == args.dia}
+
+    if ignoradas_pelo_cursor:
+        print("  %d linha(s) ja contadas em execucao anterior (cursor %s)"
+              % (ignoradas_pelo_cursor, cursor_anterior))
+    if not acumulado:
+        print("nenhum bot novo desde a ultima execucao (janela lida: %s)"
+              % formatar_janela(janela_min, janela_max))
+        if not args.reprocessar and cursor_novo and cursor_novo != cursor_anterior:
+            # ATE AQUI (2026-08-19) O CURSOR AVANCAVA E A SERIE FICAVA MUDA: o
+            # coletor rodou de verdade, leu log com atividade real (o cursor so
+            # avanca sobre linha que CASOU o formato), so que nenhuma linha era
+            # de bot — o cenario normal quando a borda esta perto de 100% HIT e
+            # absorve o crawler antes de chegar na origem. Do lado de fora isso
+            # e AMBIGUO: pelo cursor.json o coletor parece vivo, pela serie
+            # parece morto ha dias, e ninguem consegue distinguir "sem trafego
+            # de bot nesta janela" de "o coletor quebrou" so olhando o arquivo.
+            #
+            # O efeito concreto: checkP0BotObservability (internal/checks/
+            # checks.go) reprova a serie usando o MTIME do arquivo — 48h sem
+            # escrita = "serie_parada". Sem esta linha, uma janela de HIT
+            # prolongada (medida: borda em ~100% HIT, ver docs do ciclo de
+            # 2026-08-19) fabricaria um falso "coletor caiu" num coletor que
+            # nunca parou.
+            #
+            # A correcao: gravar um MARCADOR explicito de execucao com contagem
+            # zero. E uma linha v3 legitima (fecha a mesma validacao de soma que
+            # check-bot-telemetry-honesty ja aplica a qualquer linha real: 0 ==
+            # 0+0+0), entao nao precisa de excecao em nenhum leitor — so passa a
+            # tocar o arquivo e a dizer, no proprio dado, POR QUE esta zerado.
+            marcador = {
+                "schema_version": SCHEMA,
+                "date": cursor_novo.split("T", 1)[0],
+                "agent_key": "_zero_observation",
+                "function": "_observability",
+                "record_type": "zero_observation",
+                "reason": "coletado_zero_linhas_de_bot_na_janela",
+                "summable": False,
+                "requests": 0,
+                "requests_is_metric": False,
+                "requests_authentic": 0,
+                "requests_forged": 0,
+                "requests_unverifiable": 0,
+                "verification_method": "none",
+                "distinct_ips_in_window": 0,
+                "distinct_routes_in_window": 0,
+                "bytes": 0,
+                "status": {},
+                "simulations_excluded": 0,
+                "cursor_from": cursor_anterior,
+                "cursor_to": cursor_novo,
+                "window_read": formatar_janela(janela_min, janela_max),
+            }
+            os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+            with open(SERIE, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(marcador, ensure_ascii=False, sort_keys=True) + "\n")
+            with open(CURSOR, "w", encoding="utf-8") as handle:
+                json.dump({"last_seen": cursor_novo}, handle)
+                handle.write("\n")
+            print("  marcador de observacao zero gravado (coletor vivo, sem bot na janela)")
+        return 0
+
+    denominador_da_janela = botagents.denominador(
+        bruto_no_formato, sum(descontadas_por_motivo.values()))
+
+    registros = []
+    for (data, agente), dados in sorted(acumulado.items()):
+        registros.append({
+            "schema_version": SCHEMA,
+            "date": data,
+            "agent_key": agente,
+            "function": botagents.funcao_de(agente),
+            # INCREMENTO desde a execução anterior — quem consome SOMA por
+            # (date, agent_key). Ver o racional do cursor no topo do arquivo.
+            "summable": True,
+            "requests": dados["requests"],
+            # "requests" mistura autentico e forjado — nunca leia como metrica
+            # de confianca. Os tres campos abaixo sao a metrica.
+            "requests_is_metric": False,
+            "requests_authentic": dados["authentic"],
+            "requests_forged": dados["forged"],
+            "requests_unverifiable": dados["unverifiable"],
+            "verification_method": metodo_por_agente.get(agente, "none"),
+            # Observações da janela: NÃO somam entre execuções (o mesmo IP
+            # reaparece na janela seguinte).
+            "distinct_ips_in_window": len(dados["ips"]),
+            "distinct_routes_in_window": len(dados["routes"]),
+            "bytes": dados["bytes"],
+            "status": dict(sorted(dados["status"].items())),
+            "simulations_excluded": simulacoes.get(agente, 0),
+            # O par (bruto, líquido) da JANELA desta execução, com o critério
+            # nomeado. É o mesmo em todas as linhas do run — como `cursor_from`
+            # e `cursor_to` já são — e existe para que a linha da série carregue
+            # o próprio denominador em vez de obrigar quem lê a reconstituí-lo.
+            "window_denominator": denominador_da_janela,
+            "window_discounted_by_reason": dict(sorted(descontadas_por_motivo.items())),
+            "window_non_bot_lines": nao_bot_conhecido,
+            "cursor_from": cursor_anterior,
+            "cursor_to": cursor_novo,
+        })
+
+    print("bot na ORIGEM (log do nginx, IP real; janela lida nesta execucao: %s)"
+          % formatar_janela(janela_min, janela_max))
+    print("  " + botagents.denominador_em_uma_linha(
+        denominador_da_janela, "denominador do log de origem"))
+    if descontadas_por_motivo:
+        print("  desconto por motivo: " + ", ".join(
+            "%s=%d" % (m, n) for m, n in sorted(descontadas_por_motivo.items())))
+    print("  do liquido, %d linha(s) nao sao bot conhecido (navegador ou agente sem tabela)"
+          % nao_bot_conhecido)
+    if args.reprocessar:
+        print("  --reprocessar: DRY-RUN, nada sera gravado")
+    for funcao in botagents.ORDEM_FUNCAO:
+        do_grupo = [r for r in registros if r["function"] == funcao]
+        if not do_grupo:
+            continue
+        print("\n  [%s]" % funcao)
+        for registro in sorted(do_grupo, key=lambda r: (-r["requests"], r["agent_key"])):
+            marca = ""
+            if registro["requests_forged"]:
+                marca = "  (%d FORJADAS)" % registro["requests_forged"]
+            elif registro["requests_unverifiable"]:
+                marca = "  (%d sem metodo de verificacao)" % registro["requests_unverifiable"]
+            print("    %-10s %-26s req=%-6d autentico=%-6d forjado=%-6d metodo=%-13s IPs=%-3d rotas=%-5d%s"
+                  % (registro["date"], registro["agent_key"], registro["requests"],
+                     registro["requests_authentic"], registro["requests_forged"],
+                     registro["verification_method"], registro["distinct_ips_in_window"],
+                     registro["distinct_routes_in_window"], marca))
+
+    if simulacoes:
+        print("\n  fora da metrica (simulacao deste repositorio): %s"
+              % ", ".join("%s=%d" % (a, n) for a, n in simulacoes.most_common()))
+
+    registros_rotas = []
+    for (data, agente), dados in sorted(acumulado.items()):
+        if not dados["routes_count"]:
+            continue
+        registros_rotas.append({
+            "schema_version": SCHEMA_ROTAS,
+            "date": data,
+            "agent_key": agente,
+            "function": botagents.funcao_de(agente),
+            # INCREMENTO da janela, igual à série principal: quem consome SOMA
+            # por (date, agent_key, rota). O cursor é o MESMO — as duas séries
+            # nascem da mesma leitura, então nunca podem divergir de janela.
+            "summable": True,
+            "requests": dados["requests"],
+            "distinct_routes_in_window": len(dados["routes"]),
+            "top_routes_cap": TETO_TOP_ROTAS,
+            "top_routes": [{"route": rota, "requests": n}
+                           for rota, n in dados["routes_count"].most_common(TETO_TOP_ROTAS)],
+            # Sem teto de propósito: é a pergunta que originou este ledger.
+            "routes_with_errors": {rota: dict(sorted(contagem.items()))
+                                   for rota, contagem in sorted(dados["routes_status"].items())},
+            "cursor_from": cursor_anterior,
+            "cursor_to": cursor_novo,
+        })
+
+    if args.reprocessar:
+        # A CONSULTA MOSTRA AS ROTAS. Antes desta correção não havia o que
+        # mostrar: o conjunto de rotas era construído e descartado. Sem isto,
+        # auditar "qual URL deu 404 para qual bot" exigiria reler o log cru, que
+        # é exatamente o trabalho manual que este ledger elimina.
+        print("\n--reprocessar: modo consulta — NADA foi gravado (nem serie, nem cursor)")
+        com_erro = sum(len(r["routes_with_errors"]) for r in registros_rotas)
+        print("  rotas por bot que SERIAM gravadas: %d registro(s), %d rota(s) com erro"
+              % (len(registros_rotas), com_erro))
+        for registro in registros_rotas:
+            for rota, status in sorted(registro["routes_with_errors"].items())[:10]:
+                print("    %-10s %-24s %-48s %s"
+                      % (registro["date"], registro["agent_key"], rota[:48],
+                         " ".join("%s=%d" % (s, n) for s, n in status.items())))
+        if args.json:
+            print(json.dumps({"trafego": registros, "rotas": registros_rotas},
+                             ensure_ascii=False, indent=2))
+        return 0
+
+    os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+    with open(SERIE, "a", encoding="utf-8") as handle:
+        for registro in registros:
+            handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+    if registros_rotas:
+        with open(SERIE_ROTAS, "a", encoding="utf-8") as handle:
+            for registro in registros_rotas:
+                handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+        com_erro = sum(len(r["routes_with_errors"]) for r in registros_rotas)
+        print("rotas por bot gravadas em %s (%d registro(s), %d rota(s) com erro)"
+              % (os.path.relpath(SERIE_ROTAS, ROOT), len(registros_rotas), com_erro))
+    with open(CURSOR, "w", encoding="utf-8") as handle:
+        json.dump({"last_seen": cursor_novo}, handle)
+        handle.write("\n")
+    print("\nserie gravada em %s (%d registro(s)); cursor -> %s"
+          % (os.path.relpath(SERIE, ROOT), len(registros), cursor_novo))
+    print("append-only: as linhas sao INCREMENTOS — quem consome SOMA por (date, agent_key)")
+
+    if args.json:
+        print(json.dumps(registros, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""generate-v2-fonte-bcb-endereco-servivel-20260812 — a fonte respondia 200 e não entregava norma nenhuma.
+
+O DEFEITO. A medição de conteúdo de fonte oficial de 12/08 (6.218 URLs, 23.699
+ocorrências) achou 179 endereços que respondem 200 e não entregam texto; 126
+deles são do `bcb.gov.br`. O caso central, conferido byte a byte:
+
+  https://www.bcb.gov.br/estabilidadefinanceira/exibenormativo?numero=4949&tipo=RESOLUÇÃO
+      HTTP 200 · 2.866 bytes · 114 caracteres de texto visível
+      "Banco Central do Brasil Essa pagina depende do javascript para abrir,
+       favor habilitar"
+
+Isso não é fonte morta nem página ruim: é PROVENIÊNCIA QUE NINGUÉM CONSEGUE
+CONFERIR. Quem audita a página segue o link e encontra uma tela pedindo
+JavaScript. Em 31 páginas publicadas o problema é total — TODAS as fontes
+oficiais delas caem nessa condição.
+
+A CORREÇÃO. Separar QUAL DOCUMENTO SE CITA de QUAL ENDEREÇO O LEITOR RECEBE.
+A norma citada não muda — muda o endereço que a serve:
+
+  in.gov.br  — matéria do Diário Oficial da União, renderizada no servidor.
+  bcb.gov.br — PDF legado em /pre/normativos/, para as normas anteriores ao
+               acervo digital do DOU.
+
+Ambos passam pelo sufixo `gov.br` de `allowedSourceHostSuffixes`
+(internal/v2ingest/validate.go): nenhum host novo entra no allowlist.
+
+O TESTE QUE AUTORIZA A TROCA não é "responde 200". É o DISPOSITIVO RECLAMADO
+pela própria citação aparecer no texto medido do endereço novo — medido por
+`tools/measure-bcb-normativo-servable-address-20260812`, com o mesmo
+instrumento que apanhou o defeito. Onde o dispositivo não aparece, NÃO SE
+TROCA: a Instrução Normativa BCB 513 é citada na redação consolidada pela IN
+BCB 743/2026, e o DOU serve o texto ORIGINAL de 2024, que não traz o limite de
+23h59 da véspera. Trocar ali produziria fonte ERRADA, que é defeito pior do que
+fonte inconferível. Essas ficam como pendência nominal, com o motivo escrito.
+
+Página institucional e de serviço do BCB (`meubc/faqs/*`, `cidadaniafinanceira/*`,
+`detalhenoticia/*`) não é norma e não tem publicação correspondente no DOU:
+também fica como pendência nominal. Aproximar por "uma página parecida" seria
+inventar verificação.
+
+O QUE NÃO SE TOCA. O texto das páginas. O defeito é de fonte, não de corpo — e
+a contagem de palavras do ingest é reconferida linha a linha justamente para
+garantir que nenhum caractere de corpo mudou.
+
+CONTRATO DE ESCRITA (o mesmo de generate-v2-planalto-anchor-repair-20260812):
+lease de época do estoque canônico, lock exclusivo próprio, CAS pelo sha256 da
+LINHA viva, forma de serialização preservada, demais linhas byte a byte,
+escrita atômica com fsync, idempotente. NÃO commita e NÃO republica.
+
+O acervo anterior é preservado em
+`.agents/runtime/backup-paginas-20260812-fonte-bcb-endereco/v2_pages/`.
+
+Uso:
+    tools/generate-v2-fonte-bcb-endereco-servivel-20260812 --dry-run
+    tools/generate-v2-fonte-bcb-endereco-servivel-20260812
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.fonte-bcb-endereco-servivel-20260812.lock"
+DADOS = Path(__file__).with_suffix(".data.json")
+PAGES = ROOT / "data/editorial/v2_pages"
+EVIDENCIA = ROOT / "data/editorial/v2_fonte_bcb_endereco_servivel_evidencia_20260812.jsonl"
+BACKUP = ".agents/runtime/backup-paginas-20260812-fonte-bcb-endereco/v2_pages/"
+HOJE = "2026-08-12"
+
+CHAVE_VERIFICADO = re.compile(r'("verified_at"\s*:\s*)"[^"]*"')
+CHAVE_STATUS = re.compile(r'("http_status"\s*:\s*)\d+')
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def word_count(record: dict) -> int:
+    """Reproduz bodyWordCount de internal/v2ingest/validate.go."""
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def _fatia_da_fonte(linha: str, token_url: str, rel: str, numero: int) -> tuple[int, int]:
+    """Delimita o objeto `{...}` de official_sources que contém aquela URL.
+
+    A troca precisa alcançar `verified_at` e `http_status` da MESMA fonte, e
+    esses dois campos aparecem em todas as outras fontes da linha. Trocar por
+    busca global acertaria a fonte errada; por isso o recorte é pelo objeto.
+    """
+    posicao = linha.find(token_url)
+    if posicao < 0:
+        raise SystemExit(f"{rel}:{numero}: token {token_url} ausente na linha viva")
+    inicio = linha.rfind("{", 0, posicao)
+    if inicio < 0:
+        raise SystemExit(f"{rel}:{numero}: objeto de fonte não delimitado")
+    profundidade = 0
+    dentro_de_texto = False
+    escapado = False
+    for i in range(inicio, len(linha)):
+        caractere = linha[i]
+        if dentro_de_texto:
+            if escapado:
+                escapado = False
+            elif caractere == "\\":
+                escapado = True
+            elif caractere == '"':
+                dentro_de_texto = False
+            continue
+        if caractere == '"':
+            dentro_de_texto = True
+        elif caractere == "{":
+            profundidade += 1
+        elif caractere == "}":
+            profundidade -= 1
+            if profundidade == 0:
+                return inicio, i + 1
+    raise SystemExit(f"{rel}:{numero}: objeto de fonte sem fechamento")
+
+
+def reescrever_linha(linha_viva: str, corrigido: dict, trocas: list[tuple[str, str]],
+                     rel: str, numero: int) -> str:
+    """Troca URL, `verified_at` e `http_status` DENTRO do objeto da fonte.
+
+    A substituição é textual e cirúrgica porque o acervo mistura a forma padrão
+    e a compacta na mesma linha (herança de reparos anteriores): reemitir o
+    registro com json.dumps mudaria milhares de bytes que a correção não pediu.
+    A garantia vem depois — a linha nova é reinterpretada e comparada com o
+    registro corrigido em memória; divergindo num byte de significado, aborta.
+    """
+    nova = linha_viva
+    for url_antiga, url_nova in trocas:
+        token = json.dumps(url_antiga, ensure_ascii=False)
+        inicio, fim = _fatia_da_fonte(nova, token, rel, numero)
+        fatia = nova[inicio:fim]
+        fatia = fatia.replace(token, json.dumps(url_nova, ensure_ascii=False), 1)
+        fatia = CHAVE_VERIFICADO.sub(lambda m: m.group(1) + '"%s"' % HOJE, fatia, count=1)
+        fatia = CHAVE_STATUS.sub(lambda m: m.group(1) + "200", fatia, count=1)
+        nova = nova[:inicio] + fatia + nova[fim:]
+    if json.loads(nova) != corrigido:
+        raise SystemExit(
+            f"{rel}:{numero}: a linha reescrita não reproduz o registro "
+            f"corrigido; substituição textual recusada")
+    return nova
+
+
+def carregar_dados() -> dict:
+    if not DADOS.is_file():
+        raise SystemExit(f"arquivo de dados ausente: {DADOS}")
+    dados = json.loads(DADOS.read_text(encoding="utf-8"))
+    if not dados.get("correcoes"):
+        raise SystemExit(f"{DADOS.name}: 'correcoes' vazio ou ausente")
+    return dados
+
+
+def preflight(dados: dict) -> dict[tuple[str, str], dict]:
+    """Valida o plano ANTES de tocar o acervo. Chave: (intent_id, url antiga).
+
+    A chave é o PAR, nunca a URL sozinha: a mesma casca (a Resolução CMN 5.057,
+    por exemplo) também é citada por páginas fora deste reparo, e essas estão
+    explicitamente fora de escopo.
+    """
+    problemas: list[str] = []
+    mapa: dict[tuple[str, str], dict] = {}
+    documentos = dados.get("documentos") or {}
+    for correcao in dados["correcoes"]:
+        intent = correcao.get("intent_id") or ""
+        antiga = correcao.get("url_antiga") or ""
+        nova = correcao.get("url_nova") or ""
+        rotulo = f"{intent}:{antiga or '(sem url)'}"
+        if not intent or not antiga or not nova:
+            problemas.append(f"{rotulo}: correção incompleta")
+            continue
+        if antiga == nova:
+            problemas.append(f"{rotulo}: url nova idêntica à atual")
+        if (intent, antiga) in mapa:
+            problemas.append(f"{rotulo}: par repetido no arquivo de dados")
+        if not correcao.get("porque"):
+            problemas.append(f"{rotulo}: sem razão declarada")
+        if not correcao.get("norma"):
+            problemas.append(f"{rotulo}: sem a norma que se mantém citada")
+        doc = documentos.get(nova)
+        if not doc:
+            problemas.append(f"{rotulo}: destino sem evidência de medição")
+        else:
+            if doc.get("http_status") != 200:
+                problemas.append(f"{rotulo}: destino não respondeu 200")
+            if not doc.get("sha256"):
+                problemas.append(f"{rotulo}: destino sem sha256 do documento")
+            if not doc.get("tem_evidencia_de_conteudo", True):
+                problemas.append(f"{rotulo}: destino sem evidência de conteúdo")
+            if doc.get("faixa") not in ("articulado_no_texto", "documento_pdf"):
+                problemas.append(f"{rotulo}: destino em faixa {doc.get('faixa')!r} — "
+                                 f"não entrega articulado")
+            # O gate é POR CITAÇÃO, não por norma: a mesma Resolução BCB 96 é
+            # citada por uma página pelo encerramento de conta (que está no
+            # texto) e por outras pelo MED do Pix (que NÃO está — atribuição
+            # errada, defeito de outra classe). Recusar a norma inteira punia a
+            # citação correta; aceitar a norma inteira carimbava a errada.
+            exigidos = correcao.get("dispositivos_exigidos")
+            ausentes = set(doc.get("dispositivo_ausente") or [])
+            if exigidos is None:
+                if ausentes:
+                    problemas.append(
+                        f"{rotulo}: o dispositivo reclamado não está no destino — "
+                        f"troca recusada (fonte errada é pior que fonte inconferível)")
+            elif not exigidos:
+                problemas.append(f"{rotulo}: sem dispositivo exigido declarado")
+            elif set(exigidos) & ausentes:
+                problemas.append(
+                    f"{rotulo}: o dispositivo reclamado "
+                    f"({', '.join(sorted(set(exigidos) & ausentes))}) não está no "
+                    f"destino — troca recusada")
+            if not doc.get("trecho_dispositivo"):
+                problemas.append(f"{rotulo}: destino sem trecho do dispositivo medido")
+            if doc.get("norma") != correcao.get("norma"):
+                problemas.append(f"{rotulo}: destino serve {doc.get('norma')!r}, "
+                                 f"a citação é de {correcao.get('norma')!r}")
+        mapa[(intent, antiga)] = correcao
+    if problemas:
+        for problema in problemas[:40]:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        print(f"({len(problemas)} problema(s))", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(mapa)} par(es) (página, url) — "
+          f"{len(documentos)} documento(s) de destino medidos, todos com o "
+          f"dispositivo reclamado presente no texto")
+    return mapa
+
+
+def preservar(shard: Path) -> None:
+    destino = ROOT / BACKUP / shard.name
+    if destino.exists():
+        return
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(shard, destino)
+
+
+def aplicar(shard: Path, mapa: dict[tuple[str, str], dict], dry_run: bool,
+            evidencia: list[dict]) -> tuple[int, int]:
+    rel = os.path.relpath(shard, ROOT)
+    bruto = shard.read_bytes().decode("utf-8")
+    linhas = bruto.split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    saida: list[str] = []
+    paginas = 0
+    urls_total = 0
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{rel}: linha em branco {numero}")
+        registro = json.loads(raw)
+        intent = registro.get("intent_id") or ""
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        wc_antes = word_count(registro)
+
+        trocas: list[tuple[str, str]] = []
+        detalhe: list[dict] = []
+        for fonte in registro.get("official_sources") or []:
+            correcao = mapa.get((intent, fonte.get("url") or ""))
+            if not correcao:
+                continue
+            antiga = fonte["url"]
+            fonte["url"] = correcao["url_nova"]
+            fonte["verified_at"] = HOJE
+            fonte["http_status"] = 200
+            trocas.append((antiga, correcao["url_nova"]))
+            detalhe.append({"de": antiga, "para": correcao["url_nova"],
+                            "norma": correcao["norma"], "classe": "troca_endereco"})
+        if not trocas:
+            saida.append(raw)
+            continue
+        # A correção não toca texto de corpo: a contagem do ingest tem que sair
+        # idêntica. Se mudou, a substituição alcançou o que não devia.
+        if word_count(registro) != wc_antes:
+            raise SystemExit(
+                f"{rel}:{numero} ({intent}): a correção mudou a contagem de "
+                f"palavras ({wc_antes} -> {word_count(registro)}) — tocou corpo. "
+                f"Abortado.")
+        nova = reescrever_linha(raw, registro, trocas, rel, numero)
+        atual = hashlib.sha256(
+            shard.read_bytes().decode("utf-8").split("\n")[numero - 1]
+            .strip().encode("utf-8")).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {rel}:{numero} ({intent}): outra "
+                f"frente tocou este registro durante a execução.")
+        saida.append(nova)
+        paginas += 1
+        urls_total += len(trocas)
+        for item in detalhe:
+            evidencia.append({"intent_id": intent, "shard": rel, **item})
+
+    if paginas and not dry_run:
+        preservar(shard)
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(shard, payload.encode("utf-8"))
+    return paginas, urls_total
+
+
+def escrever_evidencia(dados: dict, itens: list[dict]) -> None:
+    """Critério, documento medido, decisão por par, aplicação e PENDÊNCIA.
+
+    A pendência é registro de primeira classe: fonte que ninguém consegue
+    conferir continua sendo defeito conhecido, e apagá-la da evidência faria o
+    reparo parecer completo quando não é.
+    """
+    # A APLICAÇÃO já gravada é histórico do que entrou no acervo e NUNCA se
+    # apaga: reexecutar o gerador não encontra mais as URLs antigas (o reparo é
+    # idempotente), e reescrever o arquivo do zero zeraria as 23 linhas que
+    # provam onde a troca entrou. Critério, decisão e pendência, ao contrário,
+    # são reescritos a partir do plano vigente — decisão superada não pode
+    # continuar na evidência como se valesse.
+    anteriores: dict[str, None] = {}
+    if EVIDENCIA.is_file():
+        for linha in EVIDENCIA.read_text(encoding="utf-8").splitlines():
+            linha = linha.strip()
+            if linha and '"tipo": "aplicacao"' in linha:
+                anteriores[linha] = None
+
+    linhas = [json.dumps({
+        "gerador": Path(__file__).name, "gerado_em": HOJE, "tipo": "criterio",
+        "criterio": dados.get("criterio", ""),
+        "documentos_medidos": len(dados.get("documentos") or {}),
+        "texto_anterior_preservado_em": BACKUP,
+    }, ensure_ascii=False)]
+    registros: dict[str, None] = dict(anteriores)
+    for url, doc in (dados.get("documentos") or {}).items():
+        registros[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE,
+            "tipo": "documento_oficial", "url": url, "norma": doc.get("norma", ""),
+            "consultado_em": doc.get("consultado_em", HOJE),
+            "http_status": doc.get("http_status"),
+            "sha256_documento": doc.get("sha256", ""),
+            "faixa": doc.get("faixa", ""),
+            "texto_visivel_chars": doc.get("texto_visivel_chars"),
+            "marcas_normativas": doc.get("marcas_normativas"),
+            "trecho_dispositivo": doc.get("trecho_dispositivo", ""),
+        }, ensure_ascii=False)] = None
+    for correcao in dados["correcoes"]:
+        registros[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE, "tipo": "decisao",
+            "intent_id": correcao.get("intent_id", ""),
+            "norma": correcao.get("norma", ""),
+            "url_antiga": correcao.get("url_antiga", ""),
+            "url_nova": correcao.get("url_nova", ""),
+            "porque": correcao.get("porque", ""),
+        }, ensure_ascii=False)] = None
+    for pendencia in dados.get("pendencias") or []:
+        registros[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE, "tipo": "pendencia",
+            **pendencia,
+        }, ensure_ascii=False)] = None
+    for item in sorted(itens, key=lambda i: (i.get("intent_id") or "", i.get("de") or "")):
+        registros[json.dumps({
+            "gerador": Path(__file__).name, "gerado_em": HOJE,
+            "tipo": "aplicacao", **item,
+        }, ensure_ascii=False)] = None
+    linhas.extend(sorted(registros))
+    atomic_write(EVIDENCIA, ("\n".join(linhas) + "\n").encode("utf-8"))
+    print(f"evidência: {len(linhas)} registro(s) em "
+          f"{os.path.relpath(EVIDENCIA, ROOT)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    dados = carregar_dados()
+    mapa = preflight(dados)
+
+    alvos = sorted({correcao["shard"] for correcao in dados["correcoes"]})
+    evidencia: list[dict] = []
+    total_paginas = total_urls = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for rel in alvos:
+                    shard = ROOT / rel
+                    if not shard.is_file():
+                        raise SystemExit(f"shard ausente: {rel}")
+                    paginas, urls = aplicar(shard, mapa, args.dry_run, evidencia)
+                    if paginas:
+                        print(f"{rel}: {paginas} página(s), {urls} endereço(s)")
+                    total_paginas += paginas
+                    total_urls += urls
+                if not args.dry_run:
+                    escrever_evidencia(dados, evidencia)
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    pendentes = dados.get("pendencias") or []
+    rotulo = "--dry-run: " if args.dry_run else ""
+    print(f"\n{rotulo}{total_paginas} página(s), {total_urls} endereço(s) de "
+          f"fonte trocado(s); {len(pendentes)} fonte(s) sem endereço que "
+          f"entregue texto, registrada(s) nominalmente.")
+    if args.dry_run:
+        print("Nada escrito.")
+    elif total_paginas:
+        print("Reingerir o estoque e republicar para o espelho refletir a correção.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

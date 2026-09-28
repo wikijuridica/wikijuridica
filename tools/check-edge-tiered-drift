@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""check-edge-tiered-drift — os dois interruptores de tiered cache continuam ligados?
+
+READ-ONLY (so GET). Sai 1 quando qualquer um dos dois interruptores da zona
+diverge do estado versionado em ops/cloudflare/tiered-cache.json.
+
+POR QUE EXISTE. Os dois interruptores foram alterados em 2026-08-24T22:36:17Z sem
+nenhum registro no repositorio, e nenhuma ferramenta os lia: em 2026-08-28
+`grep -rn tiered tools/` devolvia apenas comentarios em tools/measure-origin-fanout.
+Estado de producao que ninguem le e estado que deriva em silencio -- foi assim
+que a Cache Rule da zona ficou ZERADA por cinco dias em agosto (ver o cabecalho
+de tools/check-edge-rule-drift).
+
+SAO DOIS INTERRUPTORES E LIGAR SO UM NAO FAZ NADA. `argo/tiered_caching` e o
+MESTRE, que liga o recurso; `cache/tiered_cache_smart_topology_enable` escolhe a
+topologia. Com o mestre desligado o seletor fica INERTE, e nada no retorno da API
+diz isso. A medicao de 2026-08-12 e a prova: seletor ligado, mestre desligado, e
+494 de 511 requisicoes de uma familia de robo que entra por IAD atravessaram ate
+a origem -- 96,7% --, com o objeto ja cacheado em GIG horas antes. Desligar
+qualquer um dos dois recoloca o tunel no caminho de todo rastreio e recria a
+condicao de 2026-08-11.
+
+O CAMINHO DO SELETOR NAO E `/settings/`. Medido em 2026-08-28:
+`/zones/{zona}/settings/tiered_cache_smart_topology_enable` devolve HTTP 400,
+code 1003, "Undefined zone setting". O caminho real e `/zones/{zona}/cache/...`.
+Isso importa porque um gate apontado para o caminho errado recebe 400, trata como
+indisponibilidade de API e passa verde para sempre. Os endpoints vem do arquivo
+canonico, nunca hardcoded aqui, para que a correcao viva num lugar so.
+
+`editable: false` NAO E VEREDITO. O mestre responde assim e mesmo assim aceita
+PATCH (medido em 2026-08-12: success:true, valor mudou, editable continuou
+false). Por isso este gate compara APENAS `value`; `editable` e `modified_on` sao
+impressos como informacao e NUNCA reprovam -- se reprovassem, o gate gritaria
+falso a cada mexida de painel e o operador aprenderia a ignora-lo.
+
+CODIGOS DE SAIDA, e o desvio deliberado da convencao do repo:
+  0  os dois batem com o canonico  --  OU  a verificacao nao pode ocorrer
+                                       (sem credencial, sem rede, HTTP != 200,
+                                       success:false), com verificada:false.
+  1  drift confirmado: a API respondeu e um valor diverge.
+  2  o proprio harness esta quebrado: canonico ausente, ilegivel ou malformado,
+     fixture ilegivel. Aqui exit 0 seria gate verde sobre mundo vazio.
+
+Indisponibilidade de API NAO E DRIFT, e reprovar por ela ja foi defeito medido
+neste repositorio -- check-edge-vary-contract diagnosticava tunel oscilando como
+envenenamento de cache. A convencao geral do repo reserva exit 2 para
+inconclusivo; aqui a falha de rede sai 0 por ordem explicita da frente que pediu
+o instrumento, e o 2 fica para a quebra local, que e a unica que o operador pode
+consertar sozinho.
+
+Uso:
+    tools/check-edge-tiered-drift
+    tools/check-edge-tiered-drift --json
+    WIKI_TIERED_FIXTURE=/caminho/fixture.json tools/check-edge-tiered-drift   # sem rede
+
+FIXTURE: JSON no formato {"<id do interruptor>": <envelope da API>}, isto e, o
+corpo inteiro que a API devolveria ({"success":true,"result":{...}}). O parser e
+o MESMO nos dois caminhos; fixture que fosse um formato reduzido testaria codigo
+que nao roda em producao.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import urllib.error
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CANONICO = os.path.join(RAIZ, "ops/cloudflare/tiered-cache.json")
+API = "https://api.cloudflare.com/client/v4"
+ZONA_PADRAO = "b2e1366a94c5dcac97f2fc264f18928f"
+
+
+# REUSO, e nao copia, da leitura de credencial. `tools/check-edge-rule-drift` nao
+# tem extensao .py, entao `import` normal nao o alcanca; o SourceFileLoader
+# carrega o arquivo como modulo. E seguro porque la o trabalho todo esta atras de
+# `if __name__ == "__main__"`. O que se ganha: a descoberta cara de 2026-08-26 --
+# CLOUDFLARE_API_TOKEN e Global API Key (X-Auth-Email/X-Auth-Key), nao Bearer --
+# vive num arquivo so e nao precisa ser reaprendida aqui.
+def _irmao():
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-edge-rule-drift")
+    loader = importlib.machinery.SourceFileLoader("check_edge_rule_drift", caminho)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)
+    return modulo
+
+
+def canone():
+    """Le o estado versionado. Falha aqui e exit 2: sem canonico nao ha o que
+    comparar, e passar verde seria afirmar 'nao ha drift' sem ter olhado."""
+    with open(CANONICO, encoding="utf-8") as f:
+        dados = json.load(f)
+    interruptores = dados.get("interruptores") or []
+    if not interruptores:
+        raise ValueError("ops/cloudflare/tiered-cache.json sem 'interruptores'")
+    for i in interruptores:
+        for campo in ("id", "endpoint", "valor_esperado"):
+            if not i.get(campo):
+                raise ValueError(f"interruptor sem campo obrigatorio '{campo}': {i.get('id') or i}")
+    return dados, interruptores
+
+
+def le_fixture(caminho):
+    with open(caminho, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def envelope(interruptor, zona, cabecalhos, pega, fixture):
+    """Devolve (envelope_da_api, motivo_de_nao_ter_lido). Exatamente um dos dois
+    e None. O caminho de fixture e o de rede entregam a MESMA estrutura."""
+    if fixture is not None:
+        if interruptor["id"] not in fixture:
+            return None, f"fixture nao tem o interruptor '{interruptor['id']}'"
+        return fixture[interruptor["id"]], None
+    url = API + interruptor["endpoint"].replace("{zona}", zona)
+    try:
+        return pega(url, cabecalhos), None
+    except urllib.error.HTTPError as e:
+        # HTTP 400 aqui costuma ser endpoint errado, nao zona quebrada -- ver o
+        # bloco 'endpoint_que_NAO_existe' no canonico.
+        return None, f"API respondeu {e.code} {e.reason} em {interruptor['endpoint']}"
+    except Exception as e:
+        return None, f"nao consegui ler {interruptor['endpoint']}: {type(e).__name__}: {e}"
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="confere os dois interruptores de tiered cache contra ops/cloudflare/tiered-cache.json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--json", action="store_true", dest="como_json",
+                   help="imprime o relatorio em JSON, para consumo por outro gate")
+    args = p.parse_args()
+
+    relatorio = {"gate": "check-edge-tiered-drift", "verificada": False,
+                 "drift": False, "motivo": None, "fonte": None, "interruptores": []}
+
+    try:
+        dados, interruptores = canone()
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        relatorio["motivo"] = f"canonico ilegivel: {e}"
+        return saida(relatorio, args.como_json, 2)
+
+    zona = dados.get("zona") or ZONA_PADRAO
+    relatorio["zona"] = zona
+
+    fixture_caminho = os.environ.get("WIKI_TIERED_FIXTURE")
+    fixture = None
+    cabecalhos = None
+    if fixture_caminho:
+        try:
+            fixture = le_fixture(fixture_caminho)
+        except (OSError, json.JSONDecodeError) as e:
+            relatorio["motivo"] = f"WIKI_TIERED_FIXTURE ilegivel: {e}"
+            return saida(relatorio, args.como_json, 2)
+        relatorio["fonte"] = f"fixture {fixture_caminho}"
+        pega = None
+    else:
+        irmao = _irmao()
+        env = irmao.ambiente()
+        zona = env.get("CLOUDFLARE_ZONE_ID", zona)
+        relatorio["zona"] = zona
+        cabecalhos, rotulo = irmao._credenciais(env)
+        pega = irmao.pega
+        if cabecalhos is None:
+            # FALSO POSITIVO COBERTO: maquina sem .env.local nao esta em drift,
+            # esta sem instrumento. Reprovar aqui ensina o operador a ignorar.
+            relatorio["motivo"] = "sem credencial Cloudflare (.env.local sem CLOUDFLARE_ZONE_TOKEN nem CLOUDFLARE_EMAIL+CLOUDFLARE_API_TOKEN)"
+            return saida(relatorio, args.como_json, 0)
+        relatorio["fonte"] = f"API viva ({rotulo})"
+
+    divergentes = []
+    falta_ler = []
+    for interruptor in interruptores:
+        env_api, motivo = envelope(interruptor, zona, cabecalhos, pega, fixture)
+        linha = {"id": interruptor["id"], "endpoint": interruptor["endpoint"],
+                 "esperado": interruptor["valor_esperado"], "no_ar": None,
+                 "modified_on": None, "editable": None, "erro": motivo}
+        if env_api is None:
+            falta_ler.append(motivo)
+            relatorio["interruptores"].append(linha)
+            continue
+        if not env_api.get("success"):
+            motivo = f"API sem sucesso em {interruptor['endpoint']}: {env_api.get('errors')}"
+            linha["erro"] = motivo
+            falta_ler.append(motivo)
+            relatorio["interruptores"].append(linha)
+            continue
+        resultado = env_api.get("result") or {}
+        linha["no_ar"] = resultado.get("value")
+        # Metadado NUNCA reprova: 'editable' mente (o mestre diz false e aceita
+        # PATCH) e 'modified_on' muda a cada mexida de painel que nao altera o
+        # comportamento. Comparar so 'value'.
+        linha["modified_on"] = resultado.get("modified_on")
+        linha["editable"] = resultado.get("editable")
+        relatorio["interruptores"].append(linha)
+        if linha["no_ar"] != interruptor["valor_esperado"]:
+            divergentes.append((interruptor, linha))
+
+    if falta_ler and not divergentes:
+        # Nenhuma leitura util e nenhum drift provado: inconclusivo, nao reprovacao.
+        relatorio["motivo"] = "; ".join(falta_ler)
+        return saida(relatorio, args.como_json, 0)
+
+    relatorio["verificada"] = True
+    if divergentes:
+        relatorio["drift"] = True
+        relatorio["motivo"] = "; ".join(
+            f"{i['id']} esta '{l['no_ar']}' e deveria estar '{i['valor_esperado']}'"
+            for i, l in divergentes)
+        # A consequencia sai do arquivo canonico, nunca de texto duplicado aqui:
+        # assim a mensagem e o estado versionado nao podem divergir entre si.
+        relatorio["consequencias"] = [
+            {"id": i["id"], "papel": i.get("papel"), "consequencia": i.get("consequencia_se_off")}
+            for i, _ in divergentes]
+    return saida(relatorio, args.como_json, 1 if divergentes else 0)
+
+
+def saida(relatorio, como_json, codigo):
+    if como_json:
+        print(json.dumps(relatorio, ensure_ascii=False, indent=2))
+        return codigo
+    if codigo == 2:
+        print("check-edge-tiered-drift: INCONCLUSIVO (harness quebrado)")
+        print(f"  - {relatorio['motivo']}")
+        print(f"  - esperado em {os.path.relpath(CANONICO, RAIZ)}")
+        return codigo
+    for l in relatorio["interruptores"]:
+        if l["erro"]:
+            print(f"{l['id']:38s} : nao lido ({l['erro']})")
+        else:
+            print(f"{l['id']:38s} : {l['no_ar']!r} (esperado {l['esperado']!r})"
+                  f"  modified_on={l['modified_on']} editable={l['editable']}")
+    if not relatorio["verificada"]:
+        print("check-edge-tiered-drift: NAO VERIFICADA (exit 0, isto NAO e aprovacao)")
+        print(f"  - {relatorio['motivo']}")
+        print("  - indisponibilidade de API nao e drift; nada foi provado sobre a zona.")
+        return codigo
+    if not relatorio["drift"]:
+        print(f"check-edge-tiered-drift: OK ({len(relatorio['interruptores'])} interruptores conferidos, fonte: {relatorio['fonte']})")
+        return codigo
+    print("check-edge-tiered-drift: FAIL")
+    for c in relatorio["consequencias"]:
+        print(f"  - {c['id']} DESLIGADO. {c['papel']}")
+        print(f"    O que acontece se ficar assim: {c['consequencia']}")
+    print(f"  Religar: PATCH nos endpoints acima com {{\"value\":\"on\"}} usando a Global API Key")
+    print(f"  (X-Auth-Email + X-Auth-Key); o CLOUDFLARE_ZONE_TOKEN so le.")
+    return codigo
+
+
+if __name__ == "__main__":
+    sys.exit(main())

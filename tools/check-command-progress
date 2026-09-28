@@ -1,0 +1,1236 @@
+#!/usr/bin/env python3
+"""Observe command progress without signalling or otherwise mutating processes.
+
+The monitor samples a Linux process tree twice. Resource activity, artifact
+changes, heartbeats and self-reported counters are diagnostic evidence only.
+None proves which process wrote durable output. In overrun mode, a command that
+outlives its declared duration is therefore reported as risk, never productive.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import math
+import os
+import stat
+import sys
+import time
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Iterable, Mapping
+
+
+SCHEMA = "command-progress/v4"
+PROGRESS_SCHEMA = "command-progress-counter/v1"
+MIN_WINDOW_SECONDS = 0.05
+MAX_WINDOW_SECONDS = 60.0
+MAX_OBSERVER_BYTES = 1 << 20
+MAX_OBSERVERS = 32
+MAX_COUNTER_VALUE = (1 << 63) - 1
+RISK_STATUSES = frozenset(
+    {
+        "idle_stall_risk",
+        "busy_loop_risk",
+        "io_without_progress_risk",
+        "observer_invalid_risk",
+        "observer_regression_risk",
+        "reported_progress_unverified_risk",
+        "unattributed_progress_risk",
+    }
+)
+
+
+class InspectionError(RuntimeError):
+    """Raised when a live process exists but cannot be inspected safely."""
+
+
+@dataclass(frozen=True)
+class ProcessCounters:
+    pid: int
+    ppid: int
+    start_ticks: int
+    state: str
+    cpu_ticks: int
+    rchar: int = 0
+    wchar: int = 0
+    read_bytes: int = 0
+    write_bytes: int = 0
+    io_available: bool = False
+
+
+@dataclass(frozen=True)
+class TreeSnapshot:
+    root_pid: int
+    root_start_ticks: int
+    root_state: str
+    captured_monotonic: float
+    uptime_seconds: float
+    processes: tuple[ProcessCounters, ...]
+
+
+@dataclass(frozen=True)
+class MonitorConfig:
+    pid: int
+    window_seconds: float
+    busy_cpu_percent: float
+    min_io_activity_bytes: int
+    artifacts: tuple[str, ...] = ()
+    progress_files: tuple[str, ...] = ()
+    heartbeats: tuple[str, ...] = ()
+    progress_owner: str | None = None
+    progress_run_id: str | None = None
+    progress_lock_scope: str | None = None
+    overrun_risk: bool = False
+
+    @property
+    def observer_count(self) -> int:
+        return len(self.artifacts) + len(self.progress_files) + len(self.heartbeats)
+
+
+class ProcSampler:
+    """Read process identities and cumulative counters from procfs."""
+
+    def __init__(self, proc_root: Path = Path("/proc")) -> None:
+        self.proc_root = proc_root
+        self.clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+
+    def _read_io(self, pid: int) -> tuple[dict[str, int], bool]:
+        values: dict[str, int] = {}
+        try:
+            payload = (self.proc_root / str(pid) / "io").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return values, False
+        except PermissionError:
+            return values, False
+        except OSError:
+            return values, False
+        for line in payload.splitlines():
+            key, separator, raw_value = line.partition(":")
+            if not separator:
+                continue
+            try:
+                values[key] = int(raw_value.strip())
+            except ValueError:
+                continue
+        required = ("rchar", "wchar", "read_bytes", "write_bytes")
+        return values, all(key in values for key in required)
+
+    def _read_process(self, pid: int, *, strict: bool = False) -> ProcessCounters | None:
+        try:
+            payload = (self.proc_root / str(pid) / "stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except PermissionError as exc:
+            if strict:
+                raise InspectionError(f"permission_denied:/proc/{pid}/stat") from exc
+            return None
+        except OSError as exc:
+            if strict:
+                raise InspectionError(f"proc_stat_unreadable:/proc/{pid}/stat") from exc
+            return None
+
+        # comm is parenthesized and may contain spaces or ')', hence rfind.
+        close_paren = payload.rfind(")")
+        if close_paren < 0:
+            if strict:
+                raise InspectionError(f"proc_stat_malformed:/proc/{pid}/stat")
+            return None
+        fields = payload[close_paren + 2 :].split()
+        if len(fields) <= 19:
+            if strict:
+                raise InspectionError(f"proc_stat_malformed:/proc/{pid}/stat")
+            return None
+        try:
+            state = fields[0]
+            ppid = int(fields[1])
+            cpu_ticks = int(fields[11]) + int(fields[12])
+            start_ticks = int(fields[19])
+        except (ValueError, IndexError) as exc:
+            if strict:
+                raise InspectionError(f"proc_stat_malformed:/proc/{pid}/stat") from exc
+            return None
+
+        return ProcessCounters(
+            pid=pid,
+            ppid=ppid,
+            start_ticks=start_ticks,
+            state=state,
+            cpu_ticks=cpu_ticks,
+        )
+
+    def _uptime(self) -> float:
+        try:
+            value = float((self.proc_root / "uptime").read_text().split()[0])
+        except (FileNotFoundError, OSError, ValueError, IndexError):
+            return 0.0
+        return value if math.isfinite(value) and value >= 0 else 0.0
+
+    def _require_live_procfs(self) -> None:
+        """Distinguish an exited PID from an unavailable/mis-mounted procfs."""
+
+        try:
+            root_stat = self.proc_root.stat()
+            uptime = (self.proc_root / "uptime").read_text()
+            self_stat = (self.proc_root / "self" / "stat").read_text()
+        except (FileNotFoundError, PermissionError, OSError) as exc:
+            raise InspectionError(f"procfs_unavailable:{self.proc_root}") from exc
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise InspectionError(f"procfs_unavailable:{self.proc_root}")
+        try:
+            uptime_value = float(uptime.split()[0])
+        except (ValueError, IndexError) as exc:
+            raise InspectionError(f"procfs_unavailable:{self.proc_root}") from exc
+        if not math.isfinite(uptime_value) or uptime_value < 0:
+            raise InspectionError(f"procfs_unavailable:{self.proc_root}")
+        close_paren = self_stat.rfind(")")
+        fields = self_stat[close_paren + 2 :].split() if close_paren >= 0 else []
+        try:
+            int(fields[19])
+        except (ValueError, IndexError) as exc:
+            raise InspectionError(f"procfs_unavailable:{self.proc_root}") from exc
+
+    def sample(self, root_pid: int) -> TreeSnapshot | None:
+        self._require_live_procfs()
+        root = self._read_process(root_pid, strict=True)
+        if root is None:
+            # ENOENT means "exited" only while the procfs sentinel is still
+            # readable; an unmount between the first sentinel and PID read
+            # must fail closed instead of manufacturing a green exit.
+            self._require_live_procfs()
+            return None
+        processes: dict[int, ProcessCounters] = {root_pid: root}
+        try:
+            entries = tuple(self.proc_root.iterdir())
+        except OSError as exc:
+            raise InspectionError(f"procfs_unavailable:{self.proc_root}") from exc
+
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            if int(entry.name) == root_pid:
+                continue
+            process = self._read_process(int(entry.name))
+            if process is not None:
+                processes[process.pid] = process
+
+        children: dict[int, list[int]] = {}
+        for process in processes.values():
+            children.setdefault(process.ppid, []).append(process.pid)
+
+        selected: dict[int, ProcessCounters] = {root_pid: root}
+        pending = [root_pid]
+        while pending:
+            parent = pending.pop()
+            for child_pid in children.get(parent, ()):
+                if child_pid in selected:
+                    continue
+                child = processes.get(child_pid)
+                if child is None:
+                    continue
+                selected[child_pid] = child
+                pending.append(child_pid)
+
+        if os.getpid() in selected:
+            # An observer running inside the target tree necessarily adds its
+            # own CPU and I/O to that tree.  Those counters cannot be separated
+            # reliably from producer work, so accepting this topology can turn
+            # an idle ancestor into a false compute signal.
+            raise InspectionError("observer_process_inside_target_tree")
+
+        enriched: list[ProcessCounters] = []
+        for process in selected.values():
+            io_values, io_available = self._read_io(process.pid)
+            enriched.append(
+                ProcessCounters(
+                    pid=process.pid,
+                    ppid=process.ppid,
+                    start_ticks=process.start_ticks,
+                    state=process.state,
+                    cpu_ticks=process.cpu_ticks,
+                    rchar=io_values.get("rchar", 0),
+                    wchar=io_values.get("wchar", 0),
+                    read_bytes=io_values.get("read_bytes", 0),
+                    write_bytes=io_values.get("write_bytes", 0),
+                    io_available=io_available,
+                )
+            )
+
+        return TreeSnapshot(
+            root_pid=root_pid,
+            root_start_ticks=root.start_ticks,
+            root_state=root.state,
+            captured_monotonic=time.monotonic(),
+            uptime_seconds=self._uptime(),
+            processes=tuple(sorted(enriched, key=lambda process: process.pid)),
+        )
+
+
+class ObserverTransition(str, Enum):
+    """Exhaustive observer state transitions used by the verdict machine."""
+
+    UNCHANGED = "unchanged"
+    BASELINE_INVALID = "baseline_invalid"
+    INVALIDATED = "invalidated"
+    APPEARED_UNVERIFIED = "appeared_unverified"
+    DISAPPEARED = "disappeared"
+    KIND_CHANGED = "kind_changed"
+    PROGRESS_STARTED = "progress_started"
+    PROGRESS_ADVANCED = "progress_advanced"
+    PROGRESS_REGRESSED = "progress_regressed"
+    PROGRESS_IDENTITY_CHANGED = "progress_identity_changed"
+    ARTIFACT_CHANGED_UNATTRIBUTED = "artifact_changed_unattributed"
+    HEARTBEAT_CHANGED = "heartbeat_changed"
+
+
+class DuplicateJSONKey(ValueError):
+    """Raised when a progress proof uses ambiguous duplicate JSON keys."""
+
+
+def _same_open_file(before: os.stat_result, after: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    return all(getattr(before, field) == getattr(after, field) for field in fields)
+
+
+def _open_observer_anchor(
+    raw_path: str,
+) -> tuple[int | None, int | None, str | None, tuple[object, ...] | None]:
+    """Pin the parent and final entry with O_PATH without activating the file."""
+
+    if not raw_path or "\0" in raw_path:
+        return None, None, None, ("invalid", "invalid_observer_path")
+    if not hasattr(os, "O_PATH"):
+        return None, None, None, ("invalid", "observer_platform_requires_o_path")
+    absolute = os.path.isabs(raw_path)
+    parts = [part for part in raw_path.split(os.sep) if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        return None, None, None, ("invalid", "unsafe_observer_path")
+
+    path_flags = os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_flags = path_flags | os.O_DIRECTORY
+    try:
+        directory_fd = os.open("/" if absolute else ".", directory_flags)
+    except OSError as exc:
+        return None, None, None, (
+            "invalid",
+            "observer_root_unreadable",
+            exc.errno,
+        )
+
+    transferred = False
+    try:
+        for component in parts[:-1]:
+            try:
+                next_fd = os.open(component, path_flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                return None, None, None, ("missing",)
+            except OSError as exc:
+                return None, None, None, (
+                    "invalid",
+                    "path_component_unreadable",
+                    exc.errno,
+                )
+            try:
+                component_stat = os.fstat(next_fd)
+            except OSError as exc:
+                os.close(next_fd)
+                return None, None, None, (
+                    "invalid",
+                    "path_component_unreadable",
+                    exc.errno,
+                )
+            if not stat.S_ISDIR(component_stat.st_mode):
+                os.close(next_fd)
+                return None, None, None, (
+                    "invalid",
+                    "unsafe_path_component",
+                    stat.S_IFMT(component_stat.st_mode),
+                )
+            os.close(directory_fd)
+            directory_fd = next_fd
+
+        try:
+            anchor_fd = os.open(parts[-1], path_flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None, None, None, ("missing",)
+        except OSError as exc:
+            return None, None, None, (
+                "invalid",
+                "observer_anchor_failed",
+                exc.errno,
+            )
+        transferred = True
+        return anchor_fd, directory_fd, parts[-1], None
+    finally:
+        if not transferred:
+            os.close(directory_fd)
+
+
+def _same_identity(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        before.st_dev,
+        before.st_ino,
+        stat.S_IFMT(before.st_mode),
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        stat.S_IFMT(after.st_mode),
+    )
+
+
+def _pread_at_most(fd: int, size: int, offset: int) -> bytes:
+    """Read up to size bytes with pread, never exceeding the caller's budget."""
+
+    chunks: list[bytes] = []
+    remaining = max(0, size)
+    position = max(0, offset)
+    while remaining:
+        chunk = os.pread(fd, remaining, position)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        read_size = len(chunk)
+        position += read_size
+        remaining -= read_size
+    return b"".join(chunks)
+
+
+def _read_stable_regular(
+    raw_path: str,
+    *,
+    require_complete: bool,
+    read_content: bool = True,
+) -> tuple[os.stat_result | None, bytes | None, tuple[object, ...] | None]:
+    """Classify through O_PATH, then read the same regular inode by parent fd."""
+
+    anchor_fd, parent_fd, final_name, open_error = _open_observer_anchor(raw_path)
+    if anchor_fd is None or parent_fd is None or final_name is None:
+        return None, None, open_error
+    try:
+        anchor_stat = os.fstat(anchor_fd)
+        if stat.S_ISLNK(anchor_stat.st_mode):
+            return None, None, ("invalid", "symlink_observer_not_followed")
+        if not stat.S_ISREG(anchor_stat.st_mode):
+            return None, None, (
+                "invalid",
+                "observer_requires_regular_file",
+                stat.S_IFMT(anchor_stat.st_mode),
+            )
+        if not read_content:
+            return anchor_stat, b"", None
+
+        reader_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        noatime = getattr(os, "O_NOATIME", 0)
+        try:
+            reader_fd = os.open(
+                final_name,
+                reader_flags | noatime,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            reason = (
+                "symlink_observer_not_followed"
+                if exc.errno == errno.ELOOP
+                else "observer_reader_open_failed"
+            )
+            # Reopening without O_NOATIME could mutate the observed file's
+            # access time.  A read-only monitor must fail closed instead.
+            return None, None, ("invalid", reason, exc.errno)
+
+        try:
+            before = os.fstat(reader_fd)
+            if not stat.S_ISREG(before.st_mode):
+                return None, None, (
+                    "invalid",
+                    "observer_requires_regular_file",
+                    stat.S_IFMT(before.st_mode),
+                )
+            if not _same_identity(anchor_stat, before):
+                return None, None, ("invalid", "observer_replaced_before_read")
+            if require_complete and before.st_size > MAX_OBSERVER_BYTES:
+                return None, None, (
+                    "invalid",
+                    "progress_file_too_large",
+                    before.st_size,
+                )
+
+            if before.st_size <= MAX_OBSERVER_BYTES:
+                payload = _pread_at_most(reader_fd, before.st_size, 0)
+                if len(payload) != before.st_size:
+                    return None, None, ("invalid", "observer_short_read")
+            else:
+                # Three separated slices catch prefix/middle/suffix evolution
+                # while keeping total reads at or below MAX_OBSERVER_BYTES.
+                first_size = MAX_OBSERVER_BYTES // 3
+                middle_size = MAX_OBSERVER_BYTES // 3
+                last_size = MAX_OBSERVER_BYTES - first_size - middle_size
+                middle_offset = max(0, (before.st_size - middle_size) // 2)
+                last_offset = max(0, before.st_size - last_size)
+                first = _pread_at_most(reader_fd, first_size, 0)
+                middle = _pread_at_most(reader_fd, middle_size, middle_offset)
+                last = _pread_at_most(reader_fd, last_size, last_offset)
+                if (len(first), len(middle), len(last)) != (
+                    first_size,
+                    middle_size,
+                    last_size,
+                ):
+                    return None, None, ("invalid", "observer_short_read")
+                payload = b"".join((first, middle, last))
+
+            after = os.fstat(reader_fd)
+            if not _same_open_file(before, after):
+                return None, None, ("invalid", "observer_changed_during_read")
+            return before, payload, None
+        finally:
+            os.close(reader_fd)
+    except OSError as exc:
+        return None, None, ("invalid", "observer_read_failed", exc.errno)
+    finally:
+        os.close(anchor_fd)
+        os.close(parent_fd)
+
+
+def _json_object_no_duplicates(payload: bytes) -> dict[str, object]:
+    def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise DuplicateJSONKey(key)
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"non_finite_number:{value}")
+
+    decoded = payload.decode("utf-8")
+    parsed = json.loads(
+        decoded,
+        object_pairs_hook=pairs_hook,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(parsed, dict):
+        raise ValueError("progress_payload_must_be_object")
+    return parsed
+
+
+def _valid_counter(value: object) -> bool:
+    return type(value) is int and 0 <= value <= MAX_COUNTER_VALUE
+
+
+def _progress_token(
+    payload: bytes,
+    config: MonitorConfig,
+    allowed_identities: frozenset[tuple[int, int]],
+) -> tuple[object, ...]:
+    try:
+        document = _json_object_no_duplicates(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJSONKey, RecursionError, ValueError) as exc:
+        return ("invalid", "progress_json_invalid", type(exc).__name__)
+
+    if document.get("schema") != PROGRESS_SCHEMA:
+        return ("invalid", "progress_schema_invalid")
+    pid = document.get("pid")
+    start_ticks = document.get("start_ticks")
+    completed = document.get("completed")
+    if not (
+        _valid_counter(pid)
+        and pid > 0
+        and _valid_counter(start_ticks)
+        and start_ticks > 0
+    ):
+        return ("invalid", "progress_process_identity_invalid")
+    if not _valid_counter(completed):
+        return ("invalid", "progress_counter_invalid")
+    identity = (int(pid), int(start_ticks))
+    if identity not in allowed_identities:
+        return ("invalid", "progress_process_not_in_tree", *identity)
+
+    producer = document.get("producer")
+    run_id = document.get("run_id")
+    lock_scope = document.get("lock_scope")
+    optional_strings = {
+        "producer": producer,
+        "run_id": run_id,
+        "lock_scope": lock_scope,
+    }
+    if any(value is not None and (not isinstance(value, str) or not value) for value in optional_strings.values()):
+        return ("invalid", "progress_auth_field_invalid")
+    expectations = {
+        "producer": config.progress_owner,
+        "run_id": config.progress_run_id,
+        "lock_scope": config.progress_lock_scope,
+    }
+    for field, expected in expectations.items():
+        if expected is not None and document.get(field) != expected:
+            return ("invalid", f"progress_{field}_mismatch")
+
+    total = document.get("total")
+    if total is not None and (not _valid_counter(total) or completed > total):
+        return ("invalid", "progress_total_invalid")
+    return (
+        "progress",
+        int(pid),
+        int(start_ticks),
+        int(completed),
+        producer,
+        run_id,
+        lock_scope,
+    )
+
+
+def _observer_token(
+    kind: str,
+    raw_path: str,
+    config: MonitorConfig | None = None,
+    allowed_identities: frozenset[tuple[int, int]] = frozenset(),
+) -> tuple[object, ...]:
+    effective_config = config or MonitorConfig(1, 1.0, 25.0, 1)
+    path_stat, payload, read_error = _read_stable_regular(
+        raw_path,
+        require_complete=kind == "progress",
+        read_content=kind != "heartbeat",
+    )
+    if read_error is not None:
+        return read_error
+    assert path_stat is not None and payload is not None
+    if kind == "heartbeat":
+        return (
+            "heartbeat",
+            path_stat.st_size,
+            path_stat.st_mtime_ns,
+            path_stat.st_dev,
+            path_stat.st_ino,
+        )
+    if kind == "progress":
+        return _progress_token(payload, effective_config, allowed_identities)
+    digest = hashlib.sha256(payload).hexdigest()
+    return ("artifact", path_stat.st_size, digest)
+
+
+def snapshot_observers(
+    config: MonitorConfig,
+    snapshot: TreeSnapshot,
+    additional_identities: frozenset[tuple[int, int]] = frozenset(),
+) -> dict[tuple[str, str], tuple[object, ...]]:
+    observations: dict[tuple[str, str], tuple[object, ...]] = {}
+    identities = frozenset(
+        (process.pid, process.start_ticks) for process in snapshot.processes
+    ) | additional_identities
+    groups: tuple[tuple[str, Iterable[str]], ...] = (
+        ("artifact", config.artifacts),
+        ("progress", config.progress_files),
+        ("heartbeat", config.heartbeats),
+    )
+    for kind, paths in groups:
+        for path in paths:
+            observations[(kind, path)] = _observer_token(
+                kind,
+                path,
+                config,
+                identities,
+            )
+    return observations
+
+
+def classify_observer_transition(
+    kind: str,
+    older: tuple[object, ...],
+    newer: tuple[object, ...],
+    *,
+    fully_asserted_progress_metadata: bool = False,
+) -> ObserverTransition:
+    """Classify one transition without treating metadata churn as work."""
+
+    old_tag = older[0] if older else "missing"
+    new_tag = newer[0] if newer else "missing"
+    if old_tag == "invalid":
+        return ObserverTransition.BASELINE_INVALID
+    if new_tag == "invalid":
+        return ObserverTransition.INVALIDATED
+    if old_tag == "missing":
+        if new_tag == "missing":
+            return ObserverTransition.UNCHANGED
+        if (
+            kind == "progress"
+            and new_tag == "progress"
+            and len(newer) == 7
+            and fully_asserted_progress_metadata
+            and _valid_counter(newer[3])
+            and newer[3] > 0
+        ):
+            return ObserverTransition.PROGRESS_STARTED
+        return ObserverTransition.APPEARED_UNVERIFIED
+    if new_tag == "missing":
+        return ObserverTransition.DISAPPEARED
+    if old_tag != new_tag or old_tag != kind:
+        return ObserverTransition.KIND_CHANGED
+    if older == newer:
+        return ObserverTransition.UNCHANGED
+    if kind == "progress":
+        if len(older) != 7 or len(newer) != 7:
+            return ObserverTransition.KIND_CHANGED
+        old_auth = older[1:3] + older[4:7]
+        new_auth = newer[1:3] + newer[4:7]
+        if old_auth != new_auth:
+            return ObserverTransition.PROGRESS_IDENTITY_CHANGED
+        old_completed = older[3]
+        new_completed = newer[3]
+        if not (_valid_counter(old_completed) and _valid_counter(new_completed)):
+            return ObserverTransition.KIND_CHANGED
+        if new_completed > old_completed:
+            return ObserverTransition.PROGRESS_ADVANCED
+        return ObserverTransition.PROGRESS_REGRESSED
+    if kind == "artifact":
+        return ObserverTransition.ARTIFACT_CHANGED_UNATTRIBUTED
+    if kind == "heartbeat":
+        return ObserverTransition.HEARTBEAT_CHANGED
+    return ObserverTransition.KIND_CHANGED
+
+
+def _empty_result(pid: int, reason: str) -> dict[str, object]:
+    return {
+        "schema": SCHEMA,
+        "status": "exited",
+        "reason": reason,
+        "pid": pid,
+        "identity_stable": False,
+        "root_start_ticks": 0,
+        "root_state_before": "missing",
+        "root_state_after": "missing",
+        "tree_processes_before": 0,
+        "tree_processes_after": 0,
+        "tree_spawned": 0,
+        "tree_exited": 0,
+        "cpu_ticks_delta": 0,
+        "cpu_seconds_delta": 0.0,
+        "cpu_percent": 0.0,
+        "io_chars_delta": 0,
+        "io_read_bytes_delta": 0,
+        "io_write_bytes_delta": 0,
+        "io_observed_processes_before": 0,
+        "io_observed_processes_after": 0,
+        "artifact_changed": False,
+        "progress_changed": False,
+        "heartbeat_changed": False,
+        "changed_observer_count": 0,
+        "regressed_observer_count": 0,
+        "invalid_observer_count": 0,
+        "baseline_invalid_observer_count": 0,
+        "reported_progress_count": 0,
+        "unattributed_artifact_change_count": 0,
+        "observer_count": 0,
+        "window_seconds": 0.0,
+        "root_age_seconds": 0.0,
+    }
+
+
+def _counter_deltas(
+    before: TreeSnapshot,
+    after: TreeSnapshot,
+    clock_ticks: int,
+) -> tuple[dict[str, int], int, int, int, int]:
+    before_by_identity = {
+        (process.pid, process.start_ticks): process for process in before.processes
+    }
+    after_by_identity = {
+        (process.pid, process.start_ticks): process for process in after.processes
+    }
+    common = before_by_identity.keys() & after_by_identity.keys()
+    deltas = {
+        "cpu_ticks": 0,
+        "rchar": 0,
+        "wchar": 0,
+        "read_bytes": 0,
+        "write_bytes": 0,
+    }
+    for identity in common:
+        older = before_by_identity[identity]
+        newer = after_by_identity[identity]
+        for field in deltas:
+            if field != "cpu_ticks" and not (
+                older.io_available and newer.io_available
+            ):
+                # /proc/<pid>/io values are cumulative for the process lifetime.
+                # Treating a newly readable counter as a window delta can turn an
+                # idle command into a false compute signal.
+                continue
+            deltas[field] += max(0, int(getattr(newer, field)) - int(getattr(older, field)))
+    new_identities = after_by_identity.keys() - before_by_identity.keys()
+    # A descendant born after the first sample has no baseline.  Its cumulative
+    # counters are bounded by this window only when procfs proves it started no
+    # earlier than the baseline.  Never add a tolerance tick: that can import
+    # pre-window lifetime counters and manufacture activity.
+    baseline_start_tick = max(0, int(before.uptime_seconds * clock_ticks))
+    for identity in new_identities:
+        process = after_by_identity[identity]
+        # Equality is ambiguous because procfs exposes start time at clock-tick
+        # granularity: the process may have accumulated work just before the
+        # baseline in that same tick.  Only a strictly later tick is attributable.
+        if before.uptime_seconds <= 0 or process.start_ticks <= baseline_start_tick:
+            continue
+        for field in deltas:
+            if field != "cpu_ticks" and not process.io_available:
+                continue
+            deltas[field] += max(0, int(getattr(process, field)))
+    spawned = len(new_identities)
+    exited = len(before_by_identity.keys() - after_by_identity.keys())
+    io_before = sum(process.io_available for process in before.processes)
+    io_after = sum(process.io_available for process in after.processes)
+    return deltas, spawned, exited, io_before, io_after
+
+
+def evaluate_snapshots(
+    before: TreeSnapshot,
+    after: TreeSnapshot,
+    observer_before: Mapping[tuple[str, str], tuple[object, ...]],
+    observer_after: Mapping[tuple[str, str], tuple[object, ...]],
+    config: MonitorConfig,
+    clock_ticks: int,
+) -> dict[str, object]:
+    elapsed = max(0.0, after.captured_monotonic - before.captured_monotonic)
+    result = _empty_result(config.pid, "exited_during_window")
+    result.update(
+        {
+            "observer_count": config.observer_count,
+            "window_seconds": round(elapsed, 6),
+            "tree_processes_before": len(before.processes),
+            "tree_processes_after": len(after.processes),
+            "tree_exited": len(before.processes),
+            "root_start_ticks": before.root_start_ticks,
+            "root_state_before": before.root_state,
+            "root_state_after": after.root_state,
+        }
+    )
+
+    if before.root_state == "Z":
+        result["reason"] = "root_zombie_before_window"
+        return result
+    if after.root_start_ticks != before.root_start_ticks:
+        result["reason"] = "pid_identity_changed"
+        return result
+    if after.root_state == "Z":
+        result["reason"] = "root_became_zombie"
+        return result
+
+    result["identity_stable"] = True
+    deltas, spawned, exited, io_before, io_after = _counter_deltas(
+        before, after, clock_ticks
+    )
+    elapsed_for_rate = max(elapsed, 1e-9)
+    cpu_seconds = deltas["cpu_ticks"] / max(1, clock_ticks)
+    cpu_percent = cpu_seconds * 100.0 / elapsed_for_rate
+    io_chars = deltas["rchar"] + deltas["wchar"]
+
+    transitions: dict[tuple[str, str], ObserverTransition] = {}
+    for observer, older in observer_before.items():
+        newer = observer_after.get(observer, ("missing",))
+        transitions[observer] = classify_observer_transition(
+            observer[0],
+            older,
+            newer,
+            fully_asserted_progress_metadata=all(
+                (
+                    config.progress_owner,
+                    config.progress_run_id,
+                    config.progress_lock_scope,
+                )
+            ),
+        )
+
+    baseline_invalid = sum(
+        transition is ObserverTransition.BASELINE_INVALID
+        for transition in transitions.values()
+    )
+    invalid_states = {
+        ObserverTransition.BASELINE_INVALID,
+        ObserverTransition.INVALIDATED,
+        ObserverTransition.APPEARED_UNVERIFIED,
+        ObserverTransition.KIND_CHANGED,
+    }
+    regression_states = {
+        ObserverTransition.DISAPPEARED,
+        ObserverTransition.PROGRESS_REGRESSED,
+        ObserverTransition.PROGRESS_IDENTITY_CHANGED,
+    }
+    invalid = sum(transition in invalid_states for transition in transitions.values())
+    regressed = sum(
+        transition in regression_states for transition in transitions.values()
+    )
+    progress_advanced = sum(
+        transition
+        in {
+            ObserverTransition.PROGRESS_STARTED,
+            ObserverTransition.PROGRESS_ADVANCED,
+        }
+        for transition in transitions.values()
+    )
+    artifact_changed = sum(
+        transition is ObserverTransition.ARTIFACT_CHANGED_UNATTRIBUTED
+        for transition in transitions.values()
+    )
+    heartbeat_changed = sum(
+        transition is ObserverTransition.HEARTBEAT_CHANGED
+        for transition in transitions.values()
+    )
+    changed_total = sum(
+        transition is not ObserverTransition.UNCHANGED
+        for transition in transitions.values()
+    )
+
+    result.update(
+        {
+            "tree_spawned": spawned,
+            "tree_exited": exited,
+            "cpu_ticks_delta": deltas["cpu_ticks"],
+            "cpu_seconds_delta": round(cpu_seconds, 6),
+            "cpu_percent": round(cpu_percent, 3),
+            "io_chars_delta": io_chars,
+            "io_read_bytes_delta": deltas["read_bytes"],
+            "io_write_bytes_delta": deltas["write_bytes"],
+            "io_observed_processes_before": io_before,
+            "io_observed_processes_after": io_after,
+            "artifact_changed": artifact_changed > 0,
+            "progress_changed": progress_advanced > 0,
+            "heartbeat_changed": heartbeat_changed > 0,
+            "changed_observer_count": changed_total,
+            "regressed_observer_count": regressed,
+            "invalid_observer_count": invalid,
+            "baseline_invalid_observer_count": baseline_invalid,
+            "reported_progress_count": progress_advanced,
+            "unattributed_artifact_change_count": artifact_changed,
+            "root_age_seconds": round(
+                max(0.0, after.uptime_seconds - after.root_start_ticks / max(1, clock_ticks)),
+                3,
+            ),
+        }
+    )
+
+    # rchar/wchar are logical syscall bytes while read_bytes/write_bytes are
+    # storage-layer bytes.  The same operation commonly advances both layers;
+    # summing them double-counts activity and can cross the threshold falsely.
+    io_storage = deltas["read_bytes"] + deltas["write_bytes"]
+    io_activity = max(io_chars, io_storage)
+    output_observers = len(config.artifacts) + len(config.progress_files)
+    if invalid:
+        status = "observer_invalid_risk"
+        reason = (
+            "observer_baseline_invalid"
+            if baseline_invalid
+            else "observer_cannot_prove_progress"
+        )
+    elif regressed:
+        status = "observer_regression_risk"
+        reason = "observer_progress_or_identity_regressed"
+    elif progress_advanced:
+        status = "reported_progress_unverified_risk"
+        reason = "self_reported_progress_does_not_prove_writer_or_durable_output"
+    elif artifact_changed:
+        status = "unattributed_progress_risk"
+        reason = "artifact_change_without_attributed_progress"
+    elif output_observers and io_activity > 0 and io_activity >= config.min_io_activity_bytes:
+        status = "io_without_progress_risk"
+        reason = "io_activity_without_expected_output_progress"
+    elif output_observers and cpu_percent >= config.busy_cpu_percent:
+        status = "busy_loop_risk"
+        reason = "cpu_busy_without_expected_progress"
+    elif output_observers:
+        status = "idle_stall_risk"
+        reason = "expected_output_did_not_advance"
+    elif config.overrun_risk and io_activity > 0 and io_activity >= config.min_io_activity_bytes:
+        status = "io_without_progress_risk"
+        reason = "declared_duration_exceeded_with_unverified_io"
+    elif config.overrun_risk and cpu_percent >= config.busy_cpu_percent:
+        status = "busy_loop_risk"
+        reason = "declared_duration_exceeded_with_unverified_compute"
+    elif config.overrun_risk:
+        status = "idle_stall_risk"
+        reason = "declared_duration_exceeded_without_material_progress"
+    elif heartbeat_changed:
+        status = "reported_progress_unverified_risk"
+        reason = "heartbeat_does_not_prove_writer_or_durable_output"
+    elif io_activity > 0 and io_activity >= config.min_io_activity_bytes:
+        status = "compute_unverified"
+        reason = "io_activity_without_explicit_progress"
+    elif cpu_percent >= config.busy_cpu_percent:
+        status = "compute_unverified"
+        reason = "cpu_activity_without_progress_observer"
+    else:
+        status = "idle_stall_risk"
+        reason = "no_progress_cpu_or_io_activity"
+    result["status"] = status
+    result["reason"] = reason
+    return result
+
+
+def monitor(
+    config: MonitorConfig,
+    *,
+    sampler: ProcSampler | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    if config.observer_count > MAX_OBSERVERS:
+        raise InspectionError(
+            f"observer_limit_exceeded:{config.observer_count}>{MAX_OBSERVERS}"
+        )
+    sampler = sampler or ProcSampler()
+    before = sampler.sample(config.pid)
+    if before is None:
+        result = _empty_result(config.pid, "missing_before_window")
+        result["observer_count"] = config.observer_count
+        return result
+
+    if before.root_state == "Z":
+        result = _empty_result(config.pid, "root_zombie_before_window")
+        result.update(
+            {
+                "root_start_ticks": before.root_start_ticks,
+                "root_state_before": before.root_state,
+                "root_state_after": before.root_state,
+                "tree_processes_before": len(before.processes),
+                "tree_processes_after": len(before.processes),
+                "tree_exited": 0,
+                "observer_count": config.observer_count,
+                "root_age_seconds": round(
+                    max(
+                        0.0,
+                        before.uptime_seconds
+                        - before.root_start_ticks / max(1, sampler.clock_ticks),
+                    ),
+                    3,
+                ),
+            }
+        )
+        return result
+
+    observer_before = snapshot_observers(config, before)
+    sleep_fn(config.window_seconds)
+    after = sampler.sample(config.pid)
+    if after is None:
+        result = _empty_result(config.pid, "exited_during_window")
+        result.update(
+            {
+                "root_start_ticks": before.root_start_ticks,
+                "root_state_before": before.root_state,
+                "tree_processes_before": len(before.processes),
+                "tree_exited": len(before.processes),
+                "observer_count": config.observer_count,
+                "window_seconds": round(
+                    max(0.0, time.monotonic() - before.captured_monotonic), 6
+                ),
+            }
+        )
+        return result
+    before_identities = frozenset(
+        (process.pid, process.start_ticks) for process in before.processes
+    )
+    observer_after = snapshot_observers(config, after, before_identities)
+    return evaluate_snapshots(
+        before,
+        after,
+        observer_before,
+        observer_after,
+        config,
+        sampler.clock_ticks,
+    )
+
+
+def _bounded_float(name: str, minimum: float, maximum: float) -> Callable[[str], float]:
+    def parse(raw: str) -> float:
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{name} must be a number") from exc
+        if not minimum <= value <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be between {minimum:g} and {maximum:g}"
+            )
+        return value
+
+    return parse
+
+
+def _nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be an integer") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return value
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Bounded, read-only progress observer for a Linux process tree."
+    )
+    parser.add_argument("pid", type=int)
+    parser.add_argument(
+        "--artifact",
+        action="append",
+        default=[],
+        help=(
+            "Artifact path sampled only as unattributed diagnostic evidence; "
+            "it never proves productive work (repeatable)."
+        ),
+    )
+    parser.add_argument(
+        "--progress-file",
+        action="append",
+        default=[],
+        help=(
+            "JSON counter path with schema, pid, start_ticks and monotonic completed "
+            "(repeatable)."
+        ),
+    )
+    parser.add_argument(
+        "--progress-owner",
+        help="Expected self-reported producer string; exact but not writer authentication.",
+    )
+    parser.add_argument(
+        "--progress-run-id",
+        help="Expected self-reported run_id; exact but not writer authentication.",
+    )
+    parser.add_argument(
+        "--progress-lock-scope",
+        help="Expected self-reported lock_scope; exact but not writer authentication.",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        action="append",
+        default=[],
+        help="Heartbeat path whose inode, size or mtime should change (repeatable).",
+    )
+    parser.add_argument(
+        "--window-seconds",
+        type=_bounded_float("window-seconds", MIN_WINDOW_SECONDS, MAX_WINDOW_SECONDS),
+        default=30.0,
+        help=f"Sampling window, bounded to {MIN_WINDOW_SECONDS:g}..{MAX_WINDOW_SECONDS:g}s.",
+    )
+    parser.add_argument(
+        "--busy-cpu-percent",
+        type=_bounded_float("busy-cpu-percent", 0.01, 100000.0),
+        default=25.0,
+        help="Tree CPU threshold used to distinguish busy compute from idle stall.",
+    )
+    parser.add_argument(
+        "--min-io-activity-bytes",
+        type=_nonnegative_int,
+        default=1,
+        help="Minimum cumulative tree I/O delta treated as unverified compute activity.",
+    )
+    parser.add_argument(
+        "--overrun-risk",
+        action="store_true",
+        help=(
+            "Classify any still-running command in this window as a declared-duration "
+            "overrun risk; never changes or signals the command."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit compact sorted JSON instead of stable key=value output.",
+    )
+    args = parser.parse_args(argv)
+    if args.pid <= 0:
+        parser.error("pid must be a positive integer")
+    observer_groups = tuple(
+        tuple(dict.fromkeys(paths))
+        for paths in (args.artifact, args.progress_file, args.heartbeat)
+    )
+    observer_paths = tuple(path for group in observer_groups for path in group)
+    if any(not path for path in observer_paths):
+        parser.error("observer paths must not be empty")
+    if len(observer_paths) > MAX_OBSERVERS:
+        parser.error(
+            f"at most {MAX_OBSERVERS} unique observer paths are allowed"
+        )
+    for field in ("progress_owner", "progress_run_id", "progress_lock_scope"):
+        if getattr(args, field) == "":
+            parser.error(f"{field.replace('_', '-')} must not be empty")
+    if any(
+        getattr(args, field) is not None
+        for field in ("progress_owner", "progress_run_id", "progress_lock_scope")
+    ) and not args.progress_file:
+        parser.error("progress authentication fields require --progress-file")
+    return args
+
+
+KV_FIELDS = (
+    "status",
+    "schema",
+    "reason",
+    "pid",
+    "identity_stable",
+    "root_start_ticks",
+    "root_state_before",
+    "root_state_after",
+    "tree_processes_before",
+    "tree_processes_after",
+    "tree_spawned",
+    "tree_exited",
+    "cpu_ticks_delta",
+    "cpu_seconds_delta",
+    "cpu_percent",
+    "io_chars_delta",
+    "io_read_bytes_delta",
+    "io_write_bytes_delta",
+    "io_observed_processes_before",
+    "io_observed_processes_after",
+    "artifact_changed",
+    "progress_changed",
+    "heartbeat_changed",
+    "changed_observer_count",
+    "regressed_observer_count",
+    "invalid_observer_count",
+    "baseline_invalid_observer_count",
+    "reported_progress_count",
+    "unattributed_artifact_change_count",
+    "observer_count",
+    "window_seconds",
+    "root_age_seconds",
+)
+
+
+def _kv_value(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def emit(result: Mapping[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return
+    print(" ".join(f"{key}={_kv_value(result[key])}" for key in KV_FIELDS))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    config = MonitorConfig(
+        pid=args.pid,
+        window_seconds=args.window_seconds,
+        busy_cpu_percent=args.busy_cpu_percent,
+        min_io_activity_bytes=args.min_io_activity_bytes,
+        artifacts=tuple(dict.fromkeys(args.artifact)),
+        progress_files=tuple(dict.fromkeys(args.progress_file)),
+        heartbeats=tuple(dict.fromkeys(args.heartbeat)),
+        progress_owner=args.progress_owner,
+        progress_run_id=args.progress_run_id,
+        progress_lock_scope=args.progress_lock_scope,
+        overrun_risk=args.overrun_risk,
+    )
+    try:
+        result = monitor(config)
+    except InspectionError as exc:
+        print(f"check-command-progress: {exc}", file=sys.stderr)
+        return 1
+    emit(result, args.json)
+    return 2 if result["status"] in RISK_STATUSES else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

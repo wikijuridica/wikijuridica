@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""check-indexnow-backlog — o acervo no ar tem recibo de aceite do IndexNow?
+
+POR QUE ESTE GATE EXISTE. Em 2026-09-08, 6.803 das 10.181 URLs do estado do
+IndexNow estavam no ar, no sitemap e no `published_manifest`, respondendo 200, e
+sem NENHUM recibo de aceite. A semeadura de 2026-08-12 tinha gravado o hash do
+conteudo atual de cada uma, e o delta — que compara hash com hash — nunca mais as
+viu. O servico diario imprimia "nada a submeter" e ninguem percebia: a mensagem
+descrevia corretamente o delta e escondia dois tercos do acervo por anunciar.
+O defeito so apareceu quando o dono exportou do Bing Webmaster Tools 21 URLs
+fora do indice — e as 21 eram desse conjunto.
+
+`tools/test_generate_indexnow_incremental_backlog.py` tranca a logica; este gate
+tranca o ESTADO VIVO, que e outra coisa. Codigo certo com timer parado, disco
+cheio ou 403 repetido produz exatamente o mesmo silencio de antes.
+
+O QUE ELE AFIRMA, e nada alem disso:
+
+  - URL "com recibo" e a que tem `submitted_at` no estado — o campo que so e
+    gravado depois de um 200/202 real de `generate-indexnow-direct-submit`.
+    `seeded: true` nao conta: a semente e uma linha de base, e o proprio
+    `seed_note` do arquivo diz que ela nao afirma submissao.
+  - So contam as URLs que o sitemap anuncia HOJE. Estado de rota aposentada nao
+    e divida: ela nao e mais nossa para anunciar.
+  - REPROVA quando ha backlog e a drenagem esta PARADA — mais de
+    TETO_DIAS_SEM_DRENAGEM dias sem uma execucao que tenha enviado backlog. Nao
+    reprova por existir backlog: ele leva ~6 dias para escoar na cota padrao, e
+    reprovar durante a drenagem seria vermelho por dívida em andamento, que este
+    projeto ja aprendeu a nao fazer.
+  - REPROVA quando ha backlog e o estado nunca registrou drenagem alguma — o
+    formato exato do defeito original.
+
+LIMITE DECLARADO. URL que esta no sitemap e ainda NAO consta do estado aparece
+como "fora do estado" e nao reprova. E deliberado: o incremental a trata como
+"nova" na proxima execucao e a envia inteira, sem passar pelo teto da cota — o
+caminho normal de uma pagina recem-publicada. Reprovar por ela exigiria guardar
+desde quando ela esta assim, e um `check-*` que grava estado permanente e falha
+de ferramenta neste projeto. Quem some com esse numero e o proximo `roda`, nao
+este gate.
+
+O SEGUNDO SENTIDO, acrescentado em 2026-09-16 — e a razao de ele faltar.
+
+Ate aqui este gate conferia SITEMAP -> RECIBO e declarava cobertura como se
+tivesse conferido os dois lados. E a familia de defeito que este repositorio ja
+pagou ("detector que conta em vez de comparar conjunto"): o instrumento mede um
+sentido e o relatorio soa como se medisse a igualdade dos conjuntos. Enquanto
+ele imprimia "OK: toda URL no ar tem recibo", 1.968 URLs que NAO estao no
+sitemap estavam sendo anunciadas — 2.422 eventos com HTTP 200, 17,4% de tudo o
+que saiu desde 2026-09-04, e metade exata do lote de 2026-09-16T15:50:19.
+
+RECIBO -> SITEMAP e agora conferido, e a FONTE importa mais que a regra.
+
+Este lado NAO pode ser lido de `indexnow_submission_state.json`. Aquele arquivo
+tem ZERO `.md` por CONSTRUCAO: quem o escreve
+(`generate-indexnow-direct-submit.registrar_no_estado_compartilhado`) so grava
+URL para a qual conseguiu hashear um `public/<rota>/index.html`, e para
+`/x/index.md` esse caminho e `public/x/index.md/index.html`, que nao existe. Um
+gate do sentido inverso apoiado nele ficaria verde para sempre — falso-verde
+pior que a ausencia do gate, porque afirma o que nao mediu.
+
+A fonte e `data/ops/indexnow_url_state.jsonl`, o ledger por URL: uma linha por
+URL por lote REALMENTE POSTado, escrita no unico ponto por onde os dois
+submissores passam. E a evidencia do que foi ao fio, nao do que se pretendeu.
+
+REPROVA POR FLUXO, nao por estoque. So conta evento dentro da janela
+(--janela-dias, padrao 2). O historico anterior entra como informacao: reprovar
+pelo acumulado deixaria o gate vermelho para sempre sem nada que o drene — e
+gate cronicamente vermelho e gate que ninguem le.
+
+Read-only por contrato: nao escreve estado, nao submete nada, nao toca a rede.
+
+Uso:
+    tools/check-indexnow-backlog
+    tools/check-indexnow-backlog --teto-dias 3
+    tools/check-indexnow-backlog --janela-dias 7
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SITE = os.path.join(ROOT, "content/site.json")
+ESTADO = os.path.join(ROOT, "data/ops/indexnow_submission_state.json")
+# A FONTE DO SENTIDO INVERSO. Ver o cabecalho: trocar isto por ESTADO faz o
+# gate ficar verde para sempre, porque o estado nao registra o que nao tem HTML.
+LEDGER_URL = os.path.join(ROOT, "data/ops/indexnow_url_state.jsonl")
+
+# Dois dias, e nao um: o timer roda uma vez por dia e o servico tem
+# RandomizedDelaySec, entao um unico dia de folga cabe dentro do ritmo normal.
+# Dois dias sem drenagem, com backlog no ar, ja e canal parado.
+TETO_DIAS_SEM_DRENAGEM = 2
+# Mesma janela para o sentido inverso: um deploy sujo tem de aparecer no dia, e
+# sumir do vermelho quando o deploy seguinte sair limpo.
+JANELA_DIAS_ANUNCIO = 2
+
+
+def anunciadas_fora_do_sitemap(no_ar, desde):
+    """RECIBO -> SITEMAP: o que foi anunciado e o sitemap nao lista.
+
+    Devolve `(gemeas, outras, total_no_periodo, total_historico)`, com `gemeas`
+    e `outras` ordenadas e sem repeticao.
+
+    A separacao em duas classes nao e cosmetica, e decide o que o operador faz:
+
+      - GEMEA de rota do sitemap (`/x/index.md` com `/x/` anunciado) e defeito
+        inequivoco de categoria — lista de chave de purga usada como lista de
+        anuncio. Tem correcao no codigo e nome proprio.
+      - OUTRA e qualquer outro endereco fora do sitemap. Pode ser rota
+        aposentada que sobrou num arquivo, e a acao e diferente: olhar antes de
+        chamar de defeito.
+
+    So contam eventos ACEITOS (200/202): um 403 registrado e um anuncio que o
+    operador recusou, e recusa dele nao e poluicao nossa.
+    """
+    gemeas, outras = set(), set()
+    no_periodo = 0
+    historico = 0
+    if not os.path.isfile(LEDGER_URL):
+        return [], [], 0, 0
+    with open(LEDGER_URL, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except ValueError:
+                continue
+            if registro.get("http_status") not in (200, 202):
+                continue
+            url = registro.get("url") or ""
+            if not url or url in no_ar:
+                continue
+            historico += 1
+            if (registro.get("submitted_at") or "")[:10] < desde:
+                continue
+            no_periodo += 1
+            if url.endswith("/index.md") and url[: -len("index.md")] in no_ar:
+                gemeas.add(url)
+            else:
+                outras.add(url)
+    return sorted(gemeas), sorted(outras), no_periodo, historico
+
+
+def sitemap_urls():
+    urls = set()
+    for caminho in sorted(glob.glob(os.path.join(ROOT, "public/sitemaps/pages-*.xml"))):
+        with open(caminho, encoding="utf-8") as handle:
+            urls.update(re.findall(r"<loc>([^<]+)</loc>", handle.read()))
+    return urls
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--teto-dias", type=int, default=TETO_DIAS_SEM_DRENAGEM,
+                        help="dias tolerados sem drenagem enquanto houver backlog (padrão: %d)"
+                             % TETO_DIAS_SEM_DRENAGEM)
+    parser.add_argument("--janela-dias", type=int, default=JANELA_DIAS_ANUNCIO,
+                        help="janela do sentido recibo→sitemap, em dias (padrão: %d)"
+                             % JANELA_DIAS_ANUNCIO)
+    args = parser.parse_args()
+
+    if not os.path.isfile(ESTADO):
+        print("REPROVADO: %s não existe — o canal IndexNow não tem estado."
+              % os.path.relpath(ESTADO, ROOT), file=sys.stderr)
+        return 1
+    with open(ESTADO, encoding="utf-8") as handle:
+        estado = json.load(handle)
+    conhecidas = estado.get("urls") or {}
+
+    no_ar = sitemap_urls()
+    if not no_ar:
+        print("REPROVADO: nenhum shard de sitemap em public/sitemaps/ — sem base de comparação.",
+              file=sys.stderr)
+        return 1
+
+    com_recibo = [u for u in no_ar if conhecidas.get(u, {}).get("submitted_at")]
+    sem_recibo = [u for u in no_ar if u in conhecidas and not conhecidas[u].get("submitted_at")]
+    fora_do_estado = [u for u in no_ar if u not in conhecidas]
+
+    print("=== INDEXNOW: RECIBO DE ACEITE POR URL NO AR ===")
+    print("URLs no sitemap : %d" % len(no_ar))
+    print("com recibo 200/202: %d (%.1f%%)"
+          % (len(com_recibo), 100.0 * len(com_recibo) / len(no_ar)))
+    print("sem recibo      : %d" % len(sem_recibo))
+    if fora_do_estado:
+        print("fora do estado  : %d (entram como 'novas' na próxima execução)" % len(fora_do_estado))
+
+    # SENTIDO INVERSO — e ele roda ANTES de qualquer saida do sentido direto.
+    #
+    # A posicao no arquivo e parte da correcao. O `return 0` logo abaixo, no
+    # ramo "toda URL no ar tem recibo", era o caminho que o gate percorria
+    # todos os dias: um detector colocado depois dele nunca executaria, e o
+    # gate seguiria verde sem medir — o defeito de "ausencia de sinal nao e
+    # evidencia", em que o detector que eu esperava ver tinha early-return na
+    # frente.
+    hoje_utc = datetime.datetime.now(datetime.timezone.utc).date()
+    desde = (hoje_utc - datetime.timedelta(days=max(0, args.janela_dias))).isoformat()
+    gemeas, outras, no_periodo, historico = anunciadas_fora_do_sitemap(no_ar, desde)
+
+    print("\n=== INDEXNOW: URL ANUNCIADA QUE O SITEMAP NÃO LISTA (recibo→sitemap) ===")
+    print("fonte           : %s" % os.path.relpath(LEDGER_URL, ROOT))
+    print("janela          : desde %s (%d dia(s))" % (desde, args.janela_dias))
+    print("eventos aceitos fora do sitemap: %d na janela, %d no histórico"
+          % (no_periodo, historico))
+    print("  gêmea .md de rota do sitemap : %d URL(s) distintas na janela" % len(gemeas))
+    print("  outra (fora do sitemap)      : %d URL(s) distintas na janela" % len(outras))
+
+    reverso_ok = not gemeas and not outras
+    if not reverso_ok:
+        print("\nREPROVADO: %d URL(s) anunciadas ao IndexNow não estão no sitemap."
+              % (len(gemeas) + len(outras)), file=sys.stderr)
+        if gemeas:
+            print("  GÊMEA MARKDOWN (%d) — erro de categoria: a lista do anúncio veio de"
+                  % len(gemeas), file=sys.stderr)
+            print("  `--purge-targets`, que emite chave de cache da borda (`/x/` E `/x/index.md`),",
+                  file=sys.stderr)
+            print("  e a gêmea serve `rel=canonical` apontando para o HTML. Corrija no produtor",
+                  file=sys.stderr)
+            print("  da lista, não aqui. Exemplos:", file=sys.stderr)
+            for url in gemeas[:5]:
+                print("    %s" % url, file=sys.stderr)
+        if outras:
+            print("  OUTRA (%d) — endereço fora do sitemap que não é gêmea. Pode ser rota"
+                  % len(outras), file=sys.stderr)
+            print("  aposentada sobrando numa lista; confira antes de chamar de defeito:",
+                  file=sys.stderr)
+            for url in outras[:5]:
+                print("    %s" % url, file=sys.stderr)
+
+    drenagem = estado.get("backlog_drain") or {}
+    if not sem_recibo:
+        if reverso_ok:
+            print("\nOK: toda URL no ar tem recibo, e nada fora do sitemap foi anunciado.")
+            return 0
+        print("\n(o sentido sitemap→recibo está OK; a reprovação acima é do sentido inverso)",
+              file=sys.stderr)
+        return 1
+
+    if not drenagem.get("date"):
+        print("\nREPROVADO: %d URL(s) no ar sem recibo e NENHUMA drenagem registrada." % len(sem_recibo),
+              file=sys.stderr)
+        print("  É a forma exata do defeito de 2026-09-08: o delta compara hash com hash e",
+              file=sys.stderr)
+        print("  nunca vê a URL semeada. Rode tools/generate-indexnow-incremental-submit.",
+              file=sys.stderr)
+        return 1
+
+    hoje = datetime.datetime.now(datetime.timezone.utc).date()
+    try:
+        ultima = datetime.date.fromisoformat(drenagem["date"])
+    except ValueError:
+        print("\nREPROVADO: backlog_drain.date ilegível (%r)." % drenagem.get("date"), file=sys.stderr)
+        return 1
+    parado = (hoje - ultima).days
+    print("última drenagem : %s (%d dia(s) atrás, %d URL(s) naquele dia)"
+          % (drenagem["date"], parado, drenagem.get("sent", 0)))
+
+    if parado > args.teto_dias:
+        print("\nREPROVADO: %d URL(s) no ar sem recibo e a drenagem está parada há %d dias (teto: %d)."
+              % (len(sem_recibo), parado, args.teto_dias), file=sys.stderr)
+        print("  Confira o timer: systemctl list-timers wikijuridica-indexnow.timer", file=sys.stderr)
+        print("  e o journal: journalctl -u wikijuridica-indexnow.service --since '-3 days'",
+              file=sys.stderr)
+        return 1
+
+    if not reverso_ok:
+        # Drenagem saudavel NAO absolve anuncio sujo: sao dois sentidos, e o
+        # veredito do gate e a conjuncao dos dois.
+        print("\n(drenagem em andamento; a reprovação é do sentido recibo→sitemap, acima)",
+              file=sys.stderr)
+        return 1
+    print("\nOK: drenagem em andamento — %d URL(s) restantes, última há %d dia(s)."
+          % (len(sem_recibo), parado))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""Benchmark and fail-closed doctor for the project Codex anti-loop hooks."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Iterable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HOOK = ROOT / ".codex" / "hooks" / "anti_loop.py"
+HOOKS_CONFIG = ROOT / ".codex" / "hooks.json"
+REQUIRED_EVENTS = {"preToolUse", "postToolUse", "stop"}
+REQUIRED_MATCHER_NAMES = {
+    "Bash", "apply_patch", "update_goal",
+}
+REAL_EXEC_NAMES = {"Bash", "exec", "functions.exec", "exec_command"}
+SPEC = importlib.util.spec_from_file_location("portal_codex_anti_loop_benchmark", HOOK)
+if SPEC is None or SPEC.loader is None:
+    raise SystemExit(f"cannot load {HOOK}")
+anti_loop = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = anti_loop
+SPEC.loader.exec_module(anti_loop)
+
+
+def payload(index: int) -> dict[str, Any]:
+    return {
+        "session_id": "benchmark-session",
+        "turn_id": "benchmark-turn",
+        "transcript_path": None,
+        "cwd": str(ROOT),
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.6",
+        "permission_mode": "dontAsk",
+        "tool_name": "Bash",
+        "tool_input": {"command": f"go test ./internal/anti-loop-benchmark/{index % 521}"},
+        "tool_response": "Exit code: 1\nFAIL stable semantic blocker; pid=123; elapsed 10s",
+        "tool_use_id": f"benchmark-{index}",
+    }
+
+
+def percentile(values: list[float], percent: int) -> float:
+    return statistics.quantiles(values, n=100, method="inclusive")[percent - 1]
+
+
+def benchmark(iterations: int, budget_ms: float) -> tuple[int, dict[str, Any]]:
+    with tempfile.TemporaryDirectory(prefix="codex-anti-loop-benchmark-") as temporary:
+        state_dir = Path(temporary) / "state"
+        durations: list[float] = []
+        for index in range(iterations):
+            started = time.perf_counter()
+            anti_loop.process_event(payload(index), state_dir=state_dir, now=1_000 + index / 1000)
+            durations.append((time.perf_counter() - started) * 1000)
+    p95 = percentile(durations, 95)
+    result = {
+        "schema_version": 1,
+        "mode": "benchmark",
+        "iterations": iterations,
+        "p50_ms": round(percentile(durations, 50), 3),
+        "p95_ms": round(p95, 3),
+        "p99_ms": round(percentile(durations, 99), 3),
+        "max_ms": round(max(durations), 3),
+        "p95_budget_ms": budget_ms,
+        "passed": p95 < budget_ms,
+    }
+    return (0 if result["passed"] else 1), result
+
+
+def _send_json(stream: Any, message: dict[str, Any]) -> None:
+    stream.write((json.dumps(message, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    stream.flush()
+
+
+def _official_hooks_list(codex_bin: str, timeout_seconds: float) -> tuple[dict[str, Any] | None, list[str]]:
+    errors: list[str] = []
+    command = [codex_bin, "--strict-config", "-C", str(ROOT), "app-server", "--listen", "stdio://"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=False,
+            bufsize=0,
+        )
+    except OSError as error:
+        return None, [f"official_app_server_start_failed:{error}"]
+    responses: dict[int, dict[str, Any]] = {}
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        if process.stdin is None or process.stdout is None:
+            return None, ["official_app_server_missing_stdio"]
+        _send_json(process.stdin, {
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "wiki_hook_doctor", "title": "Wiki Hook Doctor", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        _send_json(process.stdin, {"method": "initialized"})
+        _send_json(process.stdin, {"id": 2, "method": "hooks/list", "params": {"cwds": [str(ROOT)]}})
+        buffered = b""
+        while time.monotonic() < deadline and 2 not in responses:
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                try:
+                    message = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                identifier = message.get("id") if isinstance(message, dict) else None
+                if isinstance(identifier, int):
+                    responses[identifier] = message
+            if 2 in responses:
+                break
+            remaining = max(0.0, deadline - time.monotonic())
+            readable, _, _ = select.select([process.stdout], [], [], remaining)
+            if not readable:
+                break
+            chunk = os.read(process.stdout.fileno(), 65_536)
+            if not chunk:
+                break
+            buffered += chunk
+        if 0 not in responses:
+            errors.append("official_initialize_response_missing")
+        listing = responses.get(2)
+        if listing is None:
+            errors.append("official_hooks_list_response_missing")
+            return None, errors
+        if "error" in listing:
+            errors.append(f"official_hooks_list_error:{listing['error']}")
+            return None, errors
+        return listing, errors
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+
+
+def _normalize_event(value: Any) -> str:
+    normalized = re.sub(r"[^a-z]", "", str(value).lower())
+    return {
+        "pretooluse": "preToolUse",
+        "posttooluse": "postToolUse",
+        "stop": "stop",
+    }.get(normalized, str(value))
+
+
+def _validate_hooks_listing(listing: dict[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    hooks: list[dict[str, Any]] = []
+    warnings: list[Any] = []
+    listing_errors: list[Any] = []
+    if listing is None:
+        return {"count": 0, "events": [], "trust": []}, ["official_hooks_list_unavailable"]
+    try:
+        configured = json.loads(HOOKS_CONFIG.read_text())
+        configured_hooks = configured["hooks"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        configured_hooks = {}
+        errors.append("project_hooks_config_invalid")
+    result = listing.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(data, list):
+        return {"count": 0, "events": [], "trust": []}, ["official_hooks_list_schema_invalid"]
+    for cwd_result in data:
+        if not isinstance(cwd_result, dict) or cwd_result.get("cwd") != str(ROOT):
+            continue
+        candidate_hooks = cwd_result.get("hooks")
+        if isinstance(candidate_hooks, list):
+            hooks.extend(item for item in candidate_hooks if isinstance(item, dict))
+        if isinstance(cwd_result.get("warnings"), list):
+            warnings.extend(cwd_result["warnings"])
+        if isinstance(cwd_result.get("errors"), list):
+            listing_errors.extend(cwd_result["errors"])
+    if warnings:
+        errors.append(f"official_hooks_list_warnings:{len(warnings)}")
+    if listing_errors:
+        errors.append(f"official_hooks_list_errors:{len(listing_errors)}")
+
+    project_hooks = [hook for hook in hooks if hook.get("sourcePath") == str(HOOKS_CONFIG)]
+    by_event: dict[str, list[dict[str, Any]]] = {}
+    for hook in project_hooks:
+        by_event.setdefault(_normalize_event(hook.get("eventName")), []).append(hook)
+    for event in sorted(REQUIRED_EVENTS):
+        candidates = by_event.get(event, [])
+        if len(candidates) != 1:
+            errors.append(f"handler_count:{event}:{len(candidates)}")
+            continue
+        hook = candidates[0]
+        if hook.get("handlerType") != "command":
+            errors.append(f"handler_type:{event}:{hook.get('handlerType')}")
+        if hook.get("enabled") is not True:
+            errors.append(f"handler_disabled:{event}")
+        if hook.get("trustStatus") != "trusted":
+            errors.append(f"handler_untrusted:{event}:{hook.get('trustStatus')}")
+        command = hook.get("command")
+        configured_name = {"preToolUse": "PreToolUse", "postToolUse": "PostToolUse", "stop": "Stop"}[event]
+        configured_groups = configured_hooks.get(configured_name, []) if isinstance(configured_hooks, dict) else []
+        expected_commands: set[Any] = set()
+        if isinstance(configured_groups, list):
+            for group in configured_groups:
+                handlers = group.get("hooks") if isinstance(group, dict) else None
+                if isinstance(handlers, list):
+                    expected_commands.update(
+                        handler.get("command") for handler in handlers if isinstance(handler, dict)
+                    )
+        if not isinstance(command, str) or command not in expected_commands:
+            errors.append(f"handler_command_invalid:{event}")
+        if event in {"preToolUse", "postToolUse"}:
+            matcher = hook.get("matcher")
+            try:
+                matcher_regex = re.compile(matcher) if isinstance(matcher, str) else None
+            except re.error:
+                matcher_regex = None
+            if matcher_regex is None:
+                errors.append(f"matcher_invalid:{event}")
+            else:
+                missing = sorted(name for name in REQUIRED_MATCHER_NAMES if matcher_regex.fullmatch(name) is None)
+                if missing:
+                    errors.append(f"matcher_missing:{event}:{','.join(missing)}")
+
+    expected_digest = anti_loop.integrity_bundle_digest()
+    expected_fragment = f"--expected-bundle-digest {expected_digest}"
+    for event, candidates in sorted(by_event.items()):
+        for hook in candidates:
+            if expected_fragment not in str(hook.get("command", "")):
+                errors.append(f"transitive_bundle_digest_mismatch:{event}")
+    return {
+        "count": len(project_hooks),
+        "events": sorted(by_event),
+        "trust": sorted({str(hook.get("trustStatus")) for hook in project_hooks}),
+        "expected_bundle_digest": expected_digest,
+    }, errors
+
+
+def _default_rollout() -> Path | None:
+    explicit = os.environ.get("CODEX_ROLLOUT_PATH")
+    if explicit:
+        return Path(explicit)
+    thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    today = dt.datetime.now().astimezone()
+    if not thread_id:
+        return None
+    for offset in (0, -1, 1):
+        day = today + dt.timedelta(days=offset)
+        directory = codex_home / "sessions" / day.strftime("%Y") / day.strftime("%m") / day.strftime("%d")
+        matches = sorted(directory.glob(f"*{thread_id}*.jsonl")) if directory.is_dir() else []
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _read_rollout_tail(path: Path, max_bytes: int) -> list[dict[str, Any]]:
+    size = path.stat().st_size
+    with path.open("rb") as stream:
+        if size > max_bytes:
+            stream.seek(size - max_bytes)
+            stream.readline()
+        payload = stream.read(max_bytes)
+    records: list[dict[str, Any]] = []
+    for line in payload.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _dict_nodes(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _dict_nodes(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _dict_nodes(nested)
+
+
+def _record_timestamp(record: dict[str, Any]) -> float:
+    value = record.get("timestamp")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) / 1000 if value > 10_000_000_000 else float(value)
+    if isinstance(value, str):
+        try:
+            return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _rollout_evidence(path: Path | None, max_bytes: int) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    if path is None:
+        return {"path": None, "tool_calls": 0, "paired_events": []}, ["rollout_path_missing"]
+    try:
+        records = _read_rollout_tail(path, max_bytes)
+    except OSError as error:
+        return {"path": str(path), "tool_calls": 0, "paired_events": []}, [f"rollout_read_failed:{error}"]
+
+    evidence_not_before = max(
+        HOOKS_CONFIG.stat().st_mtime,
+        *(path.stat().st_mtime for path in anti_loop._integrity_bundle_files()),
+    )
+    tool_calls: list[tuple[int, str, str]] = []
+    fresh_tool_calls: list[tuple[int, str, str]] = []
+    hook_events: list[tuple[int, str, str, str, str, str]] = []
+    for line_number, record in enumerate(records):
+        record_timestamp = _record_timestamp(record)
+        for node in _dict_nodes(record):
+            if node.get("type") == "custom_tool_call" and node.get("name") in REAL_EXEC_NAMES:
+                call_id = node.get("call_id")
+                metadata = node.get("internal_chat_message_metadata_passthrough")
+                turn_id = metadata.get("turn_id", "") if isinstance(metadata, dict) else ""
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+                call = (line_number, call_id, str(turn_id))
+                tool_calls.append(call)
+                if record_timestamp >= evidence_not_before:
+                    fresh_tool_calls.append(call)
+            method = node.get("method")
+            event_kind = ""
+            run: Any = None
+            hook_turn_id = ""
+            if method in {"hook/started", "hook/completed"}:
+                event_kind = method.split("/", 1)[1]
+                params = node.get("params")
+                run = params.get("run") if isinstance(params, dict) else None
+                if isinstance(params, dict):
+                    hook_turn_id = str(params.get("turnId") or params.get("turn_id") or "")
+            else:
+                node_type = re.sub(r"[^a-z]", "", str(node.get("type", "")).lower())
+                if node_type in {"hookstarted", "hookcompleted"}:
+                    event_kind = "started" if node_type == "hookstarted" else "completed"
+                    run = node.get("run")
+                    hook_turn_id = str(node.get("turn_id") or node.get("turnId") or "")
+                    if run is None and isinstance(node.get("payload"), dict):
+                        run = node["payload"].get("run")
+            if not event_kind or not isinstance(run, dict):
+                continue
+            run_id = run.get("id") or run.get("runId") or run.get("run_id")
+            event = _normalize_event(run.get("eventName") or run.get("event_name"))
+            source = str(run.get("sourcePath") or run.get("source_path") or "")
+            expected_status = "running" if event_kind == "started" else "completed"
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or record_timestamp < evidence_not_before
+                or run.get("status") != expected_status
+                or (run.get("handlerType") or run.get("handler_type")) not in {None, "command"}
+                or run.get("source") not in {None, "project"}
+            ):
+                continue
+            hook_events.append((line_number, event_kind, event, run_id, source, hook_turn_id))
+
+    open_runs: dict[tuple[str, str, str, str], list[int]] = {}
+    pairs: list[tuple[str, int, int, str]] = []
+    for line_number, event_kind, event, run_id, source, turn_id in hook_events:
+        key = (event, run_id, source, turn_id)
+        if event_kind == "started":
+            open_runs.setdefault(key, []).append(line_number)
+            continue
+        starts = open_runs.get(key)
+        if not starts:
+            continue
+        start_line = starts.pop(0)
+        if source == str(HOOKS_CONFIG) and start_line < line_number:
+            pairs.append((event, start_line, line_number, turn_id))
+
+    coherent_tool_use_ids: list[str] = []
+    paired_events: set[str] = set()
+    ordered_tools = sorted(fresh_tool_calls)
+    all_tool_boundaries = sorted(call[0] for call in tool_calls)
+    for tool_line, call_id, tool_turn_id in ordered_tools:
+        boundary = min((line for line in all_tool_boundaries if line > tool_line), default=len(records))
+        pre_pairs = [pair for pair in pairs if pair[0] == "preToolUse" and tool_line < pair[1] < pair[2] < boundary]
+        post_pairs = [pair for pair in pairs if pair[0] == "postToolUse" and tool_line < pair[1] < pair[2] < boundary]
+        coherent = False
+        for _, _, pre_complete, pre_turn_id in pre_pairs:
+            for _, post_start, _, post_turn_id in post_pairs:
+                turns = {value for value in (tool_turn_id, pre_turn_id, post_turn_id) if value}
+                if pre_complete < post_start and len(turns) <= 1:
+                    coherent = True
+                    break
+            if coherent:
+                break
+        if coherent:
+            coherent_tool_use_ids.append(call_id)
+            paired_events.update(("preToolUse", "postToolUse"))
+    if not fresh_tool_calls:
+        errors.append("rollout_fresh_real_exec_call_missing")
+    if fresh_tool_calls and not coherent_tool_use_ids:
+        errors.append("rollout_coherent_pre_post_chain_missing")
+    return {
+        "path": str(path),
+        "tail_bytes": min(path.stat().st_size, max_bytes),
+        "records": len(records),
+        "evidence_not_before": dt.datetime.fromtimestamp(evidence_not_before, dt.timezone.utc).isoformat(),
+        "tool_calls": len(tool_calls),
+        "fresh_tool_calls": len(fresh_tool_calls),
+        "coherent_tool_use_ids": coherent_tool_use_ids,
+        "paired_events": sorted(paired_events),
+    }, errors
+
+
+def doctor(codex_bin: str, rollout: Path | None, timeout_seconds: float, max_rollout_bytes: int) -> tuple[int, dict[str, Any]]:
+    listing, query_errors = _official_hooks_list(codex_bin, timeout_seconds)
+    hooks, validation_errors = _validate_hooks_listing(listing)
+    evidence, evidence_errors = _rollout_evidence(rollout, max_rollout_bytes)
+    errors = query_errors + validation_errors + evidence_errors
+    result = {
+        "schema_version": 1,
+        "mode": "doctor",
+        "hooks": hooks,
+        "rollout": evidence,
+        "errors": errors,
+        "passed": not errors,
+    }
+    return (0 if result["passed"] else 1), result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--p95-budget-ms", type=float, default=50.0)
+    parser.add_argument("--doctor", action="store_true")
+    parser.add_argument("--codex-bin", default=shutil.which("codex") or "codex")
+    parser.add_argument("--rollout", type=Path)
+    parser.add_argument("--doctor-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--max-rollout-bytes", type=int, default=16 * 1024 * 1024)
+    options = parser.parse_args()
+    if options.doctor:
+        if not (0.25 <= options.doctor_timeout_seconds <= 30):
+            parser.error("--doctor-timeout-seconds must be between 0.25 and 30")
+        if not (1 << 20 <= options.max_rollout_bytes <= 64 << 20):
+            parser.error("--max-rollout-bytes must be between 1MiB and 64MiB")
+        code, result = doctor(
+            options.codex_bin,
+            options.rollout or _default_rollout(),
+            options.doctor_timeout_seconds,
+            options.max_rollout_bytes,
+        )
+    else:
+        if options.iterations < 1000 or options.iterations > 100_000:
+            parser.error("--iterations must be between 1000 and 100000")
+        if options.p95_budget_ms <= 0 or options.p95_budget_ms > 50:
+            parser.error("--p95-budget-ms must be >0 and <=50")
+        code, result = benchmark(options.iterations, options.p95_budget_ms)
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

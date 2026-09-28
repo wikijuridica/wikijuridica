@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""check-bot-abandonment — o alarme que dispara por ABANDONO, não por cobertura.
+
+★ POR QUE ESTE CHECK EXISTE, E POR QUE `check-crawl-coverage-stall` NÃO BASTA
+
+O vigia que já existia sabe dizer que a cobertura PAROU. Só que cobertura parada
+é compatível com dois problemas OPOSTOS, que pedem correções opostas:
+
+    "não achou"          → problema de DESCOBERTA. Corrige-se com canal de
+                           descoberta: sitemap, IndexNow, feed, links.
+    "achou e recusou"    → problema de VALOR. Corrige-se com frescor, conteúdo
+                           e motivo de voltar. Publicar mais sitemap não ajuda.
+
+E há um terceiro caso que a cobertura nem enxerga: o bot que varreu TUDO e foi
+embora. Sob a régua da cobertura acumulada ele fica em 96,8% para sempre e
+parece o melhor aluno da turma. Foi assim que o `meta-externalagent` sumiu em
+23/08 sem nenhum alarme, depois de varrer o acervo inteiro duas vezes.
+
+Este check lê `data/ops/bot_return_state.json` (produzido por
+`tools/generate-bot-return-series`) e reprova quando um bot VALIOSO parou de
+vir no ritmo dele próprio.
+
+★ DOIS INSTRUMENTOS, E CONFUNDI-LOS PERDE O SINAL
+
+    `perdas`            AUSÊNCIA — parou de vir no ritmo dele. Reprova.
+    `quedas_de_volume`  VOLUME   — vem, mas muito abaixo da referência dele.
+                        Contexto, não reprova por si.
+
+O claudebot mostra por que os dois são necessários: ele SUBIA (207 → 1.374 →
+2.574 entre 25 e 27/08) e cortou a zero em 29/08. A régua de volume não vê corte
+abrupto no meio de uma subida (mediana recente 25 contra referência 22: ele
+estava CRESCENDO 13,6%); quem o apanha é a de ausência, com 8 dias sem vir.
+
+★ O CRITÉRIO NÃO É UM NÚMERO ESCOLHIDO A DEDO
+
+Abandono = `dias_desde_ultima_visita > max(3, 3 × intervalo_mediano_do_agente)`.
+O limite é do PRÓPRIO agente: um bot que visita a cada 7 dias não está
+abandonando o portal no oitavo. O piso de 3 dias existe para que ruído de
+amostragem da borda não produza alarme diário — canal de alerta afogado é canal
+morto, e este repositório já mediu 48 alertas críticos não lidos sob 536
+ruidosos (O39).
+
+★ QUATRO VEREDITOS, E CADA UM MANDA CORRIGIR OUTRA COISA
+
+    abandonou             crawler ESTABELECIDO veio e parou → falta motivo de
+                          voltar. É a única classe que reprova (exit 1).
+    esfriando             volume despencou        → idem, em curso. "Despencou"
+                          se mede contra a MEDIANA da janela anterior do próprio
+                          bot. A queda desde o PICO continua medida e impressa —
+                          ela é verdadeira — mas como contexto: sob ela o alerta
+                          incluiria 9 dos 15 bots valiosos, entre eles dois que
+                          estão ACIMA da própria referência (gptbot a 7× o ritmo
+                          dele, amazonbot a 379/dia contra 338) e um cujo pico
+                          está DENTRO da janela comparada (cloudflare-ai-search).
+    veio_uma_vez_e_sumiu  visitou UM dia e sumiu  → nunca houve retorno a
+                          perder. Relatado, não reprova. É o padrão dominante
+                          deste portal: 493 de 652 clientes distintos não-warm
+                          (75,6%) apareceram um único dia em 21 dias de log.
+    nunca_veio            zero tráfego            → falta descoberta
+    so_ua_nao_verificado  há tráfego com o UA dele e NENHUMA requisição
+                          autenticada pela Cloudflare → é política de bot e
+                          identidade, não descoberta. Medido em 2026-08-26:
+                          `perplexitybot` em 17 dias de série, zero verificadas,
+                          até 490 não verificadas num dia.
+
+★ ANTI-FRAUDE
+
+Nenhum número nasce aqui. O check LÊ o estado e aplica limiar; se o estado não
+existe, ele falha em vez de inventar. E "visita" é dia com requisição de
+identidade VERIFICADA na borda — sonda do próprio repositório vestindo o
+User-Agent de um crawler não vira visita.
+
+Uso:
+    tools/check-bot-abandonment                  # read-only, exit 1 se houver abandono
+    tools/check-bot-abandonment --json
+    tools/check-bot-abandonment --notificar      # além de imprimir, aciona notify-owner
+
+Códigos de saída:
+    0  nenhum bot valioso abandonado nem esfriando
+    1  há bot valioso abandonado ou esfriando
+    2  estado ausente ou ilegível (rode tools/generate-bot-return-series antes)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ESTADO = os.path.join(RAIZ, "data/ops/bot_return_state.json")
+GERADOR = "tools/generate-bot-return-series"
+
+# Vereditos que REPROVAM: o bot conhecia o portal e parou. É a classe que
+# significa "perdemos retorno", e é a única que a régua do dono chama de falha.
+VEREDITOS_DE_PERDA = ("abandonou", "esfriando")
+
+# Vereditos que NÃO reprovam mas entram no relatório: nunca houve retorno a
+# perder. São trabalho de descoberta e de política de bot, não regressão.
+# `veio_uma_vez_e_sumiu` mora AQUI, e nao entre as perdas, por uma razao de
+# engenharia de alarme: nao havia retorno estabelecido a perder. Um gate
+# vermelho desde o primeiro dia, por uma condicao cronica sem acao possivel no
+# commit, treina o leitor a ignorar o alarme — e e esse exatamente o defeito
+# O39 deste repositorio (48 alertas criticos nao lidos sob 536 ruidosos). O
+# exit 1 fica reservado para REGRESSAO de crawler estabelecido.
+VEREDITOS_DE_AUSENCIA = ("nunca_veio", "so_ua_nao_verificado", "veio_uma_vez_e_sumiu")
+
+
+def carregar() -> dict:
+    with open(ESTADO, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def avaliar(estado: dict) -> dict:
+    perdas, ausencias, ativos = [], [], []
+    for agente, dados in sorted(estado.get("agentes", {}).items()):
+        if not dados.get("valioso"):
+            continue
+        registro = {"agent_key": agente, **dados}
+        if dados.get("veredito") in VEREDITOS_DE_PERDA:
+            perdas.append(registro)
+        elif dados.get("veredito") in VEREDITOS_DE_AUSENCIA:
+            ausencias.append(registro)
+        else:
+            ativos.append(registro)
+    # A citação vem do BLOCO PRÓPRIO do estado, e não da soma por agente: a
+    # chave da camada de clique de volta é o ASSISTENTE (copilot, chatgpt), que
+    # não é agent_key de bot. Somar pela lista de bots devolveria ZERO tendo a
+    # série 2 cliques do Copilot gravados — zero falso na direção mais cara.
+    citacao = estado.get("citacao_clique_de_volta_total") or 0
+    # QUEDA DE VOLUME é contexto, não veredito: o bot continua vindo, a uma
+    # fração do que vinha. Um bot pode estar aqui e NÃO estar em `perdas`, e o
+    # inverso também — são dois instrumentos diferentes:
+    #
+    #   `perdas`  mede AUSÊNCIA (parou de vir no ritmo dele).
+    #   `quedas`  mede VOLUME    (vem, mas muito abaixo da referência dele).
+    #
+    # O claudebot é o caso que prova que os dois precisam existir: ele subia
+    # (207 → 1.374 → 2.574 entre 25 e 27/08) e cortou a zero em 29/08. A régua
+    # de volume não vê corte abrupto no meio de uma subida — a mediana recente
+    # dele ainda é 25 contra referência 22, ou seja, +13,6% — e é a régua de
+    # AUSÊNCIA que o apanha, com 8 dias sem vir. Ler "queda ≈ 0%" como "sinal
+    # perdido" seria ler o instrumento errado.
+    #
+    # ★ QUAL DAS DUAS QUEDAS DECIDE O ALERTA (2026-09-05)
+    #
+    # O estado publica DUAS, e as duas são verdadeiras sobre a série saneada:
+    #
+    #   `queda_desde_o_pico_pct`   "já foi maior um dia". O googlebot fez 4.297
+    #                              requisições em 10/08 e faz 43/dia agora: -99,0%
+    #                              é fato, e continua impresso aqui.
+    #   `queda_vs_referencia_pct`  "está caindo AGORA", contra a mediana da
+    #                              janela anterior do próprio bot.
+    #
+    # QUEM FILTRA É A SEGUNDA, e o motivo é operacional, não estatístico: sob a
+    # do pico esta lista tinha 9 dos 15 bots valiosos, e entre eles
+    # `cloudflare-ai-search`, cujo pico (1.647 em 04/09) está DENTRO da janela
+    # comparada; `amazonbot`, a 379/dia contra referência de 338; e `gptbot`,
+    # cuja mediana própria é 1 requisição/dia e que fez 7 — SETE VEZES o ritmo
+    # dele. Alerta que inclui bot em crescimento não separa nada, e este ramo
+    # emite severidade ALTA ao desktop do dono.
+    #
+    # O PICO CONTINUA NO FILTRO como MATERIALIDADE — "este bot já significou
+    # alguma coisa para o portal". Um bot cujo maior dia da vida foram 9
+    # requisições (bytespider) não merece alerta por variar de 9 para 2.
+    quedas = [{"agent_key": agente,
+               "queda_vs_referencia_pct": dados.get("queda_vs_referencia_pct"),
+               "queda_desde_o_pico_pct": dados.get("queda_desde_o_pico_pct"),
+               "referencia_de_volume": dados.get("referencia_de_volume"),
+               "volume_mediano_recente": dados.get("volume_mediano_recente"),
+               "requisicoes_pico": dados.get("requisicoes_pico"),
+               "requisicoes_pico_em": dados.get("requisicoes_pico_em"),
+               "requisicoes_nos_dias_recentes_completos":
+                   dados.get("requisicoes_nos_dias_recentes_completos")}
+              for agente, dados in estado.get("agentes", {}).items()
+              if dados.get("valioso") and (dados.get("queda_vs_referencia_pct") or 0) >= 90.0
+              and (dados.get("requisicoes_pico") or 0) >= 100]
+    quedas.sort(key=lambda item: -(item["requisicoes_pico"] or 0))
+    return {
+        "janela": estado.get("janela"),
+        "criterio_de_abandono": estado.get("criterio_de_abandono"),
+        "criterio_de_esfriamento": estado.get("criterio_de_esfriamento"),
+        "quedas_de_volume": quedas,
+        "citacao_por_assistente": estado.get("citacao_clique_de_volta"),
+        "bots_valiosos_ativos": len(ativos),
+        "bots_valiosos_em_perda": len(perdas),
+        "bots_valiosos_sem_retorno_a_perder": len(ausencias),
+        "perdas": perdas,
+        "ausencias": ausencias,
+        "ativos": ativos,
+        "citacao_clique_de_volta_total": citacao,
+        "is_citation_count": False,
+        "nota_citacao": "clique_de_volta e leitor humano que chegou de assistente "
+                        "(camada (c) de tools/measure-ai-citation). E limite inferior de "
+                        "INTERESSE de citacao, nunca contagem de citacao: citacao sem "
+                        "clique e resposta por memoria do modelo nao deixam rastro na origem.",
+    }
+
+
+def notificar(relatorio: dict) -> None:
+    perdas = relatorio["perdas"]
+    # ★ ESTA LINHA LIA A CHAVE ERRADA, E ISSO ANULAVA A CORRECAO DE 08-28.
+    #
+    # `avaliar()` devolve a lista sob `quedas_desde_o_pico` (hoje
+    # `quedas_de_volume`); aqui se pedia `quedas`, que nunca existiu no dicionario.
+    # `.get()` devolvia None, o `or []` transformava em lista vazia, e o ramo
+    # abaixo — escrito exatamente para NAO declarar resolvido o que nao foi
+    # resolvido — nunca executava. Com `perdas` vazia o fluxo caia direto no
+    # `--resolvido`, que e o defeito A4 do plano de rastreio, de volta inteiro.
+    #
+    # A PROVA de que era codigo morto esta no ledger: `bot-queda-desde-o-pico`
+    # aparece ZERO vezes em data/ops/owner_alerts.jsonl, e o check roda por timer
+    # desde 28/08. Chave que nunca foi emitida e ramo que nunca rodou.
+    quedas = relatorio.get("quedas_de_volume") or []
+    if not perdas and quedas:
+        # NAO SE DECLARA RESOLVIDO O QUE NAO FOI RESOLVIDO.
+        #
+        # Ate 2026-08-28 este ramo caia direto no `--resolvido` sempre que
+        # `perdas` estivesse vazia. A distincao entre "perda" (parou de vir) e
+        # "queda" (vem, mas a uma fracao do que vinha) e correta e fica de pe --
+        # o comentario de `quedas` explica por que a tendencia da janela nao ve
+        # o que ja caiu antes dela comecar.
+        #
+        # O que estava errado era a CONCLUSAO. Medido hoje: googlebot -99,4%
+        # (pico 4.297 em 10/08, agora ~28/dia), claudebot -99,9%, gptbot -100%,
+        # applebot -97,3%, yandexbot -99,4%, meta-externalagent -98,8%. E o
+        # alarme mandava ao dono "Nenhum bot valioso abandonou o portal",
+        # fechando a chave. Alerta que se auto-resolve durante o colapso e pior
+        # que alerta nenhum: ensina a ignorar o canal.
+        #
+        # Severidade propria, chave propria: nao e o mesmo evento que abandono,
+        # e nao pode competir com ele pela deduplicacao.
+        piores = ", ".join(f"{q['agent_key']} (-{q['queda_vs_referencia_pct']:.0f}% vs "
+                           f"referencia de {q['referencia_de_volume']}/dia; "
+                           f"-{q['queda_desde_o_pico_pct']:.0f}% desde o pico de "
+                           f"{q['requisicoes_pico']})"
+                           for q in quedas[:4])
+        # A CHAVE MUDOU DE NOME junto com a regua: `bot-queda-desde-o-pico` media
+        # contra o pico, e nao mede mais. Renomear e seguro porque a chave antiga
+        # nunca foi emitida (zero linhas no ledger, verificado): nao ha alerta
+        # aberto sob ela que ficasse orfao de `--resolvido`.
+        subprocess.run([os.path.join(RAIZ, "tools/notify-owner"),
+                        "--chave", "bot-queda-de-volume",
+                        "--severidade", "alta",
+                        "--titulo", f"{len(quedas)} bot(s) valioso(s) muito abaixo do ritmo deles",
+                        "--mensagem", f"Ainda vem, mas a uma fracao do que vinha: {piores}",
+                        "--evidencia", "data/ops/bot_return_state.json (queda_vs_referencia_pct, "
+                                       "mediana da janela recente contra a anterior; "
+                                       "queda_desde_o_pico_pct junto, como contexto)",
+                        "--origem", "check-bot-abandonment"], check=False)
+        return
+    if not perdas:
+        subprocess.run([os.path.join(RAIZ, "tools/notify-owner"),
+                        "--chave", "bot-abandono", "--resolvido",
+                        "--titulo", "Nenhum bot valioso abandonou o portal",
+                        "--mensagem", f"{relatorio['bots_valiosos_ativos']} bots valiosos ativos",
+                        "--origem", "check-bot-abandonment"], check=False)
+        # A chave da queda tambem se resolve, e so aqui: sem perdas E sem quedas.
+        subprocess.run([os.path.join(RAIZ, "tools/notify-owner"),
+                        "--chave", "bot-queda-de-volume", "--resolvido",
+                        "--titulo", "Nenhum bot valioso abaixo do ritmo dele",
+                        "--mensagem", "todos os bots valiosos estao na faixa da propria referencia",
+                        "--origem", "check-bot-abandonment"], check=False)
+        return
+    nomes = ", ".join(f"{p['agent_key']} ({p['veredito']}, "
+                      f"{p['dias_desde_ultima_visita']}d sem vir)" for p in perdas[:5])
+    # O TITULO NAO PODE DIZER "pararam de voltar" PARA TODOS OS PERDAS.
+    # `perdas` junta `abandonou` (parou mesmo) com `esfriando`, e bot esfriando
+    # pode ter vindo HOJE — em 2026-09-05 o applebot estava aqui com
+    # `dias_desde_ultima_visita: 0`. Dizer ao dono que ele "parou de voltar"
+    # e afirmacao falsa no proprio titulo do alerta, e o `nomes` ao lado, que
+    # traz o veredito e os dias, ja desmentia o titulo.
+    pararam = sum(1 for p in perdas if p.get("veredito") == "abandonou")
+    esfriando = len(perdas) - pararam
+    partes = ([f"{pararam} parou(aram) de voltar"] if pararam else []) + \
+             ([f"{esfriando} em queda de volume"] if esfriando else [])
+    subprocess.run([os.path.join(RAIZ, "tools/notify-owner"),
+                    "--chave", "bot-abandono",
+                    "--severidade", "alta",
+                    "--titulo", f"{len(perdas)} bot(s) valioso(s) em perda de retorno: "
+                                + ", ".join(partes),
+                    "--mensagem", nomes,
+                    "--evidencia", "tools/check-bot-abandonment (le data/ops/bot_return_state.json)",
+                    "--origem", "check-bot-abandonment",
+                    # UM AVISO POR DIA, e nao um a cada execucao. O timer que
+                    # roda este check dispara a cada ~30 min, e abandono de bot
+                    # e condicao CRONICA (medido: 19 dias). Com o cooldown
+                    # padrao de 1800 s, o dono receberia ~48 notificacoes por
+                    # dia da mesma condicao, por semanas — que e a receita
+                    # exata do canal de alerta que ninguem le.
+                    "--cooldown", "86400"], check=False)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--notificar", action="store_true",
+                        help="aciona tools/notify-owner (canal único de alerta do repo)")
+    args = parser.parse_args()
+
+    if not os.path.isfile(ESTADO):
+        print(f"estado ausente: {os.path.relpath(ESTADO, RAIZ)} — rode {GERADOR} antes",
+              file=sys.stderr)
+        return 2
+    try:
+        estado = carregar()
+    except (json.JSONDecodeError, OSError) as erro:
+        print(f"estado ilegível: {erro}", file=sys.stderr)
+        return 2
+
+    relatorio = avaliar(estado)
+    if args.notificar:
+        notificar(relatorio)
+
+    if args.json:
+        print(json.dumps(relatorio, ensure_ascii=False, indent=1))
+        return 1 if relatorio["perdas"] else 0
+
+    janela = relatorio["janela"] or {}
+    print(f"retorno de bot — janela {janela.get('de')} → {janela.get('ate')} "
+          f"({janela.get('dias')} dias)")
+    print(f"critério: {relatorio['criterio_de_abandono']}")
+    print()
+    if relatorio["perdas"]:
+        print(f"✗ {len(relatorio['perdas'])} bot(s) VALIOSO(s) pararam de voltar:")
+        for perda in relatorio["perdas"]:
+            # A QUEDA DE VOLUME ENTRA NA LINHA, e a razao foi medida em 2026-08-30:
+            # o yandexbot saia daqui como "esfriando ... ultima visita 0 dias atras",
+            # e quem lesse concluia que o detector estava errado -- foi o que eu
+            # conclui. Nao estava: "esfriando" e veredito de VOLUME, e o yandexbot
+            # tinha caido 99,4% desde o pico enquanto continuava passando todo dia.
+            # O numero que motiva o veredito nao pode faltar na linha que o anuncia.
+            # A queda entra na linha porque `esfriando` e veredito de VOLUME e o
+            # numero que o motiva nao pode faltar em quem o anuncia (medido em
+            # 2026-08-30 no yandexbot). O que mudou em 2026-09-05 e CONTRA O QUE
+            # ela se mede: a mediana da janela anterior, nao o pico. `None` diz
+            # "sem base para porcentagem", e por isso a linha a omite em vez de
+            # imprimir um zero que pareceria estabilidade.
+            queda = perda.get("queda_vs_referencia_pct")
+            referencia = perda.get("referencia_de_volume")
+            pico_pct = perda.get("queda_desde_o_pico_pct")
+            queda_txt = (f"queda {queda}% vs referência {referencia}/dia; "
+                         if queda is not None else "")
+            if pico_pct is not None:
+                queda_txt += f"{pico_pct}% desde o pico; "
+            print(f"    {perda['agent_key']:<24} {perda['veredito']:<10} "
+                  f"{queda_txt}"
+                  f"última visita {perda['ultima_visita']} "
+                  f"({perda['dias_desde_ultima_visita']} dias atrás; "
+                  f"limite do próprio ritmo: {perda['limite_de_abandono_dias']} dias; "
+                  f"mediana {perda['intervalo_mediano_entre_visitas_dias']})")
+    else:
+        print("✓ nenhum bot valioso abandonado")
+    print()
+    if relatorio["ausencias"]:
+        print(f"· {len(relatorio['ausencias'])} bot(s) valioso(s) SEM retorno a perder "
+              f"(descoberta/identidade, não regressão):")
+        for ausencia in relatorio["ausencias"]:
+            print(f"    {ausencia['agent_key']:<24} {ausencia['veredito']:<20} "
+                  f"UA não verificado: {ausencia['requisicoes_ua_nao_verificado_total']}")
+    print()
+    if relatorio["quedas_de_volume"]:
+        print(f"· queda de VOLUME (contexto, não veredito — o bot continua vindo, "
+              f"em volume muito menor que a referência dele):")
+        for queda in relatorio["quedas_de_volume"]:
+            print(f"    {queda['agent_key']:<24} referência {queda['referencia_de_volume']}/dia "
+                  f"→ dias recentes completos "
+                  f"{queda['requisicoes_nos_dias_recentes_completos']} "
+                  f"(-{queda['queda_vs_referencia_pct']}%); maior dia da vida: "
+                  f"{queda['requisicoes_pico']} em {queda['requisicoes_pico_em']} "
+                  f"(-{queda['queda_desde_o_pico_pct']}% desde ele)")
+        print()
+    print(f"· {relatorio['bots_valiosos_ativos']} bot(s) valioso(s) ativos")
+    print(f"· clique de volta de assistente na janela: "
+          f"{relatorio['citacao_clique_de_volta_total']} "
+          f"(limite inferior de interesse, NÃO contagem de citação)")
+    for assistente, total in sorted((relatorio.get("citacao_por_assistente") or {}).items(),
+                                    key=lambda item: -item[1]):
+        print(f"    {assistente:<24} {total}")
+    return 1 if relatorio["perdas"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

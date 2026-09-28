@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""measure-borda-agentes-sem-chave — quanto do tráfego é agente que se declara
+e o registro não conhece. READ-ONLY, na CAMADA DA BORDA (Regra 15).
+
+POR QUE ESTA FERRAMENTA EXISTE, e por que ela não é o mesmo que "tráfego sem
+`agent_key`". `botagents.agente_de` devolve `None` para TRÊS coisas muito
+diferentes, e somá-las produz um número que não mede o que diz medir:
+
+  * um NAVEGADOR — e está certo: pessoa não tem `agent_key`;
+  * um CLIENTE GENÉRICO (`node`, `curl`, `undici`, `python-httpx`, UA vazio),
+    que não diz quem é e por isso não pode ser registrado;
+  * um AGENTE QUE SE DECLARA e que o registro não conhece — este, e só este, é
+    a lacuna: ele tem nome próprio, muitas vezes URL de documentação do
+    operador, e mesmo assim some de toda série por agente.
+
+Medido em 2026-09-16, janela de 24h encerrada em 16:00:00Z (345 grupos, sem
+truncagem): "sem `agent_key`" eram 17.251 de 30.115 requisições líquidas, 57,3%,
+e a lacuna de verdade eram 12.741, 42,3% — os 15 pontos de diferença são 3.210 de
+pessoas e 1.300 de clientes genéricos. Publicar os 57,7% como "tráfego não
+classificado" seria o erro que a Regra 16 proíbe, com o sinal invertido: um
+número grande que não mede a coisa que se quer consertar.
+
+A CAMADA É DECLARADA EM TODA LINHA DA SAÍDA. O acervo sai de `public/` com
+`s-maxage=604800`, o `HIT` não toca o Go, e por isso `data/ops/access/*.jsonl` é
+PISO: medido no mesmo dia, `AhrefsSiteAudit` fez 1.182 requisições na origem em
+2026-09-15 e 5.859 na borda nas 24h seguintes. `httpRequestsAdaptiveGroups` é
+AMOSTRADO — a saída imprime o `sampleInterval` por balde, e onde ele é 1 a
+contagem bruta é a contagem.
+
+NÃO É GATE. Ela não reprova por volume de desconhecido: tráfego de terceiro não
+é dívida desta casa, e gate que reprova por estoque que ninguém drena nasce
+vermelho e se aprende a ignorar. Quem reprova é `tools/check-bot-registry-decidido`,
+por DECISÃO faltando — e decidir é barato.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+sys.path.insert(0, os.path.join(RAIZ, "tools"))
+import botagents          # noqa: E402
+import cloudflare_auth as cf  # noqa: E402
+
+DOMINIO = "wikijuridica.com.br"
+
+# `limit` do conjunto adaptativo. A consulta agrupa por UA e só por UA: medido
+# em 2026-09-16, 345 grupos numa janela de 24h. O teto alto é DE PROPÓSITO —
+# lista truncada vira subcontagem silenciosa, e a saída declara se truncou.
+TETO_GRUPOS = 2000
+
+CONSULTA = """
+query($zone: String!, $since: Time!, $until: Time!, $lim: Int!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $lim,
+        filter: {datetime_geq: $since, datetime_leq: $until},
+        orderBy: [count_DESC]) {
+      count
+      avg { sampleInterval }
+      dimensions { userAgent }
+    }
+  } }
+}
+"""
+
+# Cliente genérico: diz COMO foi feita a requisição, nunca QUEM a fez. Ancorado
+# no início da string porque é assim que essas bibliotecas se apresentam; um UA
+# que só MENCIONA "python" no meio não é um cliente genérico.
+PADRAO_CLIENTE_GENERICO = re.compile(
+    r"^(node|pc|undici|axios|got|curl/|wget|python-httpx\d?|python-requests|"
+    r"Python/|Go-http-client|fasthttp|okhttp|libwww|Java/|Apache-HttpClient|"
+    r"PostmanRuntime|jsdom|aiohttp)", re.IGNORECASE)
+
+# Declaração de agente: as três convenções que operadores de fato usam — o slot
+# `(compatible; TOKEN`, a URL de documentação `+https://…` e o sufixo de nome.
+PADRAO_DECLARACAO = re.compile(
+    r"(?:compatible\s*[;:]\s*[A-Za-z][A-Za-z0-9_.\-]*)"
+    r"|(?:\+https?://)"
+    r"|(?:[A-Za-z][A-Za-z0-9_.\-]*"
+    r"(?:bot|crawler|spider|scanner|fetcher|preview|collector|monitor)"
+    r"[A-Za-z0-9_.\-]*\s*/\s*\d)", re.IGNORECASE)
+
+BALDES = (
+    ("a_desta_casa", "tráfego desta casa (aquecimento, sonda, WikijuridicaBot)"),
+    ("b_com_agent_key", "agente com agent_key — entra em toda série por agente"),
+    ("c_declarado_sem_agent_key", "SE DECLARA e o registro não conhece — A LACUNA"),
+    ("d_cliente_generico", "cliente genérico: diz como, não quem"),
+    ("e_navegador", "navegador: não tem agent_key por desenho, e está certo"),
+)
+
+
+def desta_casa(ua):
+    baixo = (ua or "").lower()
+    return baixo.startswith("wikijuridica-") or "wikijuridicabot/" in baixo
+
+
+def balde_de(ua):
+    bruto = (ua or "").strip()
+    if desta_casa(bruto):
+        return "a_desta_casa"
+    if botagents.agente_de(bruto):
+        return "b_com_agent_key"
+    if not bruto or PADRAO_CLIENTE_GENERICO.match(bruto):
+        return "d_cliente_generico"
+    if PADRAO_DECLARACAO.search(bruto):
+        return "c_declarado_sem_agent_key"
+    return "e_navegador"
+
+
+def janela(fim, horas):
+    fim = fim.replace(microsecond=0)
+    return (fim - datetime.timedelta(hours=horas), fim)
+
+
+def iso(t):
+    return t.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def consulta_borda(zid, inicio, fim):
+    dados, erro = cf.graphql(CONSULTA, {"zone": zid, "since": iso(inicio),
+                                        "until": iso(fim), "lim": TETO_GRUPOS},
+                             "leitura", proposito="medicao-de-agentes-sem-chave")
+    if erro:
+        return None, erro
+    zonas = (dados or {}).get("viewer", {}).get("zones") or []
+    if not zonas:
+        return None, "zona sem dados na resposta"
+    return zonas[0]["httpRequestsAdaptiveGroups"], ""
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--horas", type=int, default=24,
+                   help="tamanho da janela em horas (o plano Free recusa mais de "
+                        "%d dia por chamada; ver cloudflare_auth.JANELA_MAXIMA_DIAS_FREE)"
+                        % cf.JANELA_MAXIMA_DIAS_FREE)
+    p.add_argument("--top", type=int, default=15,
+                   help="quantos User-Agents literais listar por balde")
+    p.add_argument("--json", action="store_true",
+                   help="imprime o resultado em JSON, sem o relatório")
+    args = p.parse_args()
+
+    if args.horas > 24 * cf.JANELA_MAXIMA_DIAS_FREE:
+        print("measure-borda-agentes-sem-chave: --horas=%d excede o teto do plano "
+              "Free (%d h por chamada). Fatie a janela e some fora daqui — o "
+              "número curto não se publica (Regra 16)."
+              % (args.horas, 24 * cf.JANELA_MAXIMA_DIAS_FREE), file=sys.stderr)
+        return 2
+
+    zid, erro = cf.zona_id(DOMINIO)
+    if erro or not zid:
+        print("measure-borda-agentes-sem-chave: zona não resolvida: %s" % erro,
+              file=sys.stderr)
+        return 2
+
+    inicio, fim = janela(datetime.datetime.now(datetime.timezone.utc), args.horas)
+    grupos, erro = consulta_borda(zid, inicio, fim)
+    if erro:
+        print("measure-borda-agentes-sem-chave: consulta falhou: %s" % erro,
+              file=sys.stderr)
+        return 2
+
+    contagem = Counter()
+    ponderado = Counter()
+    intervalos = defaultdict(list)
+    literais = defaultdict(list)
+    for g in grupos:
+        ua = g["dimensions"]["userAgent"]
+        n = g["count"]
+        si = g["avg"]["sampleInterval"]
+        b = balde_de(ua)
+        contagem[b] += n
+        ponderado[b] += n * si
+        intervalos[b].append(si)
+        literais[b].append((n, ua))
+
+    bruto = sum(contagem.values())
+    liquido = bruto - contagem["a_desta_casa"]
+    truncou = len(grupos) >= TETO_GRUPOS
+
+    resultado = {
+        "camada": "borda-cloudflare/httpRequestsAdaptiveGroups/userAgent",
+        "janela_inicio": iso(inicio),
+        "janela_fim": iso(fim),
+        "grupos_de_user_agent": len(grupos),
+        "lista_truncada": truncou,
+        "requisicoes_amostradas_bruto": bruto,
+        "requisicoes_amostradas_liquido": liquido,
+        "baldes": {},
+    }
+    for chave, _ in BALDES:
+        si = intervalos[chave] or [1.0]
+        resultado["baldes"][chave] = {
+            "requisicoes_amostradas": contagem[chave],
+            "requisicoes_estimadas": round(ponderado[chave]),
+            "sample_interval_max": round(max(si), 4),
+            "pct_do_liquido": round(100 * contagem[chave] / liquido, 2) if liquido else 0.0,
+            "user_agents_literais": [
+                {"requisicoes_amostradas": n, "user_agent": ua}
+                for n, ua in sorted(literais[chave], reverse=True)[:args.top]],
+        }
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=2))
+        return 0
+
+    print("=== AGENTES SEM agent_key — CAMADA: BORDA (Cloudflare GraphQL) ===")
+    print("consulta            : httpRequestsAdaptiveGroups, dimensão userAgent, AMOSTRADO")
+    print("janela              : %s -> %s (%d h)" % (iso(inicio), iso(fim), args.horas))
+    print("grupos de UA        : %d%s" % (len(grupos),
+          "  ATENÇÃO: lista TRUNCADA no teto de %d — a cauda foi cortada" % TETO_GRUPOS
+          if truncou else ""))
+    print("bruto / líquido     : %d / %d requisições amostradas "
+          "(líquido = bruto menos o tráfego desta casa)" % (bruto, liquido))
+    print()
+    for chave, descricao in BALDES:
+        d = resultado["baldes"][chave]
+        print("%-28s %8d amostradas  %8d estimadas  %6.1f%% do líquido  "
+              "sampleInterval_max=%.2f" % (chave, d["requisicoes_amostradas"],
+              d["requisicoes_estimadas"], d["pct_do_liquido"], d["sample_interval_max"]))
+        print("%-28s %s" % ("", descricao))
+    print()
+    print("--- %s: os %d maiores, com o User-Agent LITERAL ---"
+          % ("c_declarado_sem_agent_key", args.top))
+    for item in resultado["baldes"]["c_declarado_sem_agent_key"]["user_agents_literais"]:
+        print("%8d  %s" % (item["requisicoes_amostradas"], item["user_agent"]))
+    print()
+    print("--- d_cliente_generico: contado à parte, NUNCA num balde com nome de bot ---")
+    for item in resultado["baldes"]["d_cliente_generico"]["user_agents_literais"][:8]:
+        print("%8d  %s" % (item["requisicoes_amostradas"],
+                           item["user_agent"] or "(User-Agent vazio)"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

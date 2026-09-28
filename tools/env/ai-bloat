@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""ai-bloat - forensica de desperdicio de contexto em transcripts do Claude Code.
+
+O transcript e o registro do que foi despejado no contexto. Esta ferramenta le em
+STREAMING (linha a linha, nunca carrega o arquivo) e responde: quem consome, quanto,
+e QUAL COMANDO gerou o despejo.
+
+Uso:
+  ai-bloat                  # sessao mais recente
+  ai-bloat ARQUIVO.jsonl    # sessao especifica
+  ai-bloat --top 10         # os 10 maiores transcripts (resumo + agregado)
+  ai-bloat --offenders 15   # quantos "piores despejos" listar (default 5)
+  ai-bloat --tools 20       # quantas linhas na tabela de ferramentas
+  ai-bloat --all            # varre TODOS os transcripts
+  ai-bloat --json           # saida JSON (para script)
+
+Contabilidade: cada linha e atribuida por BYTES CRUS (len da linha) e dividida em
+baldes que somam exatamente o tamanho do arquivo (delta impresso como conferencia).
+Cada balde e marcado CONTEXTO (byte que a IA pagou em token) ou DISCO (bookkeeping
+do harness: uuid, usage, snapshot, copia de tool result - nunca vai ao modelo).
+"""
+
+import heapq
+import json
+import os
+import sys
+import time
+from collections import defaultdict
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+SNIP = 200
+MB = 1024.0 * 1024.0
+
+# Baldes que REALMENTE entram no contexto do modelo. Todo o resto e disco.
+CTX_PREFIXES = ("msg:", "attach:", "system:hookAdditionalContext")
+
+
+def is_ctx(bucket):
+    return bucket.startswith(CTX_PREFIXES)
+
+
+def human(n):
+    if n >= MB:
+        return "%.1fM" % (n / MB)
+    if n >= 1024:
+        return "%.0fK" % (n / 1024.0)
+    return "%dB" % n
+
+
+def one_line(s, n=SNIP):
+    s = " ".join(str(s).split())
+    return s[:n] + ("..." if len(s) > n else "")
+
+
+def describe_input(tool, inp):
+    """Extrai o 'culpado' legivel: cada tool guarda o alvo num campo diferente."""
+    if not isinstance(inp, dict):
+        return one_line(inp)
+    if tool == "Bash":
+        return one_line(inp.get("command", ""))
+    if tool in ("Read", "NotebookEdit"):
+        d = inp.get("file_path", "")
+        if inp.get("offset") or inp.get("limit"):
+            d += " [offset=%s limit=%s]" % (inp.get("offset"), inp.get("limit"))
+        else:
+            d += " [INTEGRAL]"
+        return one_line(d)
+    if tool == "Grep":
+        return one_line("%s in %s (%s)" % (inp.get("pattern", ""), inp.get("path", "."),
+                                           inp.get("output_mode", "files_with_matches")))
+    if tool == "Glob":
+        return one_line("%s in %s" % (inp.get("pattern", ""), inp.get("path", ".")))
+    if tool in ("WebFetch", "WebSearch"):
+        return one_line(inp.get("url") or inp.get("query", ""))
+    if tool in ("Task", "Agent"):
+        return one_line(inp.get("description") or inp.get("subagent_type", ""))
+    for k in ("command", "file_path", "pattern", "query", "prompt", "description"):
+        if k in inp:
+            return one_line(inp[k])
+    return one_line(json.dumps(inp, ensure_ascii=False))
+
+
+def describe_attachment(a):
+    if not isinstance(a, dict):
+        return one_line(a)
+    for k in ("content", "output", "stdout", "text", "message", "command", "filePath", "file_path"):
+        v = a.get(k)
+        if isinstance(v, str) and v.strip():
+            return one_line(v)
+        if isinstance(v, dict):
+            return one_line(json.dumps(v, ensure_ascii=False))
+    return one_line(json.dumps(a, ensure_ascii=False))
+
+
+def blen(obj):
+    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace"))
+
+
+class Stats(object):
+    def __init__(self, path):
+        self.path = path
+        self.size = os.path.getsize(path)
+        self.lines = 0
+        self.bad = 0
+        self.by_bucket = defaultdict(int)
+        self.side_ctx = 0
+        self.by_tool = defaultdict(lambda: [0, 0, 0, 0])  # [ctx, dup_disco, calls, pior]
+        self.offenders = []
+        self._seq = 0
+
+    def push_offender(self, nbytes, tool, snippet, keep):
+        self._seq += 1
+        item = (nbytes, self._seq, tool, snippet)
+        if len(self.offenders) < keep:
+            heapq.heappush(self.offenders, item)
+        elif nbytes > self.offenders[0][0]:
+            heapq.heapreplace(self.offenders, item)
+
+    def top_offenders(self):
+        return sorted(self.offenders, reverse=True)
+
+    @property
+    def ctx(self):
+        return sum(v for k, v in self.by_bucket.items() if is_ctx(k))
+
+    @property
+    def disk(self):
+        return sum(v for k, v in self.by_bucket.items() if not is_ctx(k))
+
+
+def scan(path, keep_offenders=25):
+    st = Stats(path)
+    names, snips = {}, {}
+    with open(path, "rb") as fh:
+        for raw in fh:
+            st.lines += 1
+            n = len(raw)
+            try:
+                d = json.loads(raw)
+            except Exception:
+                st.bad += 1
+                st.by_bucket["unparseable"] += n
+                continue
+            if not isinstance(d, dict):
+                st.by_bucket["unparseable"] += n
+                continue
+
+            etype = d.get("type", "?")
+            acct = 0
+            line_ctx = 0
+
+            def bump(bucket, nb):
+                st.by_bucket[bucket] += nb
+
+            msg = d.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str):
+                    b = len(content.encode("utf-8", "replace"))
+                    acct += b
+                    line_ctx += b
+                    bump("msg:text", b)
+                elif isinstance(content, list):
+                    for blk in content:
+                        b = blen(blk)
+                        acct += b
+                        line_ctx += b
+                        if not isinstance(blk, dict):
+                            bump("msg:other", b)
+                            continue
+                        bt = blk.get("type", "?")
+                        if bt == "tool_use":
+                            tid, tool = blk.get("id"), blk.get("name", "?")
+                            if tid:
+                                names[tid] = tool
+                                snips[tid] = describe_input(tool, blk.get("input"))
+                            bump("msg:tool_use (prompt de tool)", b)
+                        elif bt == "tool_result":
+                            tid = blk.get("tool_use_id")
+                            tool = names.get(tid, "?")
+                            rec = st.by_tool[tool]
+                            rec[0] += b
+                            rec[2] += 1
+                            rec[3] = max(rec[3], b)
+                            bump("msg:tool_result (saida de comando)", b)
+                            st.push_offender(b, tool, snips.get(tid, "(comando fora da janela)"), keep_offenders)
+                        elif bt in ("text", "thinking", "image"):
+                            bump("msg:" + bt, b)
+                        else:
+                            bump("msg:" + str(bt), b)
+                # usage e telemetria de billing: fica no disco, nunca vai ao modelo
+                if "usage" in msg:
+                    b = blen(msg["usage"])
+                    acct += b
+                    bump("usage/telemetria (billing)", b)
+
+            # toolUseResult: copia estruturada do MESMO payload ja entregue via
+            # tool_result. Disco puro - somar ao contexto seria contar duas vezes.
+            tur = d.get("toolUseResult")
+            if tur is not None:
+                b = blen(tur)
+                acct += b
+                bump("toolUseResult (copia em disco)", b)
+                tid = d.get("toolUseID")
+                if tid is None and isinstance(msg, dict) and isinstance(msg.get("content"), list):
+                    for blk in msg["content"]:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                            tid = blk.get("tool_use_id")
+                            break
+                st.by_tool[names.get(tid, "?")][1] += b
+
+            snap = d.get("snapshot")
+            if snap is not None:
+                b = blen(snap)
+                acct += b
+                bump("file-history-snapshot (rewind do harness)", b)
+
+            att = d.get("attachment")
+            if att is not None:
+                b = blen(att)
+                acct += b
+                line_ctx += b
+                sub = att.get("type", "?") if isinstance(att, dict) else "?"
+                bump("attach:" + str(sub), b)
+                st.push_offender(b, "attach:" + str(sub), describe_attachment(att), keep_offenders)
+
+            if etype == "system":
+                for k in ("hookAdditionalContext", "hookInfos", "hookErrors", "content"):
+                    v = d.get(k)
+                    if v is not None:
+                        b = blen(v)
+                        acct += b
+                        if k == "hookAdditionalContext":
+                            line_ctx += b
+                        bump("system:" + k, b)
+            elif etype == "queue-operation" and d.get("content") is not None:
+                b = blen(d["content"])
+                acct += b
+                bump("queue-operation (fila de prompts)", b)
+
+            residual = n - acct
+            if residual > 0:
+                bump("envelope/metadata (uuid, cwd, ids, timestamp)", residual)
+            elif residual < 0:
+                bump("overlap (sobreposicao de baldes)", -residual)
+
+            if d.get("isSidechain"):
+                st.side_ctx += line_ctx
+    return st
+
+
+def bar(pct):
+    return "#" * int(pct / 4)
+
+
+def report(st, offenders=5, tools=10, out=sys.stdout):
+    w = out.write
+    ctx, disk = st.ctx, st.disk
+    tot = ctx + disk or 1
+    w("=" * 78 + "\n")
+    w("ai-bloat  %s\n" % st.path)
+    w("  %s no disco | %d linhas%s\n"
+      % (human(st.size), st.lines, (" | %d ilegiveis" % st.bad) if st.bad else ""))
+    w("  CONTEXTO (token pago) %s (%.0f%%)  |  DISCO (harness, nao vai ao modelo) %s (%.0f%%)\n"
+      % (human(ctx), 100.0 * ctx / tot, human(disk), 100.0 * disk / tot))
+    if st.side_ctx:
+        w("  do contexto, %s (%.0f%%) e trafego de SUBAGENTE (isSidechain)\n"
+          % (human(st.side_ctx), 100.0 * st.side_ctx / (ctx or 1)))
+    check = sum(st.by_bucket.values())
+    w("  conferencia: baldes %s vs arquivo %s (delta %+d B)\n" % (human(check), human(st.size), check - st.size))
+
+    w("\n-- ONDE ESTAO OS BYTES (C=contexto D=disco) --------------------------------\n")
+    for k, v in sorted(st.by_bucket.items(), key=lambda kv: -kv[1])[:14]:
+        pct = 100.0 * v / st.size
+        w("  %s %-46s %8s %5.1f%% %s\n" % ("C" if is_ctx(k) else "D", one_line(k, 46), human(v), pct, bar(pct)))
+
+    rows = [r for r in sorted(st.by_tool.items(), key=lambda kv: -kv[1][0])[:tools] if r[1][0] or r[1][1]]
+    if rows:
+        w("\n-- POR FERRAMENTA (bytes que entraram no contexto) -------------------------\n")
+        w("  %-22s %8s %6s %6s %8s %8s\n" % ("ferramenta", "ctx", "%ctx", "calls", "media", "pior"))
+        for name, (c, dup, calls, mx) in rows:
+            w("  %-22s %8s %5.1f%% %6d %8s %8s\n"
+              % (one_line(name, 22), human(c), 100.0 * c / (ctx or 1), calls,
+                 human(c // calls if calls else 0), human(mx)))
+
+    top = st.top_offenders()[:offenders]
+    if top:
+        w("\n-- PIORES DESPEJOS INDIVIDUAIS (a origem culpada) --------------------------\n")
+        for i, (b, _s, tool, snip) in enumerate(top, 1):
+            w("  %d. %s  %-22s %.2f%% do contexto\n" % (i, human(b).rjust(7), tool, 100.0 * b / (ctx or 1)))
+            w("     > %s\n" % one_line(snip))
+    w("=" * 78 + "\n")
+
+
+def list_transcripts(root):
+    out = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if fn.endswith(".jsonl"):
+                p = os.path.join(dirpath, fn)
+                try:
+                    stt = os.stat(p)
+                except OSError:
+                    continue
+                out.append((stt.st_size, stt.st_mtime, p))
+    return out
+
+
+def main(argv):
+    args = argv[1:]
+    path, top, offenders, tools = None, 0, 5, 10
+    as_json = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            sys.stdout.write(__doc__)
+            return 0
+        if a == "--top":
+            i += 1
+            top = int(args[i])
+        elif a == "--offenders":
+            i += 1
+            offenders = int(args[i])
+        elif a == "--tools":
+            i += 1
+            tools = int(args[i])
+        elif a == "--json":
+            as_json = True
+        elif a == "--all":
+            top = 10 ** 6
+        elif a.startswith("-"):
+            sys.stderr.write("ai-bloat: opcao desconhecida %s (use --help)\n" % a)
+            return 2
+        else:
+            path = a
+        i += 1
+
+    t0 = time.time()
+    if path:
+        if not os.path.isfile(path):
+            sys.stderr.write("ai-bloat: nao e um arquivo legivel: %s\n" % path)
+            return 1
+        targets = [path]
+    else:
+        allt = list_transcripts(PROJECTS)
+        if not allt:
+            sys.stderr.write("ai-bloat: nenhum transcript em %s\n" % PROJECTS)
+            return 1
+        targets = ([p for _s, _m, p in sorted(allt, reverse=True)[:top]] if top
+                   else [max(allt, key=lambda t: t[1])[2]])
+
+    if len(targets) == 1 and not as_json:
+        st = scan(targets[0], keep_offenders=max(offenders, 25))
+        report(st, offenders=offenders, tools=tools)
+        sys.stdout.write("scan: %.2fs\n" % (time.time() - t0))
+        return 0
+
+    agg_tool = defaultdict(lambda: [0, 0, 0, 0])
+    agg_bucket = defaultdict(int)
+    agg_offend = []
+    tot_ctx = tot_disk = tot_size = 0
+    rows = []
+    for p in targets:
+        st = scan(p, keep_offenders=max(offenders, 10))
+        c, dsk = st.ctx, st.disk
+        tot_ctx += c
+        tot_disk += dsk
+        tot_size += st.size
+        for k, v in st.by_tool.items():
+            a = agg_tool[k]
+            a[0] += v[0]
+            a[1] += v[1]
+            a[2] += v[2]
+            a[3] = max(a[3], v[3])
+        for k, v in st.by_bucket.items():
+            agg_bucket[k] += v
+        agg_offend.extend(st.top_offenders()[:offenders])
+        worst = max(st.by_tool.items(), key=lambda kv: kv[1][0])[0] if st.by_tool else "-"
+        rows.append((st.size, c, dsk, worst, p))
+
+    if as_json:
+        json.dump({
+            "files": [{"size": s, "ctx": c, "disk": d, "top_tool": t, "path": p} for s, c, d, t, p in rows],
+            "by_bucket": {k: {"bytes": v, "context": is_ctx(k)} for k, v in agg_bucket.items()},
+            "by_tool": {k: {"ctx": v[0], "dup_disk": v[1], "calls": v[2], "max": v[3]} for k, v in agg_tool.items()},
+            "total": {"size": tot_size, "ctx": tot_ctx, "disk": tot_disk},
+            "elapsed_s": round(time.time() - t0, 2),
+        }, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+        return 0
+
+    w = sys.stdout.write
+    w("=" * 78 + "\n")
+    w("ai-bloat  %d transcripts | %s no disco | contexto %s | disco %s\n"
+      % (len(targets), human(tot_size), human(tot_ctx), human(tot_disk)))
+    w("\n-- POR SESSAO --------------------------------------------------------------\n")
+    w("  %8s %8s %8s  %-14s %s\n" % ("tamanho", "contexto", "disco", "pior tool", "sessao"))
+    for s, c, d, worst, p in sorted(rows, reverse=True)[:40]:
+        w("  %8s %8s %8s  %-14s %s\n" % (human(s), human(c), human(d), one_line(worst, 14), os.path.basename(p)[:20]))
+    w("\n-- ONDE ESTAO OS BYTES (agregado) ------------------------------------------\n")
+    for k, v in sorted(agg_bucket.items(), key=lambda kv: -kv[1])[:14]:
+        pct = 100.0 * v / (tot_size or 1)
+        w("  %s %-46s %8s %5.1f%% %s\n" % ("C" if is_ctx(k) else "D", one_line(k, 46), human(v), pct, bar(pct)))
+    w("\n-- POR FERRAMENTA (agregado) -----------------------------------------------\n")
+    w("  %-22s %8s %6s %6s %8s\n" % ("ferramenta", "ctx", "%ctx", "calls", "media"))
+    for name, (c, dup, calls, mx) in sorted(agg_tool.items(), key=lambda kv: -kv[1][0])[:tools]:
+        w("  %-22s %8s %5.1f%% %6d %8s\n"
+          % (one_line(name, 22), human(c), 100.0 * c / (tot_ctx or 1), calls, human(c // calls if calls else 0)))
+    w("\n-- PIORES DESPEJOS (todas as sessoes) --------------------------------------\n")
+    for b, _s, tool, snip in sorted(agg_offend, reverse=True)[:offenders]:
+        w("  %s  %-22s > %s\n" % (human(b).rjust(7), one_line(tool, 22), one_line(snip, 110)))
+    w("=" * 78 + "\n")
+    w("scan: %.2fs\n" % (time.time() - t0))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""cerebro-aviso — o cerebro de IA local conversando com o dono pelo painel.
+
+POR QUE EXISTE. Ordem do dono (2026-09-17): "aviso constante na tela do dono,
+com o cerebro se comunicando. O que ele ta fazendo etc. Sem lotar a tela, mas
+como um aviso, e para saber se ta saudavel". Ate esta data a unica forma de
+saber o que o cerebro fazia era ler o journal -- e o journal deste host guarda
+so o boot corrente (medido: primeira entrada 2026-09-16 15:29 -03), entao o
+incidente de 2026-09-17 12:42Z (pausa por SQLITE_BUSY que passou do limiar de
+25 min) so apareceu quando alguem foi procurar.
+
+TRES SUBCOMANDOS, e cada um tem um custo diferente de proposito:
+
+  genmon      o CONSTANTE. Saida XML do plugin genmon do xfce4-panel, chamada
+              a cada 10 s. BARATA: le data/ops/cerebro_batimento.json, olha
+              /proc/<pid> e a ultima linha do ledger de enfileiramento. Sem
+              systemctl, sem journalctl, sem rede.
+  transicao   o POP-UP. Chamado pelo timer a cada 1 min. Calcula o MESMO
+              veredito e chama tools/notify-owner SO quando a cor muda. Nada de
+              "esta tudo bem" periodico: o constante e o painel.
+  painel      instala o plugin genmon deste aviso no painel, idempotente, com
+              o padrao medido em tools/vigilia (reconhece o proprio plugin pelo
+              Command do rc, id livre varrendo TODOS os /plugins, recoloca no
+              array). `--seco` imprime o que faria.
+
+O VEREDITO NAO REIMPLEMENTA O GATE. Quem julga e tools/check-cerebro-batimento
+(internal/checks/cerebro_batimento_gate.go). Aqui so se mostram FATOS que o
+proprio worker declarou, com a regra decidida pelo chefe em 2026-09-17:
+
+  VERMELHO  arquivo ausente ou ilegivel; `ts`/`proximo_batimento_ate` nao
+            RFC3339; agora > proximo_batimento_ate (morto ou travado, vale
+            QUALQUER que seja o estado declarado); pid ausente de /proc, ou
+            /proc/<pid>/comm diferente de `cerebro` (pid reaproveitado);
+            estado `pausado_por_defeito`; pausa declarada acima do
+            `limiar_pausa_s` que o proprio worker declarou.
+  AMARELO   `pausado_transitorio` (pausa abaixo do limiar) ou
+            `pausado_a_pedido`; estado que este aviso nao conhece; contradicao
+            declarada por PRESENCA (executando_vencidas, lapides_ambulantes,
+            curaveis_paradas > 0 -- o vocabulario do batimento diz que
+            qualquer valor acima de zero e defeito, entao nao ha limiar a
+            reimplementar).
+  VERDE     `trabalhando` ou `ocioso`, com batimento no prazo e processo vivo.
+
+Os valores de estado sao os de internal/cerebrobatimento/cerebrobatimento.go,
+e o teste confere a paridade lendo o .go: o brief de 2026-09-17 falava em
+"pausado", e o valor real e `pausado_transitorio`.
+
+CAMPOS NOVOS (tipo_lote, modelo_lote, ultimo_lote_em) nasceram no binario de
+2026-09-17. Ausencia e "nao declarado por este binario", NUNCA "parado".
+
+GLIFOS: SO os que a fonte base do painel desenha. Medido em 2026-09-17 com
+Pango ("Sans Bold 10", a fonte que tools/vigilia grava no rc): U+23F8 (pausa)
+cai em "Noto Sans Symbols2" -- a MESMA familia em que U+1F441 cai, e U+1F441 e
+o glifo que tools/vigilia mediu com LARGURA ZERO no painel. A medicao offline
+deu 14 px para ele, entao largura offline NAO prova nada sobre o painel; o que
+separa e a familia de fallback. U+2713/U+2717 caem em DejaVu (fallback nunca
+provado no painel). Por isso os tres glifos daqui -- U+2022, U+2016, U+00D7 --
+estao na propria Noto Sans (fc-list ':family=Noto Sans:charset=...'), a mesma
+fonte que ja desenha "vigilia" acentuado no painel do dono. A cor e a palavra
+carregam o estado; o glifo e enfeite.
+
+CODIGOS DE SAIDA (convencao de tools/lib/saida_de_medidor.py, com a decisao de
+cada subcomando):
+  genmon     SEMPRE 0 depois de imprimir o XML, inclusive quando o proprio
+             aviso quebra: a saida vira um rotulo vermelho "aviso com defeito"
+             com o traceback no stderr. O unico leitor deste codigo e o
+             genmon, cujo tratamento de exit != 0 nao foi medido -- e um painel
+             EM BRANCO quando o aviso cai e indistinguivel de "nada a dizer".
+  transicao  0 = mediu e entregou (ou nao havia o que entregar). NUNCA 1 com o
+             cerebro vermelho: a unit nao mascara exit 1, entao ela entraria em
+             `failed` a cada minuto e o OnFailure mandaria um segundo aviso,
+             enganoso ("unit falhou"), por cima da chave `cerebro-saude`.
+             2 = nao conseguiu medir ou entregar -> OnFailure.
+  painel     0 = instalado ou ja estava; 2 = nao conseguiu.
+
+Uso:
+  tools/cerebro-aviso genmon    [--raiz R] [--proc P] [--agora RFC3339]
+  tools/cerebro-aviso transicao [--raiz R] [--proc P] [--agora RFC3339]
+  tools/cerebro-aviso painel    [--seco] [--proc P]
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+
+RAIZ_PADRAO = os.path.dirname(os.path.abspath(os.path.dirname(os.path.abspath(__file__))))
+EU = os.path.realpath(os.path.abspath(__file__))
+
+ARQ_BATIMENTO = "data/ops/cerebro_batimento.json"
+ARQ_ENFILEIRAR = "data/ops/cerebro_enfileirar.jsonl"
+DIR_AVISO = "data/ops/cerebro_log"
+# Amostras (ts, concluidas) para o ritmo. Escrito por genmon E por transicao,
+# com trava nao bloqueante: perder uma amostra numa corrida e inofensivo.
+ARQ_AMOSTRAS = DIR_AVISO + "/aviso_estado.json"
+# Ultima cor observada e notificada. Escrito SO por transicao, sob trava.
+# Arquivo separado de proposito: dois escritores read-modify-write no mesmo
+# arquivo perdem atualizacao, e perder a cor notificada repete o pop-up.
+ARQ_TRANSICAO_ESTADO = DIR_AVISO + "/aviso_transicao_estado.json"
+ARQ_TRANSICOES = DIR_AVISO + "/aviso_transicoes.jsonl"
+ARQ_CEREBRO_LOG = "tools/cerebro-log"
+ARQ_NOTIFICADOR = "tools/notify-owner"
+
+SCHEMA_AMOSTRAS = "cerebro_aviso_amostras_v1"
+SCHEMA_ESTADO = "cerebro_aviso_transicao_estado_v1"
+SCHEMA_TRANSICAO = "cerebro_aviso_transicao_v1"
+
+CHAVE_ALERTA = "cerebro-saude"
+ORIGEM_ALERTA = "cerebro-aviso"
+
+VERDE, AMARELO, VERMELHO = "verde", "amarelo", "vermelho"
+
+# Estados declarados em internal/cerebrobatimento/cerebrobatimento.go. O teste
+# confere estes literais contra o .go: divergencia e bug de paridade.
+ESTADO_TRABALHANDO = "trabalhando"
+ESTADO_OCIOSO = "ocioso"
+ESTADO_PAUSADO_A_PEDIDO = "pausado_a_pedido"
+ESTADO_PAUSADO_TRANSITORIO = "pausado_transitorio"
+ESTADO_PAUSADO_POR_DEFEITO = "pausado_por_defeito"
+ESTADOS_CONHECIDOS = (ESTADO_TRABALHANDO, ESTADO_OCIOSO, ESTADO_PAUSADO_A_PEDIDO,
+                      ESTADO_PAUSADO_TRANSITORIO, ESTADO_PAUSADO_POR_DEFEITO)
+
+# Nome do executavel do daemon. Medido em 2026-09-17: /proc/942021/comm =
+# "cerebro", cmdline "/opt/wiki/bin/cerebro servir --root /opt/wiki ...".
+COMM_DO_CEREBRO = "cerebro"
+
+# Classes de pausa (ClassePausa no .go): (rotulo curto do painel, descricao).
+CLASSES_DE_PAUSA = {
+    "ocupacao_lock": ("compilação", "outro processo segura o lock de compilação/commit"),
+    "ocupacao_carga": ("carga", "máquina carregada (loadavg acima do teto)"),
+    "portal": ("portal", "portal fora do 200 ou servidor reiniciando"),
+    "infra": ("infra", "Ollama, fila ou disjuntor indisponível"),
+    "ambiente": ("modelo", "Ollama sem o modelo pedido, ou modelos demais residentes"),
+    "manual": ("a pedido", "pausa declarada em data/ops/cerebro_pausa_manual.json"),
+}
+
+# Tipos de tarefa (constantes Tipo* de internal/cerebro): (verbo curto, frase).
+TIPOS_DE_LOTE = {
+    "embed_pagina": ("indexando", "indexando páginas (embeddings)"),
+    "extrair_dispositivos": ("extraindo", "extraindo dispositivos legais"),
+    "gerar_comentario_autoridade": ("comentando", "redigindo comentário de autoridade"),
+    "redigir_noticia": ("redigindo", "redigindo notícia"),
+    "medir_modelo": ("medindo", "medindo modelo"),
+}
+
+# Contradicoes que o vocabulario do batimento declara defeito por PRESENCA.
+ANOMALIAS_POR_PRESENCA = (
+    ("executando_vencidas", "tarefa(s) órfã(s) em executando além do lease"),
+    ("lapides_ambulantes", "lápide(s) ambulante(s) em estado vivo"),
+    ("curaveis_paradas", "tarefa(s) curável(is) que a cura do boot não reabriu"),
+)
+
+COR_HEX = {VERDE: "#8ae234", AMARELO: "#edd400", VERMELHO: "#ef2929"}
+# Glifos medidos na Noto Sans (ver docstring). "!" e ASCII.
+GLIFO = {VERDE: "•", AMARELO: "‖", VERMELHO: "×"}
+GLIFO_ATENCAO = "!"
+
+# ── Ritmo ──────────────────────────────────────────────────────────────────
+# Uma amostra por minuto de batimento basta para um ritmo de uma hora, e poupa
+# o SSD: o genmon roda a cada 10 s e o batimento muda a cada ~30 s.
+AMOSTRA_ESPACO_MIN_S = 60
+AMOSTRA_RETENCAO_S = 2 * 3600
+AMOSTRA_MAX = 200
+JANELA_RITMO_S = 3600
+# Abaixo disto o ritmo sai como delta puro, sem extrapolar para "/h".
+RITMO_SPAN_MIN_PARA_HORA_S = 5 * 60
+
+# ── Transicao ──────────────────────────────────────────────────────────────
+# Vermelho so vira pop-up quando PERSISTE. Medido no journal de 2026-09-17: o
+# restart de 10:30:41 levou 9 s ate o worker novo entrar no laco (10:30:50), e
+# nessa janela o batimento velho aponta um pid morto. Com timer de 1 min, ~15%
+# dos restarts cairiam ali e virariam um par "parado"/"voltou" falso. 45 s fica
+# acima dos 9 s medidos e abaixo da cadencia do timer, entao a SEGUNDA passada
+# consecutiva sempre confirma.
+CARENCIA_VERMELHO_S = 45
+# Pausa curta e normal (bancada compilando, SQLITE_BUSY do enfileiramento) e
+# nao pode virar pop-up: amarelo so notifica depois de 5 min (ordem do chefe).
+CARENCIA_AMARELO_S = 5 * 60
+
+TRUNCA_DIAGNOSTICO = 220
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# utilitarios
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_ts(valor):
+    """RFC3339 -> datetime com fuso. None quando ausente ou invalido."""
+    if not isinstance(valor, str) or not valor.strip():
+        return None
+    texto = valor.strip()
+    if texto.endswith("Z") or texto.endswith("z"):
+        texto = texto[:-1] + "+00:00"
+    try:
+        instante = datetime.datetime.fromisoformat(texto)
+    except ValueError:
+        return None
+    if instante.tzinfo is None:
+        return None
+    return instante
+
+
+def iso(instante):
+    return instante.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def hora_local(instante):
+    return instante.astimezone().strftime("%H:%M")
+
+
+def fmt_int(numero):
+    return f"{int(numero):,}".replace(",", ".")
+
+
+def fmt_dur(segundos):
+    segundos = max(0, int(segundos))
+    if segundos < 60:
+        return f"{segundos} s"
+    minutos = segundos // 60
+    if minutos < 60:
+        return f"{minutos} min"
+    horas, resto = divmod(minutos, 60)
+    return f"{horas} h {resto:02d} min"
+
+
+def escapa(texto):
+    """Escape de marcacao Pango. O genmon passa <txt> por gtk_label_set_markup e
+    <tool> por gtk_widget_set_tooltip_markup (strings de libgenmon.so, 4.1.1): um
+    `&` cru no diagnostico do daemon derruba o tooltip inteiro."""
+    return (str(texto).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def inteiro(batimento, campo):
+    valor = batimento.get(campo)
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return 0
+    return int(valor)
+
+
+def trunca(texto, limite=TRUNCA_DIAGNOSTICO):
+    texto = " ".join(str(texto).split())
+    return texto if len(texto) <= limite else texto[: limite - 1] + "…"
+
+
+def grava_atomico(caminho, dados):
+    diretorio = os.path.dirname(caminho)
+    os.makedirs(diretorio, exist_ok=True)
+    descritor, temporario = tempfile.mkstemp(prefix=os.path.basename(caminho) + ".",
+                                             suffix=".tmp", dir=diretorio)
+    try:
+        with os.fdopen(descritor, "w", encoding="utf-8") as arquivo:
+            json.dump(dados, arquivo, ensure_ascii=False, sort_keys=True)
+        os.replace(temporario, caminho)
+    except BaseException:
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+        raise
+
+
+def le_json(caminho):
+    """Objeto JSON do arquivo, ou None quando ausente/ilegivel (estado proprio
+    do aviso: perde-lo so zera amostras ou a cor observada)."""
+    try:
+        with open(caminho, encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+    except (OSError, ValueError):
+        return None
+    return dados if isinstance(dados, dict) else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# veredito
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Avaliacao:
+    """O que o painel e a transicao sabem sobre o cerebro neste instante."""
+
+    def __init__(self, cor, motivo, rotulo, frase):
+        self.cor = cor
+        self.motivo = motivo
+        # rotulo: texto curto do painel (sem marcacao); frase: uma linha humana
+        # que vai para o topo do tooltip e para a notificacao.
+        self.rotulo = rotulo
+        self.frase = frase
+        self.batimento = None
+        self.linhas = []
+        self.incidente_desde = None
+        self.pausa_desde = None
+        self.glifo = GLIFO[cor]
+
+    def como_dict(self):
+        return {"cor": self.cor, "motivo": self.motivo, "rotulo": self.rotulo,
+                "frase": self.frase}
+
+
+def processo_do_cerebro(proc, pid):
+    """(vivo, detalhe). Vivo exige /proc/<pid> E comm == cerebro quando legivel.
+
+    Sem a conferencia do comm, um pid reaproveitado depois de reboot ou de muito
+    fork (o batimento velho continua no disco) le verde ate o prazo vencer."""
+    if pid <= 0:
+        return False, "o batimento não declara pid"
+    base = os.path.join(proc, str(pid))
+    if not os.path.isdir(base):
+        return False, f"pid {pid} ausente de /proc"
+    try:
+        with open(os.path.join(base, "comm"), encoding="utf-8", errors="replace") as arquivo:
+            comm = arquivo.read().strip()
+    except OSError:
+        return True, f"pid {pid} vivo (comm ilegível)"
+    if comm != COMM_DO_CEREBRO:
+        return False, f"pid {pid} é outro processo ({comm})"
+    return True, f"pid {pid} vivo"
+
+
+def avaliar(raiz, proc, agora):
+    caminho = os.path.join(raiz, ARQ_BATIMENTO)
+    try:
+        with open(caminho, encoding="utf-8") as arquivo:
+            bruto = arquivo.read()
+    except FileNotFoundError:
+        return Avaliacao(VERMELHO, "batimento_ausente", "Cérebro sem batimento",
+                         f"{ARQ_BATIMENTO} não existe: o cérebro não declara pulso nenhum")
+    except OSError as erro:
+        return Avaliacao(VERMELHO, "batimento_ilegivel", "Cérebro batimento ilegível",
+                         f"não consegui ler {ARQ_BATIMENTO}: {erro}")
+    try:
+        batimento = json.loads(bruto)
+    except ValueError as erro:
+        return Avaliacao(VERMELHO, "batimento_ilegivel", "Cérebro batimento ilegível",
+                         f"{ARQ_BATIMENTO} não é JSON válido: {erro}")
+    if not isinstance(batimento, dict):
+        return Avaliacao(VERMELHO, "batimento_ilegivel", "Cérebro batimento ilegível",
+                         f"{ARQ_BATIMENTO} não é um objeto JSON")
+
+    estado = str(batimento.get("estado") or "")
+    ts = parse_ts(batimento.get("ts"))
+    prazo = parse_ts(batimento.get("proximo_batimento_ate"))
+    pid = inteiro(batimento, "pid")
+    vivo, detalhe_pid = processo_do_cerebro(proc, pid)
+    pausada_desde = parse_ts(batimento.get("pausada_desde"))
+    limiar = inteiro(batimento, "limiar_pausa_s")
+    classe = str(batimento.get("classe_pausa") or "")
+    curto_classe = CLASSES_DE_PAUSA.get(classe, (classe or "sem classe", ""))[0]
+
+    if ts is None or prazo is None:
+        campo = "ts" if ts is None else "proximo_batimento_ate"
+        av = Avaliacao(VERMELHO, "batimento_sem_prazo", "Cérebro batimento sem prazo",
+                       f"campo `{campo}` ausente ou fora do RFC3339: não há como separar travado de lote longo")
+    elif agora > prazo:
+        # VALE PARA QUALQUER ESTADO: quem se declarou trabalhando e nao voltou no
+        # prazo que ele mesmo pediu esta travado.
+        parado = (agora - ts).total_seconds()
+        av = Avaliacao(VERMELHO, "batimento_vencido", f"Cérebro parado {fmt_dur(parado)}",
+                       f"o worker prometeu voltar até {hora_local(prazo)} e não voltou "
+                       f"(último batimento às {hora_local(ts)}, estado declarado {estado or '?'})")
+        av.incidente_desde = prazo
+    elif not vivo:
+        av = Avaliacao(VERMELHO, "processo_ausente", "Cérebro sem processo",
+                       f"{detalhe_pid}: o batimento no disco é de um processo que não existe mais")
+        av.incidente_desde = ts
+    elif estado == ESTADO_PAUSADO_POR_DEFEITO:
+        duracao = (agora - pausada_desde).total_seconds() if pausada_desde else None
+        rotulo = "Cérebro pausa com defeito" + (f" {fmt_dur(duracao)}" if duracao is not None else "")
+        av = Avaliacao(VERMELHO, "pausado_por_defeito", rotulo,
+                       f"pausado por defeito ({classe or 'classe não declarada'})"
+                       + (f" há {fmt_dur(duracao)}" if duracao is not None else ""))
+        av.pausa_desde = pausada_desde
+        av.incidente_desde = pausada_desde or ts
+    elif (estado in (ESTADO_PAUSADO_TRANSITORIO, ESTADO_PAUSADO_A_PEDIDO) and pausada_desde
+          and limiar > 0 and (agora - pausada_desde).total_seconds() > limiar):
+        duracao = (agora - pausada_desde).total_seconds()
+        av = Avaliacao(VERMELHO, "pausa_acima_do_limiar",
+                       f"Cérebro pausa com defeito {fmt_dur(duracao)}",
+                       f"pausa ({classe}) há {fmt_dur(duracao)}, acima do limiar de {fmt_dur(limiar)} que o próprio worker declarou")
+        av.pausa_desde = pausada_desde
+        av.incidente_desde = pausada_desde
+    elif estado in (ESTADO_PAUSADO_TRANSITORIO, ESTADO_PAUSADO_A_PEDIDO):
+        duracao = (agora - pausada_desde).total_seconds() if pausada_desde else None
+        motivo = "pausado_a_pedido" if estado == ESTADO_PAUSADO_A_PEDIDO else "pausa"
+        rotulo = f"Cérebro pausa ({curto_classe})" + (f" {fmt_dur(duracao)}" if duracao is not None else "")
+        frase = ("pausado a pedido" if motivo == "pausado_a_pedido" else f"em pausa ({classe or 'classe não declarada'})")
+        if duracao is not None:
+            frase += f" há {fmt_dur(duracao)}"
+            if limiar > 0:
+                frase += f", limiar {fmt_dur(limiar)}"
+        av = Avaliacao(AMARELO, motivo, rotulo, frase)
+        av.pausa_desde = pausada_desde
+        av.incidente_desde = pausada_desde or ts
+    elif estado not in ESTADOS_CONHECIDOS:
+        av = Avaliacao(AMARELO, "estado_desconhecido", "Cérebro estado desconhecido",
+                       f"estado declarado {estado!r} não é nenhum dos que este aviso conhece")
+        av.glifo = GLIFO_ATENCAO
+    else:
+        anomalias = [(campo, inteiro(batimento, campo), texto)
+                     for campo, texto in ANOMALIAS_POR_PRESENCA if inteiro(batimento, campo) > 0]
+        verbo = verbo_do_lote(batimento, estado)
+        if anomalias:
+            resumo = "; ".join(f"{n} {texto}" for _, n, texto in anomalias)
+            av = Avaliacao(AMARELO, "contradicao_declarada", f"Cérebro atenção · {verbo}",
+                           f"{verbo}, mas o worker declara: {resumo}")
+            av.glifo = GLIFO_ATENCAO
+        else:
+            av = Avaliacao(VERDE, estado, f"Cérebro {verbo} · {fmt_int(inteiro(batimento, 'concluidas'))}",
+                           f"{verbo}, batimento no prazo, processo vivo")
+    av.batimento = batimento
+    av.linhas = detalhes(batimento, agora, ts, prazo, detalhe_pid, pausada_desde, limiar, classe)
+    return av
+
+
+def verbo_do_lote(batimento, estado):
+    if estado == ESTADO_OCIOSO:
+        return "ocioso"
+    tipo = str(batimento.get("tipo_lote") or "")
+    if not tipo:
+        return "trabalhando"
+    return TIPOS_DE_LOTE.get(tipo, (tipo, tipo))[0]
+
+
+def detalhes(b, agora, ts, prazo, detalhe_pid, pausada_desde, limiar, classe):
+    linhas = []
+    estado = str(b.get("estado") or "?")
+    if ts is not None:
+        linhas.append(f"Estado: {estado} (declarado às {hora_local(ts)}, há {fmt_dur((agora - ts).total_seconds())})")
+    else:
+        linhas.append(f"Estado: {estado}")
+    tipo = str(b.get("tipo_lote") or "")
+    modelo = str(b.get("modelo_lote") or "")
+    ultimo = parse_ts(b.get("ultimo_lote_em"))
+    if tipo:
+        frase = TIPOS_DE_LOTE.get(tipo, (tipo, tipo))[1]
+        prefixo = "Fazendo" if estado == ESTADO_TRABALHANDO else "Último lote"
+        texto = f"{prefixo}: {frase}"
+        if modelo:
+            texto += f" com {modelo}"
+        if estado == ESTADO_TRABALHANDO and inteiro(b, "lote"):
+            texto += f" (lote de {inteiro(b, 'lote')})"
+        linhas.append(texto)
+    else:
+        linhas.append("Fazendo: não declarado por este binário (campos tipo_lote/modelo_lote ausentes)")
+    if ultimo is not None:
+        linhas.append(f"Último lote concluído às {hora_local(ultimo)} (há {fmt_dur((agora - ultimo).total_seconds())})")
+    linhas.append(
+        f"Fila: {fmt_int(inteiro(b, 'concluidas'))} concluídas · {fmt_int(inteiro(b, 'pendentes'))} pendentes "
+        f"({fmt_int(inteiro(b, 'elegiveis_agora'))} elegíveis) · {inteiro(b, 'executando')} executando · "
+        f"{inteiro(b, 'erros')} erros")
+    if classe or pausada_desde:
+        rotulo = CLASSES_DE_PAUSA.get(classe, ("", classe or "classe não declarada"))[1]
+        texto = f"Pausa: {classe or '?'} — {rotulo}"
+        if pausada_desde is not None:
+            texto += f"; desde {hora_local(pausada_desde)}, há {fmt_dur((agora - pausada_desde).total_seconds())}"
+        if limiar > 0:
+            texto += f" de {fmt_dur(limiar)} de limiar"
+        linhas.append(texto)
+        if b.get("sonda_pausa"):
+            linhas.append(f"Sonda: {b.get('sonda_pausa')}")
+        if b.get("diagnostico_pausa"):
+            linhas.append(f"Diagnóstico: {trunca(b.get('diagnostico_pausa'))}")
+    disjuntor = parse_ts(b.get("disjuntor_aberto_ate"))
+    if disjuntor is not None and disjuntor > agora:
+        linhas.append(f"Disjuntor do Ollama aberto até {hora_local(disjuntor)}")
+    sem_elegivel = parse_ts(b.get("sem_elegivel_desde"))
+    if sem_elegivel is not None:
+        linhas.append(f"Fila sem elegível desde {hora_local(sem_elegivel)} (há {fmt_dur((agora - sem_elegivel).total_seconds())})")
+    for campo, texto in ANOMALIAS_POR_PRESENCA:
+        if inteiro(b, campo) > 0:
+            linhas.append(f"Atenção: {inteiro(b, campo)} {texto} ({campo})")
+    if prazo is not None:
+        linhas.append(f"Próximo batimento esperado até {hora_local(prazo)}")
+    linhas.append(f"Processo: {detalhe_pid}")
+    return linhas
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# amostras e ritmo
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ler_amostras(raiz):
+    dados = le_json(os.path.join(raiz, ARQ_AMOSTRAS)) or {}
+    amostras = []
+    for item in dados.get("amostras") or []:
+        if not isinstance(item, dict):
+            continue
+        instante = parse_ts(item.get("ts"))
+        concluidas = item.get("concluidas")
+        if instante is None or isinstance(concluidas, bool) or not isinstance(concluidas, int):
+            continue
+        amostras.append((instante, concluidas))
+    amostras.sort(key=lambda par: par[0])
+    return amostras
+
+
+def amostra_do_batimento(batimento):
+    if not isinstance(batimento, dict):
+        return None
+    instante = parse_ts(batimento.get("ts"))
+    concluidas = batimento.get("concluidas")
+    if instante is None or isinstance(concluidas, bool) or not isinstance(concluidas, int):
+        return None
+    return instante, concluidas
+
+
+def registrar_amostra(raiz, batimento):
+    """Acrescenta (ts, concluidas) do batimento se ele e novo e espacado.
+
+    A chave e o `ts` que o WORKER carimbou, nunca o relogio de quem le: o genmon
+    le o mesmo batimento varias vezes, e uma amostra por leitura inventaria
+    ritmo zero entre batimentos. `concluidas` que DIMINUI (fila recriada) zera o
+    historico: delta negativo nao e ritmo."""
+    nova = amostra_do_batimento(batimento)
+    if nova is None:
+        return False
+    caminho = os.path.join(raiz, ARQ_AMOSTRAS)
+    try:
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        trava = open(caminho + ".lock", "w", encoding="utf-8")
+    except OSError as erro:
+        print(f"cerebro-aviso: amostra não registrada ({erro})", file=sys.stderr)
+        return False
+    with trava:
+        try:
+            fcntl.flock(trava.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Outro processo (genmon x transicao) esta gravando a mesma amostra.
+            return False
+        amostras = ler_amostras(raiz)
+        if amostras:
+            ultima_ts, ultima_c = amostras[-1]
+            if nova[0] <= ultima_ts or nova[1] < ultima_c:
+                if nova[1] < ultima_c or nova[0] < ultima_ts:
+                    amostras = []
+                else:
+                    return False
+            elif (nova[0] - ultima_ts).total_seconds() < AMOSTRA_ESPACO_MIN_S:
+                return False
+        amostras.append(nova)
+        corte = nova[0] - datetime.timedelta(seconds=AMOSTRA_RETENCAO_S)
+        amostras = [par for par in amostras if par[0] >= corte][-AMOSTRA_MAX:]
+        grava_atomico(caminho, {
+            "schema_version": SCHEMA_AMOSTRAS,
+            "amostras": [{"ts": iso(t), "concluidas": c} for t, c in amostras],
+        })
+    return True
+
+
+def ritmo(amostras, batimento):
+    """(delta, span_s) sobre a ultima hora, ou None sem DUAS amostras reais.
+
+    A leitura atual conta como amostra (ela e um (ts, concluidas) declarado pelo
+    worker), mas so se for mais nova que a ultima guardada."""
+    pontos = list(amostras)
+    atual = amostra_do_batimento(batimento)
+    if atual is not None and (not pontos or atual[0] > pontos[-1][0]):
+        pontos.append(atual)
+    if len(pontos) < 2:
+        return None
+    topo = pontos[-1]
+    janela = [par for par in pontos if (topo[0] - par[0]).total_seconds() <= JANELA_RITMO_S]
+    if len(janela) < 2:
+        return None
+    base = janela[0]
+    span = (topo[0] - base[0]).total_seconds()
+    delta = topo[1] - base[1]
+    if span <= 0 or delta < 0:
+        return None
+    return delta, span
+
+
+def texto_ritmo(medida):
+    if medida is None:
+        return "Ritmo: ainda sem duas amostras do batimento (aparece em alguns minutos)"
+    delta, span = medida
+    texto = f"Ritmo: +{fmt_int(delta)} concluídas em {fmt_dur(span)}"
+    if span >= RITMO_SPAN_MIN_PARA_HORA_S:
+        texto += f" (≈{fmt_int(round(delta * 3600 / span))}/h)"
+    return texto
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# enfileiramento
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ultima_linha_jsonl(caminho, janela=16384):
+    """Ultima linha JSON valida, lendo so o fim do arquivo (o ledger cresce)."""
+    try:
+        with open(caminho, "rb") as arquivo:
+            arquivo.seek(0, os.SEEK_END)
+            tamanho = arquivo.tell()
+            arquivo.seek(max(0, tamanho - janela))
+            cauda = arquivo.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for linha in reversed(cauda.splitlines()):
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            dados = json.loads(linha)
+        except ValueError:
+            continue
+        if isinstance(dados, dict):
+            return dados
+    return None
+
+
+def texto_enfileiramento(raiz):
+    linha = ultima_linha_jsonl(os.path.join(raiz, ARQ_ENFILEIRAR))
+    if linha is None:
+        return "Enfileiramento: sem registro em " + ARQ_ENFILEIRAR
+    inicio = parse_ts(linha.get("inicio"))
+    duracao = linha.get("duracao_s")
+    partes = []
+    if inicio is not None:
+        partes.append(f"último às {hora_local(inicio)}")
+    if isinstance(duracao, (int, float)) and not isinstance(duracao, bool):
+        partes.append(f"levou {fmt_dur(duracao)}")
+    if linha.get("gatilho"):
+        partes.append(f"gatilho {linha.get('gatilho')}")
+    exits = []
+    for etapa in ("embeddings", "extracoes"):
+        dados = linha.get(etapa)
+        if isinstance(dados, dict) and "exit" in dados:
+            exits.append(f"{etapa} exit {dados.get('exit')}")
+    partes.extend(exits)
+    return "Enfileiramento: " + (", ".join(partes) if partes else "linha sem campos reconhecidos")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# genmon
+# ═══════════════════════════════════════════════════════════════════════════
+
+def comando_do_log(raiz):
+    """Clique do painel: so quando o log E um terminal existem de fato."""
+    log = os.path.join(raiz, ARQ_CEREBRO_LOG)
+    if not os.access(log, os.X_OK):
+        return None
+    if shutil.which("xfce4-terminal"):
+        return f"xfce4-terminal --hold -x {log} ver -f"
+    if shutil.which("wezterm"):
+        return f"wezterm start -- {log} ver -f"
+    return None
+
+
+def rotulo_markup(av):
+    cor = COR_HEX[av.cor]
+    peso = ' weight="bold"' if av.cor == VERMELHO else ""
+    if av.cor == VERMELHO:
+        return f'<span foreground="{cor}"{peso}>{escapa(av.glifo)} {escapa(av.rotulo)}</span>'
+    return f'<span foreground="{cor}">{escapa(av.glifo)}</span> {escapa(av.rotulo)}'
+
+
+def saida_genmon(raiz, proc, agora):
+    av = avaliar(raiz, proc, agora)
+    amostras = ler_amostras(raiz)
+    linhas = [av.frase[:1].upper() + av.frase[1:], ""]
+    linhas.extend(av.linhas)
+    if av.batimento is not None:
+        linhas.append(texto_ritmo(ritmo(amostras, av.batimento)))
+    linhas.append(texto_enfileiramento(raiz))
+    clique = comando_do_log(raiz)
+    if os.access(os.path.join(raiz, ARQ_CEREBRO_LOG), os.X_OK):
+        linhas.append("Log: tools/cerebro-log ver" + (" · clique para acompanhar ao vivo" if clique else ""))
+    else:
+        linhas.append("Log: journalctl -u wikijuridica-cerebro (tools/cerebro-log ainda não instalado)")
+    saida = [f"<txt>{rotulo_markup(av)}</txt>",
+             "<tool>" + escapa("\n".join(linhas)) + "</tool>"]
+    if clique:
+        saida.append(f"<txtclick>{clique}</txtclick>")
+    if av.batimento is not None:
+        registrar_amostra(raiz, av.batimento)
+    return "\n".join(saida) + "\n"
+
+
+def cmd_genmon(args):
+    agora = args.agora or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        sys.stdout.write(saida_genmon(args.raiz, args.proc, agora))
+    except Exception as erro:  # o painel nao pode ficar em branco
+        traceback.print_exc()
+        sys.stdout.write(
+            f'<txt><span foreground="{COR_HEX[VERMELHO]}" weight="bold">'
+            f'{GLIFO[VERMELHO]} Cérebro aviso com defeito</span></txt>\n'
+            f"<tool>{escapa('tools/cerebro-aviso genmon caiu: ' + type(erro).__name__ + ': ' + str(erro))}"
+            f"{escapa(chr(10) + 'O estado do cérebro NÃO foi lido. Rode o subcomando num terminal para ver o traceback.')}</tool>\n")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# transicao
+# ═══════════════════════════════════════════════════════════════════════════
+
+def evidencia(av, raiz):
+    b = av.batimento or {}
+    partes = [f"{ARQ_BATIMENTO}"]
+    if b:
+        partes.append(f"estado={b.get('estado')} ts={b.get('ts')} proximo_batimento_ate={b.get('proximo_batimento_ate')} pid={b.get('pid')}")
+        if b.get("classe_pausa"):
+            partes.append(f"classe_pausa={b.get('classe_pausa')} pausada_desde={b.get('pausada_desde')} limiar_pausa_s={b.get('limiar_pausa_s')}")
+    partes.append(f"motivo={av.motivo}")
+    partes.append("tools/cerebro-aviso genmon")
+    return "; ".join(partes)
+
+
+def notificar(raiz, argumentos):
+    comando = [os.path.join(raiz, ARQ_NOTIFICADOR), "--chave", CHAVE_ALERTA,
+               "--origem", ORIGEM_ALERTA, "--json"] + argumentos
+    try:
+        resultado = subprocess.run(comando, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as erro:
+        return 2, {"erro": f"{type(erro).__name__}: {erro}"}
+    try:
+        evento = json.loads(resultado.stdout) if resultado.stdout.strip() else {}
+    except ValueError:
+        evento = {"stdout": resultado.stdout.strip()[:300]}
+    if resultado.returncode != 0:
+        evento = dict(evento, stderr=resultado.stderr.strip()[-300:])
+    return resultado.returncode, evento
+
+
+def decidir(av, estado, agora):
+    """Pura: (novo_estado, acao). acao in {None, 'vermelho', 'amarelo', 'resolvido'}."""
+    anterior_cor = estado.get("cor_observada")
+    cor_desde = parse_ts(estado.get("cor_desde"))
+    cor_notificada = estado.get("cor_notificada") or VERDE
+    incidente_desde = parse_ts(estado.get("incidente_desde"))
+
+    if av.cor != anterior_cor or cor_desde is None:
+        cor_desde = agora
+    if av.cor == VERDE:
+        novo_incidente = incidente_desde
+    else:
+        candidatos = [t for t in (incidente_desde, av.incidente_desde, agora) if t is not None]
+        novo_incidente = min(candidatos)
+
+    acao = None
+    if av.cor == VERMELHO and cor_notificada != VERMELHO:
+        # So a SEGUNDA observacao confirma (ver CARENCIA_VERMELHO_S).
+        if anterior_cor == VERMELHO and (agora - cor_desde).total_seconds() >= CARENCIA_VERMELHO_S:
+            acao = VERMELHO
+    elif av.cor == AMARELO and cor_notificada == VERDE:
+        inicio = av.pausa_desde or cor_desde
+        if av.pausa_desde is not None and (agora - inicio).total_seconds() >= CARENCIA_AMARELO_S:
+            acao = AMARELO
+    elif av.cor == VERDE and cor_notificada != VERDE:
+        acao = "resolvido"
+
+    novo = {
+        "schema_version": SCHEMA_ESTADO,
+        "cor_observada": av.cor,
+        "motivo_observado": av.motivo,
+        "cor_desde": iso(cor_desde),
+        "cor_notificada": cor_notificada,
+        "incidente_desde": iso(novo_incidente) if (novo_incidente and av.cor != VERDE) else
+                           (estado.get("incidente_desde") if cor_notificada != VERDE else None),
+        "motivo_do_incidente": estado.get("motivo_do_incidente") if cor_notificada != VERDE else None,
+    }
+    if acao in (VERMELHO, AMARELO):
+        novo["cor_notificada"] = acao
+        if not novo.get("motivo_do_incidente"):
+            novo["motivo_do_incidente"] = av.motivo
+    elif acao == "resolvido":
+        novo["cor_notificada"] = VERDE
+    if av.cor == VERDE and novo["cor_notificada"] == VERDE:
+        novo["incidente_desde"] = None
+        novo["motivo_do_incidente"] = None
+    return novo, acao
+
+
+def argumentos_da_notificacao(av, acao, estado_anterior, raiz, agora):
+    if acao == VERMELHO:
+        titulo = "Cérebro pausado por defeito" if "pausa" in av.motivo else "Cérebro parado"
+        return ["--severidade", "alta", "--titulo", titulo,
+                "--mensagem", f"{av.rotulo}: {trunca(av.frase, 300)}",
+                "--evidencia", evidencia(av, raiz)]
+    if acao == AMARELO:
+        return ["--severidade", "media", "--titulo", "Cérebro em pausa há mais de 5 min",
+                "--mensagem", f"{av.rotulo}: {trunca(av.frase, 300)}",
+                "--evidencia", evidencia(av, raiz)]
+    inicio = parse_ts(estado_anterior.get("incidente_desde"))
+    duracao = f" depois de {fmt_dur((agora - inicio).total_seconds())}" if inicio else ""
+    motivo = estado_anterior.get("motivo_do_incidente") or estado_anterior.get("motivo_observado") or "?"
+    return ["--resolvido", "--titulo", "Cérebro saudável de novo",
+            "--mensagem", f"{av.rotulo}{duracao} de incidente (motivo: {motivo})"]
+
+
+def cmd_transicao(args):
+    raiz = args.raiz
+    agora = args.agora or datetime.datetime.now(datetime.timezone.utc)
+    av = avaliar(raiz, args.proc, agora)
+    if av.batimento is not None:
+        registrar_amostra(raiz, av.batimento)
+
+    caminho_estado = os.path.join(raiz, ARQ_TRANSICAO_ESTADO)
+    os.makedirs(os.path.dirname(caminho_estado), exist_ok=True)
+    with open(caminho_estado + ".lock", "w", encoding="utf-8") as trava:
+        fcntl.flock(trava.fileno(), fcntl.LOCK_EX)
+        estado = le_json(caminho_estado) or {}
+        novo, acao = decidir(av, estado, agora)
+
+        rc_notificacao, evento = 0, None
+        if acao is not None:
+            rc_notificacao, evento = notificar(raiz, argumentos_da_notificacao(av, acao, estado, raiz, agora))
+            if rc_notificacao != 0:
+                # Nao entregou: o estado NAO avanca, e a proxima passada tenta de
+                # novo. O exit 2 aciona o OnFailure, que e o canal de reserva.
+                novo["cor_notificada"] = estado.get("cor_notificada") or VERDE
+
+        mudou_cor = (estado.get("cor_observada"), estado.get("motivo_observado")) != (av.cor, av.motivo)
+        if mudou_cor or acao is not None:
+            linha = {
+                "schema_version": SCHEMA_TRANSICAO,
+                "ts": iso(agora),
+                "de": {"cor": estado.get("cor_observada"), "motivo": estado.get("motivo_observado")},
+                "para": {"cor": av.cor, "motivo": av.motivo},
+                "rotulo": av.rotulo,
+                "frase": av.frase,
+                "notificacao": acao,
+                "notificacao_rc": rc_notificacao if acao is not None else None,
+                "canais": (evento or {}).get("canais") if isinstance(evento, dict) else None,
+                "batimento_ts": (av.batimento or {}).get("ts"),
+                "pid": (av.batimento or {}).get("pid"),
+            }
+            caminho_linhas = os.path.join(raiz, ARQ_TRANSICOES)
+            with open(caminho_linhas, "a", encoding="utf-8") as arquivo:
+                arquivo.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+            print(f"cerebro-aviso: {estado.get('cor_observada')}/{estado.get('motivo_observado')} -> "
+                  f"{av.cor}/{av.motivo}" + (f" · notificacao={acao} rc={rc_notificacao}" if acao else ""))
+
+        if novo != estado:
+            grava_atomico(caminho_estado, novo)
+
+    if acao is not None and rc_notificacao != 0:
+        print(f"NAO MEDIDO: notify-owner saiu com {rc_notificacao} ao entregar '{acao}': {evento}",
+              file=sys.stderr)
+        return 2
+    if acao is not None and isinstance(evento, dict):
+        desktop = str((evento.get("canais") or {}).get("desktop") or "")
+        if desktop.startswith("falhou"):
+            print(f"NAO MEDIDO: notificacao '{acao}' registrada, mas o desktop falhou: {desktop}",
+                  file=sys.stderr)
+            return 2
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# painel (padrao medido em tools/vigilia:525-700)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PLUGIN_SO_PADRAO = "/usr/lib/x86_64-linux-gnu/xfce4/panel/plugins/libgenmon.so"
+MARCA_DO_COMANDO = "cerebro-aviso genmon"
+PERIODO_MS = 10000
+
+
+def dir_painel():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "xfce4", "panel")
+
+
+def xfconf(*argumentos):
+    resultado = subprocess.run(["xfconf-query", "-c", "xfce4-panel", *argumentos],
+                               capture_output=True, text=True, timeout=30)
+    return resultado.returncode, resultado.stdout
+
+
+def ids_registrados():
+    """TODOS os /plugins/plugin-N, nao so os do array do painel 1 (vigilia: id
+    repetido em painel diferente faz o xfce4-panel descartar um dos dois)."""
+    _, saida = xfconf("-l")
+    ids = []
+    for linha in saida.splitlines():
+        casamento = re.fullmatch(r"/plugins/plugin-(\d+)", linha.strip())
+        if casamento:
+            ids.append(int(casamento.group(1)))
+    return sorted(set(ids))
+
+
+def ids_do_painel():
+    rc, saida = xfconf("-p", "/panels/panel-1/plugin-ids")
+    if rc != 0:
+        return []
+    return [int(linha.strip()) for linha in saida.splitlines() if re.fullmatch(r"\d+", linha.strip())]
+
+
+def rc_do_plugin(painel, id_plugin):
+    return os.path.join(painel, f"genmon-{id_plugin}.rc")
+
+
+def id_do_nosso_genmon(painel):
+    """Reconhece pelo Command do rc, nunca pelo numero."""
+    for id_plugin in ids_registrados():
+        _, tipo = xfconf("-p", f"/plugins/plugin-{id_plugin}")
+        if tipo.strip() != "genmon":
+            continue
+        try:
+            with open(rc_do_plugin(painel, id_plugin), encoding="utf-8") as arquivo:
+                conteudo = arquivo.read()
+        except OSError:
+            continue
+        for linha in conteudo.splitlines():
+            if linha.startswith("Command=") and MARCA_DO_COMANDO in linha:
+                return id_plugin
+    return None
+
+
+def conteudo_rc():
+    # Font=(default) quebra o CSS do plugin e o rotulo fica com largura zero
+    # (tools/vigilia, medido em 2026-09-10): sempre fonte real.
+    return (f"Command={EU} genmon\n"
+            f"UpdatePeriod={PERIODO_MS}\n"
+            "Text=cérebro\n"
+            "UseLabel=0\n"
+            "Font=Sans Bold 10\n")
+
+
+def painel_rodando(proc):
+    try:
+        entradas = os.listdir(proc)
+    except OSError:
+        return False
+    for entrada in entradas:
+        if not entrada.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, entrada, "comm"), encoding="utf-8", errors="replace") as arquivo:
+                if arquivo.read().strip() == "xfce4-panel":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def cmd_painel(args):
+    seco = args.seco
+    if shutil.which("xfconf-query") is None:
+        print("cerebro-aviso: xfconf-query ausente", file=sys.stderr)
+        return 2
+    plugin_so = os.environ.get("CEREBRO_AVISO_PLUGIN_SO", PLUGIN_SO_PADRAO)
+    if not os.path.exists(plugin_so):
+        print(f"cerebro-aviso: plugin genmon ausente ({plugin_so}). "
+              "Instale antes: sudo apt-get install -y xfce4-genmon-plugin", file=sys.stderr)
+        return 2
+    painel = dir_painel()
+    prefixo = "[seco] faria: " if seco else ""
+    mudou = False
+
+    id_plugin = id_do_nosso_genmon(painel)
+    if id_plugin is not None:
+        print(f"genmon do cérebro já registrado (plugin-{id_plugin})")
+    else:
+        registrados = ids_registrados()
+        id_plugin = (max(registrados) if registrados else 0) + 1
+        print(f"{prefixo}xfconf-query -c xfce4-panel -p /plugins/plugin-{id_plugin} -n -t string -s genmon")
+        if not seco:
+            rc, _ = xfconf("-p", f"/plugins/plugin-{id_plugin}", "-n", "-t", "string", "-s", "genmon")
+            if rc != 0:
+                print(f"cerebro-aviso: xfconf-query recusou criar plugin-{id_plugin}", file=sys.stderr)
+                return 2
+        mudou = True
+
+    caminho_rc = rc_do_plugin(painel, id_plugin)
+    try:
+        with open(caminho_rc, encoding="utf-8") as arquivo:
+            atual = arquivo.read()
+    except OSError:
+        atual = None
+    if atual != conteudo_rc():
+        print(f"{prefixo}escrever {caminho_rc}")
+        if not seco:
+            os.makedirs(painel, exist_ok=True)
+            with open(caminho_rc, "w", encoding="utf-8") as arquivo:
+                arquivo.write(conteudo_rc())
+
+    no_painel = ids_do_painel()
+    if id_plugin not in no_painel:
+        # Reescreve o array inteiro (xfconf nao tem append), deduplicado: id
+        # repetido no array faz o painel comer um dos dois (vigilia, 2026-09-10).
+        novos = []
+        for item in no_painel + [id_plugin]:
+            if item not in novos:
+                novos.append(item)
+        argumentos = ["-p", "/panels/panel-1/plugin-ids", "-a"]
+        for item in novos:
+            argumentos += ["-t", "int", "-s", str(item)]
+        print(f"{prefixo}pôr plugin-{id_plugin} no fim do painel 1")
+        if not seco:
+            rc, _ = xfconf(*argumentos)
+            if rc != 0:
+                print("cerebro-aviso: xfconf-query recusou reescrever o array do painel", file=sys.stderr)
+                return 2
+        mudou = True
+
+    if not mudou:
+        print("nada a mudar no painel")
+        return 0
+
+    executavel = shutil.which("xfce4-panel")
+    if executavel is None:
+        print("cerebro-aviso: xfce4-panel ausente; o plugin só aparece num painel novo", file=sys.stderr)
+        return 2
+    os.environ.setdefault("DISPLAY", ":0")
+    if not os.environ.get("SESSION_MANAGER"):
+        print("aviso: SESSION_MANAGER ausente — relançado daqui, o logout pode salvar uma sessão sem painel; "
+              "prefira rodar este subcomando num terminal da sessão gráfica")
+    # O plugin novo so carrega em processo NOVO do painel (vigilia: `-r` nao basta).
+    if painel_rodando(args.proc):
+        print(f"{prefixo}xfce4-panel -q && xfce4-panel (relançar para carregar o plugin)")
+        if not seco:
+            subprocess.run([executavel, "-q"], capture_output=True, timeout=30)
+    else:
+        print(f"{prefixo}xfce4-panel (painel não estava rodando)")
+    if not seco:
+        subprocess.Popen([executavel], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+
+def instante_arg(valor):
+    instante = parse_ts(valor)
+    if instante is None:
+        raise argparse.ArgumentTypeError(f"--agora precisa de RFC3339 com fuso: {valor!r}")
+    return instante
+
+
+def main(argv=None):
+    analisador = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = analisador.add_subparsers(dest="comando", required=True)
+    for nome in ("genmon", "transicao"):
+        p = sub.add_parser(nome)
+        p.add_argument("--raiz", default=RAIZ_PADRAO)
+        p.add_argument("--proc", default="/proc")
+        p.add_argument("--agora", type=instante_arg, default=None,
+                       help="relogio injetado (RFC3339), para fixture reproduzivel")
+    p = sub.add_parser("painel")
+    p.add_argument("--seco", action="store_true", help="imprime o que faria, sem escrever")
+    p.add_argument("--proc", default="/proc")
+    args = analisador.parse_args(argv)
+    if args.comando == "genmon":
+        return cmd_genmon(args)
+    if args.comando == "transicao":
+        return cmd_transicao(args)
+    return cmd_painel(args)
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

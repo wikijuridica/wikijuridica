@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""generate-v2-oab-phrase-repair-20260805.
+
+Corrige frases do acervo v2 cujo TEOR JURIDICO esta certo, mas cuja REDACAO
+aproxima uma afirmacao tecnica de uma promessa de resultado — leitura vedada
+pelo Provimento OAB 205/2021 (art. 3o, caput: conteudo sobrio e informativo,
+sem "captacao de clientela"; e art. 3o, I: sem promessa de resultado).
+
+## Como estes casos foram encontrados
+
+O diferencial full-corpus regex-antiga x classificador DEC-024
+(`cmd/check-outcome-promise-regex-differential`) listou 36 registros que
+deixaram de ser bloqueados pelo detector. Revisao MANUAL das 40 frases:
+
+  35  negacao ou condenacao explicita da promessa
+        ("nao garante resultado", "sem garantir exito", "nenhum profissional
+         serio garante resultado") — sao exatamente o que o portal DEVE dizer
+   4  atribuicao a terceiro (lista de sinais de golpe; publicidade de clinica
+        sob critica; tema do art. 30 do CDC) — a promessa e do terceiro, e a
+        pagina a critica
+   1  LIMITROFE -> corrigida aqui
+
+A limitrofe nao e erro de direito: a dispensa de colacao realmente produz o
+efeito descrito (CC arts. 2.002, 2.005 e 2.006). O problema e a JUSTAPOSICAO —
+"e o que garante o resultado pretendido" colado a "um advogado ... pode
+estruturar isso" —, que num texto de lane comercial pode ser lido como
+"contrate e o resultado esta garantido". A correcao preserva o efeito juridico
+e explica o que acontece SEM a clausula, que informa mais e nao promete nada.
+
+## Por que gerador, e nao edicao manual
+
+Contrato do repo: JSONL editorial so muda por gerador. Mesmo padrao de
+`generate-v2-title-length-repair-20260804` e `generate-v2-glossary-recut-20260805`:
+lease de epoca, lock exclusivo, CAS pelo sha256 da LINHA atual (aborta se outra
+frente tocou o registro), CAS tambem por TRECHO (so substitui se o texto atual
+contiver exatamente a frase esperada), demais linhas preservadas byte a byte,
+escrita atomica com fsync, idempotente. NAO committa.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.oab-phrase-repair-20260805.lock"
+
+BEFORE = (
+    "Redigir a cláusula com a dispensa correta é o que garante o resultado pretendido; "
+    "um advogado que atue em planejamento sucessório pode estruturar isso à distância, "
+    "com análise dos documentos enviados de forma digital, para que a vontade se sustente."
+)
+AFTER = (
+    "É a redação correta da cláusula de dispensa que produz esse efeito: sem ela, o "
+    "apartamento volta ao cálculo por colação e o benefício se desfaz. Um advogado que "
+    "atue em planejamento sucessório pode estruturar essa cláusula à distância, com "
+    "análise dos documentos enviados de forma digital."
+)
+
+# intent_id -> (shard, sha256 da linha esperada, trecho atual, trecho novo)
+REPAIRS: dict[str, tuple[str, str, str, str]] = {
+    "suc-deixar-mais-para-um-filho": (
+        "data/editorial/v2_pages/sucessoes-10.jsonl",
+        "a6ccdb1b6249efd5f314bcc53b7f991d66169db3724f56e25cfda39fdca07c3f",
+        BEFORE,
+        AFTER,
+    ),
+}
+
+# Vocabulario que a frase corrigida NAO pode reintroduzir.
+FORBIDDEN = (
+    "garante o resultado",
+    "garantia de resultado",
+    "resultado garantido",
+    "êxito garantido",
+    "exito garantido",
+    "resultado certo",
+    "causa ganha",
+)
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def preflight() -> None:
+    problems: list[str] = []
+    for intent, (_shard, _digest, before, after) in sorted(REPAIRS.items()):
+        lowered = after.lower()
+        for term in FORBIDDEN:
+            if term in lowered:
+                problems.append(f"{intent}: texto novo reintroduz {term!r}")
+        if before == after:
+            problems.append(f"{intent}: texto novo identico ao atual")
+        if len(after.split()) < 20:
+            problems.append(f"{intent}: texto novo curto demais ({len(after.split())} palavras)")
+    if problems:
+        for problem in problems:
+            print(f"PREFLIGHT FALHOU: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(REPAIRS)} frase(s), sem vocabulario de promessa")
+
+
+def word_count(record: dict) -> int:
+    """Reproduz `bodyWordCount` de internal/v2ingest/validate.go:984.
+
+    A contagem do ingest soma abertura + HEADING E TEXTO de cada secao + Q e A
+    de cada item de FAQ, tokenizando sobre o texto com acentos removidos
+    (`normalizedWords`, :997). Qualquer formula mais simples aqui produz um
+    `word_count` declarado que o ingest recusa com
+    `declared_word_count_incoherent` — a pagina some do estoque sem que ninguem
+    tenha pedido isso. Foi exatamente o que aconteceu na primeira versao deste
+    gerador, que ignorava headings e FAQ: declarou 439 onde o ingest contava
+    550, e a pagina caiu (tolerancia e de 10%).
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def apply_repair(intent: str, shard: str, digest: str, before: str, after: str) -> int:
+    path = ROOT / shard
+    lines = path.read_bytes().decode("utf-8").split("\n")
+    trailing_newline = lines and lines[-1] == ""
+    if trailing_newline:
+        lines = lines[:-1]
+
+    output: list[str] = []
+    changed = 0
+    already = 0
+    for number, raw in enumerate(lines, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard}: linha em branco {number}")
+        record = json.loads(raw)
+        if record.get("intent_id") != intent:
+            output.append(raw)
+            continue
+
+        body = json.dumps(record.get("sections"), ensure_ascii=False)
+        if after in body:
+            # Texto ja aplicado. Ainda assim confere o word_count declarado: a
+            # primeira versao deste gerador gravou a frase certa com a contagem
+            # errada, e a pagina foi recusada no ingest. Idempotencia que nao
+            # repara o proprio estrago anterior deixa o defeito preso.
+            expected = word_count(record)
+            if record.get("word_count") != expected:
+                record["word_count"] = expected
+                output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                changed += 1
+                print(f"  word_count corrigido: {record.get('intent_id')} -> {expected}")
+                continue
+            already += 1
+            output.append(raw)
+            continue
+
+        current = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        if current != digest:
+            raise SystemExit(
+                f"CAS FALHOU em {shard}:{number} ({intent}): linha atual nao e a esperada.\n"
+                f"  esperado: {digest}\n  atual:    {current}\n"
+                "Outra frente tocou este registro. Reler o conteudo vivo antes de reaplicar."
+            )
+
+        hits = sum(1 for section in record["sections"] if before in section["text"])
+        if hits != 1:
+            raise SystemExit(
+                f"{shard}:{number} ({intent}): trecho esperado aparece {hits}x (deveria ser 1). "
+                "Abortado sem escrever."
+            )
+        for section in record["sections"]:
+            if before in section["text"]:
+                section["text"] = section["text"].replace(before, after)
+        record["word_count"] = word_count(record)
+        output.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        changed += 1
+
+    if changed == 0 and already == 0:
+        raise SystemExit(f"{shard}: intent {intent} nao encontrado")
+
+    if changed:
+        payload = "\n".join(output)
+        if trailing_newline:
+            payload += "\n"
+        atomic_write(path, payload.encode("utf-8"))
+
+    print(f"{shard} ({intent}): reescritos={changed} ja_aplicados={already}")
+    return changed
+
+
+def main() -> int:
+    preflight()
+    total = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for intent, (shard, digest, before, after) in sorted(REPAIRS.items()):
+                    total += apply_repair(intent, shard, digest, before, after)
+    except StockEpochBusy as error:
+        print(f"generate-v2-oab-phrase-repair-20260805: estoque ocupado: {error}", file=sys.stderr)
+        return 75
+    if total:
+        print("OK. Reingerir o estoque para o espelho refletir a correcao.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

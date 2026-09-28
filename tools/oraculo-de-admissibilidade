@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""oraculo-de-admissibilidade — pergunte ANTES de gravar: esta página entra?
+
+★ O PROBLEMA QUE ELE RESOLVE (medido em 2026-09-16)
+
+Seis produtores deste repositório escrevem página em
+`data/editorial/v2_pages/` e **adivinham** as regras de quem lê depois:
+
+    cmd/generate-acordao-pages        cmd/generate-stj-tema-pages
+    cmd/generate-stj-sumula-pages     cmd/generate-stf-informativo-pages
+    cmd/generate-diario-pages         cmd/generate-noticia-pages
+
+Os seis emitem `lane=derivada_de_fonte_oficial`, que `internal/v2ingest`
+não conhecia: 1.396 páginas recusadas no relatório de ingestão de
+2026-09-16T15:00Z. E as 30 páginas da família de acórdão do cérebro, já
+commitadas, não foram ao ar porque o censo de severidade era 10 minutos mais
+velho que o shard delas (`sem_linha_no_censo`, 30, em
+`.agents/runtime/p1b/deploy4_20260916.log`).
+
+Nos dois casos o produtor descobriu a régua **depois**, num deploy — que é o
+lugar mais caro possível.
+
+★ O DESENHO: O ORÁCULO NÃO TEM RÉGUA PRÓPRIA
+
+Ele não reimplementa nada. Ele monta uma RAIZ DE ENSAIO descartável e roda
+**os decisores de verdade** dentro dela:
+
+  eixo ESTOQUE      `cmd/ingest-v2-pages`, que chama `v2ingest.Run` — o mesmo
+                    `validateBatch`/`validatePage` do `cmd/ingest-v2-stock`.
+                    Os `reasons` que ele devolve são, caractere por caractere,
+                    os que aparecem em `data/ops/v2_ingest_report.jsonl`.
+
+  eixo PUBLICAÇÃO   `tools/generate-v2-publication-severity`, copiado com
+                    sha256 conferido. É o censo que
+                    `internal/v2publish.SelectPublishable` (v2publish.go:398)
+                    consulta para decidir o que vira HTML.
+
+Nada é escrito fora da raiz de ensaio: a cópia é sempre CÓPIA, nunca symlink
+nem hardlink — um produtor que escrevesse através de um link tocaria o acervo
+real, e este repositório já pagou esse erro uma vez (build em ensaio
+hardlinkado reescreveu `public/`).
+
+★ OS DOIS EIXOS DECIDEM COISAS DIFERENTES, E ISSO É O ACHADO
+
+`cmd/publish-v2-direct` e `internal/v2publish` **não importam**
+`internal/v2ingest` (conferido em 2026-09-16: zero ocorrências). Recusa do
+ingest NÃO impede a página de ir ao ar — impede que ela entre no estoque
+canônico `data/editorial/authorial_mass_drafts.jsonl`, que é o que mais de
+vinte gates deste repositório leem como se fosse o acervo. Medido no mesmo
+dia: 7.982 registros no estoque contra 11.116 no `published_manifest`.
+
+Por isso o oráculo responde SEMPRE os dois eixos, separados e nomeados. Quem
+só quiser publicar usa `--exigir publicacao`; quem quiser estar no estoque
+também (é o certo) usa o padrão.
+
+★ O QUE ELE NÃO PODE DECIDIR SOZINHO, E ELE DIZ QUAIS SÃO
+
+Parte das regras é de LOTE, não de registro: elas só existem contra o resto do
+acervo. No modo rápido o oráculo NÃO as avalia, e lista os códigos exatos que
+ficaram de fora em vez de deixar o produtor achar que passou. `--fiel` copia o
+acervo inteiro para a raiz de ensaio e avalia tudo — custa minutos.
+
+USO
+    tools/oraculo-de-admissibilidade --pagina <candidato.jsonl>
+    tools/oraculo-de-admissibilidade --pagina <c.jsonl> --portfolio <p.jsonl>
+    tools/oraculo-de-admissibilidade --pagina <c.jsonl> --fiel
+    tools/oraculo-de-admissibilidade --pagina <c.jsonl> --json
+
+SAÍDA
+    exit 0  todo candidato passa no eixo exigido
+    exit 1  algum candidato é recusado (o motivo sai nomeado, por eixo)
+    exit 2  o oráculo não conseguiu rodar um dos decisores (nunca "passou")
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+
+CENSO_FONTE = RAIZ / "tools" / "generate-v2-publication-severity"
+INGEST_CMD = "./cmd/ingest-v2-pages"
+GO_MODERN = RAIZ / "tools" / "go-modern"
+
+PORTFOLIO_DIR = RAIZ / "data" / "editorial" / "portfolio_v2"
+PAGES_DIR = RAIZ / "data" / "editorial" / "v2_pages"
+DRAFTS = RAIZ / "data" / "editorial" / "authorial_mass_drafts.jsonl"
+
+# Os quatro insumos nomeados que o censo lê além dos shards de v2_pages. Ficam
+# aqui porque o ensaio precisa deles para o censo do ensaio decidir igual ao
+# censo real (universo B da fila de reescrita, prontidão, vetores de qualidade
+# e colisão entre shards).
+SIDECARS_DO_CENSO = [
+    "data/editorial/v2_rewrite_queue.jsonl",
+    "data/editorial/authorial_mass_publication_readiness.jsonl",
+    "data/editorial/authorial_mass_editorial_quality_vectors.jsonl",
+    "data/ops/v2_uniqueness_20260806.json",
+]
+
+RELATORIO_INGEST = "data/ops/v2_ingest_report.jsonl"
+CENSO_SAIDA = "data/editorial/v2_publication_severity.jsonl"
+
+# Motivos do eixo ESTOQUE que só existem CONTRA O RESTO do acervo. Os nomes
+# saem de internal/v2ingest/validate.go (markSymmetricBatchDuplicates :476,
+# applyBatchConflictTier :450-455, heading reuse :410 e :501, frase duplicada
+# :526-528). Nenhum deles é avaliável com o candidato sozinho.
+MOTIVOS_DE_LOTE_ESTOQUE = [
+    "intent_id_duplicate_in_batch",
+    "public_path_duplicate_in_batch",
+    "intent_id_already_in_drafts",
+    "public_path_already_in_drafts",
+    "heading_reuse_above_selected_limit",
+    "heading_reuse_above_global_limit",
+    "duplicate_phrase_with_page",
+    "duplicate_phrase_with_existing_draft",
+]
+
+# Motivos críticos do eixo PUBLICAÇÃO que dependem do acervo inteiro: o censo
+# conta ocorrências do mesmo intent entre shards e colisões de rota.
+MOTIVOS_DE_LOTE_PUBLICACAO = [
+    "intent_duplicado_entre_shards",
+    "rota_colidente",
+]
+
+# ★ O QUE ESTE ORÁCULO NÃO DECIDE, e quem decide.
+#
+# Oráculo que valida o registro isolado e devolve verde enquanto a cadeia
+# recusa por ESTADO (git, manifesto, acervo) é instrumento pela metade — a
+# classe de defeito que ele existe para matar. Então a lista sai impressa em
+# toda execução, com o comando de quem decide cada uma.
+FORA_DA_COBERTURA = [
+    ("pareamento contra o commit PAI (a autoridade de pertinência do intent)",
+     "./tools/check-v2-portfolio-pairing"),
+    ("shard finalizado sem revisão entrando na história do git",
+     ".githooks/reference-transaction → ./tools/check-v2-finalized-commit"),
+    ("mesmo intent em dois shards do acervo",
+     "./tools/go-modern run ./cmd/check-v2-cross-shard-collision"),
+    ("rota que JÁ está publicada (o produtor decide isto sozinho hoje, em três "
+     "cópias: generate-acordao-pages:628, generate-lei-artigo-pages:272, "
+     "generate-motor-tier-a:511)",
+     "data/editorial/published_manifest.jsonl"),
+    ("similaridade de corpo entre páginas (anti-molde estatístico)",
+     "./tools/check-v2-body-near-duplicates"),
+    ("coerência do artefato publicado (HTML + sitemap + manifesto + SHA-256)",
+     "./tools/go-modern run ./cmd/publish-v2-direct  (sem --allow-public-write)"),
+    ("veredito humano de auditoria — o censo REAL o encontra varrendo o repo "
+     "inteiro (os.walk sobre .agents/runtime e afins), e a raiz de ensaio não "
+     "reproduz essa varredura: página já reprovada em auditoria pode sair "
+     "`publica: SIM` aqui e `publish:false` no censo real",
+     "./tools/generate-v2-publication-severity   (sem --write, sobre a raiz real)"),
+]
+
+
+def sha256(caminho: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with open(caminho, "rb") as handle:
+        for bloco in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(bloco)
+    return digest.hexdigest()
+
+
+def carrega_jsonl(caminho: pathlib.Path) -> list[dict]:
+    registros = []
+    with open(caminho, encoding="utf-8") as handle:
+        for numero, linha in enumerate(handle, 1):
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registros.append(json.loads(linha))
+            except json.JSONDecodeError as erro:
+                raise SystemExit(
+                    f"oraculo: {caminho}:{numero} nao e JSON valido: {erro}")
+    return registros
+
+
+def intents_do_shard(caminho: pathlib.Path) -> set[str]:
+    """Lê só o intent_id de cada linha, sem materializar o shard inteiro."""
+    intents: set[str] = set()
+    with open(caminho, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            intent = (registro.get("intent_id") or "").strip()
+            if intent:
+                intents.add(intent)
+    return intents
+
+
+def portfolio_dos_intents(intents: set[str]) -> tuple[list[dict], set[str]]:
+    """Extrai do portfólio REAL os registros dos intents do candidato."""
+    achados: list[dict] = []
+    vistos: set[str] = set()
+    for caminho in sorted(glob.glob(str(PORTFOLIO_DIR / "*.jsonl"))):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                intent = (registro.get("intent_id") or "").strip()
+                if intent in intents and intent not in vistos:
+                    achados.append(registro)
+                    vistos.add(intent)
+    return achados, intents - vistos
+
+
+def monta_raiz_de_ensaio(base: pathlib.Path, candidato: pathlib.Path,
+                         portfolio: list[dict], fiel: bool) -> dict:
+    """Cria a raiz descartável. Tudo por CÓPIA — nunca symlink nem hardlink."""
+    (base / "data" / "editorial" / "v2_pages").mkdir(parents=True)
+    (base / "data" / "editorial" / "portfolio_v2").mkdir(parents=True)
+    (base / "data" / "ops").mkdir(parents=True)
+    (base / "data" / "source-audit").mkdir(parents=True)
+    (base / "tools").mkdir(parents=True)
+
+    # go.mod é o marcador que v2ingest.findProjectRoot (v2ingest.go:1228)
+    # procura para aceitar a raiz. É cópia byte a byte do real.
+    shutil.copy2(RAIZ / "go.mod", base / "go.mod")
+
+    copiados = {"shards_do_acervo": 0, "drafts": False, "shards_substituidos": [],
+                "sidecars": []}
+    if fiel:
+        intents_do_candidato = {(p.get("intent_id") or "").strip()
+                                for p in carrega_jsonl(candidato)}
+        intents_do_candidato.discard("")
+        for caminho in sorted(glob.glob(str(PAGES_DIR / "*.jsonl"))):
+            # O CANDIDATO NAO PODE COLIDIR CONSIGO MESMO. O caso comum e o
+            # produtor gravar o shard e querer conferir antes de commitar:
+            # copiar o original ao lado da copia faria o censo contar cada
+            # intent duas vezes e acusar `rota_colidente` e
+            # `intent_duplicado_entre_shards` que nao existem. Oraculo que
+            # inventa a propria recusa e exatamente o defeito que ele veio
+            # matar, entao o shard que carrega intent do candidato e
+            # SUBSTITUIDO por ele, nunca somado — e a substituicao sai
+            # declarada na saida, para ninguem confundir com acervo ausente.
+            if intents_do_shard(pathlib.Path(caminho)) & intents_do_candidato:
+                copiados["shards_substituidos"].append(os.path.basename(caminho))
+                continue
+            shutil.copy2(caminho, base / "data" / "editorial" / "v2_pages" /
+                         os.path.basename(caminho))
+            copiados["shards_do_acervo"] += 1
+        if DRAFTS.exists():
+            shutil.copy2(DRAFTS, base / "data" / "editorial" /
+                         "authorial_mass_drafts.jsonl")
+            copiados["drafts"] = True
+        # Os quatro insumos nomeados que o censo lê além dos shards
+        # (generate-v2-publication-severity: REWRITE_QUEUE, READINESS,
+        # QUALITY_VECTORS, UNIQUENESS). Sem eles o ensaio decide o universo B e
+        # a colisão entre shards com a tabela vazia — e o censo do ensaio
+        # divergiria do real por falta de insumo, não por mérito do candidato.
+        for relativo in SIDECARS_DO_CENSO:
+            origem = RAIZ / relativo
+            if not origem.exists():
+                continue
+            destino = base / relativo
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(origem, destino)
+            copiados["sidecars"].append(relativo)
+
+    # O candidato entra com nome estável, nos dois lugares que os decisores
+    # leem: o arquivo de páginas do ingest e o diretório que o censo varre.
+    shutil.copy2(candidato, base / "candidato.jsonl")
+    shutil.copy2(candidato, base / "data" / "editorial" / "v2_pages" /
+                 "zz-candidato-do-oraculo-01.jsonl")
+
+    caminho_portfolio = base / "data" / "editorial" / "portfolio_v2" / "zz-candidato-do-oraculo-01.jsonl"
+    with open(caminho_portfolio, "w", encoding="utf-8") as handle:
+        for registro in portfolio:
+            handle.write(json.dumps(registro, ensure_ascii=False,
+                                    separators=(",", ":")) + "\n")
+
+    # O censo lê ROOT a partir do PRÓPRIO caminho (__file__), então ele precisa
+    # morar em <raiz>/tools. A cópia é conferida por sha256: oráculo que roda
+    # uma versão diferente do gate é uma segunda régua, que é o defeito que
+    # este arquivo existe para matar.
+    destino_censo = base / "tools" / CENSO_FONTE.name
+    shutil.copy2(CENSO_FONTE, destino_censo)
+    if sha256(destino_censo) != sha256(CENSO_FONTE):
+        raise SystemExit("oraculo: a copia do censo diverge do original; abortei")
+    copiados["censo_sha256"] = sha256(CENSO_FONTE)
+    return copiados
+
+
+def roda_eixo_estoque(base: pathlib.Path) -> dict[str, dict]:
+    processo = subprocess.run(
+        ["nice", "-n", "19", str(GO_MODERN), "run", INGEST_CMD,
+         "-root", str(base),
+         "-pages", str(base / "candidato.jsonl"),
+         "-portfolio", str(base / "data" / "editorial" / "portfolio_v2" /
+                           "zz-candidato-do-oraculo-01.jsonl"),
+         "-out-drafts", str(base / "data" / "editorial" /
+                            "authorial_mass_drafts.jsonl"),
+         "-mode", "append"],
+        cwd=str(RAIZ), capture_output=True, text=True, check=False)
+    relatorio = base / RELATORIO_INGEST
+    if not relatorio.exists():
+        raise SystemExit(
+            "oraculo: o ingest nao produziu relatorio (exit %d).\n%s\n%s"
+            % (processo.returncode, processo.stdout[-2000:], processo.stderr[-2000:]))
+    veredito = {}
+    for registro in carrega_jsonl(relatorio):
+        veredito[registro.get("intent_id", "")] = registro
+    return veredito
+
+
+def roda_eixo_publicacao(base: pathlib.Path) -> dict[str, dict]:
+    processo = subprocess.run(
+        ["nice", "-n", "19", sys.executable,
+         str(base / "tools" / CENSO_FONTE.name), "--write"],
+        cwd=str(base), capture_output=True, text=True, check=False)
+    saida = base / CENSO_SAIDA
+    if not saida.exists():
+        raise SystemExit(
+            "oraculo: o censo nao produziu veredito (exit %d).\n%s\n%s"
+            % (processo.returncode, processo.stdout[-2000:], processo.stderr[-2000:]))
+    veredito = {}
+    for registro in carrega_jsonl(saida):
+        veredito[registro.get("intent_id", "")] = registro
+    return veredito
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Roda os decisores reais da cadeia sobre um candidato, sem escrever nada.")
+    parser.add_argument("--pagina", required=True,
+                        help="JSONL de páginas candidatas (formato WRITING_SPEC §7)")
+    parser.add_argument("--portfolio", default="",
+                        help="JSONL do portfólio; sem ele, o oráculo procura os "
+                             "intents no portfólio real")
+    parser.add_argument("--fiel", action="store_true",
+                        help="copia o acervo inteiro para a raiz de ensaio e avalia "
+                             "também as regras de lote (custa minutos)")
+    parser.add_argument("--exigir", choices=["publicacao", "estoque", "ambos"],
+                        default="ambos",
+                        help="qual eixo decide o exit code (padrão: ambos)")
+    parser.add_argument("--json", action="store_true", dest="como_json",
+                        help="veredito em JSON, uma linha por candidato")
+    args = parser.parse_args()
+
+    candidato = pathlib.Path(args.pagina).resolve()
+    if not candidato.exists():
+        print(f"oraculo: {candidato} nao existe", file=sys.stderr)
+        return 2
+
+    paginas = carrega_jsonl(candidato)
+    if not paginas:
+        print(f"oraculo: {candidato} nao tem nenhum registro", file=sys.stderr)
+        return 2
+    intents = {(p.get("intent_id") or "").strip() for p in paginas}
+    intents.discard("")
+
+    if args.portfolio:
+        portfolio = carrega_jsonl(pathlib.Path(args.portfolio).resolve())
+        faltantes = intents - {(r.get("intent_id") or "").strip() for r in portfolio}
+    else:
+        portfolio, faltantes = portfolio_dos_intents(intents)
+
+    with tempfile.TemporaryDirectory(prefix="oraculo-admissibilidade-") as tmp:
+        base = pathlib.Path(tmp)
+        copiados = monta_raiz_de_ensaio(base, candidato, portfolio, args.fiel)
+        estoque = roda_eixo_estoque(base)
+        publicacao = roda_eixo_publicacao(base)
+
+    nao_avaliado = [] if args.fiel else MOTIVOS_DE_LOTE_ESTOQUE + MOTIVOS_DE_LOTE_PUBLICACAO
+
+    vereditos = []
+    for pagina in paginas:
+        intent = (pagina.get("intent_id") or "").strip()
+        linha_estoque = estoque.get(intent, {})
+        linha_censo = publicacao.get(intent, {})
+        entra_no_estoque = linha_estoque.get("status") == "accepted"
+        publica = bool(linha_censo.get("publish"))
+        vereditos.append({
+            "intent_id": intent,
+            "publica": publica,
+            "entra_no_estoque": entra_no_estoque,
+            "censo_severidade": linha_censo.get("severity", "sem_linha_no_censo"),
+            "censo_criticos": linha_censo.get("critical_reasons", []),
+            "censo_medios": linha_censo.get("medium_reasons", []),
+            "ingest_reasons": linha_estoque.get("reasons", []),
+            "sem_registro_no_portfolio": intent in faltantes,
+            "modo": "fiel" if args.fiel else "rapido",
+            "nao_avaliado_neste_modo": nao_avaliado,
+            "fora_da_cobertura": [o_que for o_que, _ in FORA_DA_COBERTURA],
+            "censo_sha256": copiados.get("censo_sha256", ""),
+        })
+
+    if args.como_json:
+        for veredito in vereditos:
+            print(json.dumps(veredito, ensure_ascii=False))
+    else:
+        print(f"candidatos        : {len(vereditos)}")
+        print(f"modo              : {'fiel (acervo inteiro copiado)' if args.fiel else 'rapido (candidato sozinho)'}")
+        if args.fiel:
+            print(f"acervo no ensaio  : {copiados['shards_do_acervo']} shard(s), "
+                  f"estoque {'copiado' if copiados['drafts'] else 'ausente'}")
+            if copiados["shards_substituidos"]:
+                print(f"shard(s) substituido(s) pelo candidato: "
+                      f"{', '.join(copiados['shards_substituidos'])}")
+        print(f"censo conferido   : sha256:{copiados.get('censo_sha256', '')[:16]}…")
+        print()
+        for veredito in vereditos:
+            publica = "SIM" if veredito["publica"] else "NAO"
+            estoca = "SIM" if veredito["entra_no_estoque"] else "NAO"
+            print(f"{veredito['intent_id']}")
+            print(f"  publica em public/ : {publica}   (censo: {veredito['censo_severidade']})")
+            for motivo in veredito["censo_criticos"]:
+                print(f"     critico  {motivo}")
+            for motivo in veredito["censo_medios"]:
+                print(f"     medio    {motivo}  (publica e refina)")
+            print(f"  entra no estoque   : {estoca}")
+            for motivo in veredito["ingest_reasons"]:
+                print(f"     recusa   {motivo}")
+            if veredito["sem_registro_no_portfolio"]:
+                print("     recusa   intent sem registro no portfolio_v2 "
+                      "(a autoridade de pertinencia e o commit PAI)")
+        if nao_avaliado:
+            print()
+            print("NAO AVALIADO neste modo (regra de lote; rode com --fiel):")
+            for motivo in nao_avaliado:
+                print(f"  - {motivo}")
+        print()
+        print("FORA DA COBERTURA DESTE ORACULO (depende de git, manifesto ou acervo):")
+        for o_que, quem in FORA_DA_COBERTURA:
+            print(f"  - {o_que}")
+            print(f"      quem decide: {quem}")
+
+    if args.exigir == "publicacao":
+        reprovados = [v for v in vereditos if not v["publica"]]
+    elif args.exigir == "estoque":
+        reprovados = [v for v in vereditos if not v["entra_no_estoque"]]
+    else:
+        reprovados = [v for v in vereditos
+                      if not v["publica"] or not v["entra_no_estoque"]]
+    if reprovados:
+        if not args.como_json:
+            print()
+            print(f"REPROVADOS no eixo '{args.exigir}': {len(reprovados)} de {len(vereditos)}",
+                  file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

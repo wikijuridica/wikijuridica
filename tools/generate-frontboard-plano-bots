@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""generate-frontboard-plano-bots — deriva a tasklist do PLANO_SUPERFICIE_BOTS
+para `.agents/runtime/p0_frontboard.jsonl`.
+
+POR QUE UM GERADOR, E NÃO 96 LINHAS DIGITADAS: porque a tasklist tem de ser
+REGENERÁVEL quando o plano muda. Digitar 96 entradas à mão cria uma segunda
+fonte de verdade que envelhece sozinha — exatamente o defeito que o plano
+cataloga em três lugares (o registry de bots em três cópias, o `ops/cloudflare/`
+afirmando um estado de borda que não existe, os comentários que mentem). O plano
+commitado é a fonte; o board é projeção dele.
+
+R13 (proibido hardcode) na prática: título, fase, prioridade e dependência saem
+do TEXTO do plano. Não há lista de tarefas embutida aqui. Se uma tarefa nova for
+escrita no plano, ela aparece no board na próxima execução, sem tocar neste
+arquivo.
+
+IDEMPOTENTE: tarefa cujo `id` já existe no board é PULADA, nunca reescrita — o
+board é append-only e carrega o estado vivo (quem pegou, o que mediu, o que
+fechou). Regravar por cima destruiria trabalho registrado por outra sessão, que
+é a classe de dano que o contrato do repositório proíbe. Para reprojetar uma
+tarefa já criada, edite a linha dela ou acrescente uma nova com o motivo.
+
+Uso:
+    tools/generate-frontboard-plano-bots            # ensaio: mostra e não grava
+    tools/generate-frontboard-plano-bots --aplicar  # grava no frontboard
+"""
+
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone, timedelta
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+PLANO = os.path.join(RAIZ, "docs/goal/PLANO_SUPERFICIE_BOTS_20260826.md")
+BOARD = os.path.join(RAIZ, ".agents/runtime/p0_frontboard.jsonl")
+FRENTE = "superficie-de-bots-20260826"
+AUTOR = "claude-superficie-bots-20260826"
+
+# Fuso do projeto, para bater com o formato que o board já usa (-03:00).
+TZ = timezone(timedelta(hours=-3))
+
+CABECALHO_TAREFA = re.compile(r"^\*\*(T-?\d+(?:\.\d+)*(?:\.[a-z])?)\s*[—-]\s*(.+)$")
+INICIO_SECAO = "## PLANO DE EXECUÇÃO"
+FIM_SECAO = "## Anexo"
+
+# Sinais de severidade, na ordem em que são testados. Saem do vocabulário que o
+# próprio plano usa nos cabeçalhos e nos blocos — não são rótulos inventados.
+SINAIS_PRIORIDADE = [
+    (0, ("🔴🔴", "[CRÍTICA]", "[CRÍTICO]", "PARE —", "BLOQUEIA", "CAUSARIA DANO")),
+    (1, ("🔴", "[ALTA]", "[ALTO]", "PRÉ-REQUISITO", "OBRIGATÓRIO")),
+    (2, ("[MÉDIA]", "[MÉDIO]")),
+    (3, ("[BAIXA]", "[BAIXO]", "[INFORMATIVO]")),
+]
+
+# Uma tarefa que o plano declara bloqueada nasce bloqueada no board, senão um
+# agente entrante a pega e dispara o dano que o plano documentou.
+MARCAS_BLOQUEIO = ("BLOQUEADA", "FICA BLOQUEADA", "BLOQUEADAS")
+
+# Referência a outra tarefa dentro do texto, para derivar dependência.
+REF_TAREFA = re.compile(r"\bT(\d+\.\d+(?:\.[a-z])?)\b")
+
+# A DIREÇÃO DA SETA IMPORTA, E ERRAR NELA CAUSA O DANO QUE A TAREFA EVITA.
+# Medido no ensaio antes de gravar: "T8.4 — [PRÉ-REQUISITO DE T4.2]" produzia
+# `T8.4 depende de T4.2`, exatamente ao contrário — e T8.4 existe para ser feita
+# ANTES de T4.2 (submeter nove famílias ao crítico antes de mexer no registry).
+# Por isso há duas listas, não uma.
+FRASES_EU_DEPENDO = (
+    "depende de",
+    "atrás da ordem segura",
+    "atrás de",
+    "só entra depois",
+    "so entra depois",
+    "migraram para",
+    "migrou para",
+)
+FRASES_ELE_DEPENDE_DE_MIM = (
+    "pré-requisito de",
+    "pre-requisito de",
+    "pré-requisito real de",
+    "pre-requisito real de",
+)
+
+# Negação perto da referência: o plano diz coisas como "a bomba está aqui, NÃO em
+# T6.1". Sem esta guarda, a negação vira dependência — falso positivo medido no
+# ensaio, que teria travado a Fase 1 inteira.
+NEGACOES = ("não em", "nao em", "não é", "nao e", "nunca", "em vez de", "não depende")
+
+# O plano declara alias quando uma tarefa foi promovida de fase mas o texto
+# integral ficou no lugar antigo (o caso T1.4 -> T0.9). Criar as duas entradas
+# faria o trabalho ser executado duas vezes — o próprio plano avisa isso.
+ALIAS = re.compile(r"ESTA TAREFA EXECUTA NA FASE\s+\d+,?\s*COMO\s+\*{0,2}(T\d+\.\d+)", re.I)
+
+
+def blocos_do_plano(texto: str) -> list[tuple[str, str, str]]:
+    """Devolve (id, título, corpo) de cada tarefa da seção executável."""
+    linhas = texto.split("\n")
+    try:
+        ini = next(i for i, l in enumerate(linhas) if l.startswith(INICIO_SECAO))
+    except StopIteration:
+        print(f"ERRO: seção {INICIO_SECAO!r} não encontrada em {PLANO}", file=sys.stderr)
+        sys.exit(2)
+    fim = next((i for i, l in enumerate(linhas) if l.startswith(FIM_SECAO)), len(linhas))
+    secao = linhas[ini:fim]
+
+    achados: list[tuple[str, str, int]] = []
+    for i, l in enumerate(secao):
+        m = CABECALHO_TAREFA.match(l)
+        if m:
+            achados.append((m.group(1), m.group(2), i))
+
+    blocos = []
+    for n, (tid, titulo, i) in enumerate(achados):
+        # O BANNER DE UMA TAREFA VEM ANTES DO CABEÇALHO DELA. É onde o plano
+        # grava a severidade real ("> ### 🔴🔴 T1.3 FOI REDUZIDA", "> ### 🔴 T1.1
+        # FOI CORRIGIDA") e a correção que impede o dano. Sem incluí-lo, T1.1 —
+        # restaurar a Cache Rule, o achado de maior ROI do plano — sai como
+        # prioridade média. Só se anexa o banner que cita ESTA tarefa.
+        ini_bloco = i
+        limite = achados[n - 1][2] if n > 0 else 0
+        j = i - 1
+        while j > limite and (not secao[j].strip() or secao[j].lstrip().startswith(">")):
+            if secao[j].lstrip("> ").strip().startswith("###") and tid in secao[j]:
+                ini_bloco = j
+            j -= 1
+        fim_bloco = achados[n + 1][2] if n + 1 < len(achados) else len(secao)
+        # CORTAR NO BANNER DA PRÓXIMA TAREFA. Vários banners do plano
+        # (`> ### 🔴🔴 T1.3 FOI REDUZIDA`) vêm ANTES do cabeçalho da tarefa que
+        # anunciam, e sem este corte eles caem no bloco da tarefa ANTERIOR —
+        # contaminando texto, prioridade e dependência. Medido no ensaio: o
+        # banner de T1.3 dava a T1.2 uma dependência inventada de T6.1.
+        for j in range(i + 1, fim_bloco):
+            linha = secao[j].lstrip("> ").strip()
+            if not linha.startswith("#"):
+                continue
+            # Cabeçalho de FASE encerra o bloco sempre: sem isso, o banner que
+            # vive entre duas fases cai na última tarefa da fase anterior —
+            # medido: o "🔴🔴 PARE — T6.1 CAUSARIA DANO" dava P0 a T5.12,
+            # que é a tarefa de PROTEGER o que já está bom.
+            if linha.upper().startswith(("## FASE", "### FASE")):
+                fim_bloco = j
+                break
+            # Banner de outra tarefa (## ou ###) também encerra.
+            if REF_TAREFA.search(linha) and tid not in linha:
+                fim_bloco = j
+                break
+        corpo = "\n".join(secao[ini_bloco:fim_bloco]).strip()
+        blocos.append((tid, titulo, corpo))
+    return blocos
+
+
+def limpa_titulo(titulo: str) -> str:
+    """Tira a marcação markdown do título, preservando o texto e os acentos."""
+    t = titulo.strip()
+    t = t.split("**")[0] if t.startswith("[") is False and "**" in t else t
+    t = re.sub(r"\*\*|`|\*", "", t).strip()
+    t = re.sub(r"\s+", " ", t)
+    return t.rstrip(".").strip()
+
+
+def fase_de(tid: str) -> str:
+    """A fase é o número antes do primeiro ponto. `T-1` é a fase preliminar."""
+    if tid.startswith("T-"):
+        return "-1"
+    return tid[1:].split(".")[0]
+
+
+def prioridade_de(corpo: str, fase: str) -> int:
+    """Severidade derivada dos marcadores do próprio bloco. Sem marcador, a
+    tarefa herda a prioridade da fase: as fases baixas são as que destravam o
+    resto, então uma tarefa sem rótulo na fase 0 é mais urgente que uma sem
+    rótulo na fase 9. Isso é ordem de dependência, não juízo de valor."""
+    alto = corpo[:1200].upper()
+    for prioridade, marcas in SINAIS_PRIORIDADE:
+        if any(m.upper() in alto for m in marcas):
+            return prioridade
+    try:
+        n = int(fase)
+    except ValueError:
+        return 0
+    if n <= 1:
+        return 1
+    if n <= 4:
+        return 2
+    return 3
+
+
+def bloqueada(corpo: str) -> bool:
+    return any(m in corpo[:600] for m in MARCAS_BLOQUEIO)
+
+
+NOME_DE_GATE = re.compile(r"`(check-[a-z0-9-]+|nginx-config-alcancavel|area-label-cobertura)`")
+CABECALHO_FASE = re.compile(r"^### FASE (\d+)\b(.*)$")
+
+
+def gates_do_plano(texto: str) -> set[str]:
+    """Nomes de gate que o plano declara CRIAR. Sai do parágrafo em que o próprio
+    plano os enumera — não é lista digitada aqui."""
+    nomes: set[str] = set()
+    for linha in texto.split("\n"):
+        if "Gates que este plano cria" in linha or "sem prefixo padronizado" in linha:
+            nomes.update(m.group(1) for m in NOME_DE_GATE.finditer(linha))
+    return nomes
+
+
+def fases_com_ordem_interna(texto: str) -> set[str]:
+    """Fases cujo cabeçalho declara ordem interna obrigatória — hoje só a 2, mas
+    lido do texto para que uma fase nova declarada assim seja respeitada."""
+    fases: set[str] = set()
+    for linha in texto.split("\n"):
+        m = CABECALHO_FASE.match(linha)
+        if m and "ordem interna obrigat" in m.group(2).lower():
+            fases.add(m.group(1))
+    return fases
+
+
+def alias_de(corpo: str) -> str | None:
+    """Se o plano declara que esta tarefa executa sob outro id, devolve esse id."""
+    m = ALIAS.search(corpo)
+    return m.group(1).upper() if m else None
+
+
+def dependencias_de(tid: str, corpo: str) -> tuple[list[str], list[str]]:
+    """Devolve (eu_dependo_de, eles_dependem_de_mim), ambas DECLARADAS no texto.
+
+    Só conta menção que caia na mesma frase de uma frase de dependência — o plano
+    cita tarefas o tempo todo em explicações, e tratar toda citação como
+    dependência produziria um grafo falso que travaria o board inteiro. Frase com
+    negação é descartada inteira."""
+    minhas: set[str] = set()
+    delas: set[str] = set()
+    for frase in re.split(r"(?<=[.;:!?])\s+|\n", corpo):
+        baixa = frase.lower()
+        reversa = any(f in baixa for f in FRASES_ELE_DEPENDE_DE_MIM)
+        direta = any(f in baixa for f in FRASES_EU_DEPENDO)
+        if not (reversa or direta):
+            continue
+        # POSIÇÃO DA EXPRESSÃO, para separar sujeito de objeto. A frase
+        # "A ordem segura de T6.1 passa a ser pré-requisito de T1.3" tem DUAS
+        # referências e sentidos opostos: T6.1 (antes) é o pré-requisito, T1.3
+        # (depois) é quem espera. Sem esta separação a seta sai invertida — o
+        # mesmo erro que o ensaio já pegou em T8.4.
+        corte = -1
+        if reversa:
+            for f in FRASES_ELE_DEPENDE_DE_MIM:
+                p = baixa.find(f)
+                if p >= 0:
+                    corte = p + len(f)
+                    break
+        antes_do_corte = [
+            "T" + m.group(1) for m in REF_TAREFA.finditer(frase) if m.start() < corte
+        ] if corte >= 0 else []
+        for m in REF_TAREFA.finditer(frase):
+            alvo = "T" + m.group(1)
+            if reversa and corte >= 0:
+                depois = m.start() >= corte
+                if depois and alvo == tid and antes_do_corte:
+                    # "X é pré-requisito de MIM" -> eu dependo de X.
+                    minhas.update(a for a in antes_do_corte if a != tid)
+                    continue
+                if not depois:
+                    continue  # o pré-requisito citado antes não depende de mim
+            if alvo == tid:
+                continue
+            # NEGAÇÃO SE MEDE JUNTO DA REFERÊNCIA, não na frase inteira. Testar a
+            # frase toda produziu falso NEGATIVO medido: "[PRÉ-REQUISITO DE T4.2]
+            # ... famílias que NUNCA passaram por refutação" era descartada por
+            # causa de um "nunca" a 60 caracteres de distância, e T4.2 perdia a
+            # dependência que existe para impedir o dano.
+            janela = baixa[max(0, m.start() - 45): m.start()]
+            if any(n in janela for n in NEGACOES):
+                continue
+            # A reversa vence: "X é pré-requisito de Y" é declaração de que Y
+            # espera por X, e a frase pode conter as duas construções.
+            (delas if reversa else minhas).add(alvo)
+    return sorted(minhas), sorted(delas)
+
+
+def resumo(corpo: str, limite: int = 700) -> str:
+    """Corpo sem a linha de título, colapsado, para caber no board. O plano
+    commitado continua sendo a fonte integral — o board é índice."""
+    linhas = corpo.split("\n")[1:]
+    texto = " ".join(l.strip() for l in linhas if l.strip())
+    texto = re.sub(r"\*\*|`|^\s*[-•]\s*", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto[:limite]
+
+
+def ids_existentes() -> set[str]:
+    vistos: set[str] = set()
+    if not os.path.exists(BOARD):
+        return vistos
+    with open(BOARD, encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                vistos.add(json.loads(linha).get("id", ""))
+            except Exception:
+                continue
+    return vistos
+
+
+def main() -> int:
+    aplicar = "--aplicar" in sys.argv
+    with open(PLANO, encoding="utf-8") as f:
+        texto = f.read()
+
+    blocos = blocos_do_plano(texto)
+    if not blocos:
+        print("ERRO: nenhuma tarefa extraída — o formato do plano mudou?", file=sys.stderr)
+        return 2
+
+    ja = ids_existentes()
+    agora = datetime.now(TZ).replace(microsecond=0).isoformat()
+    novas, puladas, aliases = [], [], {}
+
+    # PASSADA 1 — aliases e dependências reversas. As duas só podem ser
+    # resolvidas com o conjunto inteiro à vista: um alias declarado em T1.4
+    # suprime a entrada de T1.4, e um "pré-requisito de T4.2" escrito em T8.4
+    # é uma dependência que precisa ser gravada em T4.2.
+    reversas: dict[str, set[str]] = {}
+    for tid, _titulo, corpo in blocos:
+        destino = alias_de(corpo)
+        if destino and destino != tid:
+            aliases[tid] = destino
+        _, delas = dependencias_de(tid, corpo)
+        for alvo in delas:
+            reversas.setdefault(alvo, set()).add(tid)
+
+    # ORDENS ESTRUTURAIS, que o plano declara para CONJUNTOS de tarefas e que
+    # nenhuma frase isolada expressa. As três são lidas do texto, não digitadas.
+    gates = gates_do_plano(texto)
+    guardiao_de_gate = aliases.get("T1.4", "T0.9")  # o canal de alerta consertado
+    excecao_gate = set()
+    for linha in texto.split("\n"):
+        if "podem nascer antes" in linha:
+            excecao_gate.update("T" + m.group(1) for m in REF_TAREFA.finditer(linha))
+    estruturais: dict[str, set[str]] = {}
+    for tid, _titulo, corpo in blocos:
+        if tid in aliases or tid == guardiao_de_gate:
+            continue
+        if tid in excecao_gate:
+            continue
+        if gates and any(g in corpo for g in gates):
+            estruturais.setdefault(tid, set()).add(guardiao_de_gate)
+
+    # Fase com ordem interna obrigatória: cada tarefa espera a anterior da fase.
+    for fase in fases_com_ordem_interna(texto):
+        na_fase = [t for t, _, _ in blocos if fase_de(t) == fase and t not in aliases]
+        for anterior, seguinte in zip(na_fase, na_fase[1:]):
+            estruturais.setdefault(seguinte, set()).add(anterior)
+
+    for tid, titulo, corpo in blocos:
+        if tid in aliases:
+            puladas.append(f"{tid} (alias de {aliases[tid]}, o plano manda nao executar duas vezes)")
+            continue
+        board_id = f"bots-{tid.lower()}"
+        if board_id in ja:
+            puladas.append(board_id)
+            continue
+        fase = fase_de(tid)
+        registro = {
+            "id": board_id,
+            "front": f"[{tid}] {limpa_titulo(titulo)}",
+            "status": "blocked" if bloqueada(corpo) else "queued",
+            "priority": prioridade_de(corpo, fase),
+            "opened_at": agora,
+            "opened_at_source": "relogio-da-sessao",
+            "opened_by": AUTOR,
+            "plano": "docs/goal/PLANO_SUPERFICIE_BOTS_20260826.md",
+            "tarefa": tid,
+            "fase": fase,
+            "frente": FRENTE,
+            # Estado fino do PROTOCOLO DE VERIFICAÇÃO AO VIVO (6 passos). Fica
+            # em campo próprio para não colidir com o vocabulário de `status`,
+            # que os dois consumidores do board já leem.
+            "estado_protocolo": "pendente",
+            "medicao_antes": None,
+            "medicao_depois": None,
+            "contra_teste": None,
+            "evidencia": None,
+            "quem_executou": None,
+            "critica_fable": None,
+            "advisor": None,
+            "note": resumo(corpo),
+        }
+        minhas, _ = dependencias_de(tid, corpo)
+        # As reversas declaradas por OUTRAS tarefas ("X é pré-requisito de mim")
+        # entram aqui, resolvendo o alias quando for o caso.
+        todas = set(minhas) | reversas.get(tid, set()) | estruturais.get(tid, set())
+        todas = {aliases.get(d, d) for d in todas} - {tid}
+        if todas:
+            registro["depends_on"] = sorted(f"bots-{d.lower()}" for d in todas)
+        novas.append(registro)
+
+    print(f"plano   : {PLANO}")
+    print(f"tarefas : {len(blocos)} no plano | {len(novas)} novas | {len(puladas)} já no board")
+    por_fase: dict[str, int] = {}
+    for r in novas:
+        por_fase[r["fase"]] = por_fase.get(r["fase"], 0) + 1
+    if por_fase:
+        ordenadas = sorted(por_fase.items(), key=lambda kv: (len(kv[0]), kv[0]))
+        print("por fase:", " ".join(f"{k}={v}" for k, v in ordenadas))
+    prios: dict[int, int] = {}
+    for r in novas:
+        prios[r["priority"]] = prios.get(r["priority"], 0) + 1
+    print("por prio:", " ".join(f"P{k}={v}" for k, v in sorted(prios.items())))
+    bloqueadas = [r for r in novas if r["status"] == "blocked"]
+    if bloqueadas:
+        print(f"bloqueadas ({len(bloqueadas)}): " + ", ".join(r["tarefa"] for r in bloqueadas))
+    com_dep = [r for r in novas if r.get("depends_on")]
+    print(f"com dependência declarada: {len(com_dep)}")
+    for r in com_dep[:8]:
+        print(f"   {r['tarefa']} <- {', '.join(d.replace('bots-','').upper() for d in r['depends_on'])}")
+
+    if not aplicar:
+        print("\nENSAIO — nada gravado. Use --aplicar para escrever no frontboard.")
+        if novas:
+            print("\nExemplo da primeira entrada:")
+            print(json.dumps(novas[0], ensure_ascii=False, indent=1)[:900])
+        return 0
+
+    if not novas:
+        print("\nNada a gravar: todas as tarefas do plano já estão no board.")
+        return 0
+
+    with open(BOARD, "a", encoding="utf-8") as f:
+        for r in novas:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"\nGRAVADAS {len(novas)} tarefas em {BOARD} (append, nenhuma linha existente tocada).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

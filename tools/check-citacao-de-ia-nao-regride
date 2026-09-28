@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""check-citacao-de-ia-nao-regride — a citacao do portal em resposta gerada esta
+sendo MEDIDA todo dia, e o numero nao caiu alem do ruido?
+
+POR QUE ESTE GATE EXISTE
+------------------------
+A metrica que vale para um portal AI-first e' retorno e citacao por agente, e o
+unico lugar onde alguem conta citacao em resposta gerada e' o relatorio de
+Desempenho de IA do Bing Webmaster — que a API publica nao expoe (62 metodos na
+IWebmasterApi, nenhum de citacao; 28 candidatos testados, 28 x 404). O caminho
+de leitura e' `tools/collect-bing-ai-citations`, e um caminho de leitura que
+para de ler em silencio e' pior que nao ter caminho nenhum: o painel continua
+mostrando um numero e nos paramos de ve-lo mudar.
+
+A ARMADILHA QUE ESTE GATE FOI ESCRITO PARA NAO TER
+--------------------------------------------------
+`check-frescor-canal-diario` julga o ULTIMO REGISTRO que encontra. Quando as
+chaves do ledger de coleta se corromperam (commit d4c942f2, 2026-09-11), ele
+passou a ler `{}` para quatro dos cinco canais e a julgar o ultimo registro
+ainda hifenizado, de 2026-09-10 — e por CINCO DIAS acusou "diarios — 0 de 166
+coletada(s), marca d'agua 2026-08-29" enquanto o log real dizia
+`tls: handshake failure`. O alerta nomeava a causa errada, e um alerta que
+nomeia a causa errada custa mais caro que alerta nenhum, porque manda a sessao
+seguinte investigar o lugar errado.
+
+A correcao e' de REGUA, nao de mensagem: aqui a pergunta e' sempre **contra
+HOJE (UTC)**, nunca "contra o ultimo que existir". Ledger parado ha cinco dias
+nao produz um veredito sobre o quinto dia atras — produz "a coleta parou em
+<data>", que e' o fato.
+
+AS DUAS PERGUNTAS, E POR QUE ELAS USAM DIAS DIFERENTES
+-----------------------------------------------------
+1. A COLETA AVANCA? -> contra **hoje**. Ou houve export hoje, ou nao houve.
+2. A CONTAGEM CAIU?  -> contra o ultimo dia **FECHADO**, nunca contra hoje.
+
+A segunda usa outro dia de proposito, e nao por conveniencia: o dia corrente e'
+PARCIAL por construcao (a janela do painel e' rolante e o Bing revisa numeros de
+dias recentes), entao compara-lo com dias inteiros acusaria queda todo dia, ao
+meio-dia. Comparar numero parcial com numero fechado e' o mesmo erro de camada
+que este projeto ja cometeu duas vezes com bots e com busca.
+
+O RUIDO E' DERIVADO DA PROPRIA SERIE, e nunca de um limiar escolhido a mao:
+mediana e MAD (desvio absoluto mediano) da janela anterior ao dia julgado. Com
+menos de `MINIMO_DE_PONTOS` dias o teste de queda fica DESLIGADO e diz que
+esta desligado — declarar um limiar sem serie seria inventar o ruido que se diz
+estar medindo, e este repositorio ja teve detector que acusou 46 paginas com as
+46 sendo falso positivo.
+
+FASE 1 E FASE 2
+---------------
+O coletor esta na FASE 1: ele captura e preserva o CSV cru e grava
+`citacao_ia_export` com o sha256, o tamanho, a contagem de linhas e o cabecalho
+VERBATIM. O parser dos campos — e com ele as linhas `citacao_ia_diaria`, que
+carregam a contagem — so se escreve depois que um humano ler aquele cabecalho.
+Enquanto isso, a pergunta 1 e' respondivel e a pergunta 2 nao e'. Este gate
+responde a que da' para responder e DIZ que a outra esta pendente, em vez de
+ficar vermelho todos os dias por uma divida conhecida — gate que fica vermelho
+todo dia pela mesma divida deixa de ser lido, e ai o proximo defeito entra junto.
+
+`total_de_citacoes` E' CAMPO NOSSO, NAO DO CSV. O nome vive neste gate e no
+produtor; nenhum campo do CSV do Bing foi visto por este projeto ainda, e supor
+um seria inventar esquema. A fase 2 preenche este campo a partir do que o
+cabecalho revelar.
+
+SAIDA
+-----
+exit 0 = a coleta avancou hoje e a contagem nao regrediu (ou o teste de queda
+         esta declaradamente desligado por falta de serie)
+exit 1 = VEREDITO: serie nunca iniciada, coleta parada, ou queda alem do ruido
+exit 2 = NAO MEDIU: ledger ilegivel, argumento invalido, excecao nao tratada
+
+Uso:
+    tools/check-citacao-de-ia-nao-regride
+    tools/check-citacao-de-ia-nao-regride --raiz /caminho/de/teste --hoje 2026-09-16
+    tools/check-citacao-de-ia-nao-regride --json
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+
+RAIZ_PADRAO = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+
+LEDGER_REL = "data/ops/bing_webmaster_daily.jsonl"
+TIPO_EXPORT = "citacao_ia_export"
+TIPO_DIARIO = "citacao_ia_diaria"
+TIPO_RECONHECIMENTO = "citacao_ia_reconhecimento"
+
+COMANDO_DE_LOGIN = "./tools/collect-bing-ai-citations --login"
+
+# Quantos dias FECHADOS a janela de ruido usa. Catorze cobre duas semanas
+# inteiras, o que absorve o ciclo semanal (o trafego de busca cai no fim de
+# semana e um limiar cego a isso acusaria queda toda segunda-feira).
+JANELA_DE_RUIDO = 14
+
+# Abaixo disto o teste de queda NAO RODA e diz que nao rodou. Oito pontos e' o
+# minimo para uma mediana e um MAD significarem alguma coisa; com tres, o MAD de
+# uma serie que so' subiu e' zero e QUALQUER oscilacao viraria vermelho.
+MINIMO_DE_PONTOS = 8
+
+# MAD -> desvio-padrao equivalente, para distribuicao normal. E' a constante
+# classica (1/Phi^-1(3/4)); esta escrita aqui para nao parecer numero magico.
+MAD_PARA_SIGMA = 1.4826
+
+# Quantos desvios abaixo da mediana ainda e' ruido. Tres e' a regra usual de
+# controle de processo: sob normalidade, ~0,13% de falso positivo na cauda de
+# baixo — cerca de uma vez a cada dois anos numa serie diaria, que e' a
+# frequencia de alarme falso que um gate diario suporta sem ser ignorado.
+DESVIOS_TOLERADOS = 3.0
+
+# PISO DE DISPERSAO. Numa serie perfeitamente plana o MAD e' zero e qualquer
+# queda de uma unidade viraria vermelho. 5% da mediana e' o piso que impede o
+# gate de medir a propria estabilidade como se fosse sensibilidade.
+PISO_DE_DISPERSAO_RELATIVO = 0.05
+
+
+class NaoMediu(Exception):
+    """O gate nao conseguiu executar. Vira exit 2, nunca veredito."""
+
+
+def ler_jsonl(caminho):
+    """Le o ledger. Linha corrompida e' CONTADA, nunca engolida em silencio."""
+    registros, ilegiveis = [], 0
+    if not os.path.exists(caminho):
+        return registros, ilegiveis, False
+    try:
+        with open(caminho, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registros.append(json.loads(linha))
+                except json.JSONDecodeError:
+                    ilegiveis += 1
+    except OSError as erro:
+        raise NaoMediu("nao consegui ler %s: %s" % (caminho, erro))
+    return registros, ilegiveis, True
+
+
+def dia_de(carimbo):
+    """Os 10 primeiros caracteres de um ISO-8601. O produtor grava em UTC."""
+    if not isinstance(carimbo, str) or len(carimbo) < 10:
+        return None
+    return carimbo[:10]
+
+
+def mediana(valores):
+    ordenados = sorted(valores)
+    meio = len(ordenados) // 2
+    if len(ordenados) % 2 == 1:
+        return float(ordenados[meio])
+    return (ordenados[meio - 1] + ordenados[meio]) / 2.0
+
+
+def analisa(raiz, hoje):
+    ledger = os.path.join(raiz, LEDGER_REL)
+    registros, ilegiveis, existe = ler_jsonl(ledger)
+
+    exports = []
+    reconhecimentos = []
+    contagens = {}
+    for registro in registros:
+        tipo = registro.get("tipo")
+        if tipo == TIPO_EXPORT:
+            dia = dia_de(registro.get("coletado_em"))
+            if dia:
+                exports.append((dia, bool(registro.get("ok"))))
+        elif tipo == TIPO_RECONHECIMENTO:
+            dia = dia_de(registro.get("coletado_em"))
+            if dia:
+                reconhecimentos.append(dia)
+        elif tipo == TIPO_DIARIO:
+            dia = registro.get("data") or dia_de(registro.get("coletado_em"))
+            total = registro.get("total_de_citacoes")
+            if dia and isinstance(total, (int, float)):
+                # ULTIMA LINHA DO DIA VENCE: o ledger e' append-only porque o
+                # Bing REVISA numeros de dias recentes, e a revisao e'
+                # informacao, nao ruido. Quem consome pega a mais recente.
+                contagens[dia] = float(total)
+
+    dias_com_export_ok = sorted({dia for dia, ok in exports if ok})
+    ultimo_export = dias_com_export_ok[-1] if dias_com_export_ok else None
+
+    achados = []
+
+    # ── pergunta 1: a coleta avancou HOJE? ──────────────────────────────────
+    if not dias_com_export_ok:
+        if reconhecimentos:
+            achados.append({
+                "codigo": "serie_nunca_iniciada_com_reconhecimento",
+                "mensagem": (
+                    "a serie de citacao por IA nunca comecou: ha %d execucao(oes) de "
+                    "reconhecimento (ultima em %s) e NENHUM export bem-sucedido."
+                    % (len(reconhecimentos), max(reconhecimentos))),
+                "acao": (
+                    "Leia as linhas `citacao_ia_reconhecimento` do ledger e as fotos em "
+                    ".agents/runtime/tela/bing-ia/: elas dizem o que o painel respondeu. "
+                    "Se a sessao expirou, o TITULAR roda `%s`." % COMANDO_DE_LOGIN),
+            })
+        else:
+            achados.append({
+                "codigo": "serie_nunca_iniciada",
+                "mensagem": (
+                    "a serie de citacao por IA nunca comecou: nenhuma linha `%s` no ledger."
+                    % TIPO_EXPORT),
+                "acao": (
+                    "E' a UNICA dependencia humana desta frente, e e' de titularidade, nao "
+                    "de decisao: o TITULAR autentica a conta Microsoft UMA VEZ, com\n"
+                    "    %s\n"
+                    "Depois disso a rotina e' automatica." % COMANDO_DE_LOGIN),
+            })
+    elif ultimo_export < hoje:
+        atraso = (dt.date.fromisoformat(hoje) - dt.date.fromisoformat(ultimo_export)).days
+        achados.append({
+            "codigo": "coleta_parou",
+            "mensagem": (
+                "a coleta parou: o ultimo export bem-sucedido e' de %s, ha %d dia(s). "
+                "Hoje (UTC) e' %s e nao ha export." % (ultimo_export, atraso, hoje)),
+            "acao": (
+                "Rode `tools/collect-bing-ai-citations` e LEIA o exit code: 2 e' "
+                "instrumento quebrado (sessao expirada, token nao colhido, rota nao "
+                "observada) e o motivo sai nomeado. Sessao expirada se resolve com `%s`."
+                % COMANDO_DE_LOGIN),
+        })
+
+    # ── pergunta 2: a contagem caiu alem do ruido? ──────────────────────────
+    #
+    # Contra o ultimo dia FECHADO, nunca contra hoje: o dia corrente e' parcial
+    # por construcao e compara-lo com dias inteiros acusaria queda todo dia.
+    dias_fechados = sorted(d for d in contagens if d < hoje)
+    queda = None
+    if not contagens:
+        queda = {
+            "estado": "desligado",
+            "motivo": (
+                "FASE 1: o coletor preserva o CSV cru e grava `%s` com o cabecalho "
+                "verbatim; o parser dos campos — e com ele `%s` e o campo "
+                "`total_de_citacoes` — so se escreve depois que alguem ler aquele "
+                "cabecalho. Escrever antes seria inventar esquema."
+                % (TIPO_EXPORT, TIPO_DIARIO)),
+        }
+    elif len(dias_fechados) < MINIMO_DE_PONTOS + 1:
+        queda = {
+            "estado": "desligado",
+            "motivo": (
+                "serie curta demais para derivar ruido: %d dia(s) fechado(s), minimo %d. "
+                "Declarar limiar sem serie seria inventar o ruido que se diz medir."
+                % (len(dias_fechados), MINIMO_DE_PONTOS + 1)),
+        }
+    else:
+        julgado = dias_fechados[-1]
+        janela = dias_fechados[-(JANELA_DE_RUIDO + 1):-1]
+        valores = [contagens[d] for d in janela]
+        centro = mediana(valores)
+        desvios = [abs(v - centro) for v in valores]
+        dispersao = max(
+            MAD_PARA_SIGMA * mediana(desvios),
+            PISO_DE_DISPERSAO_RELATIVO * centro,
+        )
+        piso = centro - DESVIOS_TOLERADOS * dispersao
+        observado = contagens[julgado]
+        queda = {
+            "estado": "ligado",
+            "dia_julgado": julgado,
+            "observado": observado,
+            "mediana_da_janela": centro,
+            "dispersao": dispersao,
+            "piso": piso,
+            "dias_na_janela": len(janela),
+        }
+        if observado < piso:
+            achados.append({
+                "codigo": "queda_alem_do_ruido",
+                "mensagem": (
+                    "a citacao caiu alem do ruido medido: %s registrou %.0f, abaixo do "
+                    "piso %.1f (mediana %.1f, dispersao %.1f sobre %d dias fechados)."
+                    % (julgado, observado, piso, centro, dispersao, len(janela))),
+                "acao": (
+                    "REGRA DE PARADA do plano: se a citacao cair depois de uma mudanca de "
+                    "template ou de malha, REVERTE-SE A MUDANCA, nao a medicao. Confira "
+                    "`git log` das datas entre o ultimo dia saudavel e %s." % julgado),
+            })
+
+    return {
+        "hoje": hoje,
+        "ledger": LEDGER_REL,
+        "ledger_existe": existe,
+        "linhas_ilegiveis": ilegiveis,
+        "exports_ok": len(dias_com_export_ok),
+        "ultimo_export_ok": ultimo_export,
+        "reconhecimentos": len(reconhecimentos),
+        "dias_com_contagem": len(contagens),
+        "queda": queda,
+        "achados": achados,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Reprova quando a coleta de citacao por IA nao avanca hoje ou "
+                    "quando a contagem cai alem do ruido medido.")
+    parser.add_argument("--raiz", default=RAIZ_PADRAO,
+                        help="raiz do repositorio (padrao: %(default)s)")
+    parser.add_argument("--hoje", default=None,
+                        help="dia UTC de referencia AAAA-MM-DD (padrao: hoje em UTC)")
+    parser.add_argument("--json", action="store_true",
+                        help="imprime o relatorio em JSON")
+    args = parser.parse_args(argv)
+
+    hoje = args.hoje or dt.datetime.now(dt.timezone.utc).date().isoformat()
+    try:
+        dt.date.fromisoformat(hoje)
+    except ValueError:
+        print("check-citacao-de-ia-nao-regride: NAO MEDIU — --hoje invalido: %r" % hoje,
+              file=sys.stderr)
+        return 2
+
+    try:
+        relatorio = analisa(args.raiz, hoje)
+    except NaoMediu as erro:
+        print("check-citacao-de-ia-nao-regride: NAO MEDIU — %s" % erro, file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(relatorio, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("=== CITACAO DE IA (Bing AI Performance) ===")
+        print("camada              : citacao — resposta gerada, medida pela Microsoft")
+        print("hoje (UTC)          : %s" % relatorio["hoje"])
+        print("exports bem-sucedidos: %d" % relatorio["exports_ok"])
+        print("ultimo export ok    : %s" % (relatorio["ultimo_export_ok"] or "—"))
+        print("dias com contagem   : %d" % relatorio["dias_com_contagem"])
+        if relatorio["linhas_ilegiveis"]:
+            print("linhas ilegiveis    : %d (contadas, nao engolidas)"
+                  % relatorio["linhas_ilegiveis"])
+        queda = relatorio["queda"]
+        if queda and queda["estado"] == "desligado":
+            print("teste de queda      : DESLIGADO — %s" % queda["motivo"])
+        elif queda:
+            print("teste de queda      : dia %s, observado %.0f, piso %.1f "
+                  "(mediana %.1f, dispersao %.1f, %d dias)"
+                  % (queda["dia_julgado"], queda["observado"], queda["piso"],
+                     queda["mediana_da_janela"], queda["dispersao"],
+                     queda["dias_na_janela"]))
+        if not relatorio["achados"]:
+            print("veredito            : VERDE — a coleta avancou hoje e a contagem "
+                  "nao regrediu")
+        else:
+            print("veredito            : VERMELHO — %d achado(s)"
+                  % len(relatorio["achados"]))
+            for achado in relatorio["achados"]:
+                print()
+                print("  [%s] %s" % (achado["codigo"], achado["mensagem"]))
+                print("  %s" % achado["acao"].replace("\n", "\n  "))
+
+    return 1 if relatorio["achados"] else 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2. Sem ela, uma excecao nao tratada faz o interpretador
+    # sair com 1 — o MESMO codigo que esta ferramenta usa para "medi e esta
+    # degradado". Unit que mascara o 1 transformaria a queda em
+    # `Result=success` e o `OnFailure` nunca dispararia: instrumento quebrado
+    # indistinguivel de instrumento que disse "esta tudo bem".
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

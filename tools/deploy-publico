@@ -1,0 +1,1771 @@
+#!/usr/bin/env bash
+# deploy-publico — poe no ar o estado atual do repo, sem sobra de cache.
+#
+# POR QUE EXISTE: em 2026-08-06, depois de publicar 9.400 paginas e adicionar o
+# botao flutuante de WhatsApp, o site continuou servindo o HTML ANTIGO. O
+# binario era novo, o public/ era novo, o manifesto era novo — e mesmo assim o
+# visitante via a versao velha, porque var/on-demand-cache guardava 108 MB de
+# respostas geradas antes da mudanca. Reiniciar o servico nao limpa esse cache.
+#
+# Um deploy pela metade e pior que nenhum: o repo diz uma coisa, o mundo externo
+# ve outra, e a diferenca nao aparece em nenhum check. Este script existe para
+# que a ordem correta nao dependa de alguem lembrar dela.
+#
+# ORDEM (cada passo depende do anterior):
+#   1. republica     — o render mudou? entao os SHA-256 do manifesto mudaram.
+#                      Publicar de novo nao e opcional: sem isso o Validate
+#                      reprova no boot e o servidor NAO SOBE.
+#   2. builda        — binario novo a partir do codigo atual
+#   3. para          — trocar binario com o processo vivo da "Text file busy"
+#   4. limpa cache   — o passo esquecido. Cache e reproduzivel; o servidor
+#                      regenera sob demanda.
+#   5. sobe          — servico de volta
+#   6. confere       — smoke real contra o dominio publico; se falhar, avisa
+#                      onde esta o snapshot de rollback
+#
+# Uso:
+#   tools/deploy-publico                 # ciclo completo
+#   tools/deploy-publico --sem-republicar # so binario + cache (mudou codigo que nao e render)
+#   tools/deploy-publico --so-cache      # emergencia: limpa cache e reinicia
+#   tools/deploy-publico --ressemear     # mudou markup/CSS servido, nao o texto:
+#                                        # regrava a linha de base do ledger de
+#                                        # data por conteudo SEM re-datar o acervo
+
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+
+SERVICE=wikijuridica-server
+CACHE_DIR=var/on-demand-cache
+PUBLIC_HOST=https://wikijuridica.com.br
+LOCAL_ADDR=http://127.0.0.1:8089
+
+# O SEGUNDO BINARIO (2026-09-05).
+#
+# Este deploy conhecia UM servico. A rede social subiu em 04/09 e ficou fora
+# dele: quem publicasse o acervo deixava /redesocial/ rodando o binario da
+# vespera, e a unica forma de atualiza-la era a mao -- foi assim que, em
+# 05/09, doze rotas novas e a folha de estilo passaram horas respondendo 404
+# em producao enquanto o codigo delas ja estava commitado.
+#
+# Ele NAO compartilha o caminho de parada do acervo, e a diferenca importa: o
+# acervo faz stop/start porque o passo 4 apaga var/nginx/cache e o binario tem
+# de estar trocado antes de o socket voltar. A rede social nao depende de
+# nenhum desses passos, entao ela leva `restart` -- com Type=notify e o socket
+# ativo, o systemd segura a conexao durante a troca e o visitante nao ve 502.
+SERVICE_SOCIAL=wikijuridica-social
+LOCAL_ADDR_SOCIAL=http://127.0.0.1:8091
+
+# TOPOLOGIA DO INGRESS EM FONTE UNICA.
+#
+# Ate 2026-08-13 a unit do nginx e a porta da origem estavam escritas a mao em
+# dez ferramentas diferentes. Duas consequencias medidas:
+#
+#   - o gate de disponibilidade lia `journalctl -u nginx`. Quando o wiki ganhar
+#     instancia dedicada (wikijuridica-nginx), esse gate passa a vigiar um
+#     servico que nao serve mais o site — e fica VERDE para sempre;
+#   - durante a migracao, os checks sondariam a instancia VELHA e aprovariam uma
+#     config que ja nao e a servida.
+#
+# `ops/ingress.env` e a fonte unica: trocar la muda deploy, gates e sondas ao
+# mesmo tempo, que e a unica forma de o flip ser atomico.
+INGRESS_ENV="ops/ingress.env"
+# shellcheck source=/dev/null
+[ -f "$INGRESS_ENV" ] && . "$INGRESS_ENV"
+# A UNIT DEDICADA, nao a do sistema. Desde 2026-08-13 (commit dbaa3403) o wiki
+# tem ingresso proprio: `wikijuridica-nginx.service`, rodando
+# `nginx -c ops/nginx/standalone/nginx.conf -p var/nginx/`. O padrao antigo era
+# `nginx`, a unit COMPARTILHADA com o outro projeto deste servidor -- e com ela o
+# deploy recarregaria o servico errado: o do vizinho, que nem esta no ar. O
+# resultado seria o pior tipo de falha, a silenciosa: exit code verde, smoke
+# passando pelos workers que ninguem tocou, e a mudanca de ingresso nunca
+# entrando.
+NGINX_UNIT="${WIKI_NGINX_UNIT:-wikijuridica-nginx}"
+# O `-t` tem de validar a MESMA config que a unit carrega. `nginx -t` sem
+# argumento le /etc/nginx/nginx.conf -- o do vizinho -- e aprovaria uma config
+# que o nosso ingresso nunca vai ler. Os caminhos saem da propria unit
+# (ExecStartPre), nao de suposicao.
+NGINX_CONF="${WIKI_NGINX_CONF:-/opt/wiki/ops/nginx/standalone/nginx.conf}"
+NGINX_PREFIX="${WIKI_NGINX_PREFIX:-/opt/wiki/var/nginx/}"
+ORIGIN_PORT="${WIKI_ORIGIN_PORT:-8088}"
+# TODOS os arquivos que o ingress carrega, e nao so o vhost.
+#
+# O DEFEITO QUE ISTO FECHA, medido em producao em 2026-08-29: a lista tinha UM
+# arquivo, e a CSP nao mora nele. Ela mora em `security-headers.conf`, que entra
+# por `include`, e a config que a unit realmente carrega e `standalone/nginx.conf`.
+# Mudar o hash da CSP nao mudava a impressao da camada, o deploy concluia
+# "ingress intacto" e NAO recarregava o nginx: o acervo saiu com o script novo e o
+# header vivo continuou autorizando o hash antigo. O navegador recusou o script
+# inline em TODA pagina, EM SILENCIO — sem erro no log, sem 500, com o HTML
+# perfeito. Quarenta minutos assim, e a purga seguinte cacheou a combinacao morta
+# na borda por sete dias.
+#
+# `tools/check-ingress-fontes-completas` resolve os `include` de verdade e cobra
+# esta lista, para que ela nao envelheca de novo.
+# OS TRES .conf DA REDE SOCIAL E O DE OPERADORES ENTRARAM EM 2026-09-05, e o
+# proprio passo 0a do deploy os cobrou -- ele varre o que o ingress inclui e
+# reprova o que esta lista nao vigia. O gate estava certo e a lista, atrasada:
+#
+#   social-headers-{publico,privado}.conf  carregam a CSP da rede social, e ela
+#     e emitida por more_set_headers, que SOBRESCREVE o cabecalho do upstream.
+#     Sem reload, o navegador recusa o script em silencio -- e painel vazio e
+#     indistinguivel de "nao ha visitantes".
+#   bot-operators.conf  e gerado por tools/generate-nginx-bot-operators a partir
+#     de data/ops/bot_ip_ranges/*.json (2.491 prefixos, 7 operadores). Ele
+#     alimenta o `geo $wj_operador_do_ip` de que a chave do teto agregado
+#     depende: sem reload, faixa de IP nova nao passa a valer.
+NGINX_CONF_FONTES="${WIKI_NGINX_CONF_FONTES:-ops/nginx/wikijuridica.conf ops/nginx/security-headers.conf ops/nginx/standalone/nginx.conf ops/nginx/social-headers-publico.conf ops/nginx/social-headers-privado.conf ops/nginx/bot-operators.conf}"
+
+# JANELA DE MANUTENCAO declarada para o vigia.
+#
+# O watchdog (ops/systemd/wikijuridica-watchdog.timer) roda a cada 2 min com
+# --repair. Sem esta declaracao ele via o servico parado no meio do deploy, o
+# reiniciava, e o `cp` do binario novo falhava com "Text file busy" — deploy
+# abortado pelo proprio vigilante. Aconteceu em 2026-08-06.
+#
+# O lock e removido em qualquer saida (trap), e o vigia o ignora depois de 30
+# min, para que um deploy interrompido nao desligue a vigilancia para sempre.
+DEPLOY_LOCK=data/ops/.deploy-em-curso.lock
+mkdir -p data/ops && : >"$DEPLOY_LOCK"
+trap 'rm -f "$DEPLOY_LOCK"' EXIT INT TERM
+
+# BATIDA NO LOCK — a idade dele passa a medir SINAL DE VIDA, nao tempo de vida.
+#
+# Os tres leitores deste arquivo (internal/checks/http_smoke_redesocial.go:264,
+# tools/check-portal-health:431, tools/deploy-binario-go:628) calam a vigilancia
+# enquanto o lock for novo e acusam ORFAO depois de 30 min, para que um deploy
+# interrompido nao desligue o vigia para sempre. A regra estava certa; a medida
+# estava errada.
+#
+# Medido em 2026-09-10: o deploy #3 levou 46 min porque o passo de reaquecimento
+# sozinho custa 22.446 URLs a 12 r/s = 31 min. Aos 30 min de um deploy VIVO e
+# saudavel, check-http-smoke passou a devolver
+# `http_smoke_redesocial_lock_de_deploy_orfao=47min` — alarme falso, e alarme
+# falso treina o operador a ignorar o verdadeiro. Com o acervo crescendo, todo
+# deploy futuro cruzaria a janela.
+#
+# `com_batida_no_lock <comando...>` roda o comando em segundo plano e, em
+# primeiro plano, toca o lock enquanto ele viver. Nao ha processo separado que
+# possa sobreviver a morte do deploy: o laco mora no proprio shell do script,
+# entao `kill -9` no deploy leva a batida junto e o lock envelhece de verdade —
+# que e exatamente o que a deteccao de orfao existe para enxergar.
+# orcamento_de_aquecimento devolve os segundos que a lista precisa a 12 r/s, com
+# folga de 60%, ou 0 quando ela nao cabe na janela do deploy.
+#
+# POR QUE 0 EM VEZ DE 3600, medido em 2026-09-10: o passo dirigido tinha
+# `timeout 1800` fixo; a purga do deploy #4 foi de 22.414 URLs e, a 12 r/s, isso
+# custa 1.868 s. Estourou por 68 segundos e a borda ficou parcialmente fria com o
+# acervo recem-purgado. Cortar o orcamento no teto so adiaria o mesmo desfecho
+# para uma lista maior — e gastaria a hora inteira segurando o lock pesado antes
+# de imprimir o mesmo aviso. Acima do teto, a resposta certa nao e um numero
+# menor: e dizer que nao cabe e delegar ao timer, com o numero na tela.
+#
+# O piso de 300s cobre lista curta (uma lista de 12 URLs nao deve morrer num
+# timeout de 1 segundo).
+# segundos_de_aquecimento devolve o tempo ESTIMADO da passada, COM a folga de
+# 1,6x sobre os 12 r/s nominais — a mesma folga que decide se o reaquecimento
+# cabe na janela. Ela existe separada por um motivo medido em 2026-09-10: a
+# mensagem do reaquecimento delegado calculava o tempo por conta propria, com
+# outra variavel E outra formula, e saiu contraditoria na tela:
+#
+#     "27165 URLs a 12 r/s levariam 2263s, acima do teto de 3600s"
+#
+# 2.263 nao e acima de 3.600. O texto imprimia `TODOS_N / 12` (a lista de
+# PURGA, sem folga) enquanto a decisao usava `AQUECER_N * 16 / 10 / 12` (a
+# lista de AQUECIMENTO, com folga) — dois numeros para a mesma pergunta, e o
+# que aparecia era o que nao decidia nada. Quem le a mensagem conclui que o
+# deploy delegou sem motivo.
+#
+# Agora ha uma fonte so: quem decide e quem imprime chamam esta funcao.
+segundos_de_aquecimento() {
+	echo $(($1 * 16 / 10 / 12))
+}
+
+orcamento_de_aquecimento() {
+	local urls="$1" orcamento
+	orcamento=$(segundos_de_aquecimento "$urls")
+	if [ "$orcamento" -gt 3600 ]; then
+		echo 0
+		return 0
+	fi
+	[ "$orcamento" -lt 300 ] && orcamento=300
+	echo "$orcamento"
+}
+
+BATIDA_INTERVALO="${BATIDA_INTERVALO:-30}"
+com_batida_no_lock() {
+	"$@" &
+	batida_filho=$!
+	while kill -0 "$batida_filho" 2>/dev/null; do
+		: >"$DEPLOY_LOCK" 2>/dev/null || true
+		sleep "$BATIDA_INTERVALO"
+	done
+	wait "$batida_filho"
+}
+
+REPUBLICAR=1
+REBUILD=1
+# RESSEMEAR repassa --ressemear ao gerador de data por conteudo, no passo 6.
+#
+# POR QUE PRECISOU EXISTIR (2026-08-29): o gerador re-data toda rota cujo HTML
+# SERVIDO mudou, e ele so isenta o que a neutralizacao cobre -- <script> sem
+# atributo e datas. Mudanca ESTRUTURAL que nao e conteudo (um `target`, um
+# `aria-label`, uma classe de CSS) escapa da neutralizacao e carimba as 10 mil
+# rotas com a data de hoje, reanunciando o sitemap inteiro ao Googlebot como se
+# o texto tivesse sido revisado. Isso e frescor fabricado, que e exatamente o que
+# este ledger existe para impedir.
+#
+# Ate aqui o remedio existia (`--ressemear` regrava a linha de base sem carimbar
+# data nova) mas era INALCANCAVEL de dentro do deploy: o operador teria de deixar
+# o deploy re-datar e consertar depois, ou nao usar o deploy. O CLAUDE.md
+# registrava a armadilha em vez de resolve-la.
+#
+# Quando usar: mudou o markup/CSS/atributo servido SEM mudar o texto editorial.
+# Quando NAO usar: mudou o texto -- ai a re-datacao e verdadeira e devida.
+RESSEMEAR=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--sem-republicar)
+		REPUBLICAR=0
+		shift
+		;;
+	--so-cache)
+		REPUBLICAR=0
+		REBUILD=0
+		shift
+		;;
+	--ressemear)
+		RESSEMEAR=1
+		shift
+		;;
+	-h | --help)
+		sed -n '2,32p' "$0"
+		exit 0
+		;;
+	*)
+		echo "opcao desconhecida: $1" >&2
+		exit 2
+		;;
+	esac
+done
+
+step() { printf '\n\033[1m>> %s\033[0m\n' "$1"; }
+fail() {
+	printf '\n\033[31mFALHOU: %s\033[0m\n' "$1" >&2
+	exit 1
+}
+
+# --- 0a. o ingress e o atestado, conferidos ANTES de qualquer minuto gasto ----
+#
+# Os dois checks abaixo custam segundos e evitam as duas falhas que mais
+# custaram nesta fabrica: deploy que morre no meio (atestado do validador
+# desatualizado — quatro incidentes) e deploy que "passa" servindo um script que
+# o proprio header recusa (lista de fontes do ingress incompleta).
+#
+# Rodam ANTES do ingest de proposito. O ingest leva minutos; descobrir ali que o
+# atestado nao bate e pagar esse tempo para nada.
+if ! tools/check-validator-attestation >/dev/null 2>&1; then
+	step "0a/7 atestado do validador"
+	tools/check-validator-attestation 2>&1 | sed 's/^/  /'
+	fail "o atestado do validador nao descreve o grafo de fonte: o ingest recusaria publicar"
+fi
+if ! tools/check-ingress-fontes-completas >/dev/null 2>&1; then
+	step "0a/7 fontes do ingress"
+	tools/check-ingress-fontes-completas 2>&1 | sed 's/^/  /'
+	fail "a lista de fontes do ingress esta incompleta: mudanca de CSP nao dispararia reload"
+fi
+# O SYSTEMD HONRA O QUE ops/systemd DECLARA? (2026-09-02) Em 01/09 a unit do
+# servico ganhou Requires=wikijuridica-server.socket sem a .socket instalada:
+# o passo 3 abaixo morreria com exit 5 ("unit not found") lido como "sem sudo",
+# DEPOIS de pagar reingest e build. Fail-fast aqui, antes de tudo; a cura
+# (symlink + daemon-reload) e do vigia e do operador, nao deste passo.
+if ! tools/check-units-instaladas >/dev/null 2>&1; then
+	step "0a/7 units do systemd"
+	tools/check-units-instaladas 2>&1 | sed 's/^/  /'
+	fail "unit de ops/systemd que o systemd nao honra: o restart do passo 5 falharia. Remedio impresso acima."
+fi
+
+# --- 0a-bis. o estoque editorial esta commitado? ------------------------------
+#
+# O ACIDENTE QUE ISTO IMPEDE, e ele quase aconteceu em 2026-08-29. Este
+# repositorio roda varias sessoes concorrentes. Na hora de publicar a frente de
+# malha, `git status` mostrava 158 shards de data/editorial/v2_pages MODIFICADOS
+# E NAO COMMITADOS por outra frente, no meio de uma correcao.
+#
+# O publicador le o estoque da WORKTREE, nao do indice. Publicar naquele momento
+# teria levado ao ar 158 shards de trabalho em voo -- texto juridico a meio
+# caminho, sem revisao fechada e sem existir no historico. Nenhum gate acusaria:
+# cada lado esta coerente consigo mesmo, e o defeito so apareceria como pagina
+# publicada com texto que ninguem aprovou e que nao da para rastrear nem reverter.
+#
+# A guarda e simples e a mensagem diz o que fazer. Ela NAO tenta commitar nada
+# por conta propria: trabalho de outra sessao se commita por quem o escreveu.
+#
+# WIKI_DEPLOY_PERMITE_ESTOQUE_SUJO=1 libera, para o caso em que a propria sessao
+# esta com uma correcao aberta e sabe o que esta fazendo. Existe porque guarda
+# sem escape vira guarda que alguem desliga apagando a linha -- e ai ela some
+# para sempre, em vez de aparecer no comando com o motivo declarado.
+step "0a-bis/7 estoque editorial commitado"
+ESTOQUE_SUJO="$(git status --porcelain -- data/editorial/v2_pages data/editorial/portfolio_v2 2>/dev/null | wc -l | tr -d ' ')"
+if [ "${ESTOQUE_SUJO:-0}" -gt 0 ]; then
+	if [ "${WIKI_DEPLOY_PERMITE_ESTOQUE_SUJO:-0}" = "1" ]; then
+		echo "  $ESTOQUE_SUJO arquivo(s) de estoque nao-commitado(s) — liberado por WIKI_DEPLOY_PERMITE_ESTOQUE_SUJO=1"
+	else
+		git status --short -- data/editorial/v2_pages data/editorial/portfolio_v2 | head -8 | sed 's/^/    /'
+		[ "$ESTOQUE_SUJO" -gt 8 ] && echo "    ... e mais $((ESTOQUE_SUJO - 8))"
+		echo "  O publicador le o estoque da WORKTREE. Publicar agora levaria ao ar"
+		echo "  trabalho editorial que nao existe no historico — sem rastreio e sem reversao."
+		echo "  Remedio: quem escreveu commita. Se a correcao aberta e SUA e voce sabe"
+		echo "  o que esta publicando: WIKI_DEPLOY_PERMITE_ESTOQUE_SUJO=1 ./tools/deploy-publico"
+		fail "estoque editorial com $ESTOQUE_SUJO arquivo(s) nao-commitado(s)"
+	fi
+else
+	echo "  limpo"
+fi
+
+# --- 0. reingerir o estoque, se ele mudou ------------------------------------
+#
+# O PASSO QUE FALTAVA, e a falha que ele corrige (2026-08-07): corrigi a citacao
+# legal de 19 paginas no estoque (data/editorial/v2_pages/*.jsonl), commitei,
+# rodei este deploy e conferi no ar — o visitante continuava lendo o texto
+# ERRADO. O HTML publico nao nasce do JSONL: nasce do contentstore, que so muda
+# quando ingest-v2-stock roda. Sem este passo o repo diz uma coisa e o mundo ve
+# outra, e nenhum check acusa a diferenca, porque cada lado esta coerente
+# consigo mesmo.
+#
+# Roda so quando algum shard esta mais novo que o stock_manifest.json — o ingest
+# custa minutos e a maioria dos deploys nao toca conteudo. Se o estoque mudou e
+# o ingest reprova, o deploy PARA: publicar com o contentstore velho e
+# exatamente o defeito que este passo existe para impedir.
+#
+# ORCAMENTO DE TEMPO DIMENSIONADO PELO ACERVO, e nao por constante magica.
+#
+# tools/ingest-v2-stock chama run-go-cmd-cached, cujo derive_run_timeout_seconds
+# (tools/run-go-cmd-cached:845) cai no DEFAULT de 300s quando ninguem declara
+# WIKI_GO_CMD_TIMEOUT_SECONDS. Medicao real do ingest do acervo inteiro:
+#   .agents/runtime/deploy-20260807b.log:59  ->  status=pass duration_ms=254174
+# ou seja 254s para 9.771 paginas de shard = 26,0 ms por pagina. Com 300s de
+# teto, a margem era de 13% — e na primeira execucao do dia, que ainda compila o
+# cmd, ela nao coube: o processo foi morto sem TIMING e o deploy anunciou
+# "reprovou" (diagnostico oposto ao verdadeiro; ver classificacao abaixo).
+#
+# RECALIBRADO EM 2026-08-13, DEPOIS DE A MARGEM ACABAR NA PRATICA.
+#
+# A calibracao anterior era 40 ms/pagina, derivada de 26 ms/pagina medidos em
+# 2026-08-07, e o comentario aqui afirmava "2,01x o pior tempo ja medido". A
+# afirmacao envelheceu sem que ninguem remedisse: os quatro ingests completos
+# registrados em .agents/runtime/deploy-ingest-*.log levaram 461s, 467s, 476s e
+# 482s — contra o orcamento de 513s que a formula produzia. A folga real era de
+# 6%, nao de 101%, e hoje ela nao coube: o ingest foi morto por tempo (exit 124)
+# com o host sob load 8-11 de agentes concorrentes, e a publicacao inteira
+# reprovou. NADA foi ao ar, que e o comportamento correto — mas o motivo era uma
+# constante mentindo sobre a propria medicao.
+#
+# O ingest passou de ~26 ms/pagina (08-07) para ~49 ms/pagina (08-13), quase o
+# dobro, com o acervo praticamente do mesmo tamanho. ISSO E UM ACHADO ABERTO,
+# registrado e nao resolvido aqui: pela regua do repo, lentidao que dobra e bug
+# P0 e se corrige com incremental/shard/paralelismo no proprio cmd, nunca
+# alargando o teto. O que este bloco conserta e outra coisa — a constante estava
+# calibrada num numero que nao vale mais, e um orcamento derivado de medicao
+# obsoleta nao e orcamento, e chute.
+#
+# Formula, com a folga justificada termo a termo:
+#   segundos = paginas * 75ms/pagina / 1000 + 120s
+#     75 ms/pagina  = 49 ms MEDIDOS HOJE (482s / 9.833 linhas de shard, o pior
+#                     dos quatro registros) x 1,53 de folga para contencao de CPU
+#                     (o host e compartilhado com agentes), cache frio e I/O.
+#                     Mesmo criterio do autor original, sobre medicao atual.
+#     120 s fixos   = custo que NAO escala com o acervo: compilacao do
+#                     ./cmd/ingest-v2-stock na primeira execucao do dia mais a
+#                     validacao de manifesto/recibo/transacao.
+# Acervo de hoje: 9.833 * 75/1000 + 120 = 857s (aritmetica inteira do shell),
+# 1,78x o pior tempo medido — de volta a ordem de folga que o desenho pedia.
+#
+# Clamps: piso 300s (nunca abaixo do default atual) e teto 1800s, que e o
+# MAX_WRAPPER_TIMEOUT_SECONDS de tools/run-go-cmd-cached:39 — acima dele o
+# wrapper RECUSA a rodar (linha 589) e o deploy morreria antes de comecar, que e
+# justamente o defeito de mensagem que este bloco corrige. Um acervo que estourar
+# 1800s nao se resolve alargando timeout: shard/paralelismo/incremental no
+# proprio cmd. Valor vindo do ambiente e respeitado sem sobrescrita, e a variavel
+# so vale para ESTA invocacao (nao vaza para o publish do passo 1).
+orcamento_ingest_segundos() {
+	local paginas segundos
+	paginas="$(find data/editorial/v2_pages -name '*.jsonl' ! -name '*.partial.jsonl' -exec cat {} + 2>/dev/null | wc -l | tr -d ' ')"
+	if ! [ "$paginas" -gt 0 ] 2>/dev/null; then
+		echo "  AVISO: nao consegui contar as paginas do estoque; orcamento no piso de 300s" >&2
+		printf '300'
+		return 0
+	fi
+	segundos=$((paginas * 75 / 1000 + 120))
+	[ "$segundos" -lt 300 ] && segundos=300
+	[ "$segundos" -gt 1800 ] && segundos=1800
+	printf '%s' "$segundos"
+}
+
+if [ "$REPUBLICAR" = "1" ] && [ "${WIKI_DEPLOY_SEM_INGEST:-}" != "1" ]; then
+	# ★ O SHARD NAO E O UNICO GATILHO: O VALIDADOR TAMBEM CONTA (2026-08-30).
+	#
+	# Ate aqui a decisao era so `shard mais novo que o contentstore`. Medido na
+	# mesma sessao: 30 requisitos de fonte foram corrigidos em
+	# `internal/v2ingest` -- o gate exigia ancora que NAO EXISTE no documento e
+	# recusava pagina correta (BUG-191) --, o estoque nao mudou uma virgula, e o
+	# deploy imprimiu "ingest dispensado". O acervo seguiu servindo o veredito
+	# do validador ANTIGO, e paginas que a correcao acabara de destravar
+	# continuaram fora.
+	#
+	# O atestado do grafo e o discriminante certo, e ele ja existe: muda sempre
+	# que o codigo do validador muda, e so entao. Comparar contra o mtime do
+	# contentstore custa um stat.
+	INGEST_POR_SHARD="$(find data/editorial/v2_pages -name '*.jsonl' -newer data/editorial/stock_manifest.json -print -quit 2>/dev/null)"
+	INGEST_POR_VALIDADOR=""
+	if [ internal/v2ingest/validator_fingerprint_attestation_generated.go -nt data/editorial/stock_manifest.json ]; then
+		INGEST_POR_VALIDADOR="1"
+	fi
+	if [ -n "$INGEST_POR_SHARD" ] || [ -n "$INGEST_POR_VALIDADOR" ]; then
+		if [ -n "$INGEST_POR_SHARD" ]; then
+			step "0/7 reingerindo o estoque (shard mais novo que o contentstore)"
+		else
+			step "0/7 reingerindo o estoque (o VALIDADOR mudou desde o contentstore)"
+		fi
+		INGEST_TIMEOUT="${WIKI_GO_CMD_TIMEOUT_SECONDS:-$(orcamento_ingest_segundos)}"
+		INGEST_LOG=".agents/runtime/deploy-ingest-$(date +%Y%m%d-%H%M%S).log"
+		mkdir -p .agents/runtime
+		echo "  orcamento: ${INGEST_TIMEOUT}s (dimensionado pelo tamanho do estoque); saida em $INGEST_LOG"
+		nice -n 19 env WIKI_GO_CMD_TIMEOUT_SECONDS="$INGEST_TIMEOUT" ./tools/ingest-v2-stock 2>&1 | tee "$INGEST_LOG"
+		INGEST_RC="${PIPESTATUS[0]}"
+		# TRES DESFECHOS, TRES ACOES OPOSTAS.
+		#
+		# Ate 2026-08-12 qualquer saida != 0 virava "o ingest reprovou", o que
+		# manda o operador investigar CONTEUDO quando o problema e ENVELOPE.
+		# A linha TIMING (cmd/ingest-v2-stock/main.go:235) e o discriminante: ela
+		# so existe se o comando chegou ao fim, e sai tanto em status=pass quanto
+		# em status=fail. Sem ela, o comando nao terminou.
+		#   124/137 -> morto pelo relogio (timeout / kill-after do supervisor)
+		#   TIMING presente -> terminou e reprovou: a causa esta no log
+		#   nem um nem outro -> nem chegou a rodar (recusa do run-go-cmd-cached,
+		#                       exit 2 de validacao ou 75 de supervisao)
+		if [ "$INGEST_RC" -ne 0 ]; then
+			if [ "$INGEST_RC" = "124" ] || [ "$INGEST_RC" = "137" ]; then
+				fail "o ingest NAO TERMINOU: foi morto pelo tempo (exit $INGEST_RC) com orcamento de ${INGEST_TIMEOUT}s. Isto NAO e reprovacao de conteudo — nao ha o que investigar no estoque. Meça o ingest isolado (tools/ingest-v2-stock imprime TIMING) e redimensione o orcamento em tools/deploy-publico, ou torne o ingest incremental se o acervo cresceu. NADA foi para o ar. Log: $INGEST_LOG"
+			elif grep -q '^TIMING command=ingest-v2-stock' "$INGEST_LOG"; then
+				fail "o ingest REPROVOU (exit $INGEST_RC; terminou e disse por que — veja $INGEST_LOG). NADA foi para o ar. O estoque mudou e o contentstore ficaria velho — o visitante leria o texto antigo. Transacao interrompida se recupera com --recover-transaction-id/--recover-commit-marker (veja data/ops/v2_ingest_transaction_journal.json)."
+			else
+				fail "o ingest NEM CHEGOU A RODAR (exit $INGEST_RC, sem linha TIMING e sem morte por tempo): o envelope recusou antes do comando. Causa tipica: validacao do tools/run-go-cmd-cached (orcamento acima do teto de 1800s, janela 00-03Z do ingest-v2-stock) — a mensagem exata esta em $INGEST_LOG. NADA foi para o ar."
+			fi
+		fi
+	else
+		step "0/7 ingest dispensado (contentstore mais novo que os shards)"
+	fi
+fi
+
+# --- 0.5. o censo acompanha o estoque ----------------------------------------
+#
+# ★ O SEGUNDO DERIVADO DO ESTOQUE, E ELE NAO ERA REDERIVADO AQUI (2026-09-16).
+#
+# O passo 0/7 acima existe porque o contentstore e derivado dos shards e
+# publicar com ele velho serve texto antigo. O censo de severidade
+# (data/editorial/v2_publication_severity.jsonl) e derivado dos MESMOS shards
+# e tem consequencia PIOR: `internal/v2publish.SelectPublishable` (v2publish.go:
+# 398-402) pula toda pagina sem linha no censo com `sem_linha_no_censo`. Ou
+# seja, o censo velho nao serve conteudo errado — ele apaga, em silencio, todo
+# conteudo NOVO desde a ultima vez que alguem lembrou de rodar o censo.
+#
+# MEDIDO NESTE DEPLOY, e por isso este passo nasceu: em 2026-09-16 o shard
+# data/editorial/v2_pages/stj-acordao-derivado-01.jsonl foi commitado as
+# 12:32:25 com as 30 primeiras paginas de acordao do cerebro; o censo era de
+# 12:22:53; o publicador rodou as 13:01 e imprimiu, no proprio log do deploy
+# (.agents/runtime/p1b/deploy4_20260916.log):
+#
+#	sem_linha_no_censo                             30
+#
+# As 30 paginas estavam corretas, commitadas e pareadas — e simplesmente nao
+# foram ao ar. O deploy nao parou, nao regenerou nada e seguiu ate o fim.
+#
+# A REGRA NAO E REIMPLEMENTADA AQUI. Ela tem um dono
+# (tools/check-censo-acompanha-estoque, read-only) e um regenerador que o
+# consulta (tools/generate-censo-acompanha-estoque). Ate esta data os dois
+# tinham ZERO chamadores: a regra existia e ninguem a consultava, enquanto
+# tools/publicar carregava uma TERCEIRA copia da mesma comparacao de mtime
+# (publicar:110 censo_em_dia). Uma regra, um dono, tres chamadores.
+#
+# Regenerar o censo aqui e conserto DERIVAVEL e VERIFICAVEL, no sentido exato
+# do que tools/publicar ja documenta: recomputar um indice a partir do estoque
+# que ja esta no disco. Nao afrouxa gate nenhum — o censo continua reprovando
+# por merito o que tem de reprovar, e a pagina critica continua fora.
+if [ "$REPUBLICAR" = "1" ]; then
+	step "0.5/7 censo de severidade (o publicador so ve pagina que o censo viu)"
+	if ! nice -n 19 ./tools/generate-censo-acompanha-estoque; then
+		fail "o censo de severidade nao pode ser posto em dia. Publicar assim recusaria com 'sem_linha_no_censo' justamente as paginas novas — as que motivaram o deploy. NADA foi para o ar. Rode ./tools/check-censo-acompanha-estoque para ver quais shards estao a frente do censo."
+	fi
+fi
+
+# --- 1. republicar -----------------------------------------------------------
+if [ "$REPUBLICAR" = "1" ]; then
+	step "1/7 republicando o acervo (render novo => hashes novos)"
+	rm -f data/ops/.publish-v2-direct.lock
+	if ! nice -n 19 ./tools/go-modern run ./cmd/publish-v2-direct --allow-public-write; then
+		fail "a publicacao reprovou; NADA foi para o ar. Veja o snapshot em data/ops/publish-rollback-*/"
+	fi
+else
+	step "1/7 republicacao pulada (--sem-republicar)"
+fi
+
+# --- 1b. O JSON-LD SOBREVIVEU A REPUBLICACAO? --------------------------------
+#
+# POR QUE AQUI, e nao so no fim. Em 2026-09-09 um campo novo no publisher do
+# Article entrou SEM ser declarado no schema, que e additionalProperties:false.
+# A validacao passou a reprovar e renderArticleScript devolve string VAZIA
+# quando o Report nao passa (structured_data.go:502-504, chamado em
+# render.go:627): o Article desapareceu das 11.039 paginas de uma vez — sem
+# erro, sem log, e com a publicacao inteira saindo exit 0. Quem descobriu foi um
+# `grep -rl '"@type":"Article"' public/` que devolveu 0, DEPOIS de a purga e o
+# aquecimento ja terem sido pagos.
+#
+# Este e o ponto mais barato para abortar: o public/ novo esta no disco, o
+# rollback transacional ainda esta intacto, e nada foi purgado nem aquecido.
+# Custo medido: 2,7 s lendo os 11.287 arquivos.
+if [ -x tools/check-jsonld-cobertura ]; then
+	step "1b/7 dado estruturado do acervo"
+	if ! tools/check-jsonld-cobertura; then
+		fail "o JSON-LD do acervo regrediu: a republicacao esta no disco e o rollback intacto. NAO purgue nem aqueca antes de resolver."
+	fi
+fi
+
+# --- 2. build ----------------------------------------------------------------
+if [ "$REBUILD" = "1" ]; then
+	step "2/7 compilando o servidor"
+	nice -n 10 ./tools/go-modern build -o bin/wikijuridica-server.next ./cmd/server ||
+		fail "build do servidor"
+	# A REDE SOCIAL COMPILA JUNTO, e falha aqui aborta o deploy inteiro de
+	# proposito: publicar o acervo com o binario social quebrado deixaria
+	# /redesocial/ servindo a versao da vespera sem ninguem perceber, que e
+	# exatamente o defeito que este bloco veio corrigir. Compilar nao troca
+	# nada -- a troca e no passo 4, depois de o nginx estar validado.
+	nice -n 10 ./tools/go-modern build -o bin/wikijuridica-social.next ./cmd/social ||
+		fail "build da rede social"
+else
+	step "2/7 build pulado"
+fi
+
+# IMPRESSAO DIGITAL DA CAMADA — calculada AQUI, e nao no passo 6.
+#
+# Ela precisa existir antes do passo 4, que decide se o nginx e recarregado
+# ou nao tocado. Depende do binario recem-compilado (passo 2), entao este e o
+# primeiro ponto do script em que as duas fontes ja estao no disco.
+CAMADA_ESTADO="data/ops/deploy_layer_fingerprint.json"
+CAMADA_MUDOU=0
+INGRESS_MUDOU=0
+
+# HASH POR COMPONENTE, e nao um so combinado.
+#
+# O schema v1 guardava UM `layer_sha256` sobre [binario, vhost]. Um hash unico
+# responde "mudou ou nao mudou" e nada mais — nunca QUAL dos dois mudou. Isso
+# bastava enquanto a resposta era sempre a mesma (reiniciar o nginx), mas a
+# decisao agora tem tres saidas diferentes:
+#
+#   binario mudou      -> o servico Go ja e reiniciado nos passos 3 e 5;
+#                         o nginx nao tem nada com isso.
+#   config do ingress  -> `nginx -t` + RELOAD, e o reload precisa ser provado.
+#   nada da camada     -> NAO TOCAR no nginx. Deploy de conteudo e arquivo em
+#                         disco; o nginx le por requisicao.
+#
+# Com um hash so, ou todo deploy de conteudo pagaria um reload, ou nenhum deploy
+# de config pagaria — as duas erradas.
+BIN_ATUAL="$([ -f bin/wikijuridica-server.next ] && sha256sum bin/wikijuridica-server.next 2>/dev/null | cut -d' ' -f1)"
+INGRESS_ATUAL="$(
+	for _conf in $NGINX_CONF_FONTES; do
+		[ -f "$_conf" ] && sha256sum "$_conf"
+	done 2>/dev/null | sha256sum | cut -d' ' -f1
+)"
+CAMADA_ATUAL="$(printf '%s\n%s\n' "$BIN_ATUAL" "$INGRESS_ATUAL" | sha256sum | cut -d' ' -f1)"
+# O binario do social e outro processo e serve outro conjunto na borda
+# (/redesocial/ e os temas, s-maxage=3600). Hash proprio, purga propria.
+SOCIAL_ATUAL="$([ -f bin/wikijuridica-social.next ] && sha256sum bin/wikijuridica-social.next 2>/dev/null | cut -d' ' -f1)"
+
+# OS ARTEFATOS DE DESCOBERTA TEM IMPRESSAO PROPRIA, e a razao e um buraco medido.
+#
+# A purga seletiva so acontece quando ALGUMA PAGINA muda de conteudo. Deploy que
+# altera SOMENTE robots.txt (regenerar a politica de bots, por exemplo) sai com
+# ALVOS_N=0, cai no ramo "nada a purgar" e nao purga coisa nenhuma — nem os
+# artefatos. E `tools/generate-page-content-revision` hasheia apenas os campos
+# autorais de content/pages.json, entao robots.txt nao entra naquela conta por
+# construcao.
+#
+# O prejuizo nao e hipotetico. Em 2026-08-12 a borda serviu por DIAS um
+# robots.txt de 2.818 bytes contra 1.670 do disco, com a diretiva nao-padrao
+# Content-Signal que o Bing Webmaster acusava como erro de sintaxe e que deixava
+# a URL em "Discovered but not crawled". So uma purga manual resolveu.
+#
+# POR QUE HASH E NAO TTL CURTO NA BORDA: encurtar o edge TTL do robots.txt seria
+# a correcao obvia e seria pior. HIT nao renova TTL nesta zona; com 300 s o
+# arquivo ficaria expirado a maior parte do tempo e cada requisicao atravessaria
+# o tunel — e robots.txt respondendo 530 numa oscilacao de tunel faz o Googlebot
+# parar de rastrear o site INTEIRO, que e exatamente o colapso de 2026-08-11. Os
+# sete dias de TTL sao o que mantem robots e sitemap servives durante queda de
+# origem; o que faltava era propagar a mudanca em segundos quando ela ocorre.
+ARTEFATOS_ATUAL="$(
+	{
+		for _art in public/robots.txt public/sitemap.xml public/feed.xml \
+			public/llms.txt public/.well-known/security.txt; do
+			[ -f "$_art" ] && sha256sum "$_art"
+		done
+		for _shard in public/sitemaps/*.xml; do
+			[ -f "$_shard" ] && sha256sum "$_shard"
+		done
+	} 2>/dev/null | sha256sum | cut -d' ' -f1
+)"
+
+_le_hash() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]*\)\".*/\1/p" "$CAMADA_ESTADO" 2>/dev/null | head -1; }
+CAMADA_ANTERIOR="$(_le_hash layer_sha256)"
+BIN_ANTERIOR="$(_le_hash bin_sha256)"
+INGRESS_ANTERIOR="$(_le_hash ingress_sha256)"
+ARTEFATOS_ANTERIOR="$(_le_hash artefatos_sha256)"
+SOCIAL_ANTERIOR="$(_le_hash social_sha256)"
+
+# Estado gravado por schema anterior (v1/v2) nao tem o campo. Nesse caso o
+# artefato e tratado como MUDADO: errar para o lado de purgar custa um
+# reaquecimento; errar para o outro deixa robots.txt velho na borda por sete
+# dias, que foi o incidente.
+ARTEFATOS_MUDOU=0
+if [ -z "$ARTEFATOS_ANTERIOR" ] || [ "$ARTEFATOS_ATUAL" != "$ARTEFATOS_ANTERIOR" ]; then
+	ARTEFATOS_MUDOU=1
+fi
+
+if [ -z "$CAMADA_ANTERIOR" ]; then
+	CAMADA_MUDOU=1
+	INGRESS_MUDOU=1
+	echo "  camada de servico sem registro anterior — purga total e reload por precaucao"
+else
+	[ "$CAMADA_ATUAL" != "$CAMADA_ANTERIOR" ] && CAMADA_MUDOU=1
+	# Estado gravado pelo schema v1 nao tem os campos por componente. Nesse caso
+	# o ingress e tratado como MUDADO: errar para o lado de recarregar custa um
+	# reload; errar para o outro deixa config nova fora do ar.
+	if [ -z "$INGRESS_ANTERIOR" ] || [ "$INGRESS_ATUAL" != "$INGRESS_ANTERIOR" ]; then
+		INGRESS_MUDOU=1
+	fi
+	if [ "$CAMADA_MUDOU" -eq 1 ]; then
+		if [ "$INGRESS_MUDOU" -eq 1 ]; then
+			echo "  config do ingress mudou desde o ultimo deploy — a RESPOSTA muda sem o conteudo mudar"
+		else
+			echo "  binario mudou desde o ultimo deploy (ingress intacto) — purga do conjunto dinamico (o que o Go serve), sem tocar no nginx"
+		fi
+	fi
+fi
+# Binario por binario (2026-09-09): cada um entra na purga com o conjunto que
+# serve. Sem registro anterior (schema antigo) conta como mudado -- errar para
+# o lado de purgar. Sem .next (deploy sem rebuild) nao mudou.
+BIN_MUDOU=0
+SOCIAL_MUDOU=0
+if [ -n "$BIN_ATUAL" ] && [ "$BIN_ATUAL" != "$BIN_ANTERIOR" ]; then BIN_MUDOU=1; fi
+if [ -n "$SOCIAL_ATUAL" ] && [ "$SOCIAL_ATUAL" != "$SOCIAL_ANTERIOR" ]; then SOCIAL_MUDOU=1; fi
+
+# --- 3. parar ----------------------------------------------------------------
+# --- 2.5. brotli estatico ------------------------------------------------------
+#
+# POR QUE AQUI, entre o build e a parada do servico: os .br derivam de public/,
+# entao precisam vir DEPOIS da republicacao (passo 1) e ANTES de o servico voltar
+# a atender (passo 5). Rodar com o servico de pe e seguro -- a ferramenta escreve
+# em arquivo temporario e faz os.replace atomico.
+#
+# O DEFEITO QUE ISTO FECHA, medido em 2026-08-26: o nginx declara
+# `brotli_static on` e NAO EXISTIA UM UNICO arquivo .br em disco -- zero, contra
+# 10.298 HTMLs. A diretiva manda servir a versao pre-comprimida quando ela
+# existe; sem nenhuma, o nginx recomprimia CADA resposta a cada requisicao.
+#
+# Tres ganhos medidos: 9,0% menos bytes na rede (q11 da 6.972 contra 7.665 do q5
+# dinamico numa pagina de 25.319); CPU por requisicao vai a zero; e -- o que mais
+# importa para bot -- o ETag VOLTA A SER FORTE. Com brotli dinamico o nginx serve
+# `ETag: W/"..."`, validador FRACO, porque o filtro de compressao alterou o corpo
+# depois de o ETag ter sido calculado. Servindo o .br de disco, o ETag e do
+# arquivo servido: medido em 5 de 5 rotas, ETag sem W/ e If-None-Match devolvendo
+# 304.
+#
+# IDEMPOTENTE: so recomprime o que ficou mais novo que o proprio .br, entao o
+# custo em deploy sem mudanca de conteudo e proximo de zero. Lote completo
+# (10.370 arquivos) leva 3m20s com 4 jobs.
+step "2.5/7 pre-comprimindo o acervo (brotli estatico)"
+if [ -x tools/generate-brotli-static ]; then
+	tools/generate-brotli-static --jobs 4 2>&1 | tail -3 | sed 's/^/  /' ||
+		echo "  ATENCAO: pre-compressao falhou; o nginx cai na compressao dinamica (mais lenta, ETag fraco)"
+else
+	echo "  tools/generate-brotli-static ausente — pulado"
+fi
+
+# --- 2.6. indice de percursos por fundamento legal -----------------------------
+#
+# POR QUE AQUI, e a janela e estreita: o indice deriva de content/pages.json, que
+# o passo 1 acabou de reescrever, e e lido UMA vez no BOOT do servidor. Entao ele
+# tem de nascer DEPOIS da republicacao e ANTES de o servico voltar a atender.
+# Gerado antes do passo 1, descreveria o acervo velho; gerado depois do passo 5,
+# so entraria no ar no proximo restart.
+#
+# O QUE ELE ALIMENTA: a secao "Percursos por fundamento legal" da gemea .md, do
+# MCP, do A2A e do /api/v1/lote -- os dispositivos legais que cada pagina invoca
+# e as outras paginas do acervo que se apoiam nos mesmos. Medido em 2026-08-29:
+# 4.990 paginas, 25.639 links, 76,7% deles atravessando area de pratica, contra
+# os 11,4% de saidas cross-area da malha base. E o canal onde a densidade cabe:
+# o bloco do HTML esta no teto editorial e paga o orcamento de 50 KB do contrato
+# de indexacao, e a gemea nao paga nenhum dos dois.
+#
+# POR QUE ELE NAO ABORTA O DEPLOY: a degradacao e honesta e ja e defendida em
+# duas camadas. Artefato ausente => nenhuma pagina ganha a secao e o canal fica
+# como era. Artefato VELHO => httpserver.filtraPercursosServiveis descarta todo
+# destino que este processo nao serve, entao o pior caso e "percursos
+# desatualizados", nunca link morto. Derrubar uma publicacao inteira por causa
+# de uma secao aditiva seria trocar um problema pequeno por um grande.
+#
+# CUSTO: ~16s com a maquina ociosa, ~29s sob carga, sobre 10.126 paginas
+# (legalcocitation.TestEnsaioSobreOAcervoReal). Linear no acervo.
+step "2.6/7 regenerando o indice de percursos por fundamento legal"
+if percursos_saida=$(./tools/go-modern run ./cmd/generate-legal-cocitation 2>&1); then
+	printf '%s\n' "$percursos_saida" | tail -3 | sed 's/^/  /'
+else
+	printf '%s\n' "$percursos_saida" | tail -5 | sed 's/^/  /'
+	echo "  AVISO: indice de percursos nao regenerado; a gemea .md serve o indice anterior"
+	echo "  (o filtro anti-404 do servidor descarta destino nao-servivel, entao nao ha link morto)"
+fi
+
+# --- 2.7. espelho de temas da rede social --------------------------------------
+#
+# POR QUE AQUI: toda pagina publicada sai com a ancora do seu tema
+# (`/redesocial/tema/{area}/{slug}/`, cobrada por check-ancora-redesocial), e o
+# link e derivado da ROTA. O tema so passa a existir quando este comando espelha
+# o published_manifest no banco social. Publicar sem semear anuncia ao crawler
+# uma URL que devolve 404 -- e o proprio portal manda o bot para o vazio.
+#
+# MEDIDO EM 2026-09-10, e foi o que trouxe este passo para ca: o banco tinha
+# 10.141 temas para 11.039 paginas publicadas. As 898 paginas sem tema geraram
+# 1.161 requisicoes 404 de bots valiosos em 10 dias (GPTBot 817, PerplexityBot
+# 339, em 817 caminhos distintos de /redesocial/tema/jurisprudencia/), lidas em
+# data/ops/access/nginx-2026-09-*.jsonl. Nao era rota privada nem scanner.
+#
+# O COMANDO NAO REMOVE NADA: `PlanejaEspelho` so tem Inserir e Atualizar, e tema
+# orfao (pagina supersedida) e RELATADO, nunca apagado -- ele guarda respostas e
+# follows. Ordem do dono de 2026-09-10: se tem URL, tem conteudo; nunca excluir.
+#
+# POR QUE ANTES DO PASSO 3: o cmd/social le a tabela ao vivo (medido: URL nova
+# responde 200 sem restart), entao o tema fica de pe antes de a borda ser
+# aquecida no passo 6 -- se fosse depois, a borda cachearia o 404 por ate 1 h.
+#
+# NAO ABORTA O DEPLOY, e a degradacao e honesta: sem semeadura as paginas novas
+# ficam com a ancora apontando para 404 ate a proxima passada, que e exatamente
+# o estado anterior a este passo. Derrubar uma publicacao inteira por isso
+# trocaria um problema pequeno por um grande. O gate abaixo deixa o numero no
+# log para quem le o deploy.
+step "2.7/7 espelhando os temas da rede social"
+if temas_saida=$(./tools/go-modern run ./cmd/generate-social-temas --aplicar 2>&1); then
+	printf '%s\n' "$temas_saida" | tail -3 | sed 's/^/  /'
+else
+	printf '%s\n' "$temas_saida" | tail -5 | sed 's/^/  /'
+	echo "  AVISO: espelho de temas NAO atualizado; paginas novas anunciam tema que devolve 404"
+	echo "  (rode ./tools/go-modern run ./cmd/generate-social-temas --aplicar e confira com"
+	echo "   ./tools/check-social-temas-espelhados)"
+fi
+if ! espelho_saida=$(./tools/check-social-temas-espelhados 2>&1); then
+	printf '%s\n' "$espelho_saida" | tail -6 | sed 's/^/  /'
+fi
+
+step "3/7 parando o servico (e o socket)"
+# O SOCKET PARA JUNTO, e a ordem nao e estilo. Desde 2026-09-01 o 127.0.0.1:8089
+# pertence a wikijuridica-server.socket (ops/systemd/): e o systemd quem o
+# mantem em LISTEN, e o servico so herda o descritor. E isso que fecha a janela
+# de 502 dos restarts (1.435 respostas em 26-28/08, 12 s de ECONNREFUSED por
+# restart) — mas tem um preco exatamente AQUI: `systemctl stop $SERVICE`
+# sozinho deixa o socket aceitando, e a PRIMEIRA conexao que chegar durante os
+# passos 3-5 reativa o servico com o binario que estiver em bin/ naquele
+# instante — o VELHO, antes do cp abaixo. Ai o cp falha com "Text file busy",
+# que e o defeito que este passo existe para evitar. Parar o socket derruba os
+# dois (Requires= na unit do servico) e fecha a porta ate o passo 5; a janela
+# do deploy fica como sempre foi, a dos restarts some.
+sudo -n systemctl stop "$SERVICE.socket" "$SERVICE" 2>/dev/null || {
+	echo "  sem sudo nao-interativo. Rode voce mesmo, nesta ordem:"
+	echo "     sudo systemctl stop $SERVICE.socket $SERVICE"
+	echo "     rm -rf $CACHE_DIR && mkdir -p $CACHE_DIR"
+	echo "     mv bin/wikijuridica-server.next bin/wikijuridica-server"
+	echo "     sudo systemctl start $SERVICE.socket $SERVICE"
+	exit 1
+}
+
+# --- 4. cache ----------------------------------------------------------------
+step "4/7 limpando os caches (Go e nginx)"
+CACHE_ANTES=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo 0)
+rm -rf "$CACHE_DIR" && mkdir -p "$CACHE_DIR"
+echo "  descartados: ${CACHE_ANTES:-0} de respostas geradas antes desta versao"
+# CACHE DE ORIGEM DO NGINX (2026-09-02): var/nginx/cache guarda a ultima resposta
+# boa de cada rota dinamica (proxy_cache wj_dyn em @markdown/@fallback) para
+# servir STALE quando o Go cai. Depois de republicar, o objeto guardado e a
+# versao ANTERIOR do texto — precisa sair junto com o cache do Go, senao a
+# gemea Markdown serviria texto velho ate o TTL. Os workers do nginx rodam
+# como o usuario da unit; a limpeza e por conteudo, o diretorio fica.
+NGINX_CACHE_DIR="${WIKI_NGINX_CACHE_DIR:-var/nginx/cache}" # relativo: o script ja fez cd para a raiz
+# So quando o TEXTO pode ter mudado (republicacao). Num deploy --sem-republicar
+# o objeto guardado continua correto, e e exatamente ele que serve STALE aos
+# bots durante a troca do binario (passos 3-5): apagar aqui devolveria o 503
+# que o cache existe para evitar.
+if [ "$REPUBLICAR" = "1" ] && [ -d "$NGINX_CACHE_DIR" ]; then
+	NGINX_CACHE_ANTES=$(find "$NGINX_CACHE_DIR" -type f 2>/dev/null | wc -l)
+	find "$NGINX_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || sudo -n find "$NGINX_CACHE_DIR" -mindepth 1 -delete 2>/dev/null || true
+	echo "  cache de origem do nginx: ${NGINX_CACHE_ANTES:-0} objeto(s) descartado(s)"
+fi
+
+# O SEGUNDO cache, descoberto em 2026-08-06 e tao invisivel quanto o primeiro.
+#
+# O nginx.conf global deste host declara `open_file_cache max=900000
+# inactive=900s` (linha 1944, herdado do hardening do projeto vizinho). O cache
+# e renovado a cada acesso: pagina com trafego continuo mantem indefinidamente o
+# descritor e o tamanho ANTIGOS. Medido logo apos uma republicacao: arquivo em
+# disco com 19.855 bytes, nginx entregando 19.639 — o HTML da versao anterior,
+# nas paginas mais acessadas, que sao as que mais importam.
+#
+# CORRIGIDO EM 2026-08-13. O paragrafo acima justificava um `systemctl restart
+# nginx` a cada deploy com a frase "o restart do nginx e instantaneo". MEDIDO:
+# nao e. `systemctl show nginx` -> ExecStop=start-stop-daemon --retry QUIT/5 e
+# TimeoutStopUSec=5s; o journal de 12/08 registra OITO restarts, cada um com 8 a
+# 9 SEGUNDOS entre "Stopping" e "Started", dois deles terminando em "Stopping
+# timed out. Terminating." + "Failed with result 'timeout'". Durante a janela o
+# cloudflared devolve 502 sem retry por requisicao:
+#
+#   17:43:27 ERR failed to serve incoming request ... dial tcp 127.0.0.1:8088:
+#            connect: connection refused
+#
+# E a premissa tambem caiu: `open_file_cache_valid 5s` (wikijuridica.conf:334) ja
+# limita a janela de HTML velho a ~5 s, contra os 900 s do default herdado do
+# host. Nao ha frescor a "garantir" que justifique derrubar o ingress.
+#
+# TRES SAIDAS, decididas pelo fingerprint POR COMPONENTE calculado adiante:
+#
+#   ingress mudou     -> `nginx -t` + RELOAD, com a aplicacao PROVADA (ver abaixo).
+#   ingress intacto   -> NAO TOCAR. Deploy de conteudo e arquivo em disco; o
+#                        nginx le por requisicao e revalida em 5 s.
+#   (binario Go)      -> tratado nos passos 3 e 5; nada a ver com o nginx.
+#
+# E POR QUE ISTO E O PRIMEIRO ITEM DA ORDEM DE EXECUCAO: `systemctl restart`
+# INICIA uma unit `disabled` (disable != mask). Enquanto esta linha existir,
+# desativar o nginx do host faz o proximo deploy RESSUSCITA-LO — ou colidir na
+# porta com a instancia dedicada — e o smoke passaria mentindo nos dois casos.
+if [ "$INGRESS_MUDOU" -eq 1 ] && { command -v nginx >/dev/null 2>&1 || [ -d /etc/nginx ]; }; then
+	# GATE, e nao aviso. Ate 2026-08-12 este bloco tratava falha como AVISO e
+	# seguia — o modo de falha mais traicoeiro que um deploy pode ter: os
+	# workers ANTIGOS continuam atendendo com a config velha, entao o smoke do
+	# passo 7/7 passa (o site esta no ar!) e o deploy anuncia NO AR uma mudanca
+	# que nunca entrou.
+	#
+	# `nginx -t` vem ANTES porque config invalida derruba o ingress (o vhost e
+	# symlink para dentro deste repo, entao salvar o arquivo ja muda o que o
+	# nginx le). Abortar o deploy e sempre melhor que recarregar com sintaxe
+	# quebrada.
+	# SEM sudo, de proposito (2026-09-02): o `-t` como root cria/re-atribui os
+	# diretorios de temp e cache do prefixo ao usuario da diretiva `user` — foi
+	# assim que var/nginx/cache voltou a nobody e o canal de maquina respondeu
+	# 500 por 12 min. A unit roda como rafael e o ExecStartPre dela ja faz o
+	# `-t` sem privilegio: e o mesmo teste, com o mesmo usuario.
+	/usr/sbin/nginx -c "$NGINX_CONF" -p "$NGINX_PREFIX" -t >/dev/null 2>&1 ||
+		fail "'nginx -t' reprovou $NGINX_CONF. NADA foi recarregado. Rode: /usr/sbin/nginx -c $NGINX_CONF -p $NGINX_PREFIX -t"
+
+	# RELOAD PROVADO, nao presumido. `nginx -s reload` manda SIGHUP e sai 0
+	# ANTES de o master aceitar a config: uma config que passa no `-t` isolado e
+	# e recusada em runtime (mudar o tamanho de um limit_req_zone, por exemplo)
+	# deixaria os workers antigos servindo, com exit code verde. A prova e a
+	# ausencia de [emerg]/[alert] no error log DEPOIS do sinal.
+	# O ERROR LOG DO NOSSO INGRESSO, nao o do vizinho. O standalone declara
+	# `error_log /var/log/nginx/wikijuridica/error.log` (linha 31), e a prova de
+	# que o reload foi ACEITO e a ausencia de [emerg]/[alert] ali. Vigiar
+	# /var/log/nginx/error.log -- o do sistema -- deixaria a prova sempre verde,
+	# porque nada nosso escreve nele.
+	ERRO_LOG="${WIKI_NGINX_ERROR_LOG:-/var/log/nginx/wikijuridica/error.log}"
+	MARCA_ANTES=$([ -r "$ERRO_LOG" ] && wc -c <"$ERRO_LOG" 2>/dev/null || echo 0)
+	sudo -n systemctl reload "$NGINX_UNIT" 2>/dev/null ||
+		fail "nginx nao recarregou (unit $NGINX_UNIT). Os workers antigos seguem com a config VELHA e o smoke passaria mentindo. Ver: journalctl -u $NGINX_UNIT -n 30"
+	if [ -r "$ERRO_LOG" ]; then
+		NOVOS_ERROS=$(sudo -n tail -c +$((MARCA_ANTES + 1)) "$ERRO_LOG" 2>/dev/null | grep -cE '\[(emerg|alert)\]' || true)
+		[ "${NOVOS_ERROS:-0}" -gt 0 ] &&
+			fail "reload aceito pelo systemd mas RECUSADO pelo nginx ($NOVOS_ERROS erro(s) [emerg]/[alert] em $ERRO_LOG). Os workers antigos seguem com a config VELHA."
+	fi
+	echo "  ingress mudou: nginx validado (nginx -t) e RECARREGADO sem downtime (unit $NGINX_UNIT)"
+else
+	echo "  ingress intacto: nginx NAO foi tocado (arquivo estatico e lido por requisicao)"
+fi
+
+if [ "$REBUILD" = "1" ] && [ -f bin/wikijuridica-server.next ]; then
+	# A TROCA E POR `mv`, NAO POR `cp` — e a diferenca derrubou um deploy.
+	#
+	# ★ MEDIDO EM 2026-09-16
+	#
+	# `cp` abre o DESTINO para escrita e escreve no lugar. Sobre um binario que
+	# algum processo esta EXECUTANDO, o kernel devolve ETXTBSY: "Area de texto
+	# ocupada". Foi o que aconteceu: o passo 3/7 para o servico, o passo 4/7
+	# limpa 41 MB de cache e 22.691 objetos do nginx — e nessa janela a unit,
+	# que e ATIVADA POR SOCKET, volta sozinha na primeira requisicao. No passo
+	# 5/7 o binario ja estava em execucao de novo e o `cp` falhou, abortando o
+	# deploy DEPOIS de republicar o acervo.
+	#
+	# `mv` dentro do mesmo sistema de arquivos e `rename(2)`: troca a entrada de
+	# diretorio e nao toca no inode antigo. O processo que ja esta rodando segue
+	# com o inode velho ate ser reiniciado — que e exatamente o que o passo
+	# seguinte faz — e a troca nunca da ETXTBSY.
+	#
+	# A prova de que isto e assimetria e nao escolha: a troca do binario da rede
+	# social, 17 linhas abaixo, sempre usou `mv`. Duas linhas, o mesmo ato, dois
+	# comportamentos sob carga.
+	#
+	# O backup continua por `cp`, e esta certo: ali o binario velho e a ORIGEM
+	# da copia, nao o destino.
+	cp bin/wikijuridica-server bin/wikijuridica-server.anterior 2>/dev/null
+	mv bin/wikijuridica-server.next bin/wikijuridica-server || fail "troca do binario"
+	echo "  binario trocado (anterior preservado em bin/wikijuridica-server.anterior)"
+fi
+
+# TROCA E RESTART DA REDE SOCIAL.
+#
+# A ORDEM E binario -> socket -> servico, e ela nao se inverte: socket
+# `Type=notify` reativado com binario que ignora LISTEN_FDS faz bind proprio,
+# toma EADDRINUSE e entra em laco de 5 s com a porta em LISTEN -- 504 para
+# quem estiver na pagina. Aqui o socket ja esta ativo, entao a ordem se cumpre
+# trocando o arquivo ANTES do restart.
+#
+# `mv` e nao `cp`: sobrescrever binario em execucao devolve ETXTBSY ("Text file
+# busy"), que ja abortou um deploy em 06/08. O rename troca o inode e o
+# processo vivo segue com o antigo ate o restart.
+if [ "$REBUILD" = "1" ] && [ -f bin/wikijuridica-social.next ]; then
+	cp bin/wikijuridica-social bin/wikijuridica-social.anterior 2>/dev/null
+	mv bin/wikijuridica-social.next bin/wikijuridica-social || fail "troca do binario da rede social"
+	sudo -n systemctl restart "$SERVICE_SOCIAL.service" ||
+		fail "restart da rede social (rode: sudo systemctl restart $SERVICE_SOCIAL.service)"
+	# PROVA, e nao espera: /readyz do social confere as dependencias dele.
+	timeout 30 bash -c "until curl -s -o /dev/null --max-time 2 \
+        -A 'wikijuridica-superficie-probe/1.0' -H 'X-Warming-Request: true' \
+        $LOCAL_ADDR_SOCIAL/readyz; do sleep 0.5; done" ||
+		fail "a rede social nao respondeu em 30s: journalctl -u $SERVICE_SOCIAL -n 40"
+	echo "  rede social trocada e reiniciada (anterior em bin/wikijuridica-social.anterior)"
+fi
+
+# --- 5. subir ----------------------------------------------------------------
+step "5/7 subindo o socket e o servico"
+# Socket primeiro (Requires= ja o subiria; explicito e legivel). Com Type=notify
+# o `start` so retorna depois do READY=1 que o binario manda APOS o listen
+# (cmd/server/main.go, notificaPronto) — ate 600 s (TimeoutStartSec) —, entao o
+# laco de curl abaixo passou a ser PROVA, nao espera: ele confirma que o que
+# atende e HTTP, nao so um READY.
+sudo -n systemctl start "$SERVICE.socket" "$SERVICE" || fail "start do socket/servico"
+timeout 30 bash -c "until curl -s -o /dev/null --max-time 2 $LOCAL_ADDR/; do sleep 0.5; done" ||
+	fail "o servidor nao respondeu em 30s. Provavel reprovacao do publishedmanifest.Validate no boot: journalctl -u $SERVICE -n 40"
+
+# AQUECIMENTO DO CACHE DE ORIGEM (2026-09-03). O passo 4 apagou var/nginx/cache
+# quando houve republicacao, e a zona `wj_dyn` so protege o canal de maquina
+# contra queda do Go se tiver objeto guardado. Aqui ele volta a ficar cheio, com
+# trafego de loopback marcado como aquecimento — antes de a borda ser purgada
+# (passo 6), para que o reaquecimento de borda ja encontre a origem quente.
+# Falha aqui NAO derruba o deploy: o portal esta no ar e o cache se enche sozinho
+# sob demanda; o aviso fica no log e o timer proprio tenta de novo em ate 3 h.
+step "5b/7 aquecendo o cache de origem (gemeas e descritores)"
+if com_batida_no_lock tools/warm-origin-cache --rps 80 --concorrencia 8 2>&1 | sed 's/^/  /'; then
+	:
+else
+	echo "  AVISO: aquecimento do cache de origem nao concluiu (exit $?); o timer wikijuridica-origin-warm tenta de novo"
+fi
+# --- 6. cache de borda -------------------------------------------------------
+step "6/7 descartando o cache de borda (Cloudflare)"
+# PURGA SELETIVA, a partir do MESMO diff que data as paginas.
+#
+# Ate 2026-08-07 este passo mandava purge_everything a cada publicacao: para
+# corrigir 20 paginas, jogava fora o cache das outras 9.602 que nao mudaram, e
+# o acervo inteiro voltava frio para o crawler. tools/generate-page-content-
+# revision compara o hash do CONTEUDO de cada rota com o registro anterior e
+# imprime so o que mudou; purge-edge-cache lote de 100 em 100 e cai para purga
+# total sozinho acima do teto, quando enumerar sai mais caro. Lista vazia
+# significa que nenhuma pagina mudou — nao ha o que purgar, e purgar assim
+# mesmo seria so desperdicio.
+#
+# O NUMERO ERA 30 E ESTAVA ERRADO, com "limite duro da API" escrito ao lado.
+# A doc da Cloudflare (developers.cloudflare.com/cache/how-to/purge-cache/,
+# secao "Availability and limits", lida em 2026-08-19) da "Max operations per
+# request" = 100 para single-file purge em TODOS os planos menos Enterprise,
+# que tem 500. Purgar de 30 em 30 nao quebrava nada — so gastava 4 requisicoes
+# onde 2 bastavam, e o comentario transformava um chute em fato citavel, que e
+# a parte cara: o proximo a ler acreditaria no numero em vez de conferir.
+# purge-edge-cache foi corrigido para 100 no mesmo dia.
+PURGE_ALVOS="$(mktemp)"
+# Lista SEPARADA para a purga: paginas alteradas MAIS os artefatos de
+# descoberta. O PURGE_ALVOS continua sendo so as paginas porque o IndexNow, mais
+# abaixo, le esse mesmo arquivo — e submeter /robots.txt ou /sitemap.xml ao
+# protocolo gastaria cota anunciando o que nao e conteudo.
+PURGE_TODOS="$(mktemp)"
+trap 'rm -f "$DEPLOY_LOCK" "$PURGE_ALVOS" "$PURGE_TODOS" "${AQUECER_LISTA:-}"' EXIT INT TERM
+if tools/generate-page-content-revision --purge-targets >"$PURGE_ALVOS" 2>/dev/null; then
+	ALVOS_N="$(wc -l <"$PURGE_ALVOS" | tr -d ' ')"
+else
+	ALVOS_N=""
+fi
+
+# MUDANCA DE CAMADA TAMBEM EXIGE PURGA — e ela nao aparece no diff de conteudo.
+#
+# A purga seletiva acima e decidida pelo hash do CONTEUDO de cada rota. Isso
+# cobre "a pagina mudou" e nao cobre "a RESPOSTA mudou": corrigir um redirect,
+# um header, uma politica de cache ou o proprio render altera o que o visitante
+# recebe sem alterar uma linha de conteudo, entao ALVOS_N sai zero e nada e
+# purgado.
+#
+# Medido em 2026-08-12, depois de corrigir a barra final: a origem ja devolvia
+# 301 em /familia e /previdenciario e a borda continuava servindo 200 HIT do
+# corpo antigo. Ate 08-12 isso durava no maximo 12h; com o Edge TTL agora em 7
+# DIAS, uma correcao de rota podia ficar invisivel por uma semana.
+#
+# O detector e o hash das duas fontes que decidem a resposta sem passar pelo
+# conteudo: o binario que sera instalado e o vhost do nginx. O estado fica em
+# data/ops/, e a PRIMEIRA execucao (sem estado anterior) purga tudo de
+# proposito — nao ha como saber o que mudou desde um passado que nao foi
+# registrado, e supor que nada mudou seria a suposicao errada.
+# --- purga por camada: o que um binario novo muda, e so isso -----------------
+#
+# ATE 2026-09-09 "binario mudou (ingress intacto)" purgava TUDO: tres purgas
+# totais num dia, cada uma jogando fora 1.644 s de reaquecimento de 12.331
+# URLs, para uma mudanca que nao toca o HTML estatico de public/. Binario novo
+# do servidor muda o que o GO SERVE: descritores, lote, texto integral, gemeas
+# (inclusive /index.md e /{area}/index.md, s-maxage de 7 dias) — o conjunto
+# que tools/warm-origin-cache --listar-rotas imprime e que deploy-binario-go ja
+# purga em producao ("purgar tudo jogaria fora o cache das ~10 mil paginas HTML
+# que este deploy nao mudou"). Binario novo do social muda o HTML de
+# /redesocial/ e dos temas (s-maxage=3600), que tambem nao existem em public/.
+#
+# "Tudo" fica para o que muda a RESPOSTA de toda rota sem mudar conteudo:
+# config do ingress, camada sem registro anterior e revisao indisponivel.
+# Excecao conhecida, para ninguem redescobrir: o HTML sob demanda do @fallback
+# (rota conhecida sem arquivo em public/) so existe em buraco de release e nao
+# entra na lista. /painel/ e 404 pelo tunel e nunca esta na borda.
+#
+# modo_de_purga_da_camada ALVOS_N INGRESS_MUDOU CAMADA_ANTERIOR
+#   imprime "tudo:<motivo>" ou "lista".
+modo_de_purga_da_camada() {
+	local alvos_n="$1" ingress_mudou="$2" camada_anterior="$3"
+	if [ -z "$alvos_n" ]; then
+		echo "tudo:registro de revisao indisponivel"
+	elif [ -z "$camada_anterior" ]; then
+		echo "tudo:camada de servico sem registro anterior"
+	elif [ "$ingress_mudou" -eq 1 ]; then
+		echo "tudo:config do ingress mudou — a RESPOSTA muda sem o conteudo mudar"
+	else
+		echo "lista"
+	fi
+}
+
+# As duas fontes da lista dinamica, uma por binario. Funcoes de uma linha para
+# o teste substituir por dubles sem tocar na rede.
+rotas_dinamicas_do_servidor() { tools/warm-origin-cache --listar-rotas; }
+# INVALIDAR A ORIGEM ANTES DE PURGAR A BORDA — a ordem e o produto (2026-09-16).
+#
+# Ate hoje esta transacao purgava a borda e NUNCA tocava no cache de origem do
+# nginx (zona wj_dyn: gemea, /api/v1/*, descritores, s-maxage de SETE DIAS). O
+# passo 5 AQUECE a origem, e aquecer e um GET que recebe HIT do objeto anterior:
+# nada se renova. O efeito e pior que nao purgar -- a borda purgada vai a origem
+# no primeiro MISS e volta com o corpo de ANTES da publicacao, agora com sete
+# dias de vida pela frente.
+#
+# MEDIDO EM 2026-09-16, nas 129 rotas carimbadas nas 24 h: 125 gemeas velhas na
+# borda contra 0 no HTML, todas com `age` ~12,2 ks -- a idade da propria
+# publicacao. O controle, numa rota nomeada: purgar so a borda de
+# /noticias/index.md devolveu MISS em 1,11 s com o corpo ANTIGO; invalidar a
+# origem primeiro e purgar devolveu MISS em 1,03 s com o corpo do Go.
+#
+# A lista INTEIRA vai para a ferramenta: rota sem objeto na zona e no-op, e
+# /api/v1/citar/<rota>, /llms.txt e as gemeas estao todos la. A varredura da
+# zona e UMA por chamada (1,35 s para 24.933 objetos, medido em modo seco),
+# nao uma por rota.
+#
+# ALCANCE, PARA QUEM FOR MEXER: no ramo em que o BINARIO mudou, PURGE_TODOS
+# carrega as ~11.268 rotas dinamicas, e a invalidacao tira ~22.409 objetos de
+# uma zona de ~25.000 (medido em seco, 2026-09-16). Ate o reaquecimento
+# dirigido terminar (12 r/s), o `use_stale` do canal de maquina fica sem
+# lastro -- a MESMA janela que `deploy-binario-go` ja abre por desenho entre
+# os passos 6 e 8. E uma troca deliberada: a alternativa medida e a borda
+# servir o corpo de antes da publicacao por ate sete dias.
+invalida_origem_da_lista() { # $1 = arquivo com uma rota por linha
+	tools/purge-origin-cache --de-arquivo "$1"
+}
+# Chamada com relatorio indentado e sem engolir o exit real (o `cmd | sed` do
+# passo 5 le o exit do sed, nao o do comando).
+invalida_origem_relatando() { # $1 = arquivo com uma rota por linha
+	local saida codigo
+	saida="$(invalida_origem_da_lista "$1" 2>&1)"
+	codigo=$?
+	printf '%s\n' "$saida" | sed 's/^/  /'
+	if [ "$codigo" -ne 0 ]; then
+		echo "  AVISO: invalidacao do cache de ORIGEM saiu $codigo -- objeto que resistiu na zona"
+		echo "         ou varredura que nao fechou. A purga da borda segue, mas o primeiro MISS"
+		echo "         pode trazer o corpo anterior de volta: rode"
+		echo "         tools/purge-origin-cache --de-arquivo <lista> e confira restantes=0."
+	fi
+	return 0
+}
+# O sitemap do social e um INDICE (sitemapindex -> /redesocial/sitemap/superficie.xml,
+# 37 rotas de superficie em 2026-09-09) e os 10.141 temas NAO estao nele: vem do
+# banco. Ler so o indice devolveria 2 linhas e passaria na guarda -- sub-purga
+# em silencio, apanhada na revisao do 829805e9.
+baixa_sitemap_social() { # $1 = caminho absoluto do XML
+	curl -sf -A 'wikijuridica-superficie-probe/1.0' -H 'X-Warming-Request: true' \
+		"http://127.0.0.1:${SOCIAL_PORT:-8091}$1"
+}
+locs_do_xml() { grep -o '<loc>[^<]*' | sed 's|<loc>https\{0,1\}://[^/]*||'; }
+rotas_de_superficie_do_social() {
+	local loc
+	for loc in $(baixa_sitemap_social /redesocial/sitemap.xml | locs_do_xml); do
+		case "$loc" in
+		*.xml) baixa_sitemap_social "$loc" | locs_do_xml ;;
+		*) echo "$loc" ;;
+		esac
+	done
+}
+temas_do_social() {
+	sqlite3 -readonly var/social/social.db "select '/redesocial/tema' || caminho from temas order by caminho;" 2>/dev/null
+}
+rotas_dinamicas_do_social() {
+	local superficie temas
+	superficie="$(rotas_de_superficie_do_social)"
+	temas="$(temas_do_social)"
+	# Guarda por TAMANHO, nao por "nao vazio": superficie tem dezenas, temas tem milhares.
+	[ "$(printf '%s\n' "$superficie" | grep -c .)" -ge 10 ] || return 1
+	[ "$(printf '%s\n' "$temas" | grep -c .)" -ge 100 ] || return 1
+	printf '%s\n' "/redesocial/" "$superficie" "$temas" | grep . | sort -u
+}
+
+# lista_dinamica_da_camada BIN_MUDOU SOCIAL_MUDOU
+#   imprime as rotas que o(s) binario(s) novo(s) mudam na borda; vazio quando
+#   nenhum binario mudou. Falha (exit 1) se um lister nao devolver nada: purgar
+#   sem a lista deixaria rota dinamica velha por ate 7 dias.
+lista_dinamica_da_camada() {
+	local bin_mudou="$1" social_mudou="$2" lista
+	if [ "$bin_mudou" -eq 1 ]; then
+		lista="$(rotas_dinamicas_do_servidor)"
+		[ -n "$lista" ] || return 1
+		printf '%s\n' "$lista"
+	fi
+	if [ "$social_mudou" -eq 1 ]; then
+		lista="$(rotas_dinamicas_do_social)" || return 1
+		[ "$(printf '%s\n' "$lista" | grep -c .)" -ge 100 ] || return 1
+		printf '%s\n' "$lista"
+	fi
+	return 0
+}
+# --- fim da purga por camada ---
+
+# O TERCEIRO cache da cadeia. Republicar deixa o disco certo, mas o visitante
+# continua recebendo a versao anterior enquanto a borda guardar a resposta
+# antiga: em 2026-08-06 a home consertada so apareceu depois que o titular
+# purgou a mao. Passo manual esquecido e deploy pela metade.
+MODO_DE_PURGA="$(modo_de_purga_da_camada "$ALVOS_N" "$INGRESS_MUDOU" "$CAMADA_ANTERIOR")"
+if [ "${MODO_DE_PURGA%%:*}" = "tudo" ]; then
+	echo "  purgando tudo: ${MODO_DE_PURGA#*:}${ALVOS_N:+ (nao so as $ALVOS_N que mudaram de conteudo)}"
+	if tools/purge-edge-cache; then
+		# REAQUECER AQUI, e nao esperar o timer. A purga total deixa as 9.835
+		# URLs frias de uma vez, e o timer do aquecedor roda de doze em doze
+		# horas desde 2026-09-09 (04:20 e 16:20 UTC; antes, de quatro em quatro,
+		# e cinco das seis passadas achavam menos de 50 frios em ~10.300 HEADs).
+		# O pior caso medido era 4 h de espera
+		# mais 20,5 min de varredura: quatro horas e meia com o acervo INTEIRO
+		# exposto a 530 se o tunel oscilar, porque URL fora do cache nao tem de
+		# onde ser servida quando a origem nao responde.
+		#
+		# A 25 r/s (padrao novo, metade do teto de 50/s da zona) a varredura leva
+		# ~6,6 min, e comeca agora em vez de daqui a ate quatro horas.
+		#
+		# Falha aqui NAO derruba o deploy: a publicacao ja esta correta no disco
+		# e na borda; cache frio e degradacao de resiliencia, nao corrupcao. O
+		# timer reaquece na proxima janela de qualquer forma.
+		# --rps EXPLICITO, e nao o default da ferramenta.
+		#
+		# Esta chamada nao passava ritmo nenhum e herdava o default de 25 r/s,
+		# QUATRO VEZES o ritmo do timer (ops/systemd/wikijuridica-edge-warm.service
+		# usa `--rps 6 --concorrencia 4`). Duas consequencias medidas em 08-12:
+		# 16 varreduras num dia, 98.884 requisicoes, e o acervo inteiro entrando
+		# e saindo do cache EM BLOCO — a amostra de borda daquele dia mostrava
+		# `Age` identico em todas as paginas conferidas.
+		#
+		# Cache que expira em bloco produz tempestade de MISS na origem quando o
+		# TTL vence, exatamente o oposto do que o aquecimento existe para evitar.
+		# 12 r/s e o meio-termo declarado: metade do default antigo, o dobro do
+		# timer, varredura completa em ~14 min.
+		# ORCAMENTO DERIVADO DO TRABALHO, nao constante magica. O teto de 900s
+		# foi escolhido quando o ritmo era outro; com os 12 r/s declarados acima e
+		# o acervo de hoje ele passou a encostar: medido em 13/08, a varredura
+		# levou 829s de 900 -- 92% do orcamento, 71 segundos de folga. Uma
+		# oscilacao de latencia mata o aquecimento no meio, e o deploy so emite um
+		# aviso; o acervo fica frio e ninguem fica sabendo.
+		#
+		# A conta e a mesma que este script ja faz para o ingest: URLs / ritmo,
+		# com margem explicita. 1,6x cobre a subida do pacer, o HEAD do --so-frios
+		# e a variacao de latencia da travessia; o piso de 300s protege o acervo
+		# pequeno e o teto de 3600s impede que um erro de conta trave o deploy
+		# para sempre.
+		AQUECER_URLS="$(grep -ho '<loc>' public/sitemaps/*.xml 2>/dev/null | wc -l | tr -d ' ')"
+		[ "${AQUECER_URLS:-0}" -gt 0 ] 2>/dev/null || AQUECER_URLS=10000
+		AQUECER_ORCAMENTO=$((AQUECER_URLS * 16 / 10 / 12))
+		[ "$AQUECER_ORCAMENTO" -lt 300 ] && AQUECER_ORCAMENTO=300
+		[ "$AQUECER_ORCAMENTO" -gt 3600 ] && AQUECER_ORCAMENTO=3600
+		echo "  reaquecendo a borda a 12 r/s ($AQUECER_URLS URLs, orcamento ${AQUECER_ORCAMENTO}s)"
+		if com_batida_no_lock timeout "$AQUECER_ORCAMENTO" tools/warm-edge-cache --rps 12 --concorrencia 4; then
+			:
+		else
+			echo "  AVISO: reaquecimento nao concluiu; o acervo fica frio ate o proximo timer."
+		fi
+	else
+		echo "  AVISO: cache de borda NAO foi purgado — o dominio publico pode servir a versao anterior."
+		echo "         a purga usa CLOUDFLARE_ZONE_TOKEN (Bearer de zona); confira-o em .env.local,"
+		echo "         com CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN (Global API Key) como fallback."
+	fi
+elif [ "$ALVOS_N" = "0" ] && [ "$BIN_MUDOU" -eq 0 ] && [ "$SOCIAL_MUDOU" -eq 0 ]; then
+	# A mensagem NAO afirma mais que "o cache das N rotas foi preservado".
+	#
+	# Medido em 2026-08-07: a zona nao tem regra de cache (o phase
+	# http_request_cache_settings nao tem entrypoint) e todo HTML volta com
+	# cf-cache-status: DYNAMIC. Nao ha cache de HTML na borda para preservar, e
+	# dizer que ha e afirmar sucesso sobre algo que nao aconteceu — a mesma
+	# classe de defeito que o registro de purga com scope "tudo" e success true
+	# ja produzia. A purga segue existindo e sendo correta para o que a borda de
+	# fato guarda (estatico), so nao promete o que nao entrega.
+	#
+	# MAS "nenhuma pagina mudou" NAO QUER DIZER "nada mudou". Ate 2026-08-13
+	# este ramo saia sem purgar coisa nenhuma, e por isso um deploy que altera
+	# SOMENTE robots.txt ou o sitemap deixava a borda servindo a copia anterior
+	# ate o TTL de sete dias virar. Foi assim que o robots.txt com Content-Signal
+	# sobreviveu dias a propria correcao, com o Bing acusando erro de sintaxe o
+	# tempo todo. Os artefatos de descoberta tem impressao propria agora, e
+	# quando ela muda eles sao purgados mesmo sem uma unica pagina ter mudado.
+	if [ "$ARTEFATOS_MUDOU" -eq 1 ]; then
+		ARTEFATOS_DESCOBERTA="$(tools/warm-edge-cache --listar-artefatos 2>/dev/null)"
+		[ -n "$ARTEFATOS_DESCOBERTA" ] ||
+			fail "nao consegui ler a lista de artefatos de descoberta (tools/warm-edge-cache --listar-artefatos). Purgar sem ela deixaria artefato velho quente na borda."
+		: >"$PURGE_TODOS"
+		for artefato in $ARTEFATOS_DESCOBERTA; do
+			echo "$artefato" >>"$PURGE_TODOS"
+		done
+		for shard in public/sitemaps/*.xml; do
+			[ -e "$shard" ] && echo "/sitemaps/$(basename "$shard")" >>"$PURGE_TODOS"
+		done
+		tools/check-sitemap-shard-grace --listar-removidos >>"$PURGE_TODOS" 2>/dev/null || true
+		ARTEFATOS_N="$(wc -l <"$PURGE_TODOS" | tr -d ' ')"
+		echo "  nenhuma pagina mudou, mas os artefatos de descoberta mudaram — purgando $ARTEFATOS_N"
+		invalida_origem_relatando "$PURGE_TODOS"
+		tools/purge-edge-cache --de-arquivo "$PURGE_TODOS" || {
+			echo "  AVISO: cache de borda NAO foi purgado — robots.txt/sitemap podem ficar ate 7 dias defasados na borda."
+			echo "         a purga usa CLOUDFLARE_ZONE_TOKEN (Bearer de zona); confira-o em .env.local,"
+			echo "         com CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN (Global API Key) como fallback."
+		}
+	else
+		echo "  nenhuma pagina mudou de conteudo — nada a purgar"
+	fi
+else
+	# OS ARTEFATOS DE DESCOBERTA VAO JUNTO DAS PAGINAS.
+	#
+	# Ate 2026-08-12 a purga seletiva mandava so as ROTAS que mudaram de
+	# conteudo, e nenhum dos artefatos entrava. Medido no dominio vivo neste
+	# dia: /feed.xml, /sitemap.xml, /robots.txt e /llms.txt responderam os
+	# quatro cf-cache-status: HIT com age de 11.942s (~3h19) — a borda guardava
+	# a versao anterior de todos eles.
+	#
+	# O PREJUIZO NAO E COSMETICO: o hub WebSub busca /feed.xml quando e avisado.
+	# Com o feed velho na borda, o hub le a versao sem os itens novos, e a
+	# publicacao so chega aos assinantes quando o TTL virar — horas depois, em
+	# vez de minutos. O sitemap tem o mesmo defeito para o crawler: anunciar
+	# lastmod novo e servir XML velho ensina o buscador a nao confiar no aviso.
+	#
+	# Eles mudam a CADA publicacao que altera pagina (o feed lista os itens, o
+	# sitemap e os shards as datas, o llms.txt o acervo), entao pertencem a
+	# toda purga que ja tem pagina alterada. A lista espelha ARTEFATOS de
+	# tools/warm-edge-cache, que ja os aquecia — aquecer e nao purgar era
+	# justamente o que mantinha a copia velha quente.
+	cat "$PURGE_ALVOS" >"$PURGE_TODOS"
+	# FONTE UNICA, nao copia. Ate 2026-08-12 esta era uma lista literal, e o
+	# comentario acima ja afirmava espelhar o aquecedor — mas nao espelhava:
+	# /.well-known/security.txt estava so la. E ele e justamente o UNICO
+	# artefato que muda em TODA publicacao (o Expires e recomputado por
+	# transacao), entao a borda mantinha quente, indefinidamente, a copia velha
+	# de quem mais muda. Duas listas paralelas divergem; agora ha uma so.
+	ARTEFATOS_DESCOBERTA="$(tools/warm-edge-cache --listar-artefatos 2>/dev/null)"
+	[ -n "$ARTEFATOS_DESCOBERTA" ] ||
+		fail "nao consegui ler a lista de artefatos de descoberta (tools/warm-edge-cache --listar-artefatos). Purgar sem ela deixaria artefato velho quente na borda."
+	# SEM FILTRO DE DISCO, e a remocao dele conserta um defeito que a lista nova
+	# criou: `[ -e "public$artefato" ]` so deixava passar artefato que existe como
+	# ARQUIVO. As seis rotas da superficie de agente (/openapi.json,
+	# /.well-known/api-catalog, o indice de habilidades, os dois SKILL.md e a
+	# prova de posse do dominio) sao servidas pelo BINARIO -- nao existem em
+	# public/ por desenho, porque arquivo homonimo sombrearia a rota. Elas
+	# entravam no aquecimento e sumiam da purga, que e exatamente o par que
+	# mantem copia velha quente na borda.
+	#
+	# Purgar URL que nao existe e inofensivo: a Cloudflare aceita e ignora. O
+	# risco assimetrico esta do outro lado.
+	for artefato in $ARTEFATOS_DESCOBERTA; do
+		echo "$artefato" >>"$PURGE_TODOS"
+	done
+	# AS GEMEAS EM MARKDOWN DE CADA PAGINA QUE MUDOU.
+	#
+	# /rota/ e /rota/index.md sao DUAS entradas na borda, com chaves distintas
+	# por construcao -- e so a primeira estava sendo purgada. O efeito medido em
+	# cima do que este projeto mais persegue: corrigida uma citacao legal, o HTML
+	# sai certo e o Markdown continua servindo o texto ERRADO por ate sete dias,
+	# justamente no canal de quem cita. O plano 2.1-ii mandava purgar as duas e a
+	# implementacao ficou pela metade.
+	#
+	# So paginas de acervo tem gemea (duas secoes, ou uma das institucionais);
+	# hub e paginacao nao tem, e pedir a purga delas seria pedir o que nao existe.
+	while IFS= read -r rota; do
+		case "$rota" in
+		*/pagina/*) continue ;;
+		/fontes/* | /contato/*) continue ;;
+		esac
+		# Conta as barras: duas secoes terminam com tres ("/a/b/").
+		case "$rota" in
+		/*/*/)
+			echo "${rota}index.md" >>"$PURGE_TODOS"
+			# E OS DOIS ITENS DA API POR CAMINHO (2026-09-09). Desde a Cache
+			# Rule 3 (versao 18 da zona) a borda respeita o s-maxage=3600 de
+			# /api/v1/pages/<rota> e /api/v1/citar/<rota>; o segundo carrega o
+			# html_sha256 da pagina, que o agente usa para conferir integridade.
+			# Sem esta purga, hash VELHO por ate uma hora depois de cada
+			# republicacao, no canal de quem cita. Hub, paginacao, /fontes/ e
+			# institucionais nao tem item na API (404 medido): nao entram.
+			echo "/api/v1/pages${rota}" >>"$PURGE_TODOS"
+			echo "/api/v1/citar${rota}" >>"$PURGE_TODOS"
+			;;
+		/privacidade/ | /sobre/ | /metodologia/ | /aviso-legal/ | /termos/ | /fontes/)
+			echo "${rota}index.md" >>"$PURGE_TODOS"
+			;;
+		esac
+	done <"$PURGE_ALVOS"
+	# E A GEMEA DO HUB DE CADA AREA TOCADA (2026-09-16).
+	#
+	# O comentario acima diz que "hub e paginacao nao tem [gemea]" -- e o disco
+	# desmente a primeira metade: /noticias/index.md, /administrativo/index.md e
+	# os demais /{area}/index.md existem na zona wj_dyn e respondem 200, e e para
+	# eles que `tools/purge-origin-cache --gemeas-de-area` foi escrito. O hub
+	# lista o que a area tem, entao ele muda na publicacao que acrescenta pagina
+	# a area -- e so o HTML dele estava sendo alcancado. Medido em 2026-09-16,
+	# com o HTML dos cinco hubs conferidos frescos na borda:
+	#     /jurisprudencia/index.md   borda != Go, HIT age 12.730 s
+	# A area sai do PRIMEIRO segmento das rotas que mudaram (duas secoes, sem
+	# paginacao): purgar hub que esta publicacao nao tocou seria jogar fora
+	# aquecimento alheio.
+	awk -F/ 'NF==4 && $4=="" && $2!="" && $3!="" {print "/" $2 "/index.md"}' "$PURGE_ALVOS" |
+		sort -u >>"$PURGE_TODOS"
+	# --- fim da expansao por pagina ---
+	#
+	# O MARCADOR ACIMA E CONTRATO COM A BANCADA, nao enfeite.
+	# tools/test_deploy_publico_purga_api.sh extrai este bloco por `sed` e o
+	# executa com dubles. Ate 2026-09-16 ele o procurava por
+	# `/^    done < "$PURGE_ALVOS"$/` -- quatro espacos e um espaco depois do
+	# `<`. O shfmt converteu a indentacao em TAB e colou o `<"`, o casamento
+	# passou a devolver bloco VAZIO, e o teste reprovava com "bloco da expansao
+	# nao encontrado" sem que nada da purga tivesse mudado: guarda morta,
+	# vermelha por motivo errado. Marcador em comentario nao depende de
+	# formatacao.
+	# Os shards sao enumerados do disco, nao fixos: o numero deles acompanha o
+	# acervo, e um shard velho na borda entrega ao crawler uma lista de URLs
+	# desatualizada. Em 2026-08-11 um shard fora do ar devolveu 530.
+	for shard in public/sitemaps/*.xml; do
+		[ -e "$shard" ] && echo "/sitemaps/$(basename "$shard")" >>"$PURGE_TODOS"
+	done
+	# E OS QUE SAIRAM DO DISCO, que o glob acima nao alcanca por definicao.
+	#
+	# Um shard removido ao fim da carencia (internal/sitemapgrace) some do
+	# diretorio e, com ele, da purga — enquanto a borda segue com a copia 200
+	# QUENTE dele, que tools/warm-edge-cache manteve aquecida durante os oito
+	# dias. Resultado: a origem responde 410 e a borda entrega 200 de um shard
+	# que nao existe mais, por ate sete dias. O fingerprint agregado dos
+	# artefatos nao resolve: ele guarda um hash, nao a lista de nomes.
+	tools/check-sitemap-shard-grace --listar-removidos >>"$PURGE_TODOS" 2>/dev/null || true
+	DINAMICAS_N=0
+	if [ "$BIN_MUDOU" -eq 1 ] || [ "$SOCIAL_MUDOU" -eq 1 ]; then
+		DINAMICAS="$(mktemp)"
+		lista_dinamica_da_camada "$BIN_MUDOU" "$SOCIAL_MUDOU" >"$DINAMICAS" ||
+			fail "binario novo (server=$BIN_MUDOU social=$SOCIAL_MUDOU) e a lista dinamica veio vazia ou curta (tools/warm-origin-cache --listar-rotas / sitemap do social em $LOCAL_ADDR_SOCIAL/redesocial/sitemap.xml). Purgar sem ela deixaria rota dinamica velha na borda por ate 7 dias. SAIDA: corrija a fonte da lista e relance, ou rode a purga total a mao (tools/purge-edge-cache, depois tools/warm-edge-cache --rps 12) e retome do passo seguinte — NUNCA desligue esta guarda nem purgue a lista curta."
+		cat "$DINAMICAS" >>"$PURGE_TODOS"
+		sort -u -o "$PURGE_TODOS" "$PURGE_TODOS"
+		DINAMICAS_N="$(wc -l <"$DINAMICAS" | tr -d ' ')"
+		echo "  binario mudou (server=$BIN_MUDOU social=$SOCIAL_MUDOU): + $DINAMICAS_N rota(s) dinamica(s); o HTML estatico de public/ fica quente na borda"
+	fi
+	TODOS_N="$(wc -l <"$PURGE_TODOS" | tr -d ' ')"
+	echo "  $ALVOS_N pagina(s) mudaram de conteudo; purgando elas + $((TODOS_N - ALVOS_N)) artefato(s) de descoberta e rota(s) dinamica(s)"
+	# O TETO VAI EXPLICITO: acima de --teto-por-url (3000) purge-edge-cache
+	# degrada para purge_everything -- e a lista dinamica tem ~11 mil rotas.
+	PURGE_TETO="$TODOS_N"
+	[ "$PURGE_TETO" -lt 3000 ] && PURGE_TETO=3000
+	PURGE_TETO=$((PURGE_TETO + 1))
+	invalida_origem_relatando "$PURGE_TODOS"
+	tools/purge-edge-cache --de-arquivo "$PURGE_TODOS" --teto-por-url "$PURGE_TETO" || {
+		echo "  AVISO: cache de borda NAO foi purgado — o dominio publico pode servir a versao anterior."
+		echo "         a purga usa CLOUDFLARE_ZONE_TOKEN (Bearer de zona); confira-o em .env.local,"
+		echo "         com CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN (Global API Key) como fallback."
+	}
+	# REAQUECIMENTO DIRIGIDO (2026-09-09): exatamente o que acabou de ser purgado
+	# -- HTML, gemea e itens da API das paginas que mudaram, mais a lista
+	# dinamica quando o binario mudou -- em vez de esperar o timer. Foi isso que
+	# permitiu o timer cair de seis para duas varreduras por dia (a passada das
+	# 08:20 achava 750-970 frios: eram estas paginas). Falha nao derruba o
+	# deploy: cache frio e degradacao, nao corrupcao.
+	if [ "$TODOS_N" -gt 0 ]; then
+		# O ORCAMENTO SAI DA LISTA, NAO DE UMA CONSTANTE — a mesma formula da
+		# linha 1028, e por que ela precisou chegar aqui tambem.
+		#
+		# Ate 2026-09-10 este passo tinha `timeout 1800` fixo. No deploy #4 a
+		# purga foi de 22.414 URLs e, a 12 r/s, isso custa 1.868 s: o teto
+		# estourou por 68 segundos e o deploy imprimiu "reaquecimento dirigido
+		# nao concluiu; o timer completa na proxima janela" — com o timer so
+		# passando as 04:20 e 16:20 UTC, ou seja, a borda fria por horas logo
+		# depois de purgar o acervo inteiro.
+		#
+		# Nao era carga: e aritmetica, e vai estourar em TODO deploy que troque
+		# binario (a troca purga as ~22 mil rotas dinamicas), cada vez mais cedo
+		# conforme o acervo cresce. Teto fixo contra lista que cresce e a mesma
+		# familia do gate que compara por igualdade exata o tamanho de um
+		# diretorio vivo: mede a passagem do tempo, nao o que diz medir.
+		#
+		# 16/10 e a folga sobre o tempo teorico (N/12), a mesma que o aquecimento
+		# amplo usa; o piso de 300s cobre lista curta e o teto de 3600s existe
+		# para que uma lista absurda pare o passo em vez de segurar o lock.
+		# O QUE FOI RETIRADO NAO SE AQUECE, e o deploy mesmo o pos na lista.
+		#
+		# `check-sitemap-shard-grace --listar-removidos` entra em $PURGE_TODOS de
+		# proposito: shard retirado ao fim da carencia sai do disco e a borda
+		# seguiria servindo a copia 200 dele por ate sete dias. Purgar e certo.
+		# AQUECER e o oposto: a origem responde 410, e 410 nunca esquenta.
+		#
+		# Medido no #5 (2026-09-10): `aquecidas: 22392 em 1866s`, `status: {200:
+		# 22364, 410: 28}` — as 28 falhas eram exatamente os shards que este
+		# script tinha acabado de remover. Como `warm-edge-cache` sai com codigo
+		# de erro em QUALQUER falha, o deploy imprimiu "reaquecimento dirigido
+		# nao concluiu em 2985s" sobre uma passada que concluiu em 1.866 s.
+		# Diagnostico falso no fecho do deploy, produzido pelo proprio deploy.
+		AQUECER_LISTA="$(mktemp)"
+		REMOVIDOS="$(mktemp)"
+		tools/check-sitemap-shard-grace --listar-removidos >"$REMOVIDOS" 2>/dev/null || true
+		if [ -s "$REMOVIDOS" ]; then
+			grep -F -x -v -f "$REMOVIDOS" "$PURGE_TODOS" >"$AQUECER_LISTA" || true
+		else
+			cp "$PURGE_TODOS" "$AQUECER_LISTA"
+		fi
+		AQUECER_N="$(wc -l <"$AQUECER_LISTA" | tr -d ' ')"
+		REMOVIDOS_N="$(wc -l <"$REMOVIDOS" | tr -d ' ')"
+		rm -f "$REMOVIDOS"
+		DIRIGIDO_ORCAMENTO=$(orcamento_de_aquecimento "$AQUECER_N")
+		if [ "$DIRIGIDO_ORCAMENTO" -eq 0 ]; then
+			# NAO CABE NA JANELA, e dizer isso vale mais que tentar uma hora.
+			#
+			# Acima de ~27 mil URLs o aquecimento a 12 r/s passa do teto de uma
+			# hora. Rodar assim gastaria a hora inteira segurando o lock pesado e
+			# terminaria com a mesma borda parcialmente fria — pagando o custo e
+			# entregando o aviso do mesmo jeito. Delegar ao timer de proposito,
+			# com o numero na tela, e a decisao honesta.
+			echo "  reaquecimento dirigido DELEGADO ao timer: $AQUECER_N URLs a 12 r/s levariam $(segundos_de_aquecimento "$AQUECER_N")s com a folga de 1,6x para latencia e falha, acima do teto de 3600s da janela de deploy."
+			echo "  A borda esquenta em 04:20 e 16:20 UTC. Para antecipar: tools/warm-edge-cache --rps 12 --concorrencia 4"
+		else
+			if [ "$REMOVIDOS_N" -gt 0 ]; then
+				echo "  reaquecendo na borda o que foi purgado ($AQUECER_N URLs, 12 r/s, orcamento ${DIRIGIDO_ORCAMENTO}s; $REMOVIDOS_N shard(s) retirado(s) ficam de fora — a origem responde 410)"
+			else
+				echo "  reaquecendo na borda o que foi purgado ($AQUECER_N URLs, 12 r/s, orcamento ${DIRIGIDO_ORCAMENTO}s)"
+			fi
+			com_batida_no_lock timeout "$DIRIGIDO_ORCAMENTO" tools/warm-edge-cache --de-arquivo "$AQUECER_LISTA" --rps 12 --concorrencia 4
+			AQUECER_RC=$?
+			# O AVISO TEM DE DIZER QUAL DOS DOIS ACONTECEU.
+			#
+			# `timeout` devolve 124 quando mata o comando; qualquer outro codigo
+			# nao-zero veio do proprio aquecedor, que sai com erro em qualquer
+			# URL falha. Tratar os dois como "nao concluiu" foi o que fez o #5
+			# anunciar estouro de orcamento numa passada que terminou em 63% do
+			# tempo dele.
+			if [ "$AQUECER_RC" -eq 124 ]; then
+				echo "  AVISO: reaquecimento dirigido ESTOUROU o orcamento de ${DIRIGIDO_ORCAMENTO}s; o timer completa na proxima janela."
+			elif [ "$AQUECER_RC" -ne 0 ]; then
+				echo "  AVISO: reaquecimento dirigido CONCLUIU com falhas (exit $AQUECER_RC); veja status e amostra acima. O acervo esta no ar."
+			fi
+		fi
+	fi
+fi
+
+# INDEXNOW INCREMENTAL — avisa o buscador SO do que mudou, na mesma janela.
+#
+# A submissao completa das 9.835 URLs e util no comeco e cara de repetir: o
+# protocolo existe justamente para dizer "esta URL mudou AGORA", e mandar o
+# acervo inteiro a cada deploy desperdicia a cota e dilui o sinal.
+#
+# O gancho entra AQUI, e o lugar importa: depois da purga, que ja calculou o que
+# mudou, e ANTES de o registro de revisao avancar na linha abaixo — depois dele,
+# a memoria do que mudou nesta publicacao deixa de existir. Roda so no ramo em
+# que houve mudanca; deploy que nao mexeu em conteudo nao avisa nada.
+#
+# --purge-targets imprime CAMINHO (/familia/x/), nao URL absoluta, entao o
+# prefixo da base entra aqui.
+# SOB --ressemear O INDEXNOW FICA CALADO (2026-09-08). Desde que --purge-targets
+# deixou de cair no teto de churn, um deploy de markup lista milhares de rotas
+# (4.259 no do JSON-LD do LexML) e este ramo as mandaria todas ao IndexNow —
+# mas --ressemear existe para NAO avancar o lastmod, entao o sitemap diria
+# "nada mudou" enquanto o IndexNow diria "tudo mudou". Aviso e sitemap tem de
+# contar a mesma historia; bytes servidos que mudaram sem texto novo sao caso
+# da purga, nao do anuncio ao buscador.
+if [ -n "$ALVOS_N" ] && [ "$ALVOS_N" != "0" ] && [ "$RESSEMEAR" -eq 0 ]; then
+	BASE_URL="$(python3 -c "import json;print(json.load(open('content/site.json'))['base_url'].rstrip('/'))" 2>/dev/null || echo "")"
+	if [ -n "$BASE_URL" ]; then
+		INDEXNOW_ALVOS="$(mktemp)"
+		# A GEMEA MARKDOWN SAI DO PAYLOAD, E O NUMERO IMPRESSO E O DO PAYLOAD
+		# (2026-09-16). `--purge-targets` emite DUAS linhas por rota, `/x/` e
+		# `/x/index.md`, e esta certo: sao duas CHAVES DE CACHE na borda. Mas o
+		# indice de um buscador tem uma entrada por DOCUMENTO CANONICO, e a
+		# gemea declara o proprio veredito no cabecalho que a origem serve:
+		#
+		#   link: <https://wikijuridica.com.br/sumulas/stj-409/>; rel="canonical"
+		#
+		# Anuncia-la e pedir indexacao de um endereco que se autodeclara
+		# duplicata. Medido: 2.422 de 13.941 eventos por URL desde 2026-09-04
+		# (17,4%) em 1.968 URLs `.md` distintas, todas HTTP 200; nos lotes
+		# vindos de deploy desde 09-10, 127 de 254 = 50,0%, com as 127 maes no
+		# mesmo lote. `tools/generate-indexnow-direct-submit` ja particiona a
+		# lista por conta propria; este filtro e o cinto sobre o suspensorio, e
+		# existe tambem para que `$ALVOS_N` pare de mentir -- ele e a contagem
+		# do PURGE (o dobro), e o operador lia um numero que nunca foi enviado.
+		sed "s|^|$BASE_URL|" "$PURGE_ALVOS" | grep -v '/index\.md$' >"$INDEXNOW_ALVOS"
+		INDEXNOW_N="$(grep -c "" "$INDEXNOW_ALVOS" 2>/dev/null || echo 0)"
+		if tools/generate-indexnow-direct-submit --de-arquivo "$INDEXNOW_ALVOS" >/dev/null 2>&1; then
+			echo "  IndexNow avisado das $INDEXNOW_N pagina(s) que mudaram (de $ALVOS_N alvo(s) de purga)"
+		else
+			echo "  AVISO: IndexNow nao aceitou a submissao incremental; o sitemap segue como canal."
+		fi
+		rm -f "$INDEXNOW_ALVOS"
+	fi
+fi
+
+# O registro so avanca DEPOIS da purga: ele e a memoria de "o que ja foi ao ar
+# com esta versao". Atualizar antes apagaria justamente a lista do que precisa
+# sair do cache.
+# A SAIDA NAO E ENGOLIDA, e a diferenca e o operador saber o que fazer.
+#
+# Ate 2026-08-28 esta chamada era `> /dev/null 2>&1 || echo AVISO`. O gerador tem
+# uma guarda, `confere_formula`, que RECUSA rodar quando a formula do
+# served_sha256 mudou sem ressemeadura -- porque rodar assim carimbaria a data de
+# hoje em todas as rotas e reanunciaria o sitemap inteiro ao Googlebot. A recusa
+# vem com dez linhas explicando o remedio exato (`--ressemear`, e por que nao usar
+# `--desde-commit` na mesma passada).
+#
+# Tudo isso ia para /dev/null. O que sobrava era uma linha dizendo "AVISO:
+# registro nao pode ser atualizado", que nao diz nem o motivo nem a saida.
+#
+# Agora a saida e preservada e o veredito e classificado: RECUSADO e bloqueio
+# deliberado da guarda e para o deploy; qualquer outra falha continua sendo aviso,
+# porque pode ser transitoria e o acervo ja esta no ar. Abortar em toda falha
+# seria largo demais -- a guarda e um caso, nao a regra.
+revisao_args=()
+if [[ $RESSEMEAR -eq 1 ]]; then
+	revisao_args+=(--ressemear)
+	echo "  --ressemear: a linha de base sera regravada SEM carimbar data nova"
+fi
+revisao_saida=$(tools/generate-page-content-revision "${revisao_args[@]}" 2>&1)
+revisao_codigo=$?
+if [[ $revisao_codigo -ne 0 ]]; then
+	printf '%s\n' "$revisao_saida" | sed 's/^/  /'
+	if printf '%s' "$revisao_saida" | grep -q 'RECUSADO'; then
+		echo "  A guarda do gerador recusou deliberadamente. Deploy interrompido: siga o remedio acima." >&2
+		exit 1
+	fi
+	echo "  AVISO: registro de data por conteudo nao pode ser atualizado; a proxima purga sera mais larga."
+fi
+
+# --- 7. conferir -------------------------------------------------------------
+# ROBOTS CONFERIDO POR PARSER, e o episodio que obrigou: em 2026-08-12 uma
+# diretiva nao-padrao (`Content-Signal:`) foi acrescentada aos 28 grupos com o
+# risco declarado como "aproximadamente zero" -- porque a RFC 9309 manda o parser
+# IGNORAR linha desconhecida. O Bing Webmaster passou a acusar ERRO DE SINTAXE e a
+# URL foi para "Discovered but not crawled". Ignorar a linha e nao acusar erro por
+# causa dela sao coisas diferentes.
+#
+# Roda DEPOIS da publicacao e ANTES do smoke: e aqui que o robots ja esta no disco
+# com o conteudo que vai ao ar. Nao aborta o deploy -- o acervo publicado nao fica
+# refem de uma verificacao de robots --, mas grita alto, porque robots quebrado
+# custa rastreamento e ninguem percebe olhando o arquivo.
+if ! tools/check-robots-parser-real >/dev/null 2>&1; then
+	echo ""
+	echo "  AVISO: o robots.txt publicado REPROVOU na conferencia por parser."
+	tools/check-robots-parser-real 2>&1 | sed 's/^/    /'
+fi
+
+# COERENCIA DE public/sitemaps/, pelo mesmo motivo e no mesmo lugar.
+#
+# publishedmanifest recusa shard fora do indice e <loc> repetida, e essa recusa
+# roda no BOOT do servidor (httpserver.go:479-482): descoberta la, ela nao e
+# aviso, e portal fora do ar no proximo restart. Aqui o estado acabou de ser
+# escrito e da tempo de consertar antes de alguem reiniciar qualquer coisa.
+# Tambem pega carencia vencida que a limpeza da publicacao nao levou.
+if ! tools/check-sitemap-shard-grace >/dev/null 2>&1; then
+	echo ""
+	echo "  AVISO: public/sitemaps/ esta INCOERENTE — isso derruba o boot no proximo restart."
+	tools/check-sitemap-shard-grace 2>&1 | sed 's/^/    /'
+fi
+
+# E O ESTADO MEDIDO VIRA SERIE, aqui, que e o instante em que ele acabou de mudar.
+#
+# `data/ops/sitemap_shard_grace.jsonl` so tinha escritor para o shard que SAI da
+# carencia (registrarEventoDeCarencia, chamado de dentro do `remover()` do
+# publicador). O que ENTRA nao deixava rastro nenhum: em 2026-08-29 o ledger
+# afirmava "35 shards, 35 no indice, 0 em carencia" enquanto o disco tinha 62,
+# 34 e 28. Vinte e oito shards entraram em carencia sem uma linha sequer.
+#
+# O gerador e append-only e nao anexa quando o estado nao mudou, entao chama-lo a
+# cada deploy — sete por dia na media medida aqui — nao incha o ledger: registra
+# exatamente as transicoes. Falhar aqui NAO derruba o deploy: o artefato publico
+# ja esta correto neste ponto, e trocar uma publicacao boa por um erro de ledger
+# seria pior que o defeito, que e a mesma escolha que o publicador faz em Go.
+# A saida e CAPTURADA antes de ser indentada, e nao encanada direto no sed: com
+# `cmd | sed || aviso` quem responde pelo `||` e o sed, entao o `set -o pipefail`
+# la em cima (:34) e o unico motivo de a falha nao se perder. Guarda que depende
+# de uma opcao declarada 900 linhas antes e guarda por acidente.
+if ! SERIE_CARENCIA_SAIDA="$(tools/generate-sitemap-shard-grace-series 2>&1)"; then
+	echo "  AVISO: a serie de carencia de sitemap nao foi atualizada (o deploy segue)."
+fi
+printf '%s\n' "$SERIE_CARENCIA_SAIDA" | sed 's/^/  /'
+
+# O REGISTRY TEM DE COBRIR TODA COORTE DO PLANO VIVO, e este e o gate que impede
+# a unica forma de o registry derrubar o portal.
+#
+# O servidor e o build sao produtores SOMENTE-LEITURA do registry: coorte que ele
+# nao conhece vira ERRO, nao numero inventado -- e sem isso a disciplina "so o
+# publicador aloca" viveria apenas em comentario, que foi a critica adversarial
+# ao primeiro desenho. O preco e que um registry incompleto faria o servidor
+# recusar subir no proximo restart. Descobrir isso no boot e descobrir com o
+# portal fora do ar; descobrir aqui custa um segundo.
+#
+# Registry ausente devolve OK: sem ele o plano volta a ser o posicional de
+# sempre, que e a rota de recuo desta mudanca inteira.
+if ! ./tools/go-modern run ./cmd/seed-sitemap-registry --root . --verificar 2>&1 | sed 's/^/  /'; then
+	echo ""
+	echo "  AVISO: o registry de shard NAO cobre o plano vivo — o servidor recusaria subir." >&2
+	echo "  Remedio: ./tools/go-modern run ./cmd/seed-sitemap-registry --root . --escrever" >&2
+fi
+
+# OS TRES GATES DE CUSTO DE SITEMAP, que existiam e NAO RODAVAM EM LUGAR NENHUM.
+#
+# Levantado em 2026-08-28: `check-sitemap-shard-churn`, `check-sitemap-fidelity` e
+# `check-sitemap-discovery-cost` estao escritos no repo, tem criterio proprio e
+# nao apareciam em deploy, systemd nem cron. Gate que ninguem chama e documentacao
+# executavel, nao guarda -- e o que eles medem e exatamente o defeito que custa
+# rastreio: 36,5% do que o Googlebot faz neste site e sitemap, e uma onda que
+# revise 45 paginas de uma area troca os bytes de 32 dos 35 shards.
+#
+# NAO ABORTAM O DEPLOY, pela mesma razao do robots logo acima: o acervo publicado
+# nao fica refem de uma medicao de custo. Gritam alto, com a saida preservada --
+# engolir veredito em /dev/null foi o defeito de deploy-publico:741, corrigido
+# nesta mesma sessao, e nao se repete tres linhas abaixo.
+#
+# `--data-revisao` do churn nao e passado de proposito: sem ele o gate usa o
+# proprio estado publicado, que e o que acabou de ir ao ar.
+for gate_sitemap in check-sitemap-churn:check-sitemap-shard-churn \
+	check-sitemap-fidelidade:check-sitemap-fidelity \
+	check-sitemap-custo-de-descoberta:check-sitemap-discovery-cost \
+	check-sitemap-dispersao-de-lastmod:check-sitemap-lastmod-dispersion; do
+	rotulo="${gate_sitemap%%:*}"
+	ferramenta="${gate_sitemap##*:}"
+	[ -x "tools/$ferramenta" ] || continue
+	saida_gate=$(tools/"$ferramenta" 2>&1)
+	codigo_gate=$?
+	if [ $codigo_gate -ne 0 ]; then
+		echo ""
+		echo "  AVISO ($rotulo): o custo de sitemap para o crawler REPROVOU (exit $codigo_gate)."
+		printf '%s\n' "$saida_gate" | tail -20 | sed 's/^/    /'
+	fi
+done
+
+# A SEGUNDA passada do gate, agora com --gravar: a serie diaria so registra o
+# que de fato foi publicado, e o baseline da queda relativa nasce do estado
+# final, nunca do intermediario.
+if [ -x tools/check-jsonld-cobertura ]; then
+	step "7/7 dado estruturado publicado (serie)"
+	tools/check-jsonld-cobertura --gravar || fail "o JSON-LD publicado regrediu depois da troca de binario"
+fi
+
+step "7/7 conferindo no ar"
+ROTAS=$(
+	python3 - <<'PY'
+import json, random
+random.seed()
+try:
+    pages = [p for p in json.load(open("content/pages.json", encoding="utf-8"))
+             if p.get("unique_intent_id")]
+    amostra = random.sample(pages, min(6, len(pages)))
+    print("\n".join(p["path"] for p in amostra))
+except Exception:
+    pass
+PY
+)
+# O smoke bate na BORDA e na ORIGEM, e o motivo e um buraco medido em 2026-08-12:
+# batendo so em $PUBLIC_HOST, uma resposta em HIT passa o smoke ainda que a
+# origem esteja quebrada — o Edge TTL e de 7 dias. No deploy daquele dia isso nao
+# enganou por acidente feliz: a purga total antecedeu o smoke e o reaquecimento
+# registrou 9.902 MISS de 9.909, entao a origem serviu quase tudo. Um deploy com
+# purga parcial, ou nenhuma, nao teria essa sorte, e o "NO AR" seria uma
+# afirmacao sobre o cache, nao sobre o servidor.
+#
+# A origem se consulta pelo nginx em 127.0.0.1:8088 com o Host do dominio: e ele
+# que serve o acervo de disco (o binario Go em :8089 atende so as rotas
+# dinamicas, entao bater nele daria 404 na maioria das paginas e seria um falso
+# vermelho). As duas pernas precisam responder 200: a borda prova o que o
+# visitante recebe, a origem prova o que o servidor tem.
+ORIGIN_ADDR=http://127.0.0.1:${ORIGIN_PORT}
+FALHAS=0
+
+# A REDE SOCIAL ENTRA NA CONFERENCIA, pelo gate proprio dela.
+#
+# Ele sonda a PORTA -- as treze rotas, a folha de estilo com o hash extraido do
+# HTML servido, o 404 honesto e a CSP nomeando a folha exata. Nao ha caminho
+# fixo de CSS aqui: o nome carrega o hash do conteudo e mudaria a cada commit
+# de design, e o gate passaria a medir uma folha morta.
+#
+# Reprovar aqui CONTA como falha do deploy: o acervo e a rede social saem do
+# mesmo `git push` e do mesmo binario compilado no passo 2 -- anunciar "NO AR"
+# com /redesocial/ quebrado seria a afirmacao silenciosamente falsa que o
+# passo 7 existe para impedir.
+if [ -x tools/check-social-http-smoke ]; then
+	if tools/check-social-http-smoke >/dev/null 2>&1; then
+		printf '  \033[32mok\033[0m  rede social (13 rotas, folha e CSP)\n'
+	else
+		printf '  \033[31mFALHOU\033[0m  rede social — rode: tools/check-social-http-smoke\n'
+		FALHAS=$((FALHAS + 1))
+	fi
+fi
+for rota in / /sitemap.xml /robots.txt $ROTAS; do
+	code_origem=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+		-H "Host: wikijuridica.com.br" "$ORIGIN_ADDR$rota")
+	if [ "$code_origem" != "200" ]; then
+		printf '  \033[31m%s\033[0m  %s  (ORIGEM — a borda pode estar mascarando com HIT)\n' \
+			"$code_origem" "$rota"
+		FALHAS=$((FALHAS + 1))
+	fi
+	code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$PUBLIC_HOST$rota")
+	if [ "$code" = "200" ]; then
+		printf '  \033[32m%s\033[0m  %s\n' "$code" "$rota"
+	else
+		printf '  \033[31m%s\033[0m  %s\n' "$code" "$rota"
+		FALHAS=$((FALHAS + 1))
+	fi
+done
+
+if [ "$FALHAS" -gt 0 ]; then
+	echo
+	echo "$FALHAS rota(s) fora do ar. Rollback mais recente:"
+	ls -1dt data/ops/publish-rollback-* 2>/dev/null | head -1
+	exit 1
+fi
+
+# Registra a impressao digital da camada SO no fim, e so quando o smoke passou.
+# Gravar antes marcaria como "ja publicado" um binario que talvez nao tenha
+# subido — e o proximo deploy, achando que nada mudou, deixaria a borda servindo
+# a resposta antiga sem purgar. Erra-se para o lado de purgar demais, que custa
+# um reaquecimento; nunca para o lado de purgar de menos, que custa dias de
+# conteudo errado no ar.
+CAMADA_INPUTS_JSON="$(
+	{
+		printf '"bin/wikijuridica-server.next", "bin/wikijuridica-social.next"'
+		for _conf in $NGINX_CONF_FONTES; do printf ', "%s"' "$_conf"; done
+	}
+)"
+printf '{\n  "schema_version": "deploy_layer_fingerprint_v4",\n  "layer_sha256": "%s",\n  "bin_sha256": "%s",\n  "social_sha256": "%s",\n  "ingress_sha256": "%s",\n  "artefatos_sha256": "%s",\n  "nginx_unit": "%s",\n  "origin_port": "%s",\n  "recorded_at": "%s",\n  "inputs": [%s]\n}\n' \
+	"$CAMADA_ATUAL" "$BIN_ATUAL" "$SOCIAL_ATUAL" "$INGRESS_ATUAL" "$ARTEFATOS_ATUAL" "$NGINX_UNIT" "$ORIGIN_PORT" \
+	"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CAMADA_INPUTS_JSON" >"$CAMADA_ESTADO"
+
+echo
+printf '\033[32mNO AR\033[0m — %s paginas, cache limpo, %s\n' \
+	"$(python3 -c "import json;print(len(json.load(open('content/pages.json',encoding='utf-8'))))" 2>/dev/null)" \
+	"$PUBLIC_HOST"

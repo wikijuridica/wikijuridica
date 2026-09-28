@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""check-social-bots — o bot valioso chega à rede social, e a métrica não mente?
+
+READ-ONLY. Não escreve arquivo nenhum, não toca em ops/nginx, content/, data/ nem
+em serviço. Toda afirmação numérica sai de medição própria, reproduzível, sobre
+config versionada e log de origem bruto.
+
+TRÊS ASSERÇÕES, e a terceira é a que engana.
+
+★ (a) SOBRE A CONFIG — e o arquivo auditado é o VIVO
+
+O arquivo carregado em produção é `ops/nginx/standalone/nginx.conf`.
+`ops/nginx/wikijuridica.conf` abre com o banner NAO-CARREGADO-EM-PRODUCAO, e
+auditá-lo daria verde sobre configuração que ninguém carrega — por isso este
+gate confere o banner nas primeiras linhas do arquivo que vai auditar e recusa
+medir se ele estiver lá.
+
+Duas propriedades:
+
+  1. ZERO `limit_req` dentro de `location ^~ /redesocial/`. A herança de
+     `limit_req` no nginx é tudo-ou-nada: UMA declaração local substituiria as
+     cinco do `server{}`, inclusive as que isentam o bot valioso. A ausência é
+     a regra.
+  2. O mapa `$wj_bot_allow` é EXATAMENTE o tier ilimitado declarado em
+     `content/crawl_policy.json` — nos dois sentidos. Agente ilimitado sem token
+     no mapa é bot valioso rebaixado em silêncio; token no mapa que casa com
+     agente de OUTRA classe é isenção dada a quem a política não isenta.
+     A lista esperada é DERIVADA da política, nunca digitada aqui: gate com
+     lista própria vira a segunda fonte da verdade que este projeto passa o
+     tempo todo evitando.
+
+E uma divergência que é ACHADO DO GATE, não conserto dele: os comentários do
+bloco social nomeiam bots como se estivessem no mapa. Medido em 2026-09-05, o
+comentário fala em "pista livre ao Googlebot, ao GPTBot e ao ClaudeBot", e
+GPTBot e ClaudeBot NÃO estão no mapa — a política os põe em tier finito de
+treinamento, o que está certo. Errado está o comentário. Comentário que mente
+sobre o código é defeito a reportar (R1 do contrato do dado real), e quem o
+corrige é quem é dono do arquivo.
+
+★ (b) SONDA COM UA PRÓPRIO
+
+`wikijuridica-superficie-probe/1.0` + `X-Warming-Request: true`, contra
+127.0.0.1, pelo processo (8091) e pela borda (8088). JAMAIS se forja
+User-Agent de bot real: seria fraude, é proibido no contrato e um hook barra.
+Prova 200, HTML textual completo, sem `<script`, dentro do teto lido de
+`internal/htmlcontract.HTMLBudgetBytes`.
+
+★ (c) COMPORTAMENTO REAL, DO LOG DE ORIGEM — E A ARMADILHA QUE DECIDE A
+    HONESTIDADE DESTE GATE
+
+O método de comparação antes/depois exige 14 dias antes e 14 depois, com N>=100
+em cada janela. A rede social nasceu em 2026-09-05 (commit 27c394ca, o ingress
+na 8091). Qualquer veredito de CRESCIMENTO agora só pode sair INCONCLUSIVO,
+escrito com essa palavra e com os dias que faltam. Forçar um "passou" antes
+disso é o verde-por-construção que já custou 15 dias de rastreio caindo com o
+gate mudo.
+
+O que é honesto aos poucos dias, e é o que este gate decide:
+
+  - `requests_authentic > 0` para a superfície social;
+  - nenhuma requisição FORJADA contra a superfície social. Forjada =
+    `bot_allow=1` com IP fora de todas as faixas oficiais do operador que
+    autentica aquele agente (`data/ops/bot_ip_ranges/*.json`). Chave vazia por
+    User-Agent é chave vazia para quem digitar o User-Agent — o mapa isenta pela
+    STRING. Sobre o acervo a mesma medição sai como ACHADO numerado, sem
+    veredito: a isenção por User-Agent é decisão de arquitetura vigente, e um
+    gate vermelho todo dia por isso vira ruído que ninguém lê;
+  - `verification_method` conferido POR AGENTE contra o disco. Há faixa oficial
+    de IP para Google, Bing, DuckDuckGo, Perplexity, Anthropic e OpenAI; só rDNS
+    para Yandex; e NENHUM método para SemrushBot. Declarar "faixa oficial" para
+    um agente sem faixa no disco seria a métrica mentindo a nosso favor, e é
+    exatamente o que esta asserção proíbe;
+  - um tripwire: rastreio do acervo caindo mais de 20% DEPOIS do nascimento da
+    superfície. Ele compara só dias COMPLETOS (24 horas distintas no log), e
+    fica INCONCLUSIVO enquanto não houver um dia completo pós-nascimento —
+    atribuir à rede social uma queda anterior a ela seria falsa atribuição.
+
+NÃO SE USA AQUI, e é decisão: `crawl_coverage_daily`, `edge_bot_agents_daily` e
+`edge_bot_status_daily` vêm do GraphQL da Cloudflare com `sampled_dataset: true`
+— são amostrados — e o de agentes é append-only COM restatements: somar linha
+crua dá número inventado (já produziu "105 milhões" onde o real eram 4.297). O
+leitor canônico da borda é `serie_saneada`, em `tools/edgetelemetry.py:270`, e
+ele responde pergunta de VOLUME. Pergunta de AUTENTICIDADE se responde na
+origem: log bruto de `data/ops/access/nginx-*.jsonl` (que tem `remote_addr`) e o
+ledger `data/ops/origin_bot_traffic_daily.jsonl` para o método declarado.
+
+TRÊS DESFECHOS: 0 medido e correto · 1 medido e ERRADO · 2 não deu para medir.
+"""
+import datetime
+import glob
+import http.client
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+NOME = "check-social-bots"
+
+NGINX_VIVO = "ops/nginx/standalone/nginx.conf"
+LOCATION_DE_LEITURA = "/redesocial/"
+
+# O nascimento da superfície é uma DATA COM FONTE, não a primeira linha de log.
+# `data/ops/access/nginx-*.jsonl` rotaciona: ancorar na primeira linha faria a
+# janela do método andar para a frente sozinha conforme os arquivos velhos saem.
+NASCIMENTO_DA_SUPERFICIE = "2026-09-05"
+FONTE_DO_NASCIMENTO = "commit 27c394ca, 2026-09-05T00:11:11-03:00 (o ingress no ar, serviço na 8091)"
+
+# O método de comparação antes/depois, escrito aqui para poder ser cobrado.
+DIAS_POR_JANELA = 14
+N_MINIMO_POR_JANELA = 100
+
+# Queda do rastreio do acervo que dispara o tripwire.
+QUEDA_MAXIMA = 0.20
+
+# Janela de leitura do método de verificação declarado. Um dia só ficaria refém
+# do agente que ainda não passou hoje; sete dias cobrem o ciclo dos bots raros.
+DIAS_DE_METODO = 7
+
+ESPACO_SITEMAP = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+
+# Palavra com cara de token de User-Agent de bot. Serve para achar, nos
+# COMENTÁRIOS, promessa que o mapa não cumpre.
+RE_TOKEN_DE_BOT = re.compile(r"(?i)\b([a-z][a-z0-9_-]*(?:bot|-user|-searchbot|externalhit|externalfetcher))\b")
+
+RE_ENTRADA_DO_MAPA = re.compile(r"^~\*(\S+)\s+1\s*;")
+
+
+def carrega_base():
+    """Carrega tools/social_borda_probe.py por caminho explícito.
+
+    O idioma usual (`sys.path.insert` + import) obrigaria a suprimir o
+    diagnóstico do lint sobre import fora de ordem, e mascarar diagnóstico é
+    proibido neste repositório.
+    """
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_borda_probe.py")
+    spec = importlib.util.spec_from_file_location("social_borda_probe", caminho)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"não consegui carregar {caminho}")
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+base = carrega_base()
+
+
+def requisita_corpo(porta, caminho, timeout=10):
+    """Devolve (status, cabecalhos, corpo, erro). O módulo compartilhado descarta
+    o corpo, e este gate precisa medir o HTML servido."""
+    cabecalhos = dict(base.CABECALHOS_BASE)
+    cabecalhos["Host"] = base.HOST_PUBLICO
+    conexao = None
+    try:
+        conexao = http.client.HTTPConnection("127.0.0.1", porta, timeout=timeout)
+        conexao.request("GET", caminho, headers=cabecalhos)
+        resposta = conexao.getresponse()
+        corpo = resposta.read()
+        return resposta.status, dict(resposta.getheaders()), corpo, None
+    except (OSError, http.client.HTTPException) as erro:
+        return None, {}, b"", f"{type(erro).__name__}: {erro}"
+    finally:
+        if conexao is not None:
+            conexao.close()
+
+
+# ─── (a) configuração ────────────────────────────────────────────────────────
+
+
+def banner_de_nao_carregado(texto, linhas=5):
+    """Diz se o arquivo se declara fora de produção nas primeiras linhas.
+
+    A conferência é pelo CABEÇALHO, e não por busca no arquivo inteiro: o
+    nginx vivo cita o banner do outro arquivo em prosa, na linha 232, e uma
+    busca ingênua se recusaria a auditar justamente a config carregada.
+    """
+    cabeca = "\n".join(texto.splitlines()[:linhas])
+    return "NAO-CARREGADO-EM-PRODUCAO" in cabeca or "NÃO-CARREGADO-EM-PRODUÇÃO" in cabeca
+
+
+def linhas_do_bloco(texto, caminho):
+    """Devolve (preambulo, corpo) da location, ou (None, None).
+
+    O preâmbulo são os comentários contíguos ACIMA da diretiva — é lá que mora a
+    promessa sobre quais bots ficam isentos, e ela não está dentro das chaves.
+    """
+    padrao = re.compile(r"^\s*location\s+(?:=|~\*?|\^~)?\s*" + re.escape(caminho) + r"\s*\{")
+    linhas = texto.splitlines()
+    for i, linha in enumerate(linhas):
+        if not padrao.match(linha):
+            continue
+        j = i - 1
+        preambulo = []
+        while j >= 0 and linhas[j].lstrip().startswith("#"):
+            preambulo.append(linhas[j])
+            j -= 1
+        preambulo.reverse()
+        profundidade = linha.count("{") - linha.count("}")
+        corpo = []
+        k = i + 1
+        while k < len(linhas) and profundidade > 0:
+            profundidade += linhas[k].count("{") - linhas[k].count("}")
+            if profundidade > 0:
+                corpo.append(linhas[k])
+            k += 1
+        return "\n".join(preambulo), "\n".join(corpo)
+    return None, None
+
+
+def sem_comentario(texto):
+    """Remove comentário de fim de linha. Diretiva comentada não é diretiva."""
+    return re.sub(r"(?m)#[^\n]*$", "", texto)
+
+
+def conta_limit_req(corpo):
+    """Quantas `limit_req` VALEM no bloco. Comentário não conta como diretiva."""
+    return len(re.findall(r"\blimit_req\s+zone=", sem_comentario(corpo)))
+
+
+def tokens_do_mapa(texto):
+    """Extrai os tokens que o mapa $wj_bot_allow marca com 1."""
+    achado = re.search(r"map\s+\$http_user_agent\s+\$wj_bot_allow\s*\{(.*?)\n\}", texto, re.S)
+    if not achado:
+        return None, None
+    corpo = achado.group(1)
+    tokens = []
+    tem_default_zero = False
+    for linha in corpo.splitlines():
+        limpa = linha.split("#")[0].strip()
+        if re.match(r"^default\s+0\s*;", limpa):
+            tem_default_zero = True
+        entrada = RE_ENTRADA_DO_MAPA.match(limpa)
+        if entrada:
+            tokens.append(entrada.group(1))
+    return tokens, tem_default_zero
+
+
+def agentes_da_politica(raiz):
+    """Devolve (ilimitados, demais) a partir de content/crawl_policy.json.
+
+    O tier ilimitado é resolvido pelo NOME do tier declarado no registro, e não
+    pela classe: é o campo que a política usa para decidir o limite, e é ele que
+    o mapa do nginx materializa.
+    """
+    caminho = os.path.join(raiz, "content", "crawl_policy.json")
+    with open(caminho, encoding="utf-8") as f:
+        politica = json.load(f)
+    tiers_ilimitados = {
+        str(t.get("name")) for t in politica.get("rate_tiers", []) if t.get("unlimited") is True
+    }
+    ilimitados, demais = [], []
+    for registro in politica.get("bot_registry", []):
+        agente = str(registro.get("user_agent", "")).strip()
+        if not agente:
+            continue
+        if str(registro.get("rate_tier")) in tiers_ilimitados:
+            ilimitados.append(agente)
+        else:
+            demais.append(agente)
+    return ilimitados, demais
+
+
+def user_agent_sintetico(nome):
+    """Monta a string de User-Agent na forma em que o bot se apresenta.
+
+    Comparar o token do mapa com o NOME do registro daria falso alarme: o token
+    `~*applebot/` existe justamente para casar `Applebot/0.1` e NÃO casar
+    `Applebot-Extended`, que é treinamento e fica em tier finito. Sem a barra da
+    versão a distinção some.
+    """
+    return f"Mozilla/5.0 (compatible; {nome}/1.0; +http://exemplo.invalido/bot)"
+
+
+def casa(token, nome):
+    """Reproduz o que o `~*` do nginx faz: busca de regex, sem diferenciar caixa."""
+    try:
+        return re.search(token, user_agent_sintetico(nome), re.I) is not None
+    except re.error:
+        return False
+
+
+def confere_mapa(tokens, ilimitados, demais):
+    """Compara mapa e política nos dois sentidos. Devolve a lista de falhas."""
+    falhas = []
+    for nome in sorted(ilimitados):
+        if not any(casa(t, nome) for t in tokens):
+            falhas.append(
+                f"{nome} está no tier ilimitado de content/crawl_policy.json e NENHUM token do mapa "
+                "$wj_bot_allow casa com ele: bot valioso rebaixado em silêncio")
+    for token in tokens:
+        casados = [n for n in ilimitados if casa(token, n)]
+        indevidos = [n for n in demais if casa(token, n)]
+        if not casados:
+            falhas.append(f"o token `~*{token}` do mapa não casa com nenhum agente do tier ilimitado da política")
+        if indevidos:
+            falhas.append(
+                f"o token `~*{token}` do mapa isenta também {', '.join(sorted(indevidos))}, "
+                "que a política NÃO põe no tier ilimitado")
+    return falhas
+
+
+# Marcas de que a frase do comentário AFIRMA isenção. Sem elas o extrator
+# acusaria qualquer bot citado em qualquer prosa — inclusive uma frase que diga,
+# corretamente, que o SemrushBot fica em tier finito.
+MARCAS_DE_ISENCAO = ("isent", "pista livre", "ilimitad", "sem limite", "nao e limitad", "não é limitad")
+
+# Marcas cuja PROPRIA forma ja nega o limite. Negar de novo seria negacao
+# dupla, que e ambigua o bastante para continuar merecendo o achado.
+MARCAS_QUE_JA_SAO_NEGACAO = ("nao e limitad", "não é limitad")
+
+NEGADORES = ("nao ", "não ", "nunca ", "jamais ", "deixou de ", "sem ")
+
+# Janela curta de proposito, e a virgula a corta: assim "que, embora nao
+# devesse, tem pista livre" continua sendo achado, e so a negacao colada na
+# promessa a desarma.
+JANELA_DO_NEGADOR = 28
+
+
+def frases_de_comentario(preambulo, corpo):
+    """Junta os comentários do bloco e devolve as frases, uma a uma.
+
+    A junção vem antes do corte: a frase que interessa atravessa três linhas de
+    comentário, e cortar por linha a partiria no meio de uma enumeração de bots.
+    """
+    linhas = [linha for linha in ((preambulo or "") + "\n" + (corpo or "")).splitlines()
+              if linha.lstrip().startswith("#")]
+    texto = " ".join(linha.lstrip().lstrip("#").strip() for linha in linhas)
+    return [frase.strip() for frase in texto.split(".") if frase.strip()]
+
+
+def marca_esta_negada(frase_baixa, marca, inicio):
+    """Diz se ESTA ocorrencia da marca aparece negada.
+
+    Um comentario que corrige a propria mentira -- "o GPTBot NAO tem pista
+    livre" -- nomeia o bot ao lado da marca de isencao exatamente como o
+    comentario mentiroso o nomeava. Sem esta distincao, o detector acusa a
+    prosa que o desmente, que e o mesmo defeito de procurar o literal e achar
+    o texto SOBRE o literal.
+    """
+    if marca in MARCAS_QUE_JA_SAO_NEGACAO:
+        return False
+    janela = frase_baixa[max(0, inicio - JANELA_DO_NEGADOR):inicio]
+    if "," in janela:
+        janela = janela[janela.rindex(",") + 1:]
+    return any(negador in janela for negador in NEGADORES)
+
+
+def frase_promete_isencao(frase_baixa):
+    """A frase afirma que algum bot fica sem limite? Negacao nao conta."""
+    for marca in MARCAS_DE_ISENCAO:
+        inicio = frase_baixa.find(marca)
+        while inicio != -1:
+            if not marca_esta_negada(frase_baixa, marca, inicio):
+                return True
+            inicio = frase_baixa.find(marca, inicio + 1)
+    return False
+
+
+def divergencia_de_comentario(preambulo, corpo, tokens, ilimitados):
+    """Acha bot que o comentário declara isento e que o mapa não isenta.
+
+    Não é conserto: o arquivo é de outra frente. É achado, e sai no relatório
+    com o nome do bot para quem edita o nginx resolver.
+    """
+    conhecidos = {n.lower() for n in ilimitados}
+    divergentes = []
+    for frase in frases_de_comentario(preambulo, corpo):
+        if not frase_promete_isencao(frase.lower()):
+            continue
+        for bruto in RE_TOKEN_DE_BOT.findall(frase):
+            nome = bruto.lower()
+            if any(casa(t, nome) for t in tokens) or nome in conhecidos or nome in divergentes:
+                continue
+            divergentes.append(nome)
+    return divergentes
+
+
+# ─── (c) log de origem ───────────────────────────────────────────────────────
+
+
+def faixas_oficiais(raiz):
+    """Mapeia agente -> redes oficiais, a partir de data/ops/bot_ip_ranges/*.json.
+
+    Prefixo malformado é ignorado individualmente e contado: um arquivo com uma
+    linha ruim não pode apagar as outras duzentas.
+    """
+    por_agente = {}
+    descartados = 0
+    for caminho in sorted(glob.glob(os.path.join(raiz, "data", "ops", "bot_ip_ranges", "*.json"))):
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                dados = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        redes = []
+        for prefixo in dados.get("prefixes", []):
+            try:
+                redes.append(ipaddress.ip_network(prefixo))
+            except ValueError:
+                descartados += 1
+        for agente in dados.get("authenticates_agents", []):
+            por_agente.setdefault(str(agente).lower(), []).extend(redes)
+    return por_agente, descartados
+
+
+def dentro_das_faixas(endereco, redes):
+    """Diz se o IP está em alguma faixa. None quando o IP é ilegível."""
+    try:
+        ip = ipaddress.ip_address(endereco)
+    except (ValueError, TypeError):
+        return None
+    return any(ip in rede for rede in redes)
+
+
+def le_log_de_origem(raiz):
+    """Percorre data/ops/access/nginx-*.jsonl e devolve o resumo medido.
+
+    Só linhas reais entram: aquecimento marcado e simulação ficam de fora, e é
+    isso que impede a sonda deste repositório de inflar a própria métrica.
+    """
+    por_agente, prefixos_descartados = faixas_oficiais(raiz)
+    resumo = {
+        "linhas": 0,
+        "sem_ip": 0,
+        "horas_por_dia": {},
+        "bot_acervo_por_dia": {},
+        # A ATRIBUICAO DO TRIPWIRE PRECISA DE SUBSTRATO, e ate 2026-09-05 ela
+        # nao tinha: ele dizia "caiu DEPOIS do nascimento da rede social" sem
+        # nunca ter olhado se algum bot pisou na rede social. Estes dois campos
+        # sao o que permite dizer a verdade -- quanto foi para a superficie nova
+        # (se zero, nao houve realocacao possivel) e quais agentes sairam.
+        "bot_social_por_dia": {},
+        "acervo_por_agente_dia": {},
+        "social_total": 0,
+        "social_forjadas": 0,
+        "social_por_agente": {},
+        "forjadas_acervo": {},
+        "ips_forjados": set(),
+        "ips_por_agente": {},
+        "ultima_data": "",
+        "prefixos_descartados": prefixos_descartados,
+        "agentes_com_faixa": sorted(por_agente),
+    }
+    arquivos = sorted(glob.glob(os.path.join(raiz, "data", "ops", "access", "nginx-*.jsonl")))
+    if not arquivos:
+        return None, "não há data/ops/access/nginx-*.jsonl para ler"
+    for caminho in arquivos:
+        try:
+            arquivo = open(caminho, encoding="utf-8")
+        except OSError as erro:
+            return None, f"não consegui ler {caminho}: {erro}"
+        with arquivo:
+            for linha in arquivo:
+                try:
+                    evento = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue
+                resumo["linhas"] += 1
+                carimbo = str(evento.get("ts", ""))
+                dia = carimbo[:10]
+                if dia:
+                    resumo["ultima_data"] = max(resumo["ultima_data"], dia)
+                    resumo["horas_por_dia"].setdefault(dia, set()).add(carimbo[11:13])
+                if evento.get("warming") or evento.get("bot_simulation"):
+                    continue
+                agente = str(evento.get("agent_key") or "").lower()
+                social = str(evento.get("path", "")).startswith("/redesocial/")
+                if agente and not social and dia:
+                    resumo["bot_acervo_por_dia"][dia] = resumo["bot_acervo_por_dia"].get(dia, 0) + 1
+                    porDia = resumo["acervo_por_agente_dia"].setdefault(dia, {})
+                    porDia[agente] = porDia.get(agente, 0) + 1
+                if agente and social and dia:
+                    resumo["bot_social_por_dia"][dia] = resumo["bot_social_por_dia"].get(dia, 0) + 1
+
+                forjada = False
+                if str(evento.get("bot_allow")) == "1" and agente:
+                    redes = por_agente.get(agente)
+                    if redes:
+                        if "remote_addr" not in evento:
+                            resumo["sem_ip"] += 1
+                        else:
+                            veredito = dentro_das_faixas(evento.get("remote_addr"), redes)
+                            if veredito is False:
+                                forjada = True
+                                resumo["ips_forjados"].add(str(evento.get("remote_addr")))
+                                resumo["ips_por_agente"].setdefault(agente, set()).add(str(evento.get("remote_addr")))
+                if social:
+                    resumo["social_total"] += 1
+                    chave = agente or "sem_agent_key"
+                    resumo["social_por_agente"][chave] = resumo["social_por_agente"].get(chave, 0) + 1
+                    if forjada:
+                        resumo["social_forjadas"] += 1
+                elif forjada:
+                    resumo["forjadas_acervo"][agente] = resumo["forjadas_acervo"].get(agente, 0) + 1
+    return resumo, None
+
+
+def metodos_declarados(raiz, dias=DIAS_DE_METODO):
+    """Método de verificação mais recente por agente, na janela dos últimos dias.
+
+    O ledger grava INCREMENTOS por janela de cursor; aqui não se soma nada — só
+    se lê o método declarado, que é atributo do agente, não do volume.
+    """
+    caminho = os.path.join(raiz, "data", "ops", "origin_bot_traffic_daily.jsonl")
+    try:
+        arquivo = open(caminho, encoding="utf-8")
+    except OSError as erro:
+        return None, f"não consegui ler o ledger da origem: {erro}"
+    ultimo = {}
+    ultima_data = ""
+    with arquivo:
+        for linha in arquivo:
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            agente = str(registro.get("agent_key") or "").lower()
+            data = str(registro.get("date") or "")
+            if not agente or not data:
+                continue
+            ultima_data = max(ultima_data, data)
+            anterior = ultimo.get(agente)
+            if anterior is None or data >= anterior[0]:
+                ultimo[agente] = (data, registro.get("verification_method"))
+    if not ultima_data:
+        return None, "o ledger da origem não tem nenhuma linha com date e agent_key"
+    corte = (datetime.date.fromisoformat(ultima_data) - datetime.timedelta(days=dias - 1)).isoformat()
+    janela = {a: m for a, (d, m) in ultimo.items() if d >= corte}
+    return {"ultima_data": ultima_data, "corte": corte, "metodos": janela}, None
+
+
+def confere_metodos(declarados, agentes_com_faixa):
+    """`verification_method` é POR AGENTE, nunca em bloco. Devolve falhas."""
+    falhas = []
+    com_faixa = set(agentes_com_faixa)
+    for agente, metodo in sorted(declarados["metodos"].items()):
+        if metodo == "ip_range" and agente not in com_faixa:
+            falhas.append(
+                f"o ledger declara verification_method=ip_range para {agente}, e não há faixa oficial dele em "
+                "data/ops/bot_ip_ranges/: a métrica estaria mentindo a nosso favor")
+    metodos = set(declarados["metodos"].values())
+    tem_ambas_classes = any(a in com_faixa for a in declarados["metodos"]) and \
+        any(a not in com_faixa for a in declarados["metodos"])
+    if tem_ambas_classes and len(metodos) == 1:
+        falhas.append(
+            f"todos os {len(declarados['metodos'])} agentes da janela declaram o mesmo verification_method "
+            f"({metodos.pop()!r}), e o disco distingue quem tem faixa oficial de quem não tem: "
+            "método em bloco é métrica inventada")
+    return falhas
+
+
+def dias_completos(horas_por_dia):
+    """Dia completo é dia com as 24 horas presentes no log.
+
+    Comparar dia parcial com dia inteiro fabricaria queda onde há só o relógio.
+    """
+    return sorted(d for d, horas in horas_por_dia.items() if len(horas) >= 24)
+
+
+def horizonte_do_log_bruto(access_log=None):
+    """Até onde o log rotacionado do nginx ainda permite transcrever.
+
+    Existe porque a janela ANTERIOR do método não se completa por espera: ela é
+    passado. Ou o dia já foi transcrito para `data/ops/access/nginx-*.jsonl`, ou
+    ele ainda está no arquivo rotacionado e entra por
+    `tools/generate-origin-access-ledger --dia AAAA-MM-DD`, ou saiu do disco e
+    não volta. Dizer "faltam 11 dias" sem essa distinção sugere uma contagem
+    regressiva que nunca termina.
+
+    Só o diretório é lido (nome e mtime), nunca o conteúdo: o gate não precisa
+    do dado bruto para saber até onde ele vai.
+    """
+    pasta = os.path.dirname(access_log or base.ACCESS_LOG)
+    try:
+        entradas = [e for e in os.scandir(pasta) if e.is_file() and os.path.basename(e.path).startswith("access.log")]
+    except OSError as erro:
+        return None, f"não consegui listar {pasta}: {erro}"
+    if not entradas:
+        return None, f"nenhum arquivo access.log* em {pasta}"
+    mais_antigo = min(e.stat().st_mtime for e in entradas)
+    dia = datetime.date.fromtimestamp(mais_antigo).isoformat()
+    return {"arquivos": len(entradas), "dia_mais_antigo": dia}, None
+
+
+def veredito_de_crescimento(resumo, horizonte=None):
+    """O veredito de crescimento, que hoje só pode ser INCONCLUSIVO.
+
+    Devolve a linha do relatório. Ele NÃO reprova nem aprova: o método exige as
+    duas janelas, e enquanto elas não existirem a única saída honesta é dizer
+    quantos dias faltam E COMO cada janela se completa — a posterior por espera,
+    a anterior por transcrição do log rotacionado. Um "passou" antes disso é
+    verde por construção; uma contagem regressiva sobre janela que só o passado
+    preenche é a mesma desonestidade ao contrário.
+    """
+    ultima = resumo["ultima_data"] or NASCIMENTO_DA_SUPERFICIE
+    completos = dias_completos(resumo["horas_por_dia"])
+    antes = [d for d in completos if d < NASCIMENTO_DA_SUPERFICIE]
+    depois = [d for d in completos if d >= NASCIMENTO_DA_SUPERFICIE]
+    faltam_antes = max(0, DIAS_POR_JANELA - len(antes))
+    faltam_depois = max(0, DIAS_POR_JANELA - len(depois))
+    if faltam_antes or faltam_depois:
+        linha = (
+            f"crescimento INCONCLUSIVO: a superfície social nasceu em {NASCIMENTO_DA_SUPERFICIE} "
+            f"({FONTE_DO_NASCIMENTO}) e o log transcrito vai até {ultima}; há {len(antes)} dia(s) completo(s) "
+            f"antes e {len(depois)} depois. O método exige {DIAS_POR_JANELA}+{DIAS_POR_JANELA} dias com "
+            f"N>={N_MINIMO_POR_JANELA} em cada janela: faltam {faltam_antes} dia(s) na janela anterior e "
+            f"{faltam_depois} na posterior")
+        if faltam_depois:
+            linha += f". A janela posterior se completa por espera: faltam {faltam_depois} dia(s) completo(s)"
+        if faltam_antes:
+            primeiro = antes[0] if antes else "nenhum dia transcrito"
+            linha += (
+                f". A janela ANTERIOR não se completa por espera — ela é passado. O log transcrito começa em "
+                f"{primeiro}; os dias que faltam entram por `tools/generate-origin-access-ledger --dia AAAA-MM-DD` "
+                "enquanto o log rotacionado do nginx ainda os guardar")
+            if horizonte:
+                linha += (f" (medido agora: {horizonte['arquivos']} arquivo(s) access.log* no disco, o mais antigo "
+                          f"de {horizonte['dia_mais_antigo']})")
+        return linha
+    n_antes = sum(resumo["bot_acervo_por_dia"].get(d, 0) for d in antes[-DIAS_POR_JANELA:])
+    n_depois = sum(resumo["bot_acervo_por_dia"].get(d, 0) for d in depois[:DIAS_POR_JANELA])
+    if n_antes < N_MINIMO_POR_JANELA or n_depois < N_MINIMO_POR_JANELA:
+        return (f"crescimento INCONCLUSIVO: as duas janelas de {DIAS_POR_JANELA} dias existem, mas N={n_antes} "
+                f"antes e N={n_depois} depois, e o método exige N>={N_MINIMO_POR_JANELA} em cada uma")
+    variacao = (n_depois - n_antes) / n_antes if n_antes else 0.0
+    return (f"crescimento medido: {n_antes} requisições de bot nos {DIAS_POR_JANELA} dias completos antes de "
+            f"{NASCIMENTO_DA_SUPERFICIE} e {n_depois} nos {DIAS_POR_JANELA} depois ({variacao * 100:+.1f}%)")
+
+
+def tripwire_do_acervo(resumo):
+    """Queda do rastreio do acervo depois do nascimento. Devolve (falha, nota)."""
+    completos = dias_completos(resumo["horas_por_dia"])
+    antes = [d for d in completos if d < NASCIMENTO_DA_SUPERFICIE]
+    depois = [d for d in completos if d >= NASCIMENTO_DA_SUPERFICIE]
+    if not antes:
+        return None, "tripwire do acervo INCONCLUSIVO: nenhum dia completo anterior ao nascimento da superfície no log"
+    valores_antes = sorted(resumo["bot_acervo_por_dia"].get(d, 0) for d in antes)
+    meio = len(valores_antes) // 2
+    referencia = valores_antes[meio] if len(valores_antes) % 2 else (valores_antes[meio - 1] + valores_antes[meio]) / 2
+    if not depois:
+        return None, (
+            f"tripwire do acervo INCONCLUSIVO: nenhum dia COMPLETO após {NASCIMENTO_DA_SUPERFICIE}. "
+            f"Referência já medida (mediana de {len(antes)} dia(s) completo(s) anteriores): {referencia:.0f} "
+            "requisições de bot por dia. Atribuir à rede social uma queda anterior a ela seria falsa atribuição")
+    ultimo = depois[-1]
+    atual = resumo["bot_acervo_por_dia"].get(ultimo, 0)
+    if referencia <= 0:
+        return None, f"tripwire do acervo INCONCLUSIVO: a referência anterior é {referencia:.0f}, e não há do que cair"
+    queda = (referencia - atual) / referencia
+    nota = (f"tripwire do acervo: {atual} requisições de bot em {ultimo} contra referência {referencia:.0f} "
+            f"({queda * 100:.1f}% de variação)")
+    if queda > QUEDA_MAXIMA:
+        return (agravo_da_queda(resumo, ultimo, atual, referencia, queda)), nota
+    return None, nota
+
+
+# Quantos agentes desaparecidos a mensagem nomeia. Três é o que cabe numa linha
+# de relatório sem virar despejo; o resto vai no total.
+AGENTES_NOMEADOS_NA_QUEDA = 3
+
+
+def agravo_da_queda(resumo, dia, atual, referencia, queda):
+    """A mensagem da queda, com a atribuição MEDIDA em vez de presumida.
+
+    ★ POR QUE ESTA FUNÇÃO EXISTE
+
+    Até 2026-09-05 o tripwire dizia, literalmente, "o rastreio do acervo caiu
+    X% DEPOIS DO NASCIMENTO DA REDE SOCIAL" -- e nunca havia olhado para a rede
+    social. Ele media uma queda real e lhe pendurava uma causa que não tinha
+    medido: correlação temporal apresentada como atribuição.
+
+    O caso concreto que expôs isso: em 2026-09-05 o gate acusou queda de 51,6%
+    (2.106 contra 4.354) e culpou a rede social. Medido no mesmo ledger, no
+    mesmo instante: `/redesocial/` recebeu ZERO requisições de bot nos três dias.
+    Não há realocação possível para um destino que não recebeu nada. Quem saiu
+    foram mj12bot (959 -> 0) e semrushbot (883 -> 47), dois crawlers de SEO
+    comercial, ambos com 100% de HTTP 200 no último dia -- nem 429, nem bloqueio
+    nosso: eles simplesmente pararam de vir.
+
+    ★ O QUE ESTA FUNÇÃO NÃO FAZ, E É DELIBERADO
+
+    Ela NÃO deixa de reprovar. Queda de 51% no rastreio é dado que alguém tem de
+    olhar, e a R6 do contrato é explícita: queda de rastreio é defeito de
+    engenharia até prova medida em contrário. Trocar o vermelho por verde porque
+    a causa parece benigna seria exatamente o afrouxamento que o contrato chama
+    de fraude de gate. O que muda é o gate parar de afirmar o que não mediu --
+    e entregar, junto do vermelho, os nomes que apontam para onde investigar.
+    """
+    social = resumo.get("bot_social_por_dia", {}).get(dia, 0)
+    if social > 0:
+        atribuicao = (f"a rede social recebeu {social} requisição(ões) de bot em {dia}, "
+                      "então realocação de orçamento de rastreio é hipótese VIVA e precisa ser medida "
+                      "(o veredito de crescimento × canibalização exige as duas janelas de 14 dias)")
+    else:
+        atribuicao = ("NÃO é atribuível à rede social: ela recebeu ZERO requisição de bot em "
+                      f"{dia}, e não há realocação possível para um destino que não recebeu nada")
+
+    ontem_e_antes = sorted(d for d in resumo.get("acervo_por_agente_dia", {}) if d < dia)
+    sumidos = []
+    if ontem_e_antes:
+        anterior = resumo["acervo_por_agente_dia"][ontem_e_antes[-1]]
+        hoje = resumo["acervo_por_agente_dia"].get(dia, {})
+        for agente, antes_n in sorted(anterior.items(), key=lambda par: -par[1]):
+            depois_n = hoje.get(agente, 0)
+            if antes_n > 0 and depois_n < antes_n / 2:
+                sumidos.append(f"{agente} ({antes_n} -> {depois_n})")
+    if sumidos:
+        nomeados = ", ".join(sumidos[:AGENTES_NOMEADOS_NA_QUEDA])
+        resto = len(sumidos) - AGENTES_NOMEADOS_NA_QUEDA
+        quem = f"; agentes que caíram à metade ou menos: {nomeados}" + (f" e mais {resto}" if resto > 0 else "")
+    else:
+        quem = "; nenhum agente isolado explica a queda -- ela é difusa, o que aponta para causa comum (borda, robots, certificado)"
+
+    return (f"o rastreio do acervo caiu {queda * 100:.1f}% ({atual} em {dia} contra referência "
+            f"{referencia:.0f} dos dias completos anteriores; o teto do tripwire é "
+            f"{QUEDA_MAXIMA * 100:.0f}%). {atribuicao}{quem}")
+
+
+# ─── (b) sonda ───────────────────────────────────────────────────────────────
+
+
+def rotas_do_sitemap(porta, base_url):
+    """Devolve (caminhos, erro): o que o sitemap social manda o bot rastrear."""
+    status, _, corpo, erro = requisita_corpo(porta, "/redesocial/sitemap.xml")
+    if erro is not None:
+        return None, erro
+    if status != 200:
+        return None, f"/redesocial/sitemap.xml respondeu {status}"
+    try:
+        raiz = ET.fromstring(corpo)
+    except ET.ParseError as falha:
+        return None, f"/redesocial/sitemap.xml não é XML válido: {falha}"
+    caminhos = set()
+    pendentes = [(n.text or "").strip() for n in raiz.iter(ESPACO_SITEMAP + "loc")]
+    if raiz.tag == ESPACO_SITEMAP + "sitemapindex":
+        shards, pendentes = pendentes, []
+        for shard in shards:
+            if not shard.startswith(base_url):
+                return None, f"o índice aponta {shard!r}, fora da base pública {base_url}"
+            status, _, corpo_shard, erro = requisita_corpo(porta, shard[len(base_url):])
+            if erro is not None:
+                return None, erro
+            if status != 200:
+                return None, f"o shard {shard} respondeu {status}"
+            try:
+                no = ET.fromstring(corpo_shard)
+            except ET.ParseError as falha:
+                return None, f"{shard} não é XML válido: {falha}"
+            pendentes += [(n.text or "").strip() for n in no.iter(ESPACO_SITEMAP + "loc")]
+    for loc in pendentes:
+        if loc.startswith(base_url):
+            caminhos.add(loc[len(base_url):])
+    return sorted(caminhos), None
+
+
+def sonda_superficie(caminhos, teto):
+    """Sonda cada rota pelo processo e pela borda. Devolve (falhas, notas)."""
+    falhas, notas = [], []
+    portas = [("processo cmd/social", base.PORTA_SOCIAL)]
+    if base.escuta(base.PORTA_NGINX):
+        portas.append(("borda nginx", base.PORTA_NGINX))
+    else:
+        notas.append(f"nginx 127.0.0.1:{base.PORTA_NGINX} fora do ar: só o processo foi sondado")
+    for rotulo, porta in portas:
+        for caminho in caminhos:
+            status, cabecalhos, corpo, erro = requisita_corpo(porta, caminho)
+            if erro is not None:
+                falhas.append(f"{rotulo} {caminho}: {erro}")
+                continue
+            if status != 200:
+                falhas.append(f"{rotulo} {caminho} respondeu {status}, e o sitemap manda o bot rastrear essa URL")
+                continue
+            texto = corpo.decode("utf-8", "replace")
+            if "text/html" not in str(cabecalhos.get("Content-Type", "")):
+                falhas.append(f"{rotulo} {caminho}: Content-Type {cabecalhos.get('Content-Type')!r}, esperado text/html")
+            if "<script" in texto.lower():
+                falhas.append(f"{rotulo} {caminho}: o HTML traz `<script`, proibido nesta superfície")
+            if len(corpo) > teto:
+                falhas.append(f"{rotulo} {caminho}: {len(corpo)} bytes, acima do teto {teto}")
+            if "</html>" not in texto.lower() or "<h1" not in texto.lower():
+                falhas.append(
+                    f"{rotulo} {caminho}: o HTML não veio completo no primeiro response "
+                    "(faltou </html> ou <h1>), e bot nenhum executa JS para completar")
+            # O cabeçalho vence a meta para o bot, e o nginx pode acrescentar um
+            # que o processo não emite: por isso a conferência é nas DUAS pontas.
+            for chave, valor in cabecalhos.items():
+                if chave.lower() == "x-robots-tag" and "noindex" in str(valor).lower():
+                    falhas.append(
+                        f"{rotulo} {caminho}: X-Robots-Tag {valor!r} numa URL que o sitemap manda indexar; "
+                        "o cabeçalho vence a meta e tira a página do índice em silêncio")
+            notas.append(f"{rotulo} {caminho}: 200, {len(corpo)} bytes")
+    return falhas, notas
+
+
+def teto_de_bytes(raiz):
+    """Lê HTMLBudgetBytes do fonte Go: o número não se digita duas vezes."""
+    caminho = os.path.join(raiz, "internal", "htmlcontract", "htmlcontract.go")
+    with open(caminho, encoding="utf-8") as f:
+        texto = f.read()
+    achado = re.search(r"\bHTMLBudgetBytes\s*=\s*(\d+)", texto)
+    if not achado:
+        raise ValueError("internal/htmlcontract/htmlcontract.go não declara HTMLBudgetBytes")
+    return int(achado.group(1))
+
+
+def base_publica(raiz):
+    """URL pública travada em content/site.json."""
+    with open(os.path.join(raiz, "content", "site.json"), encoding="utf-8") as f:
+        site = json.load(f)
+    url = str(site.get("base_url", "")).strip().rstrip("/")
+    if not url.startswith("https://"):
+        raise ValueError(f"content/site.json tem base_url={url!r}, que não é HTTPS absoluto")
+    return url
+
+
+def main():
+    raiz = base.RAIZ
+    falhas, notas = [], []
+
+    # ── (a) configuração ──
+    caminho_nginx = os.path.join(raiz, NGINX_VIVO)
+    try:
+        with open(caminho_nginx, encoding="utf-8") as f:
+            texto_nginx = f.read()
+    except OSError as erro:
+        return base.relata(NOME, base.INCONCLUSIVO, [f"não consegui ler {NGINX_VIVO}: {erro}"])
+    if banner_de_nao_carregado(texto_nginx):
+        return base.relata(NOME, base.INCONCLUSIVO, [
+            f"{NGINX_VIVO} abre com o banner NAO-CARREGADO-EM-PRODUCAO: auditar config que ninguém carrega "
+            "daria verde sobre nada"])
+
+    preambulo, corpo_da_location = linhas_do_bloco(texto_nginx, LOCATION_DE_LEITURA)
+    if corpo_da_location is None:
+        falhas.append(f"{NGINX_VIVO} não declara `location ^~ {LOCATION_DE_LEITURA}`: a rede social não é proxiada")
+    else:
+        quantas = conta_limit_req(corpo_da_location)
+        if quantas:
+            falhas.append(
+                f"o bloco `location ^~ {LOCATION_DE_LEITURA}` declara {quantas} `limit_req`: a herança do nginx é "
+                "tudo-ou-nada, e uma diretiva local SUBSTITUI as cinco do server{} — inclusive a que isenta o bot valioso")
+        else:
+            notas.append(f"`location ^~ {LOCATION_DE_LEITURA}`: zero limit_req, e as cinco do server{{}} continuam herdadas")
+
+    try:
+        ilimitados, demais = agentes_da_politica(raiz)
+        teto = teto_de_bytes(raiz)
+        base_url = base_publica(raiz)
+    except (OSError, ValueError, json.JSONDecodeError) as erro:
+        return base.relata(NOME, base.INCONCLUSIVO, [f"não consegui ler a configuração versionada: {erro}"])
+
+    tokens, tem_default_zero = tokens_do_mapa(texto_nginx)
+    if tokens is None:
+        falhas.append(f"{NGINX_VIVO} não declara o mapa `$wj_bot_allow`: sem ele nenhum bot fica isento de limite")
+        tokens = []
+    else:
+        if not tem_default_zero:
+            falhas.append("o mapa `$wj_bot_allow` não tem `default 0`: sem ele o padrão vira isenção para todo mundo")
+        falhas_do_mapa = confere_mapa(tokens, ilimitados, demais)
+        falhas += falhas_do_mapa
+        if falhas_do_mapa:
+            notas.append(f"mapa $wj_bot_allow: {len(tokens)} token(s) contra {len(ilimitados)} agente(s) ilimitado(s)")
+        else:
+            notas.append(
+                f"mapa $wj_bot_allow: {len(tokens)} token(s) e {len(ilimitados)} agente(s) no tier ilimitado de "
+                "content/crawl_policy.json, equivalentes nos dois sentidos")
+
+    divergentes = divergencia_de_comentario(preambulo, corpo_da_location, tokens, ilimitados)
+    if divergentes:
+        falhas.append(
+            "ACHADO — comentário que mente sobre o mapa: os comentários de `location ^~ /redesocial/` nomeiam "
+            f"{', '.join(divergentes)} como isento(s), e nenhum token de $wj_bot_allow casa com esse(s) nome(s). "
+            "A política os põe em tier finito, o que está certo: errado está o comentário, e quem o corrige é "
+            "quem é dono do arquivo — este gate reporta, não edita")
+
+    # ── (b) sonda ──
+    if not base.escuta(base.PORTA_SOCIAL):
+        return base.relata(NOME, base.INCONCLUSIVO, [
+            f"nada escutando em 127.0.0.1:{base.PORTA_SOCIAL}: o cmd/social está parado, e indisponibilidade "
+            "nunca é reprovação"] + falhas)
+    caminhos, erro = rotas_do_sitemap(base.PORTA_SOCIAL, base_url)
+    if erro is not None:
+        falhas.append(f"não consegui derivar as rotas do sitemap social: {erro}")
+        caminhos = ["/redesocial/"]
+    if "/redesocial/" not in caminhos:
+        caminhos = ["/redesocial/"] + list(caminhos)
+    falhas_da_sonda, notas_da_sonda = sonda_superficie(caminhos, teto)
+    falhas += falhas_da_sonda
+    notas += notas_da_sonda
+
+    # ── (c) log de origem ──
+    resumo, erro = le_log_de_origem(raiz)
+    if erro is not None:
+        return base.relata(NOME, base.INCONCLUSIVO, [erro] + falhas)
+
+    declarados, erro = metodos_declarados(raiz)
+    if erro is not None:
+        notas.append(f"verification_method não pôde ser conferido: {erro}")
+    else:
+        falhas += confere_metodos(declarados, resumo["agentes_com_faixa"])
+        notas.append(
+            f"verification_method por agente, janela {declarados['corte']}..{declarados['ultima_data']}: "
+            + ", ".join(f"{a}={m}" for a, m in sorted(declarados["metodos"].items())))
+
+    autenticas = resumo["social_total"] - resumo["social_forjadas"]
+    if resumo["social_forjadas"]:
+        falhas.append(
+            f"{resumo['social_forjadas']} requisição(ões) FORJADA(S) contra /redesocial/: bot_allow=1 com IP fora "
+            "de toda faixa oficial do operador declarado")
+    if resumo["social_total"] == 0:
+        notas.append(
+            f"INCONCLUSIVO para requests_authentic da superfície social: zero requisição real a /redesocial/ no log "
+            f"de origem desde {NASCIMENTO_DA_SUPERFICIE}. A borda absorve o que o cache guarda, então a origem é "
+            "PISO de volume, nunca contador")
+    elif autenticas <= 0:
+        falhas.append(
+            f"requests_authentic = {autenticas} para /redesocial/: as {resumo['social_total']} requisições reais "
+            "medidas são todas forjadas")
+    else:
+        notas.append(
+            f"requests_authentic = {autenticas} para /redesocial/ ({resumo['social_total']} requisição(ões) real(is), "
+            f"{resumo['social_forjadas']} forjada(s)); por agente: "
+            + ", ".join(f"{a}={n}" for a, n in sorted(resumo["social_por_agente"].items())))
+
+    falha_do_tripwire, nota_do_tripwire = tripwire_do_acervo(resumo)
+    if falha_do_tripwire:
+        falhas.append(falha_do_tripwire)
+    notas.append(nota_do_tripwire)
+
+    horizonte, erro_do_horizonte = horizonte_do_log_bruto()
+    if erro_do_horizonte:
+        notas.append(f"horizonte do log rotacionado não medido: {erro_do_horizonte}")
+    notas.append(veredito_de_crescimento(resumo, horizonte))
+
+    if resumo["forjadas_acervo"]:
+        total = sum(resumo["forjadas_acervo"].values())
+        notas.append(
+            f"ACHADO sem veredito — {total} requisição(ões) forjada(s) contra o ACERVO, de "
+            f"{len(resumo['ips_forjados'])} IP(s) distintos: "
+            + ", ".join(f"{a}={n} req/{len(resumo['ips_por_agente'].get(a, ()))} IP"
+                        for a, n in sorted(resumo["forjadas_acervo"].items()))
+            + ". A isenção do nginx é por User-Agent, então chave vazia por User-Agent é chave vazia para quem "
+              "digitar o User-Agent. Reprovar por isso todo dia viraria ruído: a decisão é de arquitetura")
+    if resumo["sem_ip"]:
+        notas.append(
+            f"{resumo['sem_ip']} linha(s) com bot_allow=1 e SEM remote_addr (schema antigo do access ledger): "
+            "autenticidade não pode ser decidida nelas, e elas ficam fora da conta de forjadas")
+    if resumo["prefixos_descartados"]:
+        notas.append(f"{resumo['prefixos_descartados']} prefixo(s) malformado(s) em data/ops/bot_ip_ranges/, ignorados")
+    notas.append(
+        f"log de origem: {resumo['linhas']} linha(s); dias completos (24 h): "
+        + ", ".join(dias_completos(resumo["horas_por_dia"])))
+
+    if falhas:
+        return base.relata(NOME, base.ERRADO, falhas + ["--- medido junto ---"] + notas)
+    return base.relata(NOME, base.OK, notas)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

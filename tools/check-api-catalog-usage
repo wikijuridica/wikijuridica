@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""check-api-catalog-usage — RFC 9727 §5.4 ("Usage"): quem PEDIU o catálogo de
+verdade USOU as APIs que ele anuncia?
+
+    "Since the goal of the api-catalog well-known URI is to facilitate
+     discovery of APIs, the Publisher may wish to correlate requests to the
+     /.well-known/api-catalog URI with subsequent requests to the API URIs
+     listed in the catalog." — docs/rfc/rfc9727-api-catalog.txt, §5.4
+
+Esta é a ÚNICA prática de monitoramento da §5.4 que ainda não tinha ferramenta
+própria neste repositório (disponibilidade e performance já são cobertas por
+check-portal-health/check-tunnel-health; conteúdo correto do catálogo é coberto
+pelos testes de internal/httpserver/descritores_test.go). Esta ferramenta
+fecha a lacuna de USO: descoberta sem uso é o sinal mais acionável que existe
+— documento mal redigido ou endpoint quebrado, ninguém avisa sozinho.
+
+────────────────────────────────────────────────────────────────────────────
+CAMADA DE DADO LIDA, E O QUE ELA NÃO ENXERGA (obrigatório por
+docs/ARQUITETURA_FIEL.md e docs/CONTRATO_DADO_REAL.md — ler ANTES de confiar
+num número daqui)
+
+Fonte única: o access log do nginx do WIKI, formato `wj_main`
+(ops/nginx/wikijuridica.conf, `access_log ... wj_main`), por padrão
+/var/log/nginx/wikijuridica/access.log. O parser é IMPORTADO de
+`tools/check-access-log-bots` (regex `LINE`, `parse_request`, `identidade_de`,
+`marcado_como_aquecimento`) — não duplicado — porque esse é o leitor canônico
+já testado (tools/test_accessledger.py cobre o irmão dele) e o parser já
+absorveu cinco gerações do log_format sem quebrar. Escrever um segundo parser
+aqui reintroduziria o mesmo risco que o comentário daquele arquivo descreve:
+campo novo no fim → regex ancorada em `$` → zero linha casada → silêncio que
+parece aprovação.
+
+O que esta camada NÃO enxerga, e por isso o relatório é explícito sobre:
+
+  1. JANELA CURTA E ROTAÇÃO. O log gira diariamente (logrotate,
+     /var/log/nginx/wikijuridica/access.log.1, .2.gz, ...). Por padrão esta
+     ferramenta lê SÓ o arquivo corrente (access.log) — ausência de pedido ao
+     catálogo aqui não prova que ninguém pediu nunca, só que ninguém pediu
+     NESTA janela. `--log` aceita mais de um arquivo (repetir a flag) para
+     alargar a janela; arquivos .gz precisam ser descomprimidos antes (esta
+     ferramenta não abre gzip, para não silenciosamente ficar lenta num log
+     de 22 MB comprimido).
+  2. CACHE DE BORDA — RISCO CONFIRMADO, NÃO HIPOTÉTICO. Requisição respondida
+     inteiramente pela Cloudflare (HIT) não chega a este nginx e não aparece
+     aqui — ver docs/borda-ttl-e-aquecimento.md. Isto NÃO é risco baixo: o
+     próprio aquecedor de borda desta casa busca
+     `/.well-known/api-catalog` periodicamente (evidência no log em
+     19/08 23:31:14, UA `wikijuridica-cache-warm/1.0`, `warm=true`, resposta
+     304 via `cf_ray`), então a URL PARTICIPA do cache da Cloudflare. Um
+     descobridor externo real que peça o catálogo dentro da janela de TTL
+     aquecida recebe HIT na borda e NUNCA aparece neste log — o número de
+     "clientes que pediram o catálogo" que esta ferramenta relata é um PISO,
+     não o total, e a magnitude do subcount não é medida aqui (exigiria o
+     GraphQL da Cloudflare, fora do escopo desta ferramenta).
+  3. IDENTIDADE DO CLIENTE. A chave usada para correlacionar "quem pediu o
+     catálogo" com "quem usou a API depois" é (IP, User-Agent). É honesta, não
+     é exata: dois usuários reais atrás do mesmo NAT com o mesmo navegador
+     colapsariam numa linha; um bot que gira de IP dentro da mesma janela
+     (comum em provedores cloud) apareceria como clientes diferentes. Não há
+     cookie de sessão neste portal (HTML leve, sem JS de rastreamento) que
+     permita chave melhor.
+  4. ENDEREÇOS ANUNCIADOS SÃO OS HREF LITERAIS DO CATÁLOGO, NUNCA HARDCODED.
+     O catálogo é buscado AO VIVO em --catalog-url (padrão
+     http://127.0.0.1:8089/.well-known/api-catalog, o processo Go de origem —
+     não http://127.0.0.1:8088, que é o nginx, para não gerar uma linha
+     artificial no próprio log que se está medindo). O casamento é por PATH
+     EXATO (sem barra final, sem querystring) — sub-rotas não literalmente
+     listadas (ex.: /api/v1/search sob o anchor "item" /api/v1) NÃO contam
+     para a métrica primária, e entram só na contagem secundária de prefixo,
+     rotulada como aproximação, nunca somada à taxa de conversão principal.
+  5. IDENTIDADE DE BOT (sonda_local / faixa_oficial / nao_verificado /
+     origem_nao_publica / nao_bot_conhecido) vem de `botagents` +
+     `identidade_de`, a mesma fonte que check-access-log-bots usa. Bot sem
+     faixa de IP oficial publicada (ex.: operador que ainda não documentou
+     range) cai em `nao_verificado` — isso não é acusação de forjamento, é
+     "não dá para confirmar com o dado disponível".
+
+Nada aqui estima ou infere volume não observado. Se a janela não tem linha,
+a saída diz "zero nesta janela" — nunca um número inventado.
+
+Uso:
+    ./tools/check-api-catalog-usage
+    ./tools/check-api-catalog-usage --log /var/log/nginx/wikijuridica/access.log.1
+    ./tools/check-api-catalog-usage --json
+    ./tools/check-api-catalog-usage --catalog-url http://127.0.0.1:8089/.well-known/api-catalog
+
+Exit code (honesto — nunca 0 mascarando ausência de dado):
+    0  mediu com sucesso e nenhum endereço anunciado respondeu quebrado
+    1  pelo menos um endereço ANUNCIADO no catálogo respondeu 404 ou 5xx
+       nesta janela — o RFC chama isso de "endpoint quebrado" (§5.4); é a
+       ÚNICA fração desta medição robusta a qualquer N, ver VEREDITO abaixo
+    2  log de acesso ausente ou sem permissão de leitura — não deu para medir
+    3  catálogo não respondeu, não é JSON válido, ou não tem "linkset" —
+       não deu para saber o que ele anuncia, logo não deu para correlacionar
+
+VEREDITO (adicionado em 2026-08-27 — até então esta ferramenta só falhava por
+problema de INFRAESTRUTURA, exit 2/3; a própria métrica de uso do RFC — o que
+ela existe para vigiar — nunca virava exit code, por mais zero conversão que
+medisse).
+
+POR QUE NÃO A TAXA DE CONVERSÃO. "descoberta sem uso" é o sinal mais
+acionável do RFC, mas transformar TAXA em corte binário quebra com qualquer N
+pequeno: Googlebot e GPTBot pedem `/.well-known/*` rotineiramente e NUNCA
+"convertem" no sentido do RFC (não fazem a chamada de API em seguida — isso é
+o comportamento ESPERADO de um crawler, não um defeito), e humano que clica o
+catálogo por curiosidade também não. Um corte por "N clientes reais sem
+conversão" viraria alarme permanente assim que o portal for rastreado com
+regularidade — exatamente o "gate que sempre reprova, portanto é desligado"
+que este projeto já reconhece como inútil. Medido em 2026-08-27: 1 cliente de
+audiência real, 0 conversões — N pequeno demais para qualquer corte
+estatístico ser defensável. A taxa de conversão continua no relatório, mas
+NUNCA decide o exit code.
+
+O QUE DECIDE: o outro braço do RFC — "endpoint quebrado" — é robusto a
+qualquer N porque não depende de comportamento de terceiro, só do próprio
+catálogo estar coerente com o que ele anuncia. Medido em 2026-08-27: `/api.md`
+tem 2 linhas 404 nesta janela (interno — a auditoria de tools/check-superficie-
+bots-live que apanhou a mesma regressão), confirmando que o catálogo está
+anunciando um endereço hoje quebrado por um efeito colateral do commit
+"porteiro" de outra frente (ver tools/check-superficie-bots-live). 404/5xx
+conta em QUALQUER linha (real ou interna/sonda) — o catálogo estar quebrado
+não deixa de ser verdade porque quem tropeçou nele foi uma sonda interna.
+401/403/405/429 ficam de fora: são resposta protocolarmente correta (rota
+só-POST recebendo GET, recurso OAuth exigindo credencial), não "quebrado".
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS_DIR)
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(TOOLS_DIR)
+DEFAULT_LOG = "/var/log/nginx/wikijuridica/access.log"
+DEFAULT_CATALOG_URL = "http://127.0.0.1:8089/.well-known/api-catalog"
+CATALOG_PATH = "/.well-known/api-catalog"
+OWN_USER_AGENT = (
+    "wikijuridica-check-api-catalog-usage/1.0 "
+    "(+interno; leitura de catalogo; nao-indexar)"
+)
+
+
+def _import_check_access_log_bots():
+    """Importa tools/check-access-log-bots (nome com hífen) como módulo.
+
+    O arquivo só define funções/constantes no nível de módulo e guarda a
+    execução em `if __name__ == "__main__"` — importar não dispara leitura de
+    log nem I/O. Confirmar isso é o que evita duplicar o parser (ver
+    cabeçalho deste arquivo).
+    """
+    caminho = os.path.join(TOOLS_DIR, "check-access-log-bots")
+    loader = importlib.machinery.SourceFileLoader("check_access_log_bots", caminho)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)
+    return modulo
+
+
+_calb = _import_check_access_log_bots()
+
+
+def _norm_path(raw: str) -> str:
+    """Path canônico para comparação: sem query string, sem barra final."""
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlsplit(raw)
+    path = parsed.path or raw
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return path
+
+
+def fetch_catalog(url: str, timeout: float = 5.0) -> tuple[int, bytes, float]:
+    """Busca o catálogo AO VIVO. Sem fallback silencioso: erro sobe para o
+    chamador decidir o exit code (3 — não dá para saber o que o catálogo
+    anuncia sem o próprio catálogo)."""
+    t0 = time.monotonic()
+    # X-Warming-Request: 2026-09-16. Esta ferramenta ja se auto-exclui do
+    # PROPRIO relatorio pela convencao de nome `wikijuridica-*` (ver `e_interna`
+    # mais abaixo), mas a linha continuava chegando ao access log com
+    # `warming=false` — e todo consumidor que filtra so' por aquecimento a
+    # contava como visita. Quem sonda o proprio portal declara a sonda no fio,
+    # nao so' na propria analise.
+    req = urllib.request.Request(url, headers={"User-Agent": OWN_USER_AGENT,
+                                               "X-Warming-Request": "true"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        status = resp.status
+        body = resp.read()
+    return status, body, time.monotonic() - t0
+
+
+def extract_catalog_targets(doc: dict) -> tuple[dict[str, list[str]], set[str]]:
+    """Devolve (contexto_por_path, item_bases).
+
+    `contexto_por_path`: path exato -> lista de "relacao@anchor" (para
+    diagnóstico — de onde veio cada endereço anunciado).
+    `item_bases`: subconjunto dos paths que são "item" (as APIs em si, na
+    semântica do RFC — §4.3), usado só para a contagem SECUNDÁRIA de prefixo
+    (rotulada como aproximação na saída, nunca somada à métrica primária).
+
+    Levanta ValueError se o documento não tiver "linkset" — RFC 9727 §4
+    define o corpo como um linkset (RFC 9264), sem isso não há o que
+    correlacionar.
+    """
+    linkset = doc.get("linkset")
+    if not isinstance(linkset, list):
+        raise ValueError('documento sem "linkset" (array) no topo — não é um api-catalog RFC 9727 válido')
+    contexto: dict[str, list[str]] = collections.defaultdict(list)
+    item_bases: set[str] = set()
+    for entry in linkset:
+        if not isinstance(entry, dict):
+            continue
+        anchor_raw = entry.get("anchor", "")
+        anchor_path = _norm_path(anchor_raw) or anchor_raw
+        for relation, targets in entry.items():
+            if relation == "anchor" or not isinstance(targets, list):
+                continue
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                href = target.get("href")
+                path = _norm_path(href) if href else ""
+                if not path:
+                    continue
+                contexto[path].append(f"{relation}@{anchor_path}")
+                if relation == "item":
+                    item_bases.add(path)
+    return dict(contexto), item_bases
+
+
+def parse_time(raw: str):
+    try:
+        return datetime.datetime.strptime(raw, "%d/%b/%Y:%H:%M:%S %z")
+    except (ValueError, TypeError):
+        return None
+
+
+def analyze(log_paths: list[str], catalog_targets: dict[str, list[str]],
+            item_bases: set[str], top: int) -> dict:
+    faixas = botagents.ler_faixas(ROOT)
+    total = 0
+    malformadas = 0
+    bytes_lidos = 0
+    ts_invalido = 0
+    # Separados em REAL vs INTERNO/SONDA desde a linha, não só no agregado por
+    # cliente — é a mesma armadilha documentada em check-access-log-bots
+    # ("Googlebot: 2.053 de 2.062 linhas eram a nossa própria sonda"; ver
+    # docs/ARQUITETURA_FIEL.md). Um número único aqui repetiria o erro.
+    hits_por_href_real: collections.Counter = collections.Counter()
+    hits_por_href_interno: collections.Counter = collections.Counter()
+    hits_prefixo_item_real: collections.Counter = collections.Counter()
+    hits_prefixo_item_interno: collections.Counter = collections.Counter()
+    # Requisito 1 da encomenda: pedidos ao PRÓPRIO catálogo, por
+    # User-Agent, com a identidade — cada linha de /.well-known/api-catalog
+    # conta aqui, não só a primeira por cliente.
+    pedidos_catalogo_por_agente: collections.Counter = collections.Counter()
+
+    # (addr, agent) -> estado do cliente
+    clientes: dict[tuple[str, str], dict] = {}
+
+    # Requisito de VEREDITO (ver docstring do módulo): o catálogo anuncia um
+    # endereço que, quando pedido de verdade, responde quebrado. 404/5xx são
+    # inequívocos independentemente de N (ao contrário da taxa de conversão,
+    # que precisa de amostra); 401/403/405/429 ficam de fora de propósito —
+    # são resposta PROTOCOLARMENTE correta (ex.: GET num endpoint só-POST,
+    # ou recurso OAuth exigindo credencial), não "endpoint quebrado".
+    enderecos_quebrados: list[dict] = []
+
+    t0 = time.monotonic()
+    for log_path in log_paths:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                bytes_lidos += len(raw_line.encode("utf-8", errors="replace"))
+                linha = raw_line.rstrip("\n")
+                if not linha.strip():
+                    continue
+                total += 1
+                m = _calb.LINE.match(linha)
+                if not m:
+                    malformadas += 1
+                    continue
+                campos = m.groupdict()
+                _, path = _calb.parse_request(campos["request"])
+                path = _norm_path(path)
+                ts = parse_time(campos["time"])
+                if ts is None:
+                    ts_invalido += 1
+                agent = (campos["agent"] or "(vazio)")[:200]
+                addr = campos["addr"]
+                e_sonda = (campos["bot_sim"] or "").strip() not in ("", "-", "0")
+                warm = _calb.marcado_como_aquecimento(campos["warm"])
+                identidade = _calb.identidade_de(addr, campos["agent"] or "", e_sonda, faixas)
+                # Mesmo critério de "ferramenta desta casa" que
+                # check-access-log-bots usa (aquecimento marcado, IP não
+                # público, ou convenção de nome wikijuridica-*) — sem repetir
+                # este critério, um curl manual de teste em 127.0.0.1 conta
+                # como "audiência real" e infla a taxa de conversão.
+                e_interna = warm or identidade == "origem_nao_publica" or agent.lower().startswith("wikijuridica-")
+                key = (addr, agent)
+
+                is_catalog = path == CATALOG_PATH
+                is_advertised = path in catalog_targets
+                # Prefixo de "item" (aproximação secundária — ver cabeçalho):
+                # cobre sub-rota não listada literalmente, ex. /api/v1/search
+                # sob o anchor item /api/v1.
+                item_prefix_hit = None
+                if not is_advertised:
+                    for base in item_bases:
+                        if path == base or path.startswith(base + "/"):
+                            item_prefix_hit = base
+                            break
+
+                e_interno_linha = e_sonda or e_interna
+                if is_catalog or is_advertised:
+                    (hits_por_href_interno if e_interno_linha else hits_por_href_real)[path] += 1
+                elif item_prefix_hit:
+                    (hits_prefixo_item_interno if e_interno_linha else hits_prefixo_item_real)[item_prefix_hit] += 1
+
+                status_code = (campos.get("status") or "")
+                if is_advertised and status_code.isdigit():
+                    codigo = int(status_code)
+                    if codigo == 404 or codigo >= 500:
+                        enderecos_quebrados.append({
+                            "path": path, "status": status_code,
+                            "user_agent": agent, "identidade": identidade,
+                            "interno_ou_sonda": e_interno_linha,
+                            "timestamp": campos.get("time"),
+                        })
+
+                if is_catalog:
+                    pedidos_catalogo_por_agente[(agent, identidade, e_interno_linha)] += 1
+
+                if not (is_catalog or is_advertised or item_prefix_hit):
+                    continue  # linha irrelevante para esta correlação
+
+                c = clientes.setdefault(key, {
+                    "addr": addr,
+                    "agent": agent,
+                    "identidade": identidade,
+                    "e_sonda": e_sonda,
+                    "warm": warm,
+                    "e_interna": e_interna,
+                    "pedidos_catalogo": 0,
+                    "primeiro_catalogo_ts": None,
+                    "usos_depois": collections.Counter(),
+                    "usos_antes": collections.Counter(),
+                    "usos_prefixo_depois": collections.Counter(),
+                    "sem_timestamp": 0,
+                })
+                # bot_sim/warm podem variar linha a linha para a mesma chave;
+                # a classificação do cliente (sonda/interno/real) fica presa à
+                # PRIMEIRA linha relevante que ele gerou nesta janela — que
+                # pode ser um uso de API anterior ao próprio pedido de
+                # catálogo (o cliente já conhecia a rota antes de descobrir o
+                # catálogo). Isso é intencional e honesto: não há como saber
+                # retroativamente se aquela primeira linha era sonda sem
+                # reclassificar todo o histórico do cliente a cada nova linha.
+
+                if is_catalog:
+                    c["pedidos_catalogo"] += 1
+                    if ts is not None and (c["primeiro_catalogo_ts"] is None or ts < c["primeiro_catalogo_ts"]):
+                        c["primeiro_catalogo_ts"] = ts
+                    continue
+
+                alvo = path if is_advertised else item_prefix_hit
+                bucket_prefixo = not is_advertised
+                if ts is None:
+                    c["sem_timestamp"] += 1
+                    continue
+                # >= , não > : a resolução do nginx é o segundo (%H:%M:%S), e
+                # o caso mais comum de agente bem-comportado é buscar o
+                # catálogo e já bater no endpoint anunciado dentro do MESMO
+                # segundo. Com `>` estrito, esse caso — a prova mais direta
+                # de conversão que existe — cairia em "usos_antes" por erro
+                # de resolução de relógio, não por ordem real dos eventos.
+                if c["primeiro_catalogo_ts"] is not None and ts >= c["primeiro_catalogo_ts"]:
+                    if bucket_prefixo:
+                        c["usos_prefixo_depois"][alvo] += 1
+                    else:
+                        c["usos_depois"][alvo] += 1
+                else:
+                    if not bucket_prefixo:
+                        c["usos_antes"][alvo] += 1
+                    # uso de prefixo ANTES do catálogo não é relevante para a
+                    # métrica primária (a primária só olha hrefs exatos) —
+                    # descartado de propósito, não é bug.
+
+    duracao_leitura = time.monotonic() - t0
+
+    # ── Agregação por cliente ────────────────────────────────────────────
+    descobriram = [c for c in clientes.values() if c["pedidos_catalogo"] > 0]
+
+    def eh_audiencia_real(c):
+        return not c["e_sonda"] and not c["e_interna"]
+
+    audiencia_real = [c for c in descobriram if eh_audiencia_real(c)]
+    interna_ou_sonda = [c for c in descobriram if not eh_audiencia_real(c)]
+
+    converteram = [c for c in audiencia_real if sum(c["usos_depois"].values()) > 0]
+    nao_converteram = [c for c in audiencia_real if sum(c["usos_depois"].values()) == 0]
+    converteram_so_prefixo = [
+        c for c in nao_converteram if sum(c["usos_prefixo_depois"].values()) > 0
+    ]
+
+    def resumo_cliente(c):
+        return {
+            "addr": c["addr"],
+            "user_agent": c["agent"],
+            "identidade": c["identidade"],
+            "pedidos_catalogo": c["pedidos_catalogo"],
+            "primeiro_pedido_catalogo": c["primeiro_catalogo_ts"].isoformat() if c["primeiro_catalogo_ts"] else None,
+            "usou_depois_exato": dict(c["usos_depois"].most_common()),
+            "usou_antes_exato": dict(c["usos_antes"].most_common()),
+            "usou_depois_prefixo_item": dict(c["usos_prefixo_depois"].most_common()),
+        }
+
+    return {
+        "logs": log_paths,
+        "custo": {
+            "linhas_lidas": total,
+            "linhas_malformadas": malformadas,
+            "linhas_timestamp_invalido": ts_invalido,
+            "bytes_lidos": bytes_lidos,
+            "duracao_leitura_s": round(duracao_leitura, 3),
+        },
+        "enderecos_anunciados_quebrados_total": len(enderecos_quebrados),
+        "enderecos_anunciados_quebrados": enderecos_quebrados[:top],
+        "hits_por_href_anunciado_real": dict(hits_por_href_real.most_common(top)),
+        "hits_por_href_anunciado_interno_ou_sonda": dict(hits_por_href_interno.most_common(top)),
+        "hits_por_prefixo_item_aproximado_real": dict(hits_prefixo_item_real.most_common(top)),
+        "hits_por_prefixo_item_aproximado_interno_ou_sonda": dict(hits_prefixo_item_interno.most_common(top)),
+        "pedidos_catalogo_por_agente": [
+            {"user_agent": ua, "identidade": ident, "interno_ou_sonda": interno, "pedidos": n}
+            for (ua, ident, interno), n in pedidos_catalogo_por_agente.most_common(top)
+        ],
+        "clientes_que_pediram_catalogo": len(descobriram),
+        "clientes_audiencia_real": len(audiencia_real),
+        "clientes_interno_ou_sonda_local": len(interna_ou_sonda),
+        "clientes_converteram_uso_exato": len(converteram),
+        "clientes_nao_converteram": len(nao_converteram),
+        "clientes_nao_converteram_mas_usaram_prefixo": len(converteram_so_prefixo),
+        "taxa_conversao_descoberta_para_uso": (
+            round(len(converteram) / len(audiencia_real), 4) if audiencia_real else None
+        ),
+        "detalhe_converteram": [resumo_cliente(c) for c in sorted(
+            converteram, key=lambda c: c["pedidos_catalogo"], reverse=True
+        )[:top]],
+        "detalhe_nao_converteram": [resumo_cliente(c) for c in sorted(
+            nao_converteram, key=lambda c: c["pedidos_catalogo"], reverse=True
+        )[:top]],
+        "detalhe_interno_ou_sonda_local": [resumo_cliente(c) for c in interna_ou_sonda[:top]],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--log", action="append", default=None,
+                         help=f"access log a ler (repetir para mais de um arquivo, NA ORDEM CRONOLÓGICA "
+                              f"— mais antigo primeiro: a correlação 'antes/depois do catálogo' assume "
+                              f"que os arquivos vêm em ordem; padrão: {DEFAULT_LOG})")
+    parser.add_argument("--catalog-url", default=DEFAULT_CATALOG_URL,
+                         help=f"URL do catálogo a buscar AO VIVO (padrão: %(default)s)")
+    parser.add_argument("--top", type=int, default=15, help="quantos itens listar por ranking/detalhe")
+    parser.add_argument("--json", action="store_true", help="saída estruturada")
+    args = parser.parse_args()
+
+    log_paths = args.log or [DEFAULT_LOG]
+    for p in log_paths:
+        if not os.path.exists(p):
+            print(f"check-api-catalog-usage: log ausente: {p} — não dá para medir nesta janela", file=sys.stderr)
+            return 2
+        if not os.access(p, os.R_OK):
+            print(f"check-api-catalog-usage: sem permissão de leitura em {p}", file=sys.stderr)
+            return 2
+
+    try:
+        status, body, elapsed_fetch = fetch_catalog(args.catalog_url)
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        print(f"check-api-catalog-usage: falha ao buscar o catálogo em {args.catalog_url}: {exc} — "
+              f"sem o catálogo não dá para saber o que ele anuncia, logo não dá para correlacionar",
+              file=sys.stderr)
+        return 3
+    if status != 200:
+        print(f"check-api-catalog-usage: catálogo respondeu HTTP {status} em {args.catalog_url} — esperado 200",
+              file=sys.stderr)
+        return 3
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError as exc:
+        print(f"check-api-catalog-usage: catálogo não é JSON válido: {exc}", file=sys.stderr)
+        return 3
+    try:
+        catalog_targets, item_bases = extract_catalog_targets(doc)
+    except ValueError as exc:
+        print(f"check-api-catalog-usage: {exc}", file=sys.stderr)
+        return 3
+
+    if not catalog_targets:
+        print("check-api-catalog-usage: catálogo respondeu 200 mas não anuncia nenhum endereço "
+              '("linkset" vazio ou sem hrefs) — não há o que correlacionar', file=sys.stderr)
+        return 3
+
+    resultado = analyze(log_paths, catalog_targets, item_bases, args.top)
+    resultado["catalogo"] = {
+        "url": args.catalog_url,
+        "http_status": status,
+        "bytes": len(body),
+        "duracao_busca_s": round(elapsed_fetch, 3),
+        "enderecos_anunciados": sorted(catalog_targets.keys()),
+        "contexto_por_endereco": catalog_targets,
+        "bases_item_rfc": sorted(item_bases),
+    }
+
+    aprovado = resultado["enderecos_anunciados_quebrados_total"] == 0
+    resultado["veredito"] = {
+        "aprovado": aprovado,
+        "criterio": "nenhum endereco anunciado no catalogo responde 404/5xx nesta janela",
+    }
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=1))
+        return 0 if aprovado else 1
+
+    c = resultado["custo"]
+    print(f"check-api-catalog-usage — RFC 9727 §5.4 (Usage), janela: {', '.join(log_paths)}")
+    print(f"  custo: {c['linhas_lidas']} linhas, {c['bytes_lidos']} bytes, "
+          f"{c['duracao_leitura_s']}s de leitura do log "
+          f"({c['linhas_malformadas']} malformadas, {c['linhas_timestamp_invalido']} sem timestamp válido)")
+    print(f"  catálogo: {resultado['catalogo']['url']} -> HTTP {status}, "
+          f"{resultado['catalogo']['bytes']} bytes em {resultado['catalogo']['duracao_busca_s']}s, "
+          f"{len(catalog_targets)} endereço(s) anunciado(s):")
+    for path, ctx in sorted(catalog_targets.items()):
+        print(f"    {path}  ({', '.join(ctx)})")
+
+    print(f"\n  pedidos a {CATALOG_PATH} e aos endereços anunciados (inclui o próprio catálogo), "
+          f"REAL vs INTERNO/SONDA separados — somar os dois é o erro que já aconteceu neste repo:")
+    print("    REAL:")
+    if resultado["hits_por_href_anunciado_real"]:
+        for path, n in resultado["hits_por_href_anunciado_real"].items():
+            print(f"      {n:6d}  {path}")
+    else:
+        print("      (nenhum hit real nesta janela)")
+    print("    interno/sonda (aquecimento de borda, sonda deste repo, IP não público, UA wikijuridica-*):")
+    if resultado["hits_por_href_anunciado_interno_ou_sonda"]:
+        for path, n in resultado["hits_por_href_anunciado_interno_ou_sonda"].items():
+            print(f"      {n:6d}  {path}")
+    else:
+        print("      (nenhum)")
+    if resultado["hits_por_prefixo_item_aproximado_real"] or resultado["hits_por_prefixo_item_aproximado_interno_ou_sonda"]:
+        print("  sub-rotas sob um anchor \"item\" (aproximação, NÃO conta na taxa de conversão primária):")
+        for path, n in resultado["hits_por_prefixo_item_aproximado_real"].items():
+            print(f"    REAL      {n:6d}  {path}/...")
+        for path, n in resultado["hits_por_prefixo_item_aproximado_interno_ou_sonda"].items():
+            print(f"    interno   {n:6d}  {path}/...")
+
+    print(f"\n  pedidos ao PRÓPRIO catálogo, por User-Agent + identidade (requisito §5.4 — quem descobre):")
+    if resultado["pedidos_catalogo_por_agente"]:
+        for item in resultado["pedidos_catalogo_por_agente"]:
+            marca = "interno/sonda" if item["interno_ou_sonda"] else "real"
+            print(f"    {item['pedidos']:6d}  [{marca:13s}] [{item['identidade']}] \"{item['user_agent'][:70]}\"")
+    else:
+        print("    (nenhum pedido ao catálogo nesta janela)")
+
+    print(f"\n  clientes distintos (IP+UA) que pediram o catálogo: {resultado['clientes_que_pediram_catalogo']}")
+    print(f"    audiência real (exclui sonda deste repositório, aquecimento de borda e "
+          f"ferramenta interna/IP não público): {resultado['clientes_audiencia_real']}")
+    print(f"    interno/sonda (aquecimento, IP não público, ou UA wikijuridica-*): "
+          f"{resultado['clientes_interno_ou_sonda_local']}")
+
+    if resultado["clientes_audiencia_real"] == 0:
+        print("\n  RESULTADO: nenhum cliente de audiência real pediu o catálogo nesta janela — "
+              "taxa de conversão não é calculável (não é zero, é 'sem amostra').")
+    else:
+        taxa = resultado["taxa_conversao_descoberta_para_uso"]
+        print(f"\n  RESULTADO: {resultado['clientes_converteram_uso_exato']} de "
+              f"{resultado['clientes_audiencia_real']} clientes de audiência real que descobriram o "
+              f"catálogo depois pediram algum endereço EXATO que ele anuncia "
+              f"— taxa de conversão = {taxa:.2%}")
+        if resultado["clientes_nao_converteram_mas_usaram_prefixo"]:
+            print(f"    (+{resultado['clientes_nao_converteram_mas_usaram_prefixo']} que não bateram em href "
+                  f"exato mas usaram sub-rota sob um anchor item — sinal fraco, não somado acima)")
+
+        if resultado["detalhe_nao_converteram"]:
+            print(f"\n  descobriram e NÃO usaram (sinal mais acionável — documento confuso ou endpoint quebrado?):")
+            for d in resultado["detalhe_nao_converteram"]:
+                print(f"    [{d['identidade']}] {d['addr']} \"{d['user_agent'][:70]}\" "
+                      f"— {d['pedidos_catalogo']} pedido(s) ao catálogo, 0 uso subsequente")
+
+        if resultado["detalhe_converteram"]:
+            print(f"\n  descobriram e USARAM:")
+            for d in resultado["detalhe_converteram"]:
+                usados = ", ".join(f"{k}×{v}" for k, v in d["usou_depois_exato"].items())
+                print(f"    [{d['identidade']}] {d['addr']} \"{d['user_agent'][:70]}\" — usou: {usados}")
+
+    print("\n  O QUE ESTA MEDIÇÃO NÃO ENXERGA: janela é só o(s) arquivo(s) de log passado(s) — sem "
+          "rotação; cache de borda da Cloudflare (a URL do catálogo É aquecida, ver cabeçalho do "
+          "arquivo) esconde descobridor externo que bateu HIT — os números aqui são PISO, não total; "
+          "chave de cliente é IP+UA (sem cookie de sessão, este portal não tem JavaScript de "
+          "rastreamento); correlação primária é por endereço EXATO do catálogo, sub-rota entra só "
+          "como aproximação separada. Detalhe completo no cabeçalho do arquivo desta ferramenta.")
+
+    if resultado["enderecos_anunciados_quebrados_total"]:
+        print(f"\n  VEREDITO: REPROVADO — {resultado['enderecos_anunciados_quebrados_total']} "
+              f"requisição(ões) a endereço ANUNCIADO no catálogo responderam 404/5xx nesta janela:")
+        for item in resultado["enderecos_anunciados_quebrados"]:
+            marca = "interno/sonda" if item["interno_ou_sonda"] else "real"
+            print(f"    {item['status']}  {item['path']}  [{marca}] [{item['identidade']}] "
+                  f"\"{item['user_agent'][:70]}\" em {item['timestamp']}")
+    else:
+        print("\n  VEREDITO: aprovado — nenhum endereço anunciado respondeu 404/5xx nesta janela.")
+
+    return 0 if aprovado else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

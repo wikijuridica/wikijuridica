@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""generate-v2-title-length-repair-20260804.
+
+Reduz para a faixa contratual de 20-65 caracteres os 28 `title` do estoque v2
+que excediam 65 (66 a 105), preservando sentido, acentuacao e sobriedade.
+
+Faixa que executa: `internal/seo/seo.go:15-19` (medida em clusters de grafema
+por ptbrdisplaybudget.CharacterCount) e `internal/v2ingest/validate.go:599-601`
+(mesmos limites medidos em runas, razao de reprovacao
+`title_length_out_of_range`). No acervo os dois contadores coincidem (texto em
+NFC, sem marcas combinantes soltas), e este gerador valida os DOIS.
+
+Cada novo title e validado ANTES da escrita:
+  * 20 <= comprimento <= 65, em grafemas E em runas;
+  * diferente do `h1` da propria pagina (`validate.go:606` reprova h1==title);
+  * unico em todo o estoque `data/editorial/v2_pages/*.jsonl` (o contrato exige
+    title unico por URL indexavel);
+  * PT-BR acentuado (nenhuma reducao introduz abreviacao, truncamento ou
+    conectivo pendurado).
+
+Seguranca: lease canonica de epoca + lock exclusivo, CAS por CAMPO (so reescreve
+se o title atual for exatamente o esperado) e por LINHA (as demais linhas do
+shard sao preservadas byte a byte), escrita atomica com fsync, modo 0644,
+idempotente. NAO committa.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+import fcntl
+import glob
+import json
+import os
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.title-length-repair-20260804.lock"
+PAGES_GLOB = "data/editorial/v2_pages/*.jsonl"
+MIN_TITLE = 20
+MAX_TITLE = 65
+
+# intent_id -> (shard, title ATUAL exato, title NOVO)
+REPAIRS: dict[str, tuple[str, str, str]] = {
+    "seg-empresarial-do-defesa-multa": (
+        "data/editorial/v2_pages/codex-autonomos-seguros-r16.jsonl",
+        "Seguro D&O: cobertura de custos de defesa e limites em multas administrativas",
+        "Seguro D&O: custos de defesa e limites em multa administrativa",
+    ),
+    "seg-empresarial-garantia-execucao": (
+        "data/editorial/v2_pages/codex-autonomos-seguros-r16.jsonl",
+        "Executar o seguro garantia: como o segurado aciona a apólice na inadimplência",
+        "Seguro garantia: como acionar a apólice na inadimplência",
+    ),
+    "seg-empresarial-cyber": (
+        "data/editorial/v2_pages/codex-autonomos-seguros-r17.jsonl",
+        "Seguro cyber: cobertura de ataque hacker, vazamento e responsabilidade LGPD",
+        "Seguro cyber: ataque hacker, vazamento e responsabilidade LGPD",
+    ),
+    "seg-residencial-preciso-se-predio-tem-seguro": (
+        "data/editorial/v2_pages/codex-autonomos-seguros-r19.jsonl",
+        "Prédio já tem seguro: ainda preciso de seguro residencial próprio?",
+        "Prédio já tem seguro: preciso de seguro residencial próprio?",
+    ),
+    "seg-transporte-cargas-sinistro": (
+        "data/editorial/v2_pages/codex-autonomos-seguros-r23.jsonl",
+        "Carga roubada ou avariada: quem indeniza e como acionar o seguro de transporte",
+        "Carga roubada ou avariada: quem indeniza e como acionar",
+    ),
+    "trib-icms-st-ressarcimento-venda-outro-estado": (
+        "data/editorial/v2_pages/codex-educacao-tributario-r18.jsonl",
+        "Ressarcimento de ICMS-ST na venda interestadual: recuperar o imposto retido antes",
+        "Ressarcimento de ICMS-ST na venda interestadual: como pedir",
+    ),
+    "trib-irpj-subvencao-icms-tributacao": (
+        "data/editorial/v2_pages/codex-educacao-tributario-r18.jsonl",
+        "Subvenção de ICMS no IRPJ: a tributação após a Lei 14.789 e o crédito fiscal",
+        "Subvenção de ICMS no IRPJ: a tributação após a Lei 14.789",
+    ),
+    "trib-iptu-isencao-aposentado-baixa-renda": (
+        "data/editorial/v2_pages/codex-educacao-tributario-r20.jsonl",
+        "Isenção de IPTU para aposentado de baixa renda: requisitos e como solicitar",
+        "Isenção de IPTU para aposentado de baixa renda: requisitos",
+    ),
+    "trib-iptu-progressividade-tempo-nao-edificado": (
+        "data/editorial/v2_pages/codex-educacao-tributario-r20.jsonl",
+        "IPTU progressivo no tempo: quando o município pode aumentar por terreno sem uso",
+        "IPTU progressivo no tempo: quando o município pode aumentar",
+    ),
+    "trib-simples-limite-proporcional-abertura": (
+        "data/editorial/v2_pages/codex-educacao-tributario-r21.jsonl",
+        "Empresa aberta no meio do ano: como calcular o limite proporcional do Simples e evitar o desenquadramento",
+        "Empresa aberta no meio do ano: limite proporcional do Simples",
+    ),
+    "trib-taxa-lixo-coleta-legalidade": (
+        "data/editorial/v2_pages/codex-educacao-tributario-r21.jsonl",
+        "Taxa de lixo: quando a cobrança é legal e quando é taxa de limpeza inconstitucional",
+        "Taxa de lixo: quando a cobrança é legal ou inconstitucional",
+    ),
+    "tra-fuga-local-acidente-com-vitima-omissao-socorro": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r14.jsonl",
+        "Sair do local de acidente com vítima: omissão de socorro e agravantes",
+        "Sair do local de acidente com vítima: omissão de socorro",
+    ),
+    "tra-entregar-veiculo-a-nao-habilitado-art310": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r14.jsonl",
+        "Entregar o veículo a quem não pode dirigir: o crime do artigo 310 do CTB",
+        "Entregar o veículo a quem não pode dirigir: artigo 310 do CTB",
+    ),
+    "tra-descumprir-restricao-medica-cnh-multa": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r15.jsonl",
+        "Descumprir a restrição médica da CNH: a multa por dirigir fora das condições impostas",
+        "Descumprir a restrição médica da CNH: a multa aplicada",
+    ),
+    "tra-entrega-amigavel-veiculo-quita-divida": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r15.jsonl",
+        "Entrega amigável do veículo financiado: devolver o carro quita mesmo a dívida",
+        "Entrega amigável do veículo financiado quita mesmo a dívida?",
+    ),
+    "tra-multa-estacionar-frente-garagem-guia-rebaixada": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r18.jsonl",
+        "Estacionar em frente à garagem ou na guia rebaixada: a multa e como contestar",
+        "Estacionar em frente à garagem: a multa e como contestar",
+    ),
+    "tra-multa-sinalizacao-via-ausente-ou-apagada": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r18.jsonl",
+        "Multa com sinalização da via ausente ou ilegível: como anular a autuação",
+        "Multa com sinalização ausente ou ilegível: como anular",
+    ),
+    "tra-multa-emergencia-estado-de-necessidade": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r19.jsonl",
+        "Infração cometida em emergência: estado de necessidade como defesa",
+        "Infração em emergência: estado de necessidade como defesa",
+    ),
+    "tra-multa-nao-dar-passagem-veiculo-emergencia": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r19.jsonl",
+        "Não dar passagem a veículo de emergência: a multa e as defesas possíveis",
+        "Não dar passagem a veículo de emergência: multa e defesas",
+    ),
+    "tra-reprovacao-repetida-exame-pratico-cobranca": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r21.jsonl",
+        "Reprovações sucessivas no exame prático: o que pode ser cobrado a cada nova tentativa",
+        "Reprovações no exame prático: o que pode ser cobrado",
+    ),
+    "tra-reprovado-exame-aptidao-detran-contestar": (
+        "data/editorial/v2_pages/codex-sucessoes-transito-r21.jsonl",
+        "Reprovado no exame de aptidão do Detran: como contestar a inaptidão",
+        "Reprovado no exame de aptidão do Detran: como contestar",
+    ),
+    "const-ato-juridico-perfeito": (
+        "data/editorial/v2_pages/constitucional-w3-01.jsonl",
+        "Ato jurídico perfeito: por que um contrato antigo resiste à lei nova",
+        "Ato jurídico perfeito: por que o contrato resiste à lei nova",
+    ),
+    "const-poder-constituinte-derivado": (
+        "data/editorial/v2_pages/constitucional-w3-01.jsonl",
+        "Poder constituinte derivado: como a Constituição pode ser reformada",
+        "Poder constituinte derivado: como reformar a Constituição",
+    ),
+    "const-clausula-de-reserva-de-plenario": (
+        "data/editorial/v2_pages/constitucional-w3-01.jsonl",
+        "Cláusula de reserva de plenário: por que uma turma não decide sozinha",
+        "Cláusula de reserva de plenário: a turma não decide sozinha",
+    ),
+    "cons-multa-cancelamento-hospede-desiste-abusiva": (
+        "data/editorial/v2_pages/consumidor-w3-06.jsonl",
+        "Multa de cancelamento de hospedagem maior que a divulgada: e agora",
+        "Multa de cancelamento de hospedagem maior que a divulgada",
+    ),
+    "emp-aumento-capital-social-direito-preferencia": (
+        "data/editorial/v2_pages/empresarial-25.jsonl",
+        "Aumento de capital social: direito de preferência do sócio explicado",
+        "Aumento de capital social: direito de preferência do sócio",
+    ),
+    "emp-reducao-capital-social-quando-pode": (
+        "data/editorial/v2_pages/empresarial-25.jsonl",
+        "Redução de capital social: quando é permitida e efeitos para credores",
+        "Redução de capital social: quando é permitida e seus efeitos",
+    ),
+    "emp-responsabilidade-solidaria-integralizacao-capital": (
+        "data/editorial/v2_pages/empresarial-25.jsonl",
+        "Responsabilidade solidária na integralização do capital: até quando existe",
+        "Responsabilidade solidária na integralização do capital",
+    ),
+}
+
+
+def grapheme_count(text: str) -> int:
+    """Clusters de grafema: uma base seguida de suas marcas combinantes."""
+    normalized = unicodedata.normalize("NFC", text)
+    count = 0
+    for character in normalized:
+        if unicodedata.combining(character) == 0:
+            count += 1
+    return count
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def existing_titles() -> dict[str, str]:
+    """title -> intent_id de toda pagina ativa do estoque."""
+    titles: dict[str, str] = {}
+    for path in sorted(glob.glob(os.fspath(ROOT / PAGES_GLOB))):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record.get("skipped") is True:
+                    continue
+                title = (record.get("title") or "").strip()
+                intent = record.get("intent_id") or ""
+                if title:
+                    titles[title] = intent
+    return titles
+
+
+def preflight() -> None:
+    """Valida os 28 titles novos antes de qualquer escrita."""
+    taken = existing_titles()
+    problems: list[str] = []
+    seen_new: dict[str, str] = {}
+    for intent, (_rel, old, new) in sorted(REPAIRS.items()):
+        graphemes = grapheme_count(new)
+        runes = len(new)
+        if not (MIN_TITLE <= graphemes <= MAX_TITLE):
+            problems.append(f"{intent}: grafemas={graphemes} fora de {MIN_TITLE}-{MAX_TITLE}: {new!r}")
+        if not (MIN_TITLE <= runes <= MAX_TITLE):
+            problems.append(f"{intent}: runas={runes} fora de {MIN_TITLE}-{MAX_TITLE}: {new!r}")
+        if grapheme_count(old) <= MAX_TITLE:
+            problems.append(f"{intent}: title atual ja cabe na faixa ({grapheme_count(old)}); reparo desnecessario")
+        if new in seen_new:
+            problems.append(f"{intent}: title novo colide com {seen_new[new]}: {new!r}")
+        seen_new[new] = intent
+        owner = taken.get(new)
+        if owner is not None and owner != intent:
+            problems.append(f"{intent}: title novo ja usado por {owner}: {new!r}")
+    if problems:
+        for problem in problems:
+            print(f"PREFLIGHT FALHOU: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(REPAIRS)} titles novos dentro de {MIN_TITLE}-{MAX_TITLE} "
+          f"grafemas/runas, unicos no estoque")
+
+
+def by_file() -> dict[str, dict[str, tuple[str, str]]]:
+    grouped: dict[str, dict[str, tuple[str, str]]] = {}
+    for intent, (rel, old, new) in REPAIRS.items():
+        grouped.setdefault(rel, {})[intent] = (old, new)
+    return grouped
+
+
+def apply_file(rel: str, wanted: dict[str, tuple[str, str]]) -> tuple[int, int]:
+    path = ROOT / rel
+    payload = path.read_bytes()
+    lines = payload.decode("utf-8").split("\n")
+    trailing_newline = lines and lines[-1] == ""
+    if trailing_newline:
+        lines = lines[:-1]
+
+    changed = 0
+    already = 0
+    seen: set[str] = set()
+    output: list[str] = []
+    for number, raw in enumerate(lines, 1):
+        if not raw.strip():
+            raise SystemExit(f"{rel}: linha em branco {number}")
+        record = json.loads(raw)
+        intent = record.get("intent_id")
+        if intent not in wanted:
+            output.append(raw)
+            continue
+        seen.add(intent)
+        old, new = wanted[intent]
+        current = record.get("title")
+        if current == new:
+            already += 1
+            output.append(raw)
+            continue
+        if current != old:
+            raise SystemExit(
+                f"CAS de campo falhou {rel}:{number} intent={intent} "
+                f"title esperado={old!r} atual={current!r}"
+            )
+        if (record.get("h1") or "").strip() == new:
+            raise SystemExit(f"{rel}:{number} intent={intent}: title novo igual ao h1")
+        record["title"] = new
+        output.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+        changed += 1
+
+    missing = sorted(set(wanted) - seen)
+    if missing:
+        raise SystemExit(f"{rel}: intents nao encontrados: {missing}")
+    if changed == 0:
+        return 0, already
+
+    rewritten = "\n".join(output)
+    if trailing_newline:
+        rewritten += "\n"
+    if path.read_bytes() != payload:
+        raise SystemExit(f"{rel}: mudou durante a transacao - abortado")
+    atomic_write(path, rewritten.encode("utf-8"))
+    return changed, already
+
+
+def main() -> int:
+    preflight()
+    total_changed = 0
+    total_already = 0
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                for rel, wanted in sorted(by_file().items()):
+                    changed, already = apply_file(rel, wanted)
+                    total_changed += changed
+                    total_already += already
+                    print(f"shard={rel} reparados={changed} ja_aplicados={already}")
+    except StockEpochBusy as error:
+        print(f"title-length-repair: canonical stock busy: {error}", file=sys.stderr)
+        return 75
+    print(f"total reparados={total_changed} ja_aplicados={total_already} alvo={len(REPAIRS)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

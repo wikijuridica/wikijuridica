@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""repair-invalidated-layer — devolve ao lugar a camada que um reset invalidou.
+
+ESTA FERRAMENTA ESCREVE. Ela faz `os.rename` dentro da árvore de trabalho, e é
+por isso que ela não se chama `check-*`.
+
+O QUE ELA CONSERTA, e por que existe (o caso de 2026-08-04)
+==========================================================
+`tools/bootstrap-chain --from N` reinicia a cadeia chamando
+`tools/bootstrap-step-receipts reset --invalidate-declared-outputs`, que NÃO
+apaga nada: move cada output declarado para um vizinho
+`<arquivo>.stale-resume-<passo>-<origem>-<token>` por `renameat2`, preservando
+os bytes (`move_to_recoverable_stale` em tools/bootstrap-step-receipts:529).
+
+O desenho é correto — o problema é a cadeia que não chega ao fim. Os passos
+executados regeneram seus outputs; os que não rodaram deixam a camada
+invalidada e ausente do disco. Em 2026-08-04 foram 10 camadas (21 MB, entre
+elas `semantic_cluster_index.jsonl` com 1.771 registros e
+`refined_public_prose.jsonl` com 590) fora do disco desde um reset, com os
+bytes intactos ao lado o tempo todo. Ninguém tinha perdido nada e ninguém sabia
+disso.
+
+POR QUE ISTO É UM ARQUIVO SEPARADO (2026-08-29)
+==============================================
+Este código morava em `tools/check-invalidated-layer-recovery`, atrás da flag
+`--recover`. `CLAUDE.md` declara que `tools/check-*` é read-only e que
+`tools/generate-*` escreve; um `check-*` capaz de renomear arquivo VERSIONADO
+mistura os dois papéis, e quem o rodasse para diagnosticar podia sair tendo
+alterado justamente o que pretendia auditar. O diagnóstico ficou lá — puro,
+sem nenhuma flag de escrita — e o poder de mexer no disco ficou aqui.
+
+Nada foi afrouxado na travessia: continua valendo a regra de segurança que
+sempre governou este código — só devolve o vizinho ao lugar quando os bytes
+conferem com o que está no HEAD. Divergiu do HEAD, não toca: pode ser trabalho
+mais novo que ninguém commitou, e sobrescrever isso seria perder evolução, o
+que este repositório proíbe.
+
+A varredura NÃO é reimplementada aqui. Ela é importada do próprio check, que é
+o oráculo único de "o que está fora do lugar" — duas varreduras divergindo
+seria a próxima família de bug. O carregamento por `importlib` é o padrão do
+repositório para arquivo de nome hifenizado (ver `carregar()` em
+tools/check-body-word-count-formula).
+
+Uso:
+    ./tools/repair-invalidated-layer --dry-run   # lista o que faria, não escreve
+    ./tools/repair-invalidated-layer             # restaura
+    ./tools/repair-invalidated-layer --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(os.environ.get(
+    "WIKI_ROOT", pathlib.Path(__file__).resolve().parent.parent)).resolve()
+CHECK = pathlib.Path(__file__).resolve().parent / "check-invalidated-layer-recovery"
+
+
+def carregar_check():
+    """Importa o check (nome hifenizado) para reusar a varredura dele."""
+    especificacao = importlib.util.spec_from_loader(
+        "check_invalidated_layer_recovery",
+        importlib.machinery.SourceFileLoader(
+            "check_invalidated_layer_recovery", os.fspath(CHECK)),
+    )
+    if especificacao is None or especificacao.loader is None:
+        raise SystemExit(f"repair-invalidated-layer: não consegui carregar {CHECK}")
+    modulo = importlib.util.module_from_spec(especificacao)
+    especificacao.loader.exec_module(modulo)
+    return modulo
+
+
+def bytes_do_head(relativo: str) -> bytes | None:
+    resultado = subprocess.run(
+        ["git", "show", f"HEAD:{relativo}"],
+        cwd=ROOT, capture_output=True,
+    )
+    if resultado.returncode != 0:
+        return None
+    return resultado.stdout
+
+
+def recuperar(ausentes: list[dict], escrever: bool) -> tuple[list[dict], list[dict]]:
+    restaurados: list[dict] = []
+    recusados: list[dict] = []
+    for registro in ausentes:
+        stale = ROOT / registro["preservado_em"]
+        original = ROOT / registro["camada"]
+        if original.exists():
+            recusados.append({**registro, "motivo": "original reapareceu durante a execução"})
+            continue
+        conteudo_head = bytes_do_head(registro["camada"])
+        if conteudo_head is not None:
+            # Versionada: só devolve se os bytes forem exatamente os do HEAD.
+            # Divergência aqui pode ser trabalho mais novo que ninguém commitou,
+            # e sobrescrever isso seria perder evolução.
+            conteudo_stale = stale.read_bytes()
+            if hashlib.sha256(conteudo_stale).digest() != hashlib.sha256(conteudo_head).digest():
+                recusados.append({
+                    **registro,
+                    "motivo": "bytes divergem do HEAD; pode ser trabalho novo — exige análise",
+                })
+                continue
+            registro = {**registro, "origem": "confere com o HEAD"}
+        else:
+            # Nunca commitada: o vizinho stale é a ÚNICA cópia que existe. Não há
+            # o que sobrescrever (o original está ausente), então devolver ao
+            # lugar é estritamente melhor que deixar o conteúdo fora do caminho.
+            # O mtime original é preservado pelo move, então qualquer gate de
+            # frescor continua enxergando a idade real do artefato.
+            registro = {**registro, "origem": "não versionada — única cópia existente"}
+        if escrever:
+            os.rename(stale, original)
+        restaurados.append(registro)
+    return restaurados, recusados
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="mostra o que seria restaurado sem tocar no disco")
+    parser.add_argument("--json", action="store_true", help="saída estruturada")
+    args = parser.parse_args()
+
+    check = carregar_check()
+    ausentes, regenerados = check.coletar()
+    restaurados, recusados = recuperar(ausentes, escrever=not args.dry_run)
+
+    resultado = {
+        "restaurados": restaurados,
+        "recusados": recusados,
+        "backups_de_camada_regenerada": len(regenerados),
+        "dry_run": args.dry_run,
+    }
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=1))
+    else:
+        verbo = "restauraria" if args.dry_run else "restaurou"
+        total = sum(item["bytes"] for item in restaurados)
+        print(f"repair-invalidated-layer: {verbo} {len(restaurados)} camada(s) "
+              f"({total} bytes)")
+        for item in restaurados:
+            print(f"  {item['camada']} <- {item['preservado_em']} ({item['origem']})")
+        print(f"repair-invalidated-layer: backups de camada já regenerada: "
+              f"{len(regenerados)} (ruído a classificar, nunca a apagar)")
+
+    for item in recusados:
+        print(f"repair-invalidated-layer: NÃO restaurado {item['camada']}: "
+              f"{item['motivo']}", file=sys.stderr)
+
+    # Recusa é veredito de "exige análise humana", não sucesso: sai != 0 para que
+    # a divergência com o HEAD não passe calada em execução automatizada.
+    return 1 if recusados else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

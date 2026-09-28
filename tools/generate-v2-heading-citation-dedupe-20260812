@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""generate-v2-heading-citation-dedupe-20260812 — a citação no título repetia a do corpo.
+
+O DEFEITO. A página `trib-simples-distribuicao-lucros-isenta` cita "art. 15 da
+Lei 9.249" no TÍTULO de uma seção e de novo no corpo dela. No HTML publicado a
+conta fica em três: o portal emite um bloco "Nesta página" que repete os
+títulos das seções, então o título aparece no índice, aparece de novo como
+`<h2>` e o corpo traz a citação uma terceira vez — as três dentro de um trecho
+de 39 palavras.
+
+O detector de prosa acusa isso como `repeated_phrase` ("molde/permutação
+mecânica"), e é a ÚNICA página do acervo de 9.622 nesse estado. A acusação
+bloqueava três gates ao mesmo tempo: agent-friendly-html,
+canonical-sitemap-consistency e legal-content-quality.
+
+POR QUE CORRIGIR O TEXTO E NÃO O DETECTOR. A repetição é real: o leitor lê a
+mesma citação três vezes em duas linhas. Título de seção não precisa carregar o
+número do artigo — quem confere vai ao corpo, onde a citação continua inteira,
+com o ano e o dispositivo ("percentuais de presunção do art. 15 da Lei
+9.249/1995"). Tirar a citação do título deixa o texto melhor E remove a
+acusação; mexer no detector para aceitar deixaria o texto como está.
+
+O QUE NÃO MUDA: a informação jurídica. A seção continua explicando o mesmo
+limite, calculado pela mesma presunção, com a mesma base legal citada no corpo.
+Nenhum número, prazo ou dispositivo é alterado.
+
+CONTRATO DE ESCRITA (o mesmo dos reparos datados anteriores): lease de época,
+lock exclusivo, CAS pelo sha256 da LINHA viva, CAS por TRECHO (exatamente uma
+ocorrência), demais linhas preservadas byte a byte, word_count recalculado pela
+fórmula do ingest, escrita atômica com fsync, idempotente. NÃO commita e NÃO
+republica.
+
+Uso:
+    tools/generate-v2-heading-citation-dedupe-20260812 --dry-run
+    tools/generate-v2-heading-citation-dedupe-20260812
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.heading-citation-dedupe-20260812.lock"
+
+# intent_id -> (shard, trecho atual, trecho novo)
+REPAROS: dict[str, tuple[str, str, str]] = {
+    "trib-simples-distribuicao-lucros-isenta": (
+        "data/editorial/v2_pages/tributario-03.jsonl",
+        "O limite calculado pela presunção do art. 15 da Lei 9.249",
+        "O limite calculado pela presunção de lucro",
+    ),
+}
+
+# A citação tem de CONTINUAR na página: sai do título, permanece no corpo.
+CITACAO_NO_CORPO = "art. 15 da Lei 9.249/1995"
+
+# O texto novo não pode afirmar mais do que a fonte primária sustenta.
+TEXTOS_PROIBIDOS = ("jurisprudência pacífica", "entendimento pacificado", "sempre",
+                    "garantido", "com certeza")
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", value)
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len([token for token in re.split(r"[^0-9A-Za-z]+", folded) if token])
+
+
+def word_count(record: dict) -> int:
+    """Reproduz bodyWordCount de internal/v2ingest/validate.go.
+
+    O texto novo é mais longo que o antigo; declarar sem recalcular derruba a
+    página no ingest (declared_word_count_incoherent).
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def _contar(record: dict, trecho: str) -> int:
+    total = (record.get("opening") or "").count(trecho)
+    for section in record.get("sections") or []:
+        total += (section.get("heading") or "").count(trecho)
+        total += (section.get("text") or "").count(trecho)
+    for item in record.get("faq") or []:
+        total += (item.get("q") or "").count(trecho)
+        total += (item.get("a") or "").count(trecho)
+    return total
+
+
+def _substituir(record: dict, antes: str, depois: str) -> bool:
+    if antes in (record.get("opening") or ""):
+        record["opening"] = record["opening"].replace(antes, depois)
+        return True
+    for section in record.get("sections") or []:
+        if antes in (section.get("heading") or ""):
+            section["heading"] = section["heading"].replace(antes, depois)
+            return True
+        if antes in (section.get("text") or ""):
+            section["text"] = section["text"].replace(antes, depois)
+            return True
+    for item in record.get("faq") or []:
+        if antes in (item.get("q") or ""):
+            item["q"] = item["q"].replace(antes, depois)
+            return True
+        if antes in (item.get("a") or ""):
+            item["a"] = item["a"].replace(antes, depois)
+            return True
+    return False
+
+
+def preflight() -> None:
+    problemas: list[str] = []
+    for intent, (_shard, antes, depois) in sorted(REPAROS.items()):
+        if antes == depois:
+            problemas.append(f"{intent}: título novo idêntico ao atual")
+        if not antes or not depois:
+            problemas.append(f"{intent}: trecho vazio")
+        # O título novo não pode carregar a citação — é justamente ela que sai.
+        if "9.249" in depois or "art. 15" in depois:
+            problemas.append(f"{intent}: título novo ainda carrega a citação que deveria sair")
+        # E não pode perder o assunto: o título continua sendo sobre o limite
+        # calculado por presunção.
+        for termo in ("limite", "presunção"):
+            if termo not in depois.lower():
+                problemas.append(f"{intent}: título novo perdeu o termo {termo!r}")
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def aplicar(shard_rel: str, alvos: dict[str, tuple[str, str]], dry_run: bool) -> tuple[int, int]:
+    path = ROOT / shard_rel
+    linhas = path.read_bytes().decode("utf-8").split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    saida: list[str] = []
+    alterados = 0
+    ja_feitos = 0
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard_rel}: linha em branco {numero}")
+        registro = json.loads(raw)
+        intent = registro.get("intent_id")
+        if intent not in alvos:
+            saida.append(raw)
+            continue
+
+        antes, depois = alvos[intent]
+        if _contar(registro, depois) == 1 and _contar(registro, antes) == 0:
+            ja_feitos += 1
+            saida.append(raw)
+            continue
+
+        ocorrencias = _contar(registro, antes)
+        if ocorrencias != 1:
+            raise SystemExit(
+                f"CAS DE TRECHO FALHOU em {shard_rel}:{numero} ({intent}): "
+                f"o trecho aparece {ocorrencias} vez(es), esperado exatamente 1. "
+                f"Reler o conteúdo vivo antes de reaplicar.")
+
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        if not _substituir(registro, antes, depois):
+            raise SystemExit(f"{shard_rel}:{numero} ({intent}): substituição não aplicada")
+        registro["word_count"] = word_count(registro)
+        nova = json.dumps(registro, ensure_ascii=False, sort_keys=True)
+        atual = hashlib.sha256(
+            path.read_bytes().decode("utf-8").split("\n")[numero - 1].strip().encode("utf-8")
+        ).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {shard_rel}:{numero} ({intent}): "
+                f"outra frente tocou este registro durante a execução.")
+        saida.append(nova)
+        alterados += 1
+        print(f"  corrigido: {intent} -> word_count={registro['word_count']}")
+
+    if alterados and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(path, payload.encode("utf-8"))
+    return alterados, ja_feitos
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    preflight()
+
+    por_shard: dict[str, dict[str, tuple[str, str]]] = {}
+    for intent, (shard, antes, depois) in REPAROS.items():
+        por_shard.setdefault(shard, {})[intent] = (antes, depois)
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                total_alterados = 0
+                total_ja = 0
+                for shard in sorted(por_shard):
+                    alterados, ja = aplicar(shard, por_shard[shard], args.dry_run)
+                    total_alterados += alterados
+                    total_ja += ja
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print(f"\n--dry-run: {total_alterados} correção(ões) aplicáveis, "
+              f"{total_ja} já feita(s). Nada escrito.")
+        return 0
+    print(f"\n{total_alterados} corrigida(s), {total_ja} já estava(m) correta(s).")
+    if total_alterados:
+        print("Reingerir o estoque e republicar para o espelho refletir a correção.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

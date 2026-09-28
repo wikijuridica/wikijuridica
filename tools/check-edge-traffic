@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""check-edge-traffic — quem realmente visita o portal, medido na borda, sem JavaScript.
+
+POR QUE EXISTE: o portal precisa saber o que dá retorno, e não tem sistema de
+conversão. Havia três candidatos a fonte, e dois falham:
+
+  - access log do Go: desde o cutover de 2026-08-06 o nginx serve o acervo
+    direto do disco, então o Go só vê /buscar/ e rotas dinâmicas. Subconta
+    drasticamente.
+  - beacon de JavaScript: mediria o visitante, mas ao custo de um script de
+    terceiro em toda página, numa que promete zero JS — e foi por isso que a
+    injeção automática do Cloudflare Web Analytics foi DESLIGADA nesta data.
+  - analytics da BORDA (esta ferramenta): o Cloudflare já conta cada requisição
+    que passa por ele, incluindo robôs, sem executar nada no navegador. É a
+    única das três que mede tudo e não pesa nada.
+
+O QUE ELE RESPONDE: quantas pessoas e quantos robôs, quais páginas, de onde
+vieram, e — o que mais importa para decidir conteúdo — se Googlebot e os robôs
+de IA estão de fato rastreando o acervo.
+
+AUDIÊNCIA NÃO É O NÚMERO BRUTO: a borda conta tudo o que passa por ela,
+inclusive as ~59 mil requisições/dia que o próprio servidor gera reaquecendo o
+cache. A série separa as duas coisas em colunas e em campos distintos, e o
+número do aquecimento vem do ledger real de `tools/warm-edge-cache` — nunca de
+estimativa. Ver o bloco de SCHEMA, abaixo, para o porquê de cada escolha.
+
+Credencial em `.env.local`, fora do versionamento: CLOUDFLARE_ZONE_TOKEN
+(Bearer de escopo de zona) quando presente; senão CLOUDFLARE_EMAIL +
+CLOUDFLARE_API_TOKEN (Global API Key). Resolvido por tools/cloudflare_auth.py.
+Read-only: só lê a API e grava a série em data/ops/ para histórico.
+
+Uso:
+    tools/check-edge-traffic
+    tools/check-edge-traffic --dias 30
+    tools/check-edge-traffic --json
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+import cloudflare_auth  # noqa: E402  (idem)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ENV = os.path.join(ROOT, ".env.local")
+SITE = os.path.join(ROOT, "content/site.json")
+SERIE = os.path.join(ROOT, "data/ops/edge_traffic_daily.jsonl")
+# Série por agente EXATO (tools/generate-bot-agents-daily). Consultada apenas
+# para saber, por `agent_key`, se a ULTIMA linha já promoveu aquele operador a
+# verificado por FAIXA DE IP oficial (authenticity v4 — ver
+# AUTENTICIDADE_PROMOVE_IP) quando a Cloudflare não autentica por
+# `verifiedBotCategory`. Esta ferramenta NÃO calcula a faixa: ela só LÊ o
+# veredito que o produtor já gravou, forward-compatible com o schema v4 que
+# ainda não existe na série no momento desta correção (2026-09-02) — enquanto
+# não existir, `agentes_promovidos_por_ip_range` devolve conjunto vazio e nada
+# muda de comportamento.
+SERIE_AGENTES = os.path.join(ROOT, "data/ops/edge_bot_agents_daily.jsonl")
+# Ledger REAL do aquecimento de borda (tools/warm-edge-cache). Cada execucao
+# grava urls, started_at, finished_at e o mapa status. E a UNICA fonte exata do
+# volume proprio que entra na serie diaria — ver AQUECIMENTO abaixo.
+AQUECIMENTO = os.path.join(ROOT, "data/ops/edge_cache_warm.jsonl")
+
+# TRAFEGO PROPRIO NAO E SO O AQUECEDOR — e essa era a inflacao.
+#
+# Ate 2026-08-26 `organic_requests` descontava do bruto da Cloudflare APENAS o
+# ledger do aquecedor. Toda outra ferramenta nossa que sai para a borda --
+# sonda de auditoria, medicao de superficie, verificacao de rota -- atravessa a
+# Cloudflare, entra no bruto e NAO entra no desconto: vira "audiencia organica".
+#
+# Medido no dia: nesta propria sessao, ~700 sondas do orquestrador e ~110 de um
+# agente entraram em organic_requests por sairem sem marcacao. O campo declara
+# `basis: exact_raw_minus_warming_ledger` -- afirmacao de exatidao que o dado
+# nao sustentava.
+#
+# A correcao e estrutural, nao disciplinar: qualquer ferramenta interna que
+# alcance a borda grava num destes ledgers, e o desconto soma TODOS. Ledger novo
+# entra aqui, nao numa segunda copia da regra.
+LEDGERS_PROPRIOS = [
+    AQUECIMENTO,
+    os.path.join(ROOT, "data/ops/edge_probe_requests.jsonl"),
+]
+API = "https://api.cloudflare.com/client/v4"
+
+SCHEMA = "edge_traffic_daily_v5"
+# v5 (2026-09-02): `local_verification_sampled_24h` deixa de somar o UA de robô
+# estrangeiro NÃO verificado — medido no PerplexityBot: ~700 req/dia caíam
+# nesse campo e no bloco impresso "gerado pelo proprio servidor (NAO e
+# visita)", uma afirmação falsa (o tráfego é de fora, só não está autenticado
+# pela Cloudflare). Esse volume ganha bloco próprio, `foreign_unverified_bot_
+# sampled_24h`, com o rótulo ROTULO_ESTRANGEIRO_NAO_VERIFICADO. Além disso, um
+# operador cuja série `edge_bot_agents_daily.jsonl` já o promoveu a verificado
+# por FAIXA DE IP (authenticity v4) entra em `external_sampled_24h` como
+# audiência de verdade, com o volume promovido nomeado à parte em
+# `bot_promoted_by_ip_range_sampled_24h` — nunca silenciosamente somado.
+# v4 (2026-08-12): `external_sampled_24h` e `local_verification_sampled_24h`
+# mudaram de significado. Ate aqui a separacao entre "visita" e "trafego
+# proprio" se apoiava so na STRING do User-Agent mais um heuristico de pais;
+# agora robo so entra em `external_sampled_24h` se a Cloudflare AUTENTICAR a
+# identidade (`verifiedBotCategory`, que funciona no plano Free — a afirmacao
+# anterior de que nao funcionava estava errada e sustentou a contagem por UA em
+# toda a familia de ferramentas de telemetria). O UA de robo nao autenticado
+# passou a ter campo proprio, `unverified_bot_ua_sampled_24h`, em vez de entrar
+# na conta com o nome do operador que ele alegava ser. Sem o bump, uma linha de
+# antes e uma de depois pareceriam a mesma medicao.
+# v3 (2026-08-12): a serie passa a separar AUDIENCIA de TRAFEGO PROPRIO.
+#
+# O QUE QUEBROU: em 2026-08-12 entrou um timer que reaquece as 9.842 URLs do
+# acervo de 4 em 4 horas (~59 mil requisicoes/dia contra a borda). O
+# aquecimento e honesto no fio — User-Agent proprio `wikijuridica-cache-warm/1.0`
+# e cabecalho X-Warming-Request: true — e os relatorios de ORIGEM ja o excluem.
+# Mas `httpRequests1dGroups`, a fonte desta serie, NAO tem dimensao de
+# User-Agent: requests/pageViews/uniques somavam o aquecimento como se fosse
+# audiencia. Medido na primeira execucao apos o timer: 29.552 de 31.708
+# requisicoes do dia (93,2%) eram nossas, contra um pico organico de ~4,3 mil
+# de Googlebot no melhor dia ja medido. A serie estaria ~10x acima do real.
+#
+# POR QUE O BUMP: sem ele nao ha como um leitor (ou um verificador de
+# honestidade) distinguir linha escrita ANTES da correcao — que soma
+# aquecimento como audiencia — de linha escrita DEPOIS. Mesma razao do bump em
+# tools/generate-bot-agents-daily (v2, campo "authenticity").
+#
+# POR QUE NAO MIGRAR PARA httpRequestsAdaptiveGroups (que TEM userAgent):
+#   - o conjunto e AMOSTRADO; apresentar estimativa como contagem exata e dado
+#     falso (mesma postura ja documentada em generate-bot-agents-daily);
+#   - a consulta agrupa por combinacao e tem teto: a execucao de 2026-08-12
+#     BATEU no teto de 200 e cortou a cauda. Total montado sobre lista truncada
+#     e subcontagem silenciosa — pior que o problema que resolveria;
+#   - a janela maxima e de 1 dia por consulta: uma serie de 7/30 dias viraria
+#     7/30 consultas de estimativa;
+#   - `uniq { uniques }` nao tem equivalente no conjunto adaptativo — migrar
+#     custaria a coluna.
+# Por isso a serie continua exata (1dGroups) e o volume proprio e ANOTADO a
+# partir do ledger real. O bloco amostrado segue existindo abaixo, agora como
+# CONFERENCIA independente do numero do ledger, nunca como fonte dele.
+
+CONSULTA_DIARIA = """
+query($zone: String!, $since: Date!, $until: Date!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequests1dGroups(limit: 60, filter: {date_geq: $since, date_leq: $until},
+                         orderBy: [date_ASC]) {
+      dimensions { date }
+      sum { requests pageViews bytes
+            countryMap { clientCountryName requests }
+            responseStatusMap { edgeResponseStatus requests } }
+      uniq { uniques }
+    }
+  } }
+}
+"""
+
+# httpRequestsAdaptiveGroups traz o User-Agent, que é o que separa robô de
+# pessoa. Amostrado pelo Cloudflare, então serve para PROPORÇÃO e presença, não
+# para contagem exata — e é declarado assim na saída, nunca apresentado como
+# número absoluto.
+CONSULTA_AGENTES = """
+query($zone: String!, $since: Time!, $until: Time!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: 200,
+        filter: {datetime_geq: $since, datetime_leq: $until},
+        orderBy: [count_DESC]) {
+      count
+      dimensions { userAgent clientRequestHTTPHost clientCountryName verifiedBotCategory }
+    }
+  } }
+}
+"""
+
+# REQUISIÇÕES LÍQUIDAS DE TRÁFEGO PRÓPRIO — filtro NO SERVIDOR (`userAgent_
+# notlike`), não soma de `fora` no cliente. Medido em 2026-09-02: o tráfego
+# próprio foi 98,4% das amostras desta janela — CONSULTA_AGENTES agrupa por
+# (UA, host, país, categoria) e já truncava em 200 combinações antes de somar
+# `fora`, então o total de "audiência" ali é PISO, não medida limpa. Sem
+# dimensão nenhuma, esta consulta devolve UM grupo (medido: 1 grupo, nenhuma
+# combinação a truncar) — o `count` bruto de requisições cujo User-Agent NÃO
+# começa por "wikijuridica" na mesma janela de 24h.
+#
+# ★ O QUE ESTE PRODUTOR NÃO PROMETE: `pageViews` e `uniques` NÃO existem no
+# tipo de `httpRequestsAdaptiveGroups` (confirmado por introspecção GraphQL ao
+# vivo em 2026-09-02: `ZoneHttpRequestsAdaptiveGroupsSum` não tem `pageViews`,
+# e `ZoneHttpRequestsAdaptiveGroups` não tem campo `uniq`). Só `httpRequests1d
+# Groups` tem os dois, e esse dataset não filtra por User-Agent (confirmado
+# pela mesma introspecção: seu filtro não tem nenhum campo `userAgent*`).
+# Chamar o `count` daqui de "page views" seria etiquetar errado um número real
+# — a mesma fraude de medição que o contrato deste repositório proíbe. O que
+# esta consulta mede, e só isto, é REQUISIÇÃO bruta amostrada.
+CONSULTA_LIQUIDA = """
+query($zone: String!, $since: Time!, $until: Time!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: 10,
+        filter: {datetime_geq: $since, datetime_leq: $until, userAgent_notlike: "wikijuridica%"}) {
+      count
+    }
+  } }
+}
+"""
+
+# IPs de cliente DISTINTOS na mesma janela e mesmo filtro — o mais perto deste
+# conjunto de um "quantos visitantes", já que `httpRequestsAdaptiveGroups` não
+# tem `uniq`. NÃO é o `uniques` de `httpRequests1dGroups` (que usa outra
+# metodologia, HyperLogLog sobre outra combinação de sinais) — por isso o nome
+# do campo diz "distinct_client_ips", nunca "uniques" liso, para não sugerir
+# que é o mesmo número com outro filtro. Medido em 2026-09-02: 1.048 grupos
+# numa janela de 24h — bem abaixo do teto de 10.000 desta consulta.
+CONSULTA_LIQUIDA_IPS = """
+query($zone: String!, $since: Time!, $until: Time!, $limite: Int!) {
+  viewer { zones(filter: {zoneTag: $zone}) {
+    httpRequestsAdaptiveGroups(limit: $limite,
+        filter: {datetime_geq: $since, datetime_leq: $until, userAgent_notlike: "wikijuridica%"},
+        orderBy: [count_DESC]) {
+      count
+      dimensions { clientIP }
+    }
+  } }
+}
+"""
+LIMITE_LIQUIDA_IPS = 10000
+AVISO_LIQUIDA_IPS = 9500
+
+# Rótulo -> fragmentos de User-Agent. Mesma família do registry Go
+# (internal/crawl.DefaultBotRegistry) para que a leitura aqui e a política de
+# rate limit falem dos mesmos atores.
+FAMILIAS = [
+    ("Googlebot", ["googlebot"]),
+    ("Google (outros)", ["google-inspectiontool", "googleother", "storebot-google", "adsbot-google", "google-extended"]),
+    ("Bing", ["bingbot", "adidxbot"]),
+    ("OpenAI", ["oai-searchbot", "chatgpt-user", "gptbot"]),
+    ("Anthropic", ["claude-searchbot", "claude-user", "claudebot", "anthropic"]),
+    ("Perplexity", ["perplexitybot", "perplexity-user"]),
+    ("Apple", ["applebot"]),
+    ("DuckDuckGo", ["duckduckbot"]),
+    ("Yandex", ["yandexbot"]),
+    ("Meta/Facebook", ["meta-externalagent", "meta-externalfetcher", "facebookexternalhit"]),
+    ("Amazon", ["amazonbot", "amzn-"]),
+    # Sem esta linha o UA "Mozilla/5.0 (compatible; Cloudflare-AgentReadiness/1.0)"
+    # não casa nenhuma marca (não contém "bot") e cai em "pessoa (navegador)":
+    # 24 requisições de infraestrutura contadas como gente, 13% da fatia humana
+    # do dia 2026-08-06.
+    ("infraestrutura/monitoramento", ["cloudflare-agentreadiness", "cf-", "uptimerobot",
+                                      "pingdom", "betteruptime", "site24x7"]),
+    ("SEO (terceiros)", ["semrushbot", "ahrefsbot", "mj12bot", "dotbot", "blexbot", "dataforseo"]),
+    ("outros robôs", ["bot", "crawler", "spider", "scrapy", "curl", "wget", "python-requests", "headless"]),
+]
+
+# Operadores que rastreiam SEMPRE das próprias redes, publicadas e fora do
+# Brasil. Um User-Agent desses chegando de IP brasileiro não é visita: é a
+# verificação local (tools/check-what-bots-see) batendo no domínio público. Foi
+# assim que 915 das 1.966 requisições de 2026-08-06 apareceram como "robô", com
+# ChatGPT, Claude e Perplexity "rastreando" um site que nenhum deles visitou.
+#
+# POR QUE PAÍS, E NÃO O CABEÇALHO: a verificação manda X-Bot-Simulation: true, e
+# o Go registra isso — mas o GraphQL da borda não expõe cabeçalho arbitrário. A
+# origem é o único discriminador que a borda oferece hoje.
+#
+# LIMITE HONESTO: se algum desses operadores passar a rastrear do Brasil, a
+# linha cai aqui e some da métrica. Por isso ela NÃO é descartada — aparece
+# nomeada na saída, para que a queda seja vista e conferida, nunca silenciosa.
+FAMILIAS_SEMPRE_ESTRANGEIRAS = {
+    "Googlebot", "Google (outros)", "Bing", "OpenAI", "Anthropic",
+    "Perplexity", "Apple", "DuckDuckGo", "Yandex", "Meta/Facebook", "Amazon",
+}
+
+# Cliente de linha de comando saindo do próprio servidor: curl do smoke, do
+# watchdog, de agente. Fora da métrica de visita pelo mesmo motivo.
+FERRAMENTAS_LOCAIS = ["curl", "wget", "python-requests", "go-http-client", "httpie"]
+
+ROTULO_SIMULACAO = "verificacao local (fora da metrica)"
+
+# Rótulo do UA de robô que a Cloudflare NÃO autenticou e que também não veio do
+# Brasil. Até 2026-08-12 essa requisição entrava na métrica com o nome do
+# operador que o User-Agent alegava — e virava "Googlebot visitou" sem que
+# ninguém tivesse conferido quem era. Ela não é descartada: aparece nomeada, na
+# conta do que não é visita, do mesmo jeito que o aquecimento.
+#
+# ★ ESTE RÓTULO NÃO É "TRÁFEGO PRÓPRIO" (correção de 2026-09-02). Até aqui ele
+# caía no mesmo balde impresso como "gerado pelo proprio servidor (NAO e
+# visita)" — falso: é tráfego real de fora, só sem autenticação da Cloudflare.
+# Medido no PerplexityBot: ~700 req/dia, 100% dos IPs em faixa oficial
+# publicada (data/ops/bot_ip_ranges/perplexitybot.json), verifiedBotCategory
+# sempre vazia. Ele ganha bloco de impressão PRÓPRIO — ver
+# ROTULO_ESTRANGEIRO_NAO_VERIFICADO_TEXTO — para não ser lido como aquecimento.
+ROTULO_NAO_VERIFICADO = "UA de robo sem verificacao (fora da metrica)"
+
+# Texto do bloco de saída dedicado a ROTULO_NAO_VERIFICADO — nem visita
+# confirmada (a Cloudflare não autenticou) nem sonda desta casa (não veio do
+# Brasil): tráfego real de origem estrangeira que fica de fora da métrica até
+# ter verificação, mas que o operador NÃO pode confundir com o próprio
+# aquecimento.
+ROTULO_ESTRANGEIRO_NAO_VERIFICADO_TEXTO = (
+    "bot nao verificado pela Cloudflare, origem estrangeira (NAO e visita nem sonda)")
+
+# Vocabulário de `authenticity` (tools/generate-bot-agents-daily,
+# data/ops/edge_bot_agents_daily.jsonl) que PROMOVE um agente a verificado
+# quando a Cloudflare não autentica por `verifiedBotCategory` mas a faixa de IP
+# oficial do operador confirma — a mesma segunda lane de
+# tools/check-crawler-error-budget. Vazio no schema v3 (o corrente nesta
+# correção); existe para o dia em que o produtor gravar v4 sem que este
+# consumidor precise de outra mudança.
+AUTENTICIDADE_PROMOVE_IP = {"ip_range_at_edge", "cloudflare_and_ip_range"}
+
+
+def ler_env():
+    return cloudflare_auth.ambiente(ENV)
+
+
+def cabecalhos(env):
+    """Cabecalhos de leitura -- CLOUDFLARE_ZONE_TOKEN (menor privilegio) com
+    fallback para CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN (Global API Key).
+    Delegado a tools/cloudflare_auth.py desde 2026-09-03: ate entao esta
+    funcao exigia CLOUDFLARE_API_TOKEN presente mesmo com o token de zona no
+    ambiente (checava `if not token` antes de olhar o escopado) -- abortava
+    com "credencial ausente" tendo uma credencial valida na mao."""
+    cab, _ = cloudflare_auth.cabecalhos("leitura", env=env)
+    return cab
+
+
+def graphql(headers, consulta, variaveis):
+    corpo = json.dumps({"query": consulta, "variables": variaveis}).encode()
+    pedido = urllib.request.Request(API + "/graphql", data=corpo, headers=headers)
+    try:
+        with urllib.request.urlopen(pedido, timeout=60) as resposta:
+            dados = json.loads(resposta.read().decode("utf-8"))
+    except urllib.error.HTTPError as erro:
+        return None, "HTTP %s" % erro.code
+    except Exception as erro:
+        return None, str(erro)[:120]
+    if dados.get("errors"):
+        return None, "; ".join(e.get("message", "?") for e in dados["errors"][:2])
+    zonas = (dados.get("data") or {}).get("viewer", {}).get("zones") or []
+    return (zonas[0] if zonas else {}), ""
+
+
+def familia_de(user_agent, pais="", categoria_verificada="", chaves_promovidas=frozenset()):
+    """Quem é o cliente, com a identidade do robô AUTENTICADA quando é robô.
+
+    A ordem dos critérios importa, e mudou em 2026-08-12 (e ganhou uma quarta
+    linha em 2026-09-02):
+
+      1. `verifiedBotCategory` da Cloudflare — a verificação da própria borda,
+         por rDNS e faixa de IP publicada pelo operador. É o critério FORTE: um
+         robô que passa por ele é aquele robô, venha de onde vier.
+      2. faixa de IP oficial já confirmada na série por agente
+         (`chaves_promovidas`, lida de edge_bot_agents_daily.jsonl) — segundo
+         critério FORTE, para o operador que a Cloudflare não autentica mas que
+         publica a própria faixa (medido: PerplexityBot, ~700 req/dia).
+      3. país de origem — o heurístico anterior, mantido como terceira linha
+         para nomear a sonda que sai desta máquina.
+      4. UA de robô que não passou em nenhum dos três: NÃO é visita de robô, e
+         agora é dito assim, em vez de entrar na conta com o nome do operador
+         que o User-Agent alegava.
+
+    A verificação só é exigida de quem se apresenta como robô conhecido. Pessoa
+    com navegador nunca tem categoria verificada — cobrá-la ali transformaria
+    todo visitante humano em suspeito, que é o falso positivo óbvio deste tipo
+    de detector.
+    """
+    baixo = (user_agent or "").lower()
+    if not baixo:
+        return "sem User-Agent"
+    # Ferramentas deste repositório se identificam com UA próprio
+    # (wikijuridica-check-*, wikijuridica-watchdog). Contá-las como visita seria
+    # inflar a própria métrica — a proibição mais dura do contrato do projeto.
+    if baixo.startswith("wikijuridica-"):
+        return "ferramenta interna (fora da metrica)"
+    local = (pais or "").upper() == "BR"
+    verificado = bool((categoria_verificada or "").strip())
+    chave = botagents.agente_de(user_agent)
+    promovido = bool(chave and chave in chaves_promovidas)
+    for rotulo, marcas in FAMILIAS:
+        if any(marca in baixo for marca in marcas):
+            if verificado or promovido:
+                return rotulo
+            if local and rotulo in FAMILIAS_SEMPRE_ESTRANGEIRAS:
+                return ROTULO_SIMULACAO
+            if local and any(marca in baixo for marca in FERRAMENTAS_LOCAIS):
+                return ROTULO_SIMULACAO
+            if rotulo in FAMILIAS_SEMPRE_ESTRANGEIRAS:
+                return ROTULO_NAO_VERIFICADO
+            return rotulo
+    return "pessoa (navegador)"
+
+
+def agentes_promovidos_por_ip_range():
+    """agent_key -> True, para o operador cuja ÚLTIMA linha (maior `date`) em
+    edge_bot_agents_daily.jsonl já tem `authenticity` em
+    AUTENTICIDADE_PROMOVE_IP.
+
+    Só LÊ; não recalcula a faixa (isso é trabalho do produtor,
+    tools/generate-bot-agents-daily). "Última" é por DATA, não por posição no
+    arquivo — o append-only reprocessa a mesma janela de 8 dias a cada
+    execução, então uma linha de um dia mais velho pode aparecer DEPOIS de uma
+    mais nova no arquivo.
+
+    Arquivo ausente ou schema sem o campo `authenticity` devolve conjunto
+    vazio — nunca erro: esta é uma leitura de conveniência, e sua ausência não
+    pode derrubar a série principal desta ferramenta.
+    """
+    por_agente_data = {}
+    por_agente_authenticity = {}
+    if not os.path.isfile(SERIE_AGENTES):
+        return frozenset()
+    try:
+        with open(SERIE_AGENTES, encoding="utf-8") as handle:
+            for linha in handle:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    registro = json.loads(linha)
+                except ValueError:
+                    continue
+                chave = registro.get("agent_key")
+                data = registro.get("date") or ""
+                if not chave or not data:
+                    continue
+                if data >= por_agente_data.get(chave, ""):
+                    por_agente_data[chave] = data
+                    por_agente_authenticity[chave] = registro.get("authenticity")
+    except OSError:
+        return frozenset()
+    return frozenset(chave for chave, autenticidade in por_agente_authenticity.items()
+                     if autenticidade in AUTENTICIDADE_PROMOVE_IP)
+
+
+def trafego_liquido(headers, zona, ini, fim):
+    """(requests_liquido, distinct_ips, aviso_truncado, erro) na janela [ini, fim].
+
+    `requests_liquido` vem de CONSULTA_LIQUIDA: requisição bruta AMOSTRADA cujo
+    User-Agent não começa por "wikijuridica" — filtro no SERVIDOR, sem somar
+    baldes truncados no cliente. `distinct_ips` vem de CONSULTA_LIQUIDA_IPS: a
+    contagem de `clientIP` distintos no mesmo filtro — não é o `uniques` de
+    httpRequests1dGroups (ver o comentário das duas consultas).
+
+    Falha de rede aqui NUNCA derruba a série principal: devolve zeros e o erro,
+    e quem chama decide se imprime o aviso.
+    """
+    variaveis = {"zone": zona, "since": ini.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "until": fim.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    dados, erro = graphql(headers, CONSULTA_LIQUIDA, variaveis)
+    if erro:
+        return 0, 0, False, erro
+    grupos = dados.get("httpRequestsAdaptiveGroups", [])
+    requests_liquido = grupos[0]["count"] if grupos else 0
+
+    dados_ips, erro_ips = graphql(headers, CONSULTA_LIQUIDA_IPS,
+                                  dict(variaveis, limite=LIMITE_LIQUIDA_IPS))
+    if erro_ips:
+        return requests_liquido, 0, False, erro_ips
+    grupos_ips = dados_ips.get("httpRequestsAdaptiveGroups", [])
+    truncado = len(grupos_ips) >= AVISO_LIQUIDA_IPS
+    return requests_liquido, len(grupos_ips), truncado, ""
+
+
+def aquecimento_por_dia():
+    """Volume de aquecimento por dia UTC, lido do ledger REAL — nunca estimado.
+
+    A CONTAGEM E A SOMA DO MAPA `status`, nao o campo `urls`: uma URL que voltou
+    429 CHEGOU a borda e foi contada por ela, entao pertence ao total. Na
+    varredura de 2026-08-12T01:14 os dois batem (9.835 = 8.541x200 + 1.294x429);
+    quando divergirem, a diferenca aparece em `urls_declared` para conferencia.
+
+    ATRIBUICAO: pelo dia UTC de `started_at` — a mesma referencia da dimensao
+    `date` do httpRequests1dGroups. Execucao que atravessa a meia-noite cai
+    inteira no dia de inicio e marca `straddle`, porque o ledger nao registra
+    quantas requisicoes cairam de cada lado: com a marca, o dia se le como
+    aproximado; sem ela, seria numero inventado.
+
+    Execucao sem mapa `status` (interrompida antes de qualquer resposta) NAO
+    vira zero silencioso: conta em `sem_status`, e o dia perde a condicao de
+    exato.
+
+    Devolve (por_dia, primeira_data, primeiro_instante, linhas_ilegiveis).
+    """
+    por_dia = {}
+    primeira_data = ""
+    primeiro_instante = ""
+    ilegiveis = 0
+    caminhos = [c for c in LEDGERS_PROPRIOS if os.path.exists(c)]
+    if not caminhos:
+        return por_dia, "", "", 0
+
+    def _linhas_de_todos():
+        """Linhas de TODOS os ledgers de tráfego próprio, em sequência. O
+        agrupamento é por dia, então a ordem entre ledgers não importa."""
+        for caminho in caminhos:
+            with open(caminho, encoding="utf-8") as handle:
+                for bruta in handle:
+                    yield bruta
+
+    for linha in _linhas_de_todos():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            registro = json.loads(linha)
+            inicio = str(registro["started_at"])
+            dia = inicio[:10]
+            fim = str(registro.get("finished_at") or "")[:10]
+            status = registro.get("status") or {}
+            total = sum(int(v) for v in status.values())
+            declaradas = int(registro.get("urls") or 0)
+        except Exception:
+            # Linha corrompida nao pode virar zero: some do total e some da
+            # afirmacao de exatidao. Ela e contada e dita na saida.
+            ilegiveis += 1
+            continue
+        dados = por_dia.setdefault(dia, {"requests": 0, "runs": 0, "urls_declared": 0,
+                                         "sem_status": 0, "straddle": False})
+        dados["requests"] += total
+        dados["runs"] += 1
+        dados["urls_declared"] += declaradas
+        if not status:
+            dados["sem_status"] += 1
+        if fim and fim != dia:
+            dados["straddle"] = True
+        if not primeira_data or dia < primeira_data:
+            primeira_data = dia
+        if not primeiro_instante or inicio < primeiro_instante:
+            primeiro_instante = inicio
+    return por_dia, primeira_data, primeiro_instante, ilegiveis
+
+
+def separar_proprio(bruto, paginas, aquecido, data, hoje, primeira_data, primeiro_instante):
+    """Anota um dia da serie com o trafego proprio e devolve a audiencia.
+
+    Nenhum campo afirma exatidao que a evidencia nao sustenta: dia anterior ao
+    ledger fica com `organic_requests: null` e diz por que, em vez de chutar.
+    """
+    campos = {
+        "self_traffic_source": os.path.relpath(AQUECIMENTO, ROOT),
+        "page_views_filter": "none_includes_self_traffic",
+        "uniques_filter": "none_includes_self_traffic",
+    }
+    if not primeira_data or data < primeira_data:
+        # O ledger comecou depois deste dia. O aquecimento pode ter existido
+        # (varredura manual) e nao ha registro que o quantifique.
+        campos.update({
+            "self_warming_requests": None,
+            "self_warming_runs": 0,
+            "self_warming_coverage": "no_ledger",
+            "self_warming_note": "dia anterior a primeira linha do ledger (%s): o volume proprio"
+                                 " deste dia nao e reconstruivel" % (primeira_data or "ausente"),
+            "organic_requests": None,
+            "organic_requests_basis": "unavailable_no_ledger",
+            "organic_page_views_min": None,
+        })
+        return campos, None
+
+    dados = aquecido.get(data) or {"requests": 0, "runs": 0, "urls_declared": 0,
+                                   "sem_status": 0, "straddle": False}
+    warm = dados["requests"]
+    campos["self_warming_requests"] = warm
+    campos["self_warming_runs"] = dados["runs"]
+    campos["self_warming_urls_declared"] = dados["urls_declared"]
+
+    ressalvas = []
+    if data == primeira_data:
+        # O ledger nasceu no meio deste dia: o que rodou antes de primeiro_instante
+        # nao esta registrado, entao o proprio pode ser MAIOR e a audiencia MENOR.
+        ressalvas.append("ledger comeca em %s, nao a 00:00 UTC" % primeiro_instante)
+    if dados["straddle"]:
+        ressalvas.append("execucao atravessa a meia-noite UTC e foi somada no dia de inicio")
+    if dados["sem_status"]:
+        ressalvas.append("%d execucao(oes) sem mapa de status (nao somadas)" % dados["sem_status"])
+    if dados["runs"] == 0:
+        # Dia dentro da vigencia do ledger e sem NENHUMA execucao registrada. O
+        # timer roda de 4 em 4 horas, entao isso e uma de duas coisas: o timer
+        # estava parado (e ai o zero e verdade) ou a execucao caiu antes de
+        # gravar a linha (e ai nao e). Daqui nao da para distinguir as duas, e
+        # escrever "aquecimento = 0" afirmaria o que nao foi medido — por isso a
+        # audiencia deste dia sai como LIMITE SUPERIOR, nunca como valor fechado.
+        ressalvas.append("nenhuma execucao de aquecimento registrada neste dia:"
+                         " timer parado ou execucao que nao gravou")
+    if data == hoje:
+        ressalvas.append("dia em curso: bruto e aquecimento ainda crescendo")
+
+    campos["self_warming_coverage"] = "ledger" if not ressalvas else "ledger_com_ressalva"
+    if ressalvas:
+        campos["self_warming_note"] = "; ".join(ressalvas)
+
+    organico = bruto - warm
+    if organico < 0:
+        # Nunca publicar negativo nem grampear em zero: os dois seriam numero
+        # falso. A defasagem do agregado da borda (minutos) contra o ledger
+        # (instantaneo) e a causa provavel, e quem le precisa ver isso.
+        campos["organic_requests"] = None
+        campos["organic_requests_basis"] = "unavailable_warming_exceeds_raw"
+        campos["self_warming_note"] = ("aquecimento (%d) maior que o bruto da borda (%d):"
+                                       " defasagem do agregado; audiencia nao derivavel"
+                                       % (warm, bruto))
+        campos["organic_page_views_min"] = None
+        return campos, None
+
+    campos["organic_requests"] = organico
+    # PISO, nao valor: o ledger conta requisicoes, e parte do aquecimento bate em
+    # /robots.txt, /sitemap.xml, /feed.xml, /llms.txt e nos shards, que a borda
+    # NAO conta como pageView — e um 429 tambem nao e pageView. Subtrair tudo
+    # tira mais do que entrou, logo o resultado e limite inferior. Decompor
+    # exatamente exigiria o ledger separar por tipo de alvo, o que ele nao faz:
+    # publicar um numero "exato" aqui seria estimativa disfarcada.
+    campos["organic_page_views_min"] = max(0, paginas - warm)
+    if (data == primeira_data or dados["straddle"] or dados["sem_status"]
+            or dados["runs"] == 0):
+        campos["organic_requests_basis"] = "upper_bound_raw_minus_warming_ledger"
+    elif data == hoje:
+        campos["organic_requests_basis"] = "provisional_raw_minus_warming_ledger"
+    else:
+        campos["organic_requests_basis"] = "exact_raw_minus_warming_ledger"
+    return campos, organico
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dias", type=int, default=7)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    env = ler_env()
+    headers = cabecalhos(env)
+    if not headers:
+        print("check-edge-traffic: sem credencial Cloudflare em .env.local "
+              "(CLOUDFLARE_ZONE_TOKEN ou CLOUDFLARE_EMAIL + CLOUDFLARE_API_TOKEN)", file=sys.stderr)
+        return 2
+    with open(SITE, encoding="utf-8") as handle:
+        dominio = json.load(handle)["base_url"].rstrip("/").split("//", 1)[-1]
+
+    zonas = urllib.request.Request(API + "/zones?name=" + dominio, headers=headers)
+    try:
+        with urllib.request.urlopen(zonas, timeout=30) as resposta:
+            resultado = json.loads(resposta.read().decode("utf-8"))
+    except Exception as erro:
+        print("check-edge-traffic: zona indisponivel: %s" % str(erro)[:120], file=sys.stderr)
+        return 1
+    if not resultado.get("result"):
+        print("check-edge-traffic: zona %s nao encontrada" % dominio, file=sys.stderr)
+        return 1
+    zona = resultado["result"][0]["id"]
+
+    # UTC, nao a hora local. A dimensao `date` do httpRequests1dGroups e o dia
+    # UTC, e o ledger de aquecimento grava started_at em UTC — este servidor
+    # roda em UTC-3, entao `date.today()` discordava dos dois entre 21h e 24h
+    # locais: o dia UTC recem-FECHADO ainda casava com "hoje" e era gravado com
+    # a ressalva "dia em curso", afirmando movimento onde nao havia mais. Alem
+    # disso, nessas 3 horas o dia UTC corrente nem era pedido a API.
+    hoje = datetime.datetime.now(datetime.timezone.utc).date()
+    desde = hoje - datetime.timedelta(days=args.dias - 1)
+    dados, erro = graphql(headers, CONSULTA_DIARIA,
+                          {"zone": zona, "since": desde.isoformat(), "until": hoje.isoformat()})
+    if erro:
+        print("check-edge-traffic: consulta diaria falhou: %s" % erro, file=sys.stderr)
+        return 1
+    dias = dados.get("httpRequests1dGroups", [])
+
+    aquecido, primeira_warm, instante_warm, warm_ilegiveis = aquecimento_por_dia()
+
+    print("=== TRAFEGO NA BORDA — %s ===" % dominio)
+    print("medido pelo Cloudflare, sem JavaScript no navegador")
+    # A série diária não traz User-Agent, então BRUTO é tudo que passou pela
+    # borda: audiência, verificação local e o aquecimento do próprio servidor.
+    # Chamar isso de "tráfego real" foi o que fez 2026-08-06 parecer 1.966
+    # visitas quando 915 eram verificação local — e o que faria 2026-08-12
+    # parecer 31.708 quando 29.552 eram o nosso próprio aquecimento.
+    print("BRUTO = tudo que passou pela borda. AQUECIM. = requisicoes do proprio")
+    print("servidor (tools/warm-edge-cache), contadas no ledger real. AUDIENCIA =")
+    print("BRUTO - AQUECIM.: e a unica coluna que representa quem procurou o site.\n")
+    print("%-11s %9s %9s %10s %9s %8s %9s" % (
+        "DIA", "BRUTO", "AQUECIM.", "AUDIENCIA", "PAGEVIEWS", "UNICOS", "TRAFEGO"))
+    registros = []
+    for grupo in dias:
+        soma, unico = grupo["sum"], grupo["uniq"]
+        data = grupo["dimensions"]["date"]
+        campos, organico = separar_proprio(soma["requests"], soma["pageViews"], aquecido,
+                                           data, hoje.isoformat(), primeira_warm, instante_warm)
+        warm = campos.get("self_warming_requests")
+        print("%-11s %9d %9s %10s %9d %8d %8.1fMB" % (
+            data, soma["requests"],
+            "-" if warm is None else "%d" % warm,
+            "-" if organico is None else "%d" % organico,
+            soma["pageViews"], unico["uniques"], soma["bytes"] / 1048576))
+        registro = {
+            "schema_version": SCHEMA,
+            "date": data,
+            # Bruto, como a borda conta o dia de calendário: inclui verificação
+            # local e aquecimento. Nunca leia isto como visita.
+            "requests": soma["requests"],
+            "requests_filter": "none_raw_edge_count",
+            "page_views": soma["pageViews"],
+            "uniques": unico["uniques"],
+            "bytes": soma["bytes"],
+        }
+        registro.update(campos)
+        registros.append(registro)
+
+    # A ressalva vai junto da tabela, não num rodapé que ninguém lê: quem vê um
+    # traço precisa saber ali mesmo que aquele dia NÃO é audiência medida.
+    sem_ledger = [r["date"] for r in registros if r.get("self_warming_coverage") == "no_ledger"]
+    if sem_ledger:
+        print("\n  '-' = dia anterior ao ledger de aquecimento (%s): o BRUTO desses dias"
+              % (primeira_warm or "ausente"))
+        print("  pode conter varredura propria e NAO ha registro que a quantifique.")
+        print("  sob ressalva: %s" % ", ".join(sem_ledger))
+    ressalvados = [r["date"] for r in registros
+                   if r.get("self_warming_coverage") == "ledger_com_ressalva"]
+    if ressalvados:
+        print("\n  ressalva no ledger (audiencia e limite, nao valor fechado):")
+        for registro in registros:
+            if registro.get("self_warming_coverage") == "ledger_com_ressalva":
+                print("    %s: %s" % (registro["date"], registro.get("self_warming_note", "")))
+    if warm_ilegiveis:
+        print("\n  AVISO: %d linha(s) ilegivel(is) em %s — nao somadas, o aquecimento"
+              % (warm_ilegiveis, os.path.relpath(AQUECIMENTO, ROOT)))
+        print("  informado e piso, nao total.")
+
+    if dias:
+        ultimo = dias[-1]["sum"]
+        erros = {s["edgeResponseStatus"]: s["requests"]
+                 for s in ultimo.get("responseStatusMap", []) if s["edgeResponseStatus"] >= 400}
+        if erros:
+            print("\n--- respostas de erro (ultimo dia) ---")
+            for codigo, quantidade in sorted(erros.items()):
+                marca = "   <-- rate limit" if codigo == 429 else ""
+                print("  %s  %d%s" % (codigo, quantidade, marca))
+        paises = sorted(ultimo.get("countryMap", []), key=lambda c: -c["requests"])[:5]
+        if paises:
+            print("\n--- origem (ultimo dia) ---")
+            for pais in paises:
+                print("  %-4s %d" % (pais["clientCountryName"], pais["requests"]))
+
+    # Quem são: separa robô de pessoa por User-Agent.
+    # A API recusa janela maior que 1 dia neste conjunto ("cannot request a time
+    # range wider than 1d"), por ser o dado amostrado e mais caro. Pedir mais
+    # nao devolve nada — entao a janela e 24h, e a saida diz isso.
+    fim = datetime.datetime.now(datetime.timezone.utc)
+    ini = fim - datetime.timedelta(hours=23, minutes=50)
+    agentes, erro_agentes = graphql(headers, CONSULTA_AGENTES, {
+        "zone": zona,
+        "since": ini.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "until": fim.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    if erro_agentes:
+        print("\n(quem visita: indisponivel — %s)" % erro_agentes)
+    else:
+        chaves_promovidas = agentes_promovidos_por_ip_range()
+        contagem = {}
+        origem = {}
+        promovidos_por_ip = {}
+        linhas = agentes.get("httpRequestsAdaptiveGroups", [])
+        for grupo in linhas:
+            dimensoes = grupo["dimensions"]
+            pais = dimensoes.get("clientCountryName") or ""
+            rotulo = familia_de(dimensoes.get("userAgent"), pais,
+                                dimensoes.get("verifiedBotCategory"), chaves_promovidas)
+            contagem[rotulo] = contagem.get(rotulo, 0) + grupo["count"]
+            if rotulo not in (ROTULO_SIMULACAO, ROTULO_NAO_VERIFICADO,
+                              "ferramenta interna (fora da metrica)"):
+                origem.setdefault(rotulo, {})
+                origem[rotulo][pais] = origem[rotulo].get(pais, 0) + grupo["count"]
+                chave = botagents.agente_de(dimensoes.get("userAgent"))
+                if (chave in chaves_promovidas
+                        and not (dimensoes.get("verifiedBotCategory") or "").strip()):
+                    promovidos_por_ip[rotulo] = promovidos_por_ip.get(rotulo, 0) + grupo["count"]
+        # A métrica é o que veio de FORA. O que o próprio servidor gerou fica
+        # visível logo abaixo, nomeado — separado da conta, nunca apagado.
+        fora = {r: q for r, q in contagem.items()
+                if r not in (ROTULO_SIMULACAO, ROTULO_NAO_VERIFICADO,
+                             "ferramenta interna (fora da metrica)")}
+        total = sum(fora.values()) or 1
+        print("\n--- quem visita (ultimas 24h; amostragem do Cloudflare, use como PROPORCAO) ---")
+        if len(linhas) >= 200:
+            # A consulta agrupa por (UA, host, pais): quanto mais robô distinto
+            # aparece, mais combinações. No teto, a cauda foi cortada e o que
+            # falta são justamente os visitantes raros — dizer o total sem esta
+            # linha seria apresentar amostra truncada como censo.
+            print("  AVISO: consulta no teto de 200 combinacoes — a cauda foi cortada.")
+        for rotulo, quantidade in sorted(fora.items(), key=lambda kv: -kv[1]):
+            paises = origem.get(rotulo, {})
+            de = ", ".join("%s=%d" % (p or "?", n)
+                           for p, n in sorted(paises.items(), key=lambda kv: -kv[1])[:3])
+            print("  %-30s %7d  (%4.1f%%)  de %s" % (
+                rotulo, quantidade, 100.0 * quantidade / total, de))
+
+        # PRÓPRIO é só o que ESTE servidor gerou (simulação de auditoria saindo
+        # do Brasil + ferramenta interna). Bot estrangeiro não verificado (UA
+        # de robô que não veio do Brasil e a Cloudflare não autenticou) NÃO é
+        # tráfego próprio — é tráfego real de fora sem verificação, e ganha
+        # bloco separado logo abaixo. Confundir os dois foi o defeito medido em
+        # 2026-09-02: ~700 req/dia do PerplexityBot apareciam neste bloco como
+        # se o próprio servidor as tivesse gerado.
+        proprio = {r: q for r, q in contagem.items()
+                  if r in (ROTULO_SIMULACAO, "ferramenta interna (fora da metrica)")}
+        estrangeiro_nao_verificado = {r: q for r, q in contagem.items() if r == ROTULO_NAO_VERIFICADO}
+        if proprio:
+            # Isto é o que o painel do Cloudflare soma junto e apresenta como
+            # robô. Aqui fica na conta certa: tráfego que o servidor gerou
+            # contra si mesmo. Somar como visita é a fraude de métrica que o
+            # contrato do repositório proíbe.
+            print("\n  --- gerado pelo proprio servidor (NAO e visita) ---")
+            for rotulo, quantidade in sorted(proprio.items(), key=lambda kv: -kv[1]):
+                print("  %-30s %7d  (%4.1f%% do bruto)" % (
+                    rotulo, quantidade, 100.0 * quantidade / (sum(contagem.values()) or 1)))
+            print("  o painel do Cloudflare NAO faz essa separacao: la esses numeros")
+            print("  aparecem como Googlebot, OpenAI, Anthropic e Perplexity.")
+
+        if estrangeiro_nao_verificado:
+            # NEM visita confirmada (falta autenticacao) NEM sonda desta casa
+            # (nao veio do Brasil nem foi promovido por faixa de IP oficial) —
+            # tercEIRA categoria, que ate 2026-09-02 caia dentro do bloco acima
+            # e era lida como se o proprio servidor a tivesse gerado.
+            print("\n  --- %s ---" % ROTULO_ESTRANGEIRO_NAO_VERIFICADO_TEXTO)
+            for rotulo, quantidade in sorted(estrangeiro_nao_verificado.items(), key=lambda kv: -kv[1]):
+                print("  %-30s %7d  (%4.1f%% do bruto)" % (
+                    rotulo, quantidade, 100.0 * quantidade / (sum(contagem.values()) or 1)))
+            print("  pode ser operador real sem verificacao da Cloudflare (ver")
+            print("  data/ops/bot_ip_ranges/ e tools/check-crawler-error-budget para a lane por")
+            print("  IP) ou User-Agent forjado. Nao entra na metrica ate ter verificacao.")
+
+        if promovidos_por_ip:
+            print("\n  --- promovido a verificado por faixa de IP oficial (edge_bot_agents_daily) ---")
+            for rotulo, quantidade in sorted(promovidos_por_ip.items(), key=lambda kv: -kv[1]):
+                print("  %-30s %7d  (ja contado em 'quem visita' acima)" % (rotulo, quantidade))
+
+        # CONFERENCIA INDEPENDENTE do numero do ledger — nunca a fonte dele.
+        # As janelas sao diferentes (dia de calendario UTC contra 24h moveis) e
+        # este conjunto e AMOSTRADO e truncado no teto de combinacoes, entao os
+        # dois nao batem na unidade e nao devem. A comparacao existe para
+        # apanhar deriva grossa: aquecimento rodando sem gravar no ledger
+        # apareceria aqui como UA proprio muito acima do registrado.
+        interna = contagem.get("ferramenta interna (fora da metrica)", 0)
+        registro_hoje = next((r for r in registros if r["date"] == hoje.isoformat()), None)
+        ledger_hoje = (registro_hoje or {}).get("self_warming_requests")
+        if ledger_hoje is not None and interna:
+            print("\n  conferencia do aquecimento: ledger = %d (exato, dia UTC) contra"
+                  % ledger_hoje)
+            print("  %d de UA proprio na amostra de 24h. Janela e amostragem diferentes:"
+                  % interna)
+            print("  serve para ver deriva, nao para bater na unidade.")
+
+        # A separação vai para a série do dia, não só para o terminal: quem ler
+        # o histórico daqui a um mês precisa saber quanto daquele número era
+        # verificação própria.
+        #
+        # JANELA DIFERENTE, NOME DIFERENTE: `requests` é o dia de calendário;
+        # estes dois vêm da janela móvel de ~24h e são amostrados pelo
+        # Cloudflare. Somados dão mais que o bruto. O sufixo _sampled_24h existe
+        # para impedir a subtração `requests - local_...`, que produz número sem
+        # sentido. Use-os como PROPORÇÃO.
+        for registro in registros:
+            if registro["date"] == hoje.isoformat():
+                # v5: só simulação local + ferramenta interna — bot estrangeiro
+                # não verificado SAIU deste campo (ver o comentário de SCHEMA).
+                registro["local_verification_sampled_24h"] = sum(proprio.values())
+                registro["external_sampled_24h"] = sum(fora.values())
+                # Detalhe do que ficou de fora, para que "próprio" não vire uma
+                # caixa-preta: sonda desta máquina, ferramenta interna e UA de
+                # robô que a borda não autenticou são coisas diferentes.
+                registro["unverified_bot_ua_sampled_24h"] = contagem.get(ROTULO_NAO_VERIFICADO, 0)
+                # v5: nomeado à parte — não é "tráfego próprio", é tráfego real
+                # de origem estrangeira sem verificação da Cloudflare nem faixa
+                # de IP oficial catalogada.
+                registro["foreign_unverified_bot_sampled_24h"] = sum(estrangeiro_nao_verificado.values())
+                # Volume que JÁ está contado em `external_sampled_24h` (dentro
+                # de `fora`) só porque a série por agente o promoveu por faixa
+                # de IP oficial — nomeado para não virar caixa-preta dentro de
+                # "audiência". Vazio enquanto edge_bot_agents_daily não gravar
+                # authenticity em AUTENTICIDADE_PROMOVE_IP (ver o comentário de
+                # SERIE_AGENTES).
+                registro["bot_promoted_by_ip_range_sampled_24h"] = promovidos_por_ip
+                registro["bot_identity_verification"] = "cloudflare_verified_bot_category"
+                registro["bot_identity_verification_ip_range_promotion"] = bool(promovidos_por_ip)
+                registro["sampled_window_start"] = ini.strftime("%Y-%m-%dT%H:%M:%SZ")
+                registro["sampled_window_end"] = fim.strftime("%Y-%m-%dT%H:%M:%SZ")
+                # Requisição líquida filtrada NO SERVIDOR (userAgent_notlike),
+                # sem o teto de 200 combinações de CONSULTA_AGENTES — ver
+                # CONSULTA_LIQUIDA. NÃO é `page_views` nem `uniques`: o dataset
+                # amostrado não tem esses campos (introspecção GraphQL viva,
+                # 2026-09-02 — ver o comentário da consulta). `bytes` seguem
+                # brutos (SCHEMA de cima), nunca removidos.
+                liquido, ips_distintos, ips_truncado, erro_liquido = trafego_liquido(
+                    headers, zona, ini, fim)
+                if erro_liquido:
+                    registro["requests_sem_trafego_proprio_sampled_24h"] = None
+                    registro["distinct_client_ips_sem_trafego_proprio_sampled_24h"] = None
+                    registro["requests_sem_trafego_proprio_basis"] = "indisponivel: " + erro_liquido
+                else:
+                    registro["requests_sem_trafego_proprio_sampled_24h"] = liquido
+                    registro["distinct_client_ips_sem_trafego_proprio_sampled_24h"] = ips_distintos
+                    registro["requests_sem_trafego_proprio_basis"] = (
+                        "httpRequestsAdaptiveGroups, filter userAgent_notlike:\"wikijuridica%\", "
+                        "amostrado; NAO e page_views nem uniques (campos ausentes neste dataset)")
+                    if ips_truncado:
+                        registro["requests_sem_trafego_proprio_note"] = (
+                            "consulta de clientIP distintos perto/no teto de %d grupos — "
+                            "distinct_client_ips pode subestimar" % LIMITE_LIQUIDA_IPS)
+                    print("\n  liquido (filtro no servidor, 24h): %d requisicao(oes), %d IP(s) de "
+                          "cliente distinto(s)%s"
+                          % (liquido, ips_distintos, "  [AVISO: perto do teto]" if ips_truncado else ""))
+
+        # Como a separação é feita, dita toda vez: quem lê precisa saber em que
+        # ela se apoia — e onde ela erraria.
+        print("\n  criterio: robo entra na metrica se a Cloudflare AUTENTICAR a identidade")
+        print("  (verifiedBotCategory = rDNS + faixa de IP publicada pelo operador) OU se a")
+        print("  serie por agente (edge_bot_agents_daily.jsonl) ja o tiver promovido por faixa")
+        print("  de IP oficial. O X-Bot-Simulation que a sonda deste repositorio manda so chega")
+        print("  ao nginx, nunca a borda — por isso a origem BR continua como terceira linha,")
+        print("  para nomear a sonda que sai desta maquina. UA de operador estrangeiro sem")
+        print("  nenhuma das verificacoes aparece como '%s',"
+              % ROTULO_NAO_VERIFICADO)
+        print("  em bloco proprio — NUNCA somado ao trafego que este servidor gera.")
+        ausentes = [r for r, _ in FAMILIAS if r in ("Googlebot", "OpenAI", "Anthropic") and r not in fora]
+        if ausentes:
+            print("\n  AINDA NAO VISTOS de fato: %s" % ", ".join(ausentes))
+            print("  (dominio novo: o sitemap e o canal; a descoberta leva dias a semanas)")
+
+    if registros:
+        os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+        ultimo_por_data = {}
+        if os.path.exists(SERIE):
+            with open(SERIE, encoding="utf-8") as handle:
+                for linha in handle:
+                    linha = linha.strip()
+                    if linha:
+                        try:
+                            anterior = json.loads(linha)
+                            ultimo_por_data[anterior["date"]] = anterior
+                        except Exception:
+                            continue
+        vistos = set(ultimo_por_data)
+        # O dia corrente é reescrito a cada execução porque o número ainda está
+        # crescendo. O arquivo é append-only (nunca reescrito, para não competir
+        # com outra frente), então uma data pode ter VÁRIAS linhas: a ÚLTIMA é a
+        # boa. Somar o arquivo inteiro conta o mesmo dia duas vezes — quem
+        # consumir precisa deduplicar por `date` mantendo a última ocorrência.
+        #
+        # A regra anterior era `data nova OU hoje`, e com ela um dia FECHADO
+        # nunca mais recebia linha: a ultima versao de ontem ficava sendo o
+        # retrato parcial gravado ontem. Com a anotacao de aquecimento isso
+        # seria pior que estagnacao — o dia fechado ficaria para sempre sem
+        # separar audiencia de trafego proprio. Agora tambem se acrescenta
+        # quando o registro recalculado DIFERE do ultimo gravado: append-only
+        # preservado (nada e reescrito), e o passado converge.
+        novos = [r for r in registros
+                 if r["date"] == hoje.isoformat() or ultimo_por_data.get(r["date"]) != r]
+        with open(SERIE, "a", encoding="utf-8") as handle:
+            for registro in novos:
+                handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+        print("\nserie gravada em %s (%d registro(s))" % (os.path.relpath(SERIE, ROOT), len(novos)))
+        repetidas = len(vistos & {r["date"] for r in registros})
+        if repetidas:
+            print("append-only: dedupe por `date` mantendo a ULTIMA linha (%d data(s) repetida(s))"
+                  % repetidas)
+
+    if args.json:
+        print(json.dumps(registros, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

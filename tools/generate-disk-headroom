@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# tools/generate-disk-headroom — a serie de espaco em disco que nao existia.
+#
+# ★ POR QUE EXISTE (2026-08-29, BUG-147)
+#
+# Medido: `ls tools/ | grep -iE 'disk|disco'` nao devolvia nada. O catalogo da
+# caca registrou `/` em 78% e a medicao de hoje deu 80% — subindo, sem gate,
+# sem serie, sem ninguem avisado.
+#
+# Isso mata a publicacao no pior lugar possivel. A publicacao e TRANSACIONAL
+# (internal/publicrelease) exatamente para o portal nunca ficar hibrido: staging,
+# SHA-256, lock, promocao, rollback. Disco cheio no meio disso e a unica falha
+# que a transacao nao consegue tratar bem, porque ate o rollback precisa
+# escrever.
+#
+# ★ POR QUE UMA SERIE, E NAO SO UM `df` NO GATE
+#
+# "80% usado" nao aciona ninguem — e um numero sem derivada. "no ritmo dos
+# ultimos 7 dias o disco enche em 9 dias" aciona. Derivada exige historico, e
+# historico nao existia: `sar` esta instalado mas a coleta esta DESLIGADA
+# (`sar -F` responde "Please check if data collecting is enabled"), e nenhum
+# ledger de data/ops registrava disco. Sem serie propria, nao ha projecao.
+#
+# ★ SEPARACAO DE PAPEIS
+#
+# Este e um `generate-*`: ele ESCREVE a amostra. Quem decide e reprova e o
+# `tools/check-disk-headroom`, read-only, que le esta serie. A separacao entre
+# check e generate foi reforcada no repositorio e nao se mistura aqui.
+#
+# ★ O QUE ENTRA NA AMOSTRA
+#
+# `/` porque e onde /opt/wiki vive e onde a transacao escreve. `/mnt/hdd` porque
+# e o destino do backup (tools/generate-backup-wiki): se ELE encher, o backup
+# para de existir em silencio, que e o modo de falha do BUG-146 voltando pela
+# porta dos fundos. Bytes, nunca porcentagem: `df -h` arredonda, e 78%->80% pode
+# ser tanto 6 GB quanto 18 GB — imprecisao que destroi a projecao.
+#
+# ★ A CADENCIA HORARIA E CONTRATO, NAO CONVENIENCIA (B8, 2026-09-01)
+#
+# O gate calcula a tendencia por DIA UTC COMPLETO, interpolando o valor da
+# meia-noite entre a ultima amostra antes e a primeira depois — e so aceita a
+# fronteira se a fresta entre as duas for <= 3 h (tres vezes esta cadencia). Foi
+# assim que o piso deixou de oscilar com a hora: a reta de minimos quadrados
+# sobre todas as amostras caiu de 137 para 57 GiB em 22 h com o disco parado.
+# Quem trocar o timer (`*:07`, RandomizedDelaySec=3min) para cadencia diaria
+# nao "economiza df": invalida todas as fronteiras e deixa o gate INCONCLUSIVO
+# para sempre. `df` custa milissegundos; a resolucao continua de graca.
+
+set -u -o pipefail
+
+RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SERIE="$RAIZ/data/ops/disk_headroom.jsonl"
+AGORA="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PONTOS=(/ /mnt/hdd)
+
+falha() {
+	echo "disk-headroom: $*" >&2
+	exit "${2:-1}"
+}
+
+LINHA="$(
+	nice -n 19 python3 - "$AGORA" "${PONTOS[@]}" <<'PYEOF'
+import json
+import os
+import subprocess
+import sys
+
+agora = sys.argv[1]
+pontos = sys.argv[2:]
+
+alvos = []
+for ponto in pontos:
+    if not os.path.ismount(ponto) and ponto != "/":
+        # Ponto de montagem ausente nao e erro fatal: o HDD pode estar
+        # desmontado e a amostra tem de registrar ISSO, nao sumir com a linha.
+        alvos.append({"ponto": ponto, "montado": False})
+        continue
+    saida = subprocess.run(
+        ["df", "-B1", "--output=source,fstype,size,used,avail,target", ponto],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()
+    if len(saida) < 2:
+        alvos.append({"ponto": ponto, "montado": False})
+        continue
+    campos = saida[1].split()
+    fonte, fstype, total, usado, livre, destino = campos[0], campos[1], int(campos[2]), int(campos[3]), int(campos[4]), campos[5]
+    alvos.append({
+        "ponto": destino,
+        "montado": True,
+        "fonte": fonte,
+        "fstype": fstype,
+        "total_b": total,
+        "usado_b": usado,
+        "livre_b": livre,
+        # Percentual DERIVADO dos bytes, para a serie ser autocontida. O gate
+        # nunca le esta chave para projetar — projeta sobre livre_b.
+        # MESMA DEFINICAO DO `df`, de proposito: usado/(usado+livre), NAO
+        # usado/total. O ext4 reserva 5% dos blocos para o root, que nao entram
+        # em `avail`; dividir por `total` daria 78,80% onde `df -h` mostra 80% e
+        # a primeira coisa que o operador faria seria desconfiar da serie.
+        "pct_usado": round(100.0 * usado / (usado + livre), 4) if (usado + livre) else None,
+        # Bloco reservado ao root, registrado porque explica a diferenca acima e
+        # porque NAO esta disponivel para a transacao de publicacao.
+        "reservado_b": total - usado - livre,
+    })
+
+print(json.dumps({
+    "schema_version": "disk_headroom_v1",
+    "checked_at": agora,
+    "alvos": alvos,
+}, ensure_ascii=False, sort_keys=True))
+PYEOF
+)" || falha "amostragem falhou" 1
+
+mkdir -p "$(dirname "$SERIE")"
+printf '%s\n' "$LINHA" >>"$SERIE"
+
+printf '%s' "$LINHA" | nice -n 19 python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for a in d["alvos"]:
+    if not a.get("montado"):
+        print("disk-headroom: %s NAO MONTADO" % a["ponto"])
+        continue
+    print("disk-headroom: %-9s livre=%.2f GiB de %.2f GiB (%.2f%% usado)" % (
+        a["ponto"], a["livre_b"]/1073741824.0, a["total_b"]/1073741824.0, a["pct_usado"]))
+'
+exit 0

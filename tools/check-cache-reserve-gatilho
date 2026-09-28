@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""check-cache-reserve-gatilho — o Cache Reserve deve ser LIGADO hoje? E o vivo bate com o canonico?
+
+READ-ONLY (disco + um GET). Duas perguntas, dois vereditos, um exit:
+
+  1. GATILHO. A decisao D1 (2026-09-09, ops/cloudflare/cache-reserve.json) deixa
+     o Cache Reserve DESLIGADO e fixa o gatilho numerico para liga-lo:
+       regra 1  travessia (origem / borda) de perplexitybot, oai-searchbot ou
+                bingbot ACIMA de 5% em 3 dias CONSECUTIVOS;
+       regra 2  `misses_pre_head_sem_purga` ACIMA de 2% do acervo de referencia
+                (10.141 => 203) em 3 dias consecutivos.
+     Qualquer uma atingida => "LIGAR" (exit 1). Nenhuma => "manter desligado"
+     (exit 0). Os limiares vem do canonico (bloco `gatilho_para_ligar`), nunca
+     hardcoded aqui; as flags so os sobrepoem para experimento.
+
+  2. DRIFT. O vivo (GET cache_reserve) e comparado ao `valor_esperado` do
+     canonico. Vivo diferente SEM linha `fase: cache_reserve` em
+     data/ops/edge_rule_apply.jsonl que o explique e drift de painel (exit 1,
+     "DRIFT"). Vivo diferente COM linha que o explique e "a ferramenta ligou e
+     o canonico nao acompanhou" (exit 1, mensagem distinta: o conserto e
+     editar o JSON, nao a zona). Sem credencial ou sem rede o vivo fica "nao
+     verificado" e NAO e drift -- indisponibilidade de API ja foi lida como
+     defeito neste repositorio (check-edge-vary-contract diagnosticava tunel
+     oscilando como envenenamento), e a parte de disco continua a valer.
+
+FONTES, na ordem, POR DIA:
+  a) data/ops/cache_baseline_daily.jsonl (frente A1, tools/generate-cache-
+     baseline): ultima linha por `date`; `travessia_por_bot[bot].travessia` e
+     `misses_pre_head_sem_purga.total`. E a fonte que sabe separar o MISS de
+     evicao do MISS pos-purga, entao a regra 2 SO e avaliada por ela.
+  b) fallback, para dia que a baseline nao tem: travessia calculada direto de
+     data/ops/edge_bot_agents_daily.jsonl x data/ops/origin_bot_traffic_daily
+     .jsonl, com a MESMA regra da A1 -- borda = `requests_sampled` da ULTIMA
+     linha por (date, agent_key) via tools/edgetelemetry.serie_saneada (faixa
+     de IP so quando o total esta zerado); origem = soma de
+     `requests_authentic` (senao `requests`) das linhas `summable` do dia. A
+     regra 2 fica n/d nesse dia.
+  c) nenhum dia da janela com dado em (a) nem (b) => "sem serie", exit 2. O
+     gate NAO inventa serie.
+
+★ A ARMADILHA QUE ESTE GATE EXISTE PARA NAO REPETIR. O ledger da borda e
+CUMULATIVO intradiario (varias linhas por (date, agent_key); a ultima e o
+total do dia). Somar todas as linhas infla a borda ~40x e faz a travessia
+parecer sub-1%. Medido em 2026-09-09 sobre 02..08/09: com a soma bruta,
+perplexitybot 0,5-1,5%, oai-searchbot 0,6-1,4%, bingbot 0,6-1,2%; com a ultima
+linha, 29-99%, 39-91% e 44-84%. Os "0,3-0,9%" citados como premissa de D1 sao
+o numero inflado. tools/test_check_cache_reserve_gatilho.py trava isso com uma
+serie em que a soma daria "manter" e a ultima linha da "LIGAR".
+
+"CONSECUTIVOS" e literal: a janela sao os ultimos --dias dias CIVIS (UTC)
+terminando ontem (--ate muda o fim); dia sem dado quebra a sequencia e sai
+impresso como n/d. O teste prova por MUTACAO que trocar all() por any() no
+guarda faz 2 dias acima + 1 abaixo virar LIGAR.
+
+CONTEXTO IMPRESSO, NUNCA VEREDITO: `purgas_tudo` do dia (data/ops/edge_cache_
+purge.jsonl, success:true, scope "tudo"). Purge Everything e SOFT PURGE no
+Cache Reserve (doc oficial): o objeto revalida na origem de qualquer jeito,
+entao travessia em dia de purga "tudo" nao e algo que o Reserve remova. A
+coluna esta ai para o leitor ver isso; a regra e aplicada como esta escrita.
+
+CODIGOS DE SAIDA:
+  0  manter desligado, e vivo bate com o canonico (ou nao verificado)
+  1  LIGAR (regra 1 ou 2 atingida) e/ou drift (vivo != canonico)
+  2  sem serie (nenhum dia da janela com dado), canonico ilegivel
+
+Uso:
+    tools/check-cache-reserve-gatilho
+    tools/check-cache-reserve-gatilho --dias 3 --ate 2026-09-08
+    tools/check-cache-reserve-gatilho --json
+    tools/check-cache-reserve-gatilho --sem-vivo      # so disco (sem GET)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402
+import edgetelemetry  # noqa: E402
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CANONICO = os.path.join(RAIZ, "ops/cloudflare/cache-reserve.json")
+LEDGER = os.path.join(RAIZ, "data/ops/edge_rule_apply.jsonl")
+BASELINE = os.path.join(RAIZ, "data/ops/cache_baseline_daily.jsonl")
+BORDA = os.path.join(RAIZ, "data/ops/edge_bot_agents_daily.jsonl")
+ORIGEM = os.path.join(RAIZ, "data/ops/origin_bot_traffic_daily.jsonl")
+PURGAS = os.path.join(RAIZ, "data/ops/edge_cache_purge.jsonl")
+ENV = os.path.join(RAIZ, ".env.local")
+API = "https://api.cloudflare.com/client/v4"
+ZONA_PADRAO = "b2e1366a94c5dcac97f2fc264f18928f"
+FASE = "cache_reserve"
+
+
+# ───────────────────────────── leitura ───────────────────────────────────────
+
+def ler_jsonl(caminho):
+    registros = []
+    if not os.path.isfile(caminho):
+        return registros
+    with open(caminho, encoding="utf-8") as fh:
+        for bruto in fh:
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registros.append(json.loads(bruto))
+            except json.JSONDecodeError:
+                continue
+    return registros
+
+
+def canone():
+    with open(CANONICO, encoding="utf-8") as f:
+        dados = json.load(f)
+    if dados.get("valor_esperado") not in ("on", "off"):
+        raise ValueError("valor_esperado tem de ser 'on' ou 'off'")
+    g = dados.get("gatilho_para_ligar") or {}
+    r1 = g.get("regra_1") or {}
+    r2 = g.get("regra_2") or {}
+    for nome, bloco, campos in (("regra_1", r1, ("bots", "limiar_pct", "dias_consecutivos")),
+                                ("regra_2", r2, ("limiar_pct_do_acervo", "acervo_referencia", "dias_consecutivos"))):
+        for c in campos:
+            if bloco.get(c) in (None, "", []):
+                raise ValueError(f"gatilho_para_ligar.{nome}.{c} ausente")
+    if not ((dados.get("endpoints") or {}).get("estado") or {}).get("caminho"):
+        raise ValueError("endpoints.estado.caminho ausente")
+    return dados
+
+
+def baseline_por_dia(registros):
+    """Ultima linha por `date` -- a convencao do produtor (append idempotente)."""
+    por_dia = {}
+    for r in registros:
+        if r.get("schema_version") != "cache_baseline_v1" or not r.get("date"):
+            continue
+        por_dia[r["date"]] = r
+    return por_dia
+
+
+def travessia_da_baseline(linha, bots):
+    t = linha.get("travessia_por_bot") or {}
+    saida = {}
+    for bot in bots:
+        b = t.get(bot) or {}
+        razao = b.get("travessia")
+        saida[bot] = {
+            "travessia_pct": round(100.0 * razao, 2) if isinstance(razao, (int, float)) else None,
+            "origem": b.get("origem"), "borda": b.get("borda"),
+            "status": b.get("status") or ("ok" if isinstance(razao, (int, float)) else "sem_dado"),
+        }
+    return saida
+
+
+def travessia_calculada(dia, borda_por_chave, linhas_origem, bots):
+    """A MESMA regra de tools/generate-cache-baseline (travessia_por_bot):
+    ultima linha por (date, agent_key), `requests_sampled`, faixa de IP so
+    como fallback; origem somada das linhas summable."""
+    origem = {b: 0 for b in bots}
+    for r in linhas_origem:
+        if r.get("date") != dia or r.get("agent_key") not in origem or r.get("summable") is False:
+            continue
+        if r.get("requests_authentic") is not None:
+            origem[r["agent_key"]] += r["requests_authentic"] or 0
+        else:
+            origem[r["agent_key"]] += r.get("requests") or 0
+    saida = {}
+    for bot in bots:
+        r = borda_por_chave.get((dia, bot))
+        if r is None:
+            saida[bot] = {"travessia_pct": None, "origem": origem[bot], "borda": None, "status": "sem_dado"}
+            continue
+        total = r.get("requests_sampled") or 0
+        faixa_ip = r.get("requests_sampled_ip_range") or 0
+        borda = total if total > 0 else faixa_ip
+        if borda > 0:
+            saida[bot] = {"travessia_pct": round(100.0 * origem[bot] / borda, 2),
+                          "origem": origem[bot], "borda": borda, "status": "ok"}
+        else:
+            saida[bot] = {"travessia_pct": None, "origem": origem[bot], "borda": 0, "status": "nao_mensuravel"}
+    return saida
+
+
+def misses_da_baseline(linha):
+    bloco = linha.get("misses_pre_head_sem_purga")
+    if isinstance(bloco, dict) and isinstance(bloco.get("total"), (int, float)):
+        return bloco["total"]
+    return None
+
+
+def purgas_tudo_por_dia(purgas):
+    contagem = {}
+    for p in purgas:
+        if p.get("success") is not True or p.get("scope") != "tudo":
+            continue
+        dia = (p.get("purged_at") or "")[:10]
+        if dia:
+            contagem[dia] = contagem.get(dia, 0) + 1
+    return contagem
+
+
+def serie_consecutiva_acima(valores, limiar, dias):
+    """True so se ha exatamente `dias` valores, todos presentes e todos ACIMA
+    do limiar. Dia sem dado (None) quebra a sequencia. E este guarda que o
+    teste de mutacao ataca: any() no lugar de all() faz 2 acima + 1 abaixo
+    disparar."""
+    return len(valores) == dias and all(v is not None and v > limiar for v in valores)
+
+
+# ───────────────────────────── vivo e ledger ─────────────────────────────────
+
+def ler_vivo(zona, caminho, env):
+    """(result_ou_None, motivo_de_nao_ter_lido). Credencial ausente, rede
+    fora e success:false viram motivo -- nunca excecao, nunca drift."""
+    cab, rotulo = cloudflare_auth.cabecalhos("leitura", env=env)
+    if cab is None:
+        return None, "sem credencial Cloudflare (.env.local sem CLOUDFLARE_ZONE_TOKEN nem CLOUDFLARE_EMAIL+CLOUDFLARE_API_TOKEN)"
+    url = API + caminho.replace("{zona}", zona)
+    dados, erro = cloudflare_auth.pega(url, "leitura", env=env)
+    if erro:
+        return None, f"nao consegui ler {caminho}: {erro}"
+    if not (dados or {}).get("success"):
+        msgs = "; ".join(e.get("message", "") for e in (dados or {}).get("errors", []))
+        return None, f"API sem sucesso em {caminho}: {msgs or 'sem detalhe'}"
+    return (dados.get("result") or {}), None
+
+
+# Ponto de injecao dos testes.
+LER_VIVO = ler_vivo
+
+
+def explicacao_no_ledger(registros, valor_vivo):
+    """A linha da fase cache_reserve que EXPLICA o valor vivo, lendo o ledger em
+    ordem: uma `intencao` so explica quando o `resultado` de PATCH SEGUINTE
+    confirma (`success: true` e o mesmo valor). Intencao orfa -- PATCH recusado,
+    que e o primeiro evento real provavel numa zona Free ("A paid Cache Reserve
+    plan is required") -- nao explica nada: se o painel ligar depois dela, e
+    DRIFT. Devolve a intencao (que carrega ferramenta e motivo) ou, na falta
+    dela, o proprio resultado. None se nenhuma."""
+    pendente = None
+    achada = None
+    for r in registros:
+        if r.get("fase") != FASE:
+            continue
+        evento = r.get("evento")
+        if evento == "intencao":
+            pendente = r if r.get("valor_pretendido") == valor_vivo else None
+            continue
+        if evento != "resultado":
+            continue
+        operacao = r.get("operacao")
+        if operacao is not None and not str(operacao).startswith("PATCH"):
+            continue  # limpeza (POST cache_reserve_clear) nao muda o valor
+        confirmou = bool(r.get("success")) and \
+            ((r.get("result") or {}).get("value") == valor_vivo or r.get("valor_pretendido") == valor_vivo)
+        if confirmou:
+            achada = pendente or r
+        pendente = None
+    return achada
+
+
+# ───────────────────────────── main ──────────────────────────────────────────
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="gatilho diario do Cache Reserve + drift do interruptor contra ops/cloudflare/cache-reserve.json",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dias", type=int, default=None, help="dias consecutivos exigidos (padrao: canonico)")
+    ap.add_argument("--ate", default=None, help="ultimo dia da janela, YYYY-MM-DD UTC (padrao: ontem)")
+    ap.add_argument("--limiar-travessia", type=float, default=None, help="%% (padrao: canonico)")
+    ap.add_argument("--limiar-misses-pct", type=float, default=None, help="%% do acervo (padrao: canonico)")
+    ap.add_argument("--acervo", type=int, default=None, help="acervo de referencia (padrao: canonico)")
+    ap.add_argument("--sem-vivo", action="store_true", help="nao faz o GET; so avalia o disco")
+    ap.add_argument("--json", action="store_true", dest="como_json")
+    args = ap.parse_args(argv)
+
+    rel = {"gate": "check-cache-reserve-gatilho", "janela": None, "linhas": [],
+           "regra_1": None, "regra_2": None, "vivo": None, "drift": False,
+           "drift_motivo": None, "veredito": None, "motivo": None}
+
+    try:
+        dados = canone()
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        rel["motivo"] = f"canonico ilegivel: {e}"
+        return saida(rel, args.como_json, 2)
+
+    g = dados["gatilho_para_ligar"]
+    r1, r2 = g["regra_1"], g["regra_2"]
+    bots = list(r1["bots"])
+    dias = args.dias or int(r1["dias_consecutivos"])
+    limiar_trav = args.limiar_travessia if args.limiar_travessia is not None else float(r1["limiar_pct"])
+    pct_misses = args.limiar_misses_pct if args.limiar_misses_pct is not None else float(r2["limiar_pct_do_acervo"])
+    acervo = args.acervo or int(r2["acervo_referencia"])
+    limiar_misses = pct_misses / 100.0 * acervo
+    if dias < 1:
+        rel["motivo"] = "--dias tem de ser >= 1"
+        return saida(rel, args.como_json, 2)
+
+    hoje = dt.datetime.now(dt.timezone.utc).date()
+    try:
+        ate = dt.date.fromisoformat(args.ate) if args.ate else hoje - dt.timedelta(days=1)
+    except ValueError:
+        rel["motivo"] = f"--ate invalido: {args.ate!r}"
+        return saida(rel, args.como_json, 2)
+    janela = [(ate - dt.timedelta(days=i)).isoformat() for i in range(dias - 1, -1, -1)]
+    rel["janela"] = {"de": janela[0], "ate": janela[-1], "dias": dias}
+    rel["parametros"] = {"bots": bots, "limiar_travessia_pct": limiar_trav,
+                         "limiar_misses_pct_acervo": pct_misses, "acervo": acervo,
+                         "limiar_misses_absoluto": limiar_misses}
+
+    # ── disco ──
+    baseline = baseline_por_dia(ler_jsonl(BASELINE))
+    purgas = purgas_tudo_por_dia(ler_jsonl(PURGAS))
+    borda_por_chave = None
+    linhas_origem = None
+    for dia in janela:
+        linha = {"date": dia, "fonte": None, "purgas_tudo": purgas.get(dia, 0),
+                 "travessia": {b: {"travessia_pct": None, "origem": None, "borda": None, "status": "sem_dado"} for b in bots},
+                 "misses_pre_head_sem_purga": None}
+        if dia in baseline:
+            linha["fonte"] = "baseline"
+            linha["travessia"] = travessia_da_baseline(baseline[dia], bots)
+            linha["misses_pre_head_sem_purga"] = misses_da_baseline(baseline[dia])
+        else:
+            if borda_por_chave is None:
+                borda_por_chave, _descartadas = edgetelemetry.serie_saneada(RAIZ, caminho=BORDA)
+                linhas_origem = ler_jsonl(ORIGEM)
+            calc = travessia_calculada(dia, borda_por_chave, linhas_origem, bots)
+            if any(v["status"] != "sem_dado" for v in calc.values()):
+                linha["fonte"] = "calculado"
+                linha["travessia"] = calc
+        rel["linhas"].append(linha)
+
+    com_dado = [l for l in rel["linhas"] if l["fonte"]]
+
+    # ── vivo e drift (antes do 'sem serie': drift e achado mesmo sem serie) ──
+    env = cloudflare_auth.ambiente(ENV)
+    zona = env.get("CLOUDFLARE_ZONE_ID") or dados.get("zona") or ZONA_PADRAO
+    esperado = dados["valor_esperado"]
+    rel["zona"] = zona
+    rel["canonico_valor_esperado"] = esperado
+    if args.sem_vivo:
+        rel["vivo"] = {"verificado": False, "motivo": "--sem-vivo"}
+    else:
+        result, motivo = LER_VIVO(zona, dados["endpoints"]["estado"]["caminho"], env)
+        if result is None:
+            rel["vivo"] = {"verificado": False, "motivo": motivo}
+        else:
+            valor = result.get("value")
+            rel["vivo"] = {"verificado": True, "value": valor, "modified_on": result.get("modified_on"),
+                           "editable": result.get("editable")}
+            if valor != esperado:
+                explic = explicacao_no_ledger(ler_jsonl(LEDGER), valor)
+                rel["drift"] = True
+                if explic is None:
+                    rel["drift_motivo"] = (f"DRIFT: cache_reserve esta {valor!r} e o canonico espera {esperado!r}, "
+                                           f"SEM linha fase={FASE} em {os.path.relpath(LEDGER, RAIZ)} que explique "
+                                           f"(mudanca de painel? modified_on={result.get('modified_on')})")
+                else:
+                    rel["drift_motivo"] = (f"canonico DESATUALIZADO: cache_reserve esta {valor!r} por "
+                                           f"{explic.get('ferramenta', '?')} em {explic.get('aplicado_em')} "
+                                           f"(motivo: {explic.get('motivo') or 'sem motivo gravado'}), mas "
+                                           f"{os.path.relpath(CANONICO, RAIZ)} ainda diz {esperado!r} -- edite o JSON")
+
+    if not com_dado:
+        rel["motivo"] = (f"sem serie: nenhum dia de {janela[0]}..{janela[-1]} tem dado em "
+                         f"{os.path.relpath(BASELINE, RAIZ)} nem nas series brutas da borda/origem")
+        return saida(rel, args.como_json, 1 if rel["drift"] else 2)
+
+    # ── regra 1 ──
+    atingidas_1 = []
+    detalhe_1 = {}
+    for bot in bots:
+        valores = [l["travessia"][bot]["travessia_pct"] for l in rel["linhas"]]
+        detalhe_1[bot] = valores
+        if serie_consecutiva_acima(valores, limiar_trav, dias):
+            atingidas_1.append(bot)
+    rel["regra_1"] = {"limiar_pct": limiar_trav, "dias": dias, "por_bot": detalhe_1,
+                      "atingida": bool(atingidas_1), "bots_atingidos": atingidas_1}
+
+    # ── regra 2 ──
+    valores_m = [l["misses_pre_head_sem_purga"] for l in rel["linhas"]]
+    atingida_2 = serie_consecutiva_acima(valores_m, limiar_misses, dias)
+    rel["regra_2"] = {"limiar_absoluto": limiar_misses, "dias": dias, "valores": valores_m,
+                      "atingida": atingida_2}
+
+    if atingidas_1 or atingida_2:
+        rel["veredito"] = "LIGAR"
+        partes = []
+        if atingidas_1:
+            partes.append("regra 1 atingida por " + ", ".join(
+                f"{b} ({' / '.join(fmt_pct(v) for v in detalhe_1[b])})" for b in atingidas_1))
+        if atingida_2:
+            partes.append(f"regra 2 atingida ({' / '.join(str(v) for v in valores_m)} > {limiar_misses:.0f})")
+        rel["motivo"] = "; ".join(partes)
+    else:
+        rel["veredito"] = "manter desligado"
+        rel["motivo"] = "nenhuma regra atingida na janela"
+
+    codigo = 1 if (rel["veredito"] == "LIGAR" or rel["drift"]) else 0
+    return saida(rel, args.como_json, codigo)
+
+
+def fmt_pct(v):
+    return "n/d" if v is None else f"{v:.1f}%"
+
+
+def saida(rel, como_json, codigo):
+    if como_json:
+        rel["exit"] = codigo
+        print(json.dumps(rel, ensure_ascii=False, indent=2))
+        return codigo
+    if rel.get("janela"):
+        j = rel["janela"]
+        print(f"check-cache-reserve-gatilho: janela {j['de']}..{j['ate']} ({j['dias']} dias, ate ontem UTC salvo --ate)")
+    if rel.get("linhas"):
+        bots = rel["parametros"]["bots"]
+        cab = f"{'dia':10s}  {'fonte':10s}  {'purgas_tudo':11s}  " + "  ".join(f"{b:22s}" for b in bots) + "  misses_pre_head_sem_purga"
+        print(cab)
+        for l in rel["linhas"]:
+            celulas = []
+            for b in bots:
+                t = l["travessia"][b]
+                if t["travessia_pct"] is None:
+                    celulas.append(f"{'n/d':22s}")
+                else:
+                    celulas.append(f"{fmt_pct(t['travessia_pct']) + ' (' + str(t['origem']) + '/' + str(t['borda']) + ')':22s}")
+            m = l["misses_pre_head_sem_purga"]
+            print(f"{l['date']:10s}  {(l['fonte'] or 'sem dado'):10s}  {l['purgas_tudo']:<11d}  "
+                  + "  ".join(celulas) + f"  {('n/d' if m is None else m)}")
+    if rel.get("regra_1"):
+        r1 = rel["regra_1"]
+        print(f"regra 1 (travessia > {r1['limiar_pct']:.1f}% em {r1['dias']} dias consecutivos): "
+              + ("ATINGIDA por " + ", ".join(r1["bots_atingidos"]) if r1["atingida"] else "nao atingida"))
+        r2 = rel["regra_2"]
+        p = rel["parametros"]
+        print(f"regra 2 (misses_pre_head_sem_purga > {r2['limiar_absoluto']:.0f} = {p['limiar_misses_pct_acervo']:.1f}% "
+              f"de {p['acervo']} em {r2['dias']} dias): "
+              + ("ATINGIDA" if r2["atingida"] else "nao atingida")
+              + f" ({' / '.join('n/d' if v is None else str(v) for v in r2['valores'])})")
+    v = rel.get("vivo") or {}
+    if v.get("verificado"):
+        print(f"vivo: cache_reserve={v['value']!r} (modified_on {v['modified_on']}, editable {v['editable']}); "
+              f"canonico espera {rel.get('canonico_valor_esperado')!r}")
+    elif v:
+        print(f"vivo: NAO VERIFICADO ({v.get('motivo')}) -- isto nao e drift nem aprovacao")
+    if rel.get("drift"):
+        print(f"  - {rel['drift_motivo']}")
+    if codigo == 2:
+        print(f"check-cache-reserve-gatilho: INCONCLUSIVO (exit 2)")
+        print(f"  - {rel['motivo']}")
+        return codigo
+    if rel.get("veredito"):
+        print(f"VEREDITO: {rel['veredito']} -- {rel['motivo']}")
+        if rel["veredito"] == "LIGAR":
+            print("  para ligar: tools/apply-cache-reserve --on --dry-run, depois --on --confirmar --motivo '...'")
+            print("  contexto: purge 'tudo' e soft purge no Reserve (revalida na origem); veja a coluna purgas_tudo")
+    print(f"check-cache-reserve-gatilho: exit {codigo}")
+    return codigo
+
+
+if __name__ == "__main__":
+    sys.exit(main())

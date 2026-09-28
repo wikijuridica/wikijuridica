@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Prova, contra a ORIGEM VIVA, que o hash declarado no header autoriza o script
+que a mesma resposta carrega.
+
+POR QUE ISTO NAO EXISTIA E PRECISAVA EXISTIR: toda a camada de medicao documenta
+o mesmo medo — "o script morre em silencio, e painel vazio e indistinguivel de
+'nao ha visitantes'". Havia gate para a paridade Go <-> .conf (teste de drift),
+gate para o corpo do script nas paginas (check-analytics-contract) e teste para a
+derivacao do hash (pageinline). Nenhum deles pergunta a coisa que o navegador
+pergunta: o header que VEIO com esta resposta autoriza o script que VEIO nela?
+
+Um nginx sem reload depois de mudar a CSP passa em todos os outros gates e
+reprova aqui — que e exatamente o modo de falha temido.
+
+Uso:
+  ./tools/check-csp-hash-servido                    # origem local (nginx :8088)
+  ./tools/check-csp-hash-servido --base https://wikijuridica.com.br
+  ./tools/check-csp-hash-servido --rotas /familia/ /buscar/
+"""
+import argparse
+import base64
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+SITE = RAIZ / "content" / "site.json"
+# Sonda com UA proprio e cabecalho de aquecimento: requisicao interna nunca se
+# disfarca de visitante, e nao entra na contagem de trafego real.
+UA = "wikijuridica-superficie-probe/1.0"
+
+
+def dominio():
+    return json.loads(SITE.read_text(encoding="utf-8"))["base_url"].rstrip("/")
+
+
+def fontes_da_diretiva(csp, nome):
+    """Fontes declaradas numa diretiva da CSP servida, ou conjunto vazio."""
+    for diretiva in csp.split(";"):
+        partes = diretiva.strip().split()
+        if partes and partes[0].lower() == nome:
+            return set(partes[1:])
+    return set()
+
+
+def hashes_da_diretiva(csp, nome):
+    """So conta o hash que esta NA diretiva pedida: um sha256 em style-src
+    autoriza estilo e nunca script, e vice-versa."""
+    return set(re.findall(r"'(sha256-[A-Za-z0-9+/=]+)'", " ".join(sorted(fontes_da_diretiva(csp, nome)))))
+
+
+def busca(base, rota, host):
+    cmd = ["curl", "-sS", "-D", "-", "-A", UA, "-H", "X-Warming-Request: true"]
+    if host:
+        cmd += ["-H", f"Host: {host}"]
+    cmd += [base.rstrip("/") + rota]
+    saida = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if saida.returncode != 0:
+        return None, None, saida.stderr.strip()[:200]
+    bruto = saida.stdout
+    corte = bruto.find("\r\n\r\n")
+    if corte < 0:
+        corte = bruto.find("\n\n")
+    if corte < 0:
+        return None, None, "resposta sem separacao de cabecalho"
+    return bruto[:corte], bruto[corte:].lstrip("\r\n"), ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--base", default="http://127.0.0.1:8088",
+                        help="origem a sondar (default: nginx local)")
+    parser.add_argument("--rotas", nargs="*", default=["/", "/familia/", "/buscar/"])
+    args = parser.parse_args()
+
+    alvo = dominio()
+    host = alvo.split("//", 1)[-1] if args.base.startswith("http://127.") else None
+
+    falhas = []
+    for rota in args.rotas:
+        cabecalhos, corpo, erro = busca(args.base, rota, host)
+        if erro or corpo is None:
+            print(f"  FALHA {rota}: nao respondeu ({erro})")
+            falhas.append(rota)
+            continue
+
+        # TODOS os headers CSP, nao so o ultimo: quando ha mais de um, o
+        # navegador aplica a INTERSECAO deles (registrado em
+        # ops/proposed/wj-proxy-hide-security-headers.conf). Um header extra sem o
+        # hash bloquearia o script, e olhar so o ultimo nao veria.
+        cspList = [linha.split(":", 1)[1].strip() for linha in cabecalhos.splitlines()
+                   if linha.lower().startswith("content-security-policy:")]
+        if not cspList:
+            print(f"  FALHA {rota}: resposta sem Content-Security-Policy")
+            falhas.append(rota)
+            continue
+
+        # E o hash conta so se estiver em `script-src`: um sha256 que apareca em
+        # style-src autoriza estilo, nunca script.
+        hashes = hashes_da_diretiva(cspList[0], "script-src")
+        estilos = hashes_da_diretiva(cspList[0], "style-src")
+        largasDeEstilo = {f for f in fontes_da_diretiva(cspList[0], "style-src")
+                          if f in ("'unsafe-inline'", "*")}
+        for outra in cspList[1:]:
+            hashes &= hashes_da_diretiva(outra, "script-src")
+            estilos &= hashes_da_diretiva(outra, "style-src")
+            largasDeEstilo &= {f for f in fontes_da_diretiva(outra, "style-src")
+                               if f in ("'unsafe-inline'", "*")}
+        # Script inline SEM atributo: e o unico que o contrato de HTML leve
+        # admite, e o unico cujo hash a CSP precisa autorizar.
+        # STATUS ANTES DE CONTEUDO. Sem isto, uma resposta 502/503 — o servico
+        # subindo depois de um restart, por exemplo — vira "esperava 1 script,
+        # achei 0", que manda o operador procurar defeito no render quando o que
+        # houve foi indisponibilidade. Aconteceu duas vezes na sessao em que este
+        # gate nasceu.
+        primeira = cabecalhos.splitlines()[0] if cabecalhos else ""
+        if " 200" not in primeira:
+            print(f"  FALHA {rota}: a resposta nao foi 200 ({primeira.strip()}) — nada a conferir")
+            falhas.append(rota)
+            continue
+
+        puros = re.findall(r"<script>(.*?)</script>", corpo, re.S)
+        if len(puros) != 1:
+            comAtributo = len(re.findall(r"<script\s+[^>]*>", corpo))
+            print(f"  FALHA {rota}: esperava exatamente 1 script inline sem atributo, achei {len(puros)}"
+                  f" (e {comAtributo} com atributo, que sao JSON-LD)")
+            falhas.append(rota)
+            continue
+
+        digest = hashlib.sha256(puros[0].encode("utf-8")).digest()
+        servido = "sha256-" + base64.b64encode(digest).decode("ascii")
+        if servido in hashes:
+            print(f"  ok    {rota}: header autoriza o script servido ({len(puros[0].encode())} B)")
+        else:
+            print(f"  FALHA {rota}: o header NAO autoriza o script desta resposta")
+            print(f"          script servido -> '{servido}'")
+            print(f"          header declara -> {sorted(hashes) or '(nenhum hash)'}")
+            print("          causa tipica: nginx sem reload depois de a CSP mudar."
+                  " O navegador recusa o script em silencio.")
+            falhas.append(rota)
+            continue
+
+        # O ESTILO, pela MESMA pergunta (BUG-079, 2026-08-29): desde que
+        # `style-src 'unsafe-inline'` saiu, a folha inline tambem passou a
+        # depender de hash. O modo de falha e ainda mais visivel que o do script
+        # — a pagina inteira chega sem uma linha de CSS —, e continua invisivel
+        # para o servidor: 200, HTML completo, gate de conteudo verde.
+        folhas = re.findall(r"<style>(.*?)</style>", corpo, re.S)
+        if len(folhas) != 1:
+            print(f"  FALHA {rota}: esperava exatamente 1 <style> sem atributo, achei {len(folhas)}")
+            falhas.append(rota)
+            continue
+        digestFolha = hashlib.sha256(folhas[0].encode("utf-8")).digest()
+        folhaServida = "sha256-" + base64.b64encode(digestFolha).decode("ascii")
+        if folhaServida in estilos:
+            print(f"  ok    {rota}: header autoriza a folha servida ({len(folhas[0].encode())} B)")
+        elif largasDeEstilo:
+            # Estado ESPERADO enquanto a camada nao recarregou: a politica antiga
+            # aplica o CSS por fonte larga, entao a pagina nao esta quebrada — mas
+            # o BUG-079 continua aberto NESTA camada, e dizer "ok" aqui esconderia
+            # justamente o que este gate existe para mostrar.
+            print(f"  ATENCAO {rota}: a folha e aplicada por {sorted(largasDeEstilo)} — esta camada ainda "
+                  "serve a politica anterior ao fechamento do style-src (recarregue o nginx / republique o binario)")
+        else:
+            print(f"  FALHA {rota}: o header NAO autoriza a folha desta resposta")
+            print(f"          folha servida  -> '{folhaServida}'")
+            print(f"          header declara -> {len(estilos)} hash(es) em style-src")
+            print("          causa tipica: constante de CSS mudou e a camada nao acompanhou."
+                  " O navegador recusa o <style> em silencio e a pagina sai sem estilo.")
+            falhas.append(rota)
+
+    print()
+    if falhas:
+        print(f"REPROVADO: {len(falhas)} rota(s) servem script que o proprio header recusa")
+        return 1
+    print(f"APROVADO: em {len(args.rotas)} rota(s), o header casa o script E a folha da mesma resposta")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

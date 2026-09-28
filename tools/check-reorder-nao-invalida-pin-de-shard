@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""check-reorder-nao-invalida-pin-de-shard — reordenar shard nao pode
+invalidar o pin de uma linha que uma fila viva ja referencia por POSICAO.
+
+POR QUE ESTE GATE EXISTE (2026-09-08, achado antes de rodar
+`ops/relaunch-writing.sh` + `tools/generate-v2-shard-slice-reorder --apply`
+sobre lotes de permutacao pura). `data/editorial/v2_rewrite_queue.jsonl` pina
+cada linha enfileirada por `source_shard` (caminho), `source_line` (POSICAO
+dentro do shard) e `source_shard_sha256` (hash do shard inteiro no momento
+em que a fila foi montada). `data/editorial/v2_portfolio_intent_migrations.jsonl`
+pina do mesmo jeito, por `target_shard` (nome do arquivo) e
+`source_shard_sha256`. Os dois sao comparados byte a byte contra o shard vivo
+por `tools/v2_portfolio_intent_migrations.py:223,287` antes de qualquer
+escrita — reordenar um shard troca a POSICAO das linhas sem trocar o
+conteudo, e como cada pin so identifica a linha pela posicao, uma
+reordenacao pura ja e o bastante para o pin apontar para outro registro.
+
+DECISAO DE NEGOCIO (o gate so a aplica, nao a inventa): shard com fila de
+reescrita VIVA (pin ainda batendo com o disco) NAO se reordena. O lote sai do
+manifesto mecanico `data/ops/writing_mechanical_reorder_todo.jsonl` — a fila
+existe para melhorar texto, a ordem e cosmetica, e drenar a fila as pressas
+para permitir o reorder e o mesmo erro pelo outro lado.
+
+O QUE ESTE GATE FAZ. Le o manifesto mecanico (mesmo schema fechado
+`v2_writing_mechanical_reorder_v1` de `check-reorder-nao-toca-publicada`) e,
+para cada `target_rel_path` distinto nele, cruza com:
+
+  1. `data/editorial/v2_rewrite_queue.jsonl` — campos `source_shard`,
+     `source_line`, `source_shard_sha256` (formato "sha256:<hex>").
+  2. `data/editorial/v2_portfolio_intent_migrations.jsonl` — campos
+     `target_shard` (SO o nome do arquivo, resolvido para
+     "data/editorial/v2_pages/<target_shard>") e `source_shard_sha256`
+     (hex puro, sem prefixo) — confirmado em
+     `tools/v2_portfolio_intent_migrations.py:527` (`target_path.name`).
+
+O pin so conta como VIVO se, normalizado (prefixo "sha256:" removido,
+minusculo), ele bater com o sha256 do shard NO DISCO agora. Pin ja
+divergente do disco e divida anterior a esta verificacao — nao a
+reordenacao proposta a criou — e entra num contador separado, sem reprovar
+por ela: reprovar por divida alheia e o falso positivo que este repositorio
+ja pagou (ver `docs/PRECEDENTES_DAS_ORDENS.md`).
+
+O QUE ESTE GATE NAO COBRE, DECLARADO:
+  - `internal/v2pagedistinctness`: o `ContentDigest` depende da ordem das
+    linhas, mas o mecanismo se autocura por rebuild na proxima passada — nao
+    e um pin que trava, e este gate nao o confere.
+  - `internal/v2privateverdict`: FECHADO em 2026-09-08 — o pacote NAO tem
+    consumidor em producao, entao reordenar shard nao quebra nada por ali. Isso
+    foi MEDIDO, nao deduzido: varredura das onze funcoes exportadas
+    (DefaultLimits, BuildShard, Decode, DecodeValidated, BuildSegment,
+    DecodeSegment, DecodeSegmentValidated, BuildCohort, DecodeCohort, SegmentID,
+    HierarchyCapacity) procurando `v2privateverdict.<Func>` em internal/, cmd/ e
+    tools/ fora do proprio pacote devolveu ZERO chamadas; o unico arquivo
+    externo que menciona o nome e internal/v2ingest/adjudicate_shard.go:180, e
+    num COMENTARIO. Nao e "improvavel": nao existe caminho. Se a frente de
+    vereditos privados voltar a ser ligada, esta linha tem de ser reavaliada.
+  - `data/editorial/authorial_mass_signature_shard_rewrite_plan.jsonl`: tem
+    `shard_id`/`source_shard_fingerprint_sha256`, mas sobre
+    "authorial-mass-scale-shard-NNN" — um espaco de sharding DIFERENTE de
+    `data/editorial/v2_pages/*.jsonl`, sem nenhum campo de caminho para esse
+    estoque. Nao ha chave para cruzar sem inventar um mapeamento; este gate
+    nao o cruza.
+
+Manifesto ausente ou vazio (0 bytes) = PASS explicito, "0 lotes a conferir",
+com o mtime do arquivo quando existe — para nao fingir que conferiu algo que
+nao leu. Linha do manifesto com schema errado ou JSON invalido REPROVA (nao
+e "0 lotes": e um registro que a ferramenta nao consegue provar seguro).
+
+Linha ILEGIVEL dentro de `v2_rewrite_queue.jsonl` ou de
+`v2_portfolio_intent_migrations.jsonl` (JSON invalido, nao e objeto) NAO faz
+este gate reprovar sozinha — o defeito, se existir, e desses arquivos, e
+outro gate cuida deles — mas o total de linhas ilegiveis por ledger e IMPRESSO
+sempre, porque uma linha nao lida e um pin que este gate nao pode afirmar que
+NAO esta vivo.
+
+READ-ONLY. Sem `--forcar`, sem flag que relaxe: este gate nao tem escape.
+
+Uso:
+    tools/check-reorder-nao-invalida-pin-de-shard
+    tools/check-reorder-nao-invalida-pin-de-shard --json
+    tools/check-reorder-nao-invalida-pin-de-shard --root /caminho \
+        --manifest /caminho/manifesto.jsonl \
+        --rewrite-queue /caminho/fila.jsonl \
+        --migrations /caminho/migracoes.jsonl
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+
+SCHEMA_VERSION_ESPERADA = "v2_writing_mechanical_reorder_v1"
+
+# Espelha _MANIFEST_FIELDS e _TARGET_REL de
+# tools/generate-v2-shard-slice-reorder (linhas 61-67) — mesmo contrato de
+# schema que o produtor exige antes de aplicar. Este gate nao importa o
+# produtor (custaria ~1,5s autenticando 42MB de estoque a cada chamada; um
+# check-* precisa ser barato e stdlib puro) — mesma razao documentada em
+# check-reorder-nao-toca-publicada.
+CAMPOS_MANIFESTO = {
+    "schema_version", "slug", "target_rel_path", "target_sha256",
+    "expected_n", "expected_intent_ids", "reason_codes",
+    "preserved_record_sha256", "recovery_item_sha256",
+}
+TARGET_REL_RE = re.compile(r"data/editorial/v2_pages/[a-z0-9_.-]+\.jsonl")
+
+
+def _sem_chave_duplicada(par_lista):
+    resultado = {}
+    for chave, valor in par_lista:
+        if chave in resultado:
+            raise ValueError(f"chave duplicada: {chave!r}")
+        resultado[chave] = valor
+    return resultado
+
+
+def carregar_manifesto(caminho: str) -> tuple[list[dict], list[str], str | None]:
+    """Devolve (lotes_validos, motivos_de_reprovacao_por_registro_malformado, mtime_iso)."""
+    if not os.path.isfile(caminho):
+        return [], [], None
+    info = os.stat(caminho)
+    mtime_iso = _dt.datetime.fromtimestamp(info.st_mtime).isoformat()
+    if info.st_size == 0:
+        return [], [], mtime_iso
+    lotes: list[dict] = []
+    malformados: list[str] = []
+    with open(caminho, "rb") as handle:
+        payload = handle.read()
+    linhas = payload.split(b"\n")
+    if payload.endswith(b"\n"):
+        linhas = linhas[:-1]
+    for numero, bruta in enumerate(linhas, 1):
+        if not bruta.strip():
+            continue
+        try:
+            registro = json.loads(bruta, object_pairs_hook=_sem_chave_duplicada)
+        except (json.JSONDecodeError, ValueError) as erro:
+            malformados.append(f"linha {numero}: JSON invalido ({erro})")
+            continue
+        if not isinstance(registro, dict) or set(registro) != CAMPOS_MANIFESTO:
+            malformados.append(f"linha {numero}: schema fora de {sorted(CAMPOS_MANIFESTO)}")
+            continue
+        if registro.get("schema_version") != SCHEMA_VERSION_ESPERADA:
+            malformados.append(
+                f"linha {numero}: schema_version={registro.get('schema_version')!r} "
+                f"!= {SCHEMA_VERSION_ESPERADA!r}")
+            continue
+        slug = registro.get("slug")
+        target_rel_path = registro.get("target_rel_path")
+        caminho_valido = (
+            isinstance(target_rel_path, str)
+            and TARGET_REL_RE.fullmatch(target_rel_path) is not None
+            and target_rel_path == f"data/editorial/v2_pages/{slug}.jsonl"
+        )
+        if not caminho_valido:
+            malformados.append(
+                f"linha {numero}: target_rel_path={target_rel_path!r} invalido ou nao "
+                f"corresponde ao slug {slug!r}")
+            continue
+        lotes.append(registro)
+    return lotes, malformados, mtime_iso
+
+
+def normaliza_pin(valor) -> str | None:
+    """Remove o prefixo "sha256:" (presente em v2_rewrite_queue, ausente em
+    v2_portfolio_intent_migrations) e baixa a caixa — sem isso todo pin da
+    fila de reescrita leria como "divida anterior" e o gate nunca reprovaria."""
+    if not isinstance(valor, str):
+        return None
+    v = valor.strip().lower()
+    if v.startswith("sha256:"):
+        v = v[len("sha256:"):]
+    if re.fullmatch(r"[0-9a-f]{64}", v) is None:
+        return None
+    return v
+
+
+def sha256_arquivo(caminho: str) -> str | None:
+    if not os.path.isfile(caminho):
+        return None
+    digest = hashlib.sha256()
+    with open(caminho, "rb") as handle:
+        for bloco in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(bloco)
+    return digest.hexdigest()
+
+
+def cruzar_rewrite_queue(caminho: str, shards_alvo: set[str]) -> tuple[dict, int, list[int]]:
+    """Devolve (por_shard, total_ilegiveis, amostra_linhas_ilegiveis).
+    por_shard[shard] = lista de (source_line, pin_normalizado, intent_id) —
+    so para shards em shards_alvo, streaming, sem carregar o arquivo inteiro
+    em memoria."""
+    por_shard: dict[str, list[tuple]] = {shard: [] for shard in shards_alvo}
+    ilegiveis = 0
+    amostra_ilegiveis: list[int] = []
+    if not os.path.isfile(caminho):
+        return por_shard, -1, []  # sentinela: ledger inteiro ausente
+    with open(caminho, encoding="utf-8") as handle:
+        for numero, linha in enumerate(handle, 1):
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                ilegiveis += 1
+                if len(amostra_ilegiveis) < 5:
+                    amostra_ilegiveis.append(numero)
+                continue
+            if not isinstance(registro, dict):
+                ilegiveis += 1
+                if len(amostra_ilegiveis) < 5:
+                    amostra_ilegiveis.append(numero)
+                continue
+            shard = registro.get("source_shard")
+            if shard not in shards_alvo:
+                continue
+            pin = normaliza_pin(registro.get("source_shard_sha256"))
+            por_shard[shard].append((
+                registro.get("source_line"), pin, registro.get("intent_id")))
+    return por_shard, ilegiveis, amostra_ilegiveis
+
+
+def cruzar_migrations(caminho: str, shards_alvo: set[str]) -> tuple[dict, int, list[int]]:
+    """Devolve (por_shard, total_ilegiveis, amostra_linhas_ilegiveis).
+    por_shard[shard] = lista de (migration_id, pin_normalizado)."""
+    por_shard: dict[str, list[tuple]] = {shard: [] for shard in shards_alvo}
+    ilegiveis = 0
+    amostra_ilegiveis: list[int] = []
+    if not os.path.isfile(caminho):
+        return por_shard, -1, []
+    with open(caminho, encoding="utf-8") as handle:
+        for numero, linha in enumerate(handle, 1):
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                ilegiveis += 1
+                if len(amostra_ilegiveis) < 5:
+                    amostra_ilegiveis.append(numero)
+                continue
+            if not isinstance(registro, dict):
+                ilegiveis += 1
+                if len(amostra_ilegiveis) < 5:
+                    amostra_ilegiveis.append(numero)
+                continue
+            target_shard = registro.get("target_shard")
+            if not isinstance(target_shard, str):
+                continue
+            shard_rel = f"data/editorial/v2_pages/{os.path.basename(target_shard)}"
+            if shard_rel not in shards_alvo:
+                continue
+            pin = normaliza_pin(registro.get("source_shard_sha256"))
+            por_shard[shard_rel].append((
+                registro.get("migration_id"), pin))
+    return por_shard, ilegiveis, amostra_ilegiveis
+
+
+NAO_COBERTO = [
+    "internal/v2pagedistinctness: o ContentDigest depende da ordem das linhas, "
+    "mas se autocura por rebuild na proxima passada — nao e um pin que trava, "
+    "e este gate nao o confere.",
+    "internal/v2privateverdict: FECHADO em 2026-09-08 — o pacote nao tem consumidor "
+    "em producao (zero chamadas as onze funcoes exportadas fora do proprio pacote; "
+    "a unica mencao externa e um comentario em internal/v2ingest/adjudicate_shard.go:180), "
+    "entao reordenar shard nao quebra nada por ali. Reavaliar se a frente voltar a ser ligada.",
+    "data/editorial/authorial_mass_signature_shard_rewrite_plan.jsonl: shard_id/"
+    "source_shard_fingerprint_sha256 sao de outro espaco de sharding "
+    "(authorial-mass-scale-shard-NNN), sem campo de caminho para "
+    "data/editorial/v2_pages/*.jsonl — nao ha chave para cruzar sem inventar "
+    "um mapeamento, entao este gate nao o cruza.",
+]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--root", default=ROOT,
+                         help="raiz do repo — resolve todos os defaults a partir dela "
+                              "(default: raiz deste checkout).")
+    parser.add_argument("--manifest", default=None,
+                         help="default: <root>/data/ops/writing_mechanical_reorder_todo.jsonl")
+    parser.add_argument("--rewrite-queue", default=None,
+                         help="default: <root>/data/editorial/v2_rewrite_queue.jsonl")
+    parser.add_argument("--migrations", default=None,
+                         help="default: <root>/data/editorial/v2_portfolio_intent_migrations.jsonl")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if args.manifest is None:
+        args.manifest = os.path.join(args.root, "data", "ops", "writing_mechanical_reorder_todo.jsonl")
+    if args.rewrite_queue is None:
+        args.rewrite_queue = os.path.join(args.root, "data", "editorial", "v2_rewrite_queue.jsonl")
+    if args.migrations is None:
+        args.migrations = os.path.join(args.root, "data", "editorial", "v2_portfolio_intent_migrations.jsonl")
+
+    lotes, malformados, mtime_iso = carregar_manifesto(args.manifest)
+
+    def imprime_nao_coberto():
+        print("\nNAO COBERTO POR ESTE GATE (declarado, nao e ausencia de checagem escondida):")
+        for item in NAO_COBERTO:
+            print(f"  - {item}")
+
+    if not lotes and not malformados:
+        motivo = ("manifesto ausente" if not os.path.isfile(args.manifest)
+                   else "manifesto vazio (0 bytes)")
+        print(f"check-reorder-nao-invalida-pin-de-shard: pass — 0 lotes a conferir ({motivo}: "
+              f"{args.manifest}" + (f", mtime={mtime_iso}" if mtime_iso else "") + ")")
+        if args.json:
+            print(json.dumps({
+                "ok": True, "lotes": 0, "manifesto_mtime": mtime_iso,
+                "conflitos": [], "divida_anterior": [], "malformados": [],
+                "nao_coberto": NAO_COBERTO,
+            }, ensure_ascii=False, sort_keys=True))
+        imprime_nao_coberto()
+        return 0
+
+    shards_alvo = sorted({r["target_rel_path"] for r in lotes})
+    slug_por_shard = {r["target_rel_path"]: r["slug"] for r in lotes}
+
+    por_shard_queue, ilegiveis_queue, amostra_ilegiveis_queue = cruzar_rewrite_queue(
+        args.rewrite_queue, set(shards_alvo))
+    por_shard_migr, ilegiveis_migr, amostra_ilegiveis_migr = cruzar_migrations(
+        args.migrations, set(shards_alvo))
+
+    conflitos: list[dict] = []
+    divida_anterior: list[dict] = []
+    resultado_por_shard: list[dict] = []
+
+    for shard in shards_alvo:
+        caminho_absoluto = os.path.join(args.root, shard)
+        disco = sha256_arquivo(caminho_absoluto)
+
+        vivo_queue = []
+        stale_queue = []
+        for source_line, pin, intent_id in por_shard_queue.get(shard, []):
+            alvo = vivo_queue if (disco is not None and pin == disco) else stale_queue
+            alvo.append({"source_line": source_line, "intent_id": intent_id, "pin": pin})
+
+        vivo_migr = []
+        stale_migr = []
+        for migration_id, pin in por_shard_migr.get(shard, []):
+            alvo = vivo_migr if (disco is not None and pin == disco) else stale_migr
+            alvo.append({"migration_id": migration_id, "pin": pin})
+
+        entrada = {
+            "slug": slug_por_shard[shard],
+            "target_rel_path": shard,
+            "shard_ausente_no_disco": disco is None,
+            "disco_sha256": disco,
+            "rewrite_queue_vivo": len(vivo_queue),
+            "rewrite_queue_divida_anterior": len(stale_queue),
+            "portfolio_intent_migrations_vivo": len(vivo_migr),
+            "portfolio_intent_migrations_divida_anterior": len(stale_migr),
+        }
+        resultado_por_shard.append(entrada)
+
+        if vivo_queue:
+            conflitos.append({
+                "shard": shard, "slug": slug_por_shard[shard],
+                "ledger": "data/editorial/v2_rewrite_queue.jsonl",
+                "linhas_afetadas": len(vivo_queue),
+                "amostra": vivo_queue[:5],
+            })
+        if vivo_migr:
+            conflitos.append({
+                "shard": shard, "slug": slug_por_shard[shard],
+                "ledger": "data/editorial/v2_portfolio_intent_migrations.jsonl",
+                "linhas_afetadas": len(vivo_migr),
+                "amostra": vivo_migr[:5],
+            })
+        if stale_queue:
+            divida_anterior.append({
+                "shard": shard, "ledger": "data/editorial/v2_rewrite_queue.jsonl",
+                "linhas_afetadas": len(stale_queue),
+            })
+        if stale_migr:
+            divida_anterior.append({
+                "shard": shard, "ledger": "data/editorial/v2_portfolio_intent_migrations.jsonl",
+                "linhas_afetadas": len(stale_migr),
+            })
+
+    ok = not conflitos and not malformados
+
+    if args.json:
+        print(json.dumps({
+            "ok": ok, "lotes": len(lotes),
+            "manifesto_mtime": mtime_iso,
+            "shards_conferidos": resultado_por_shard,
+            "conflitos": conflitos,
+            "divida_anterior": divida_anterior,
+            "malformados": malformados,
+            "rewrite_queue_ledger_ausente": ilegiveis_queue == -1,
+            "rewrite_queue_linhas_ilegiveis": max(ilegiveis_queue, 0),
+            "rewrite_queue_linhas_ilegiveis_amostra": amostra_ilegiveis_queue,
+            "migrations_ledger_ausente": ilegiveis_migr == -1,
+            "migrations_linhas_ilegiveis": max(ilegiveis_migr, 0),
+            "migrations_linhas_ilegiveis_amostra": amostra_ilegiveis_migr,
+            "nao_coberto": NAO_COBERTO,
+        }, ensure_ascii=False, sort_keys=True))
+
+    if ilegiveis_queue == -1:
+        print(f"AVISO: {args.rewrite_queue} ausente — 0 pin(s) conferidos contra "
+              f"{len(shards_alvo)} shard(s) do manifesto.", file=sys.stderr)
+    elif ilegiveis_queue:
+        print(f"AVISO: {ilegiveis_queue} linha(s) ilegivel(is) em {args.rewrite_queue} "
+              f"(primeiras: {amostra_ilegiveis_queue}) — nao entram na contagem de pins "
+              "vivos nem de divida anterior.", file=sys.stderr)
+    if ilegiveis_migr == -1:
+        print(f"AVISO: {args.migrations} ausente — 0 pin(s) conferidos contra "
+              f"{len(shards_alvo)} shard(s) do manifesto.", file=sys.stderr)
+    elif ilegiveis_migr:
+        print(f"AVISO: {ilegiveis_migr} linha(s) ilegivel(is) em {args.migrations} "
+              f"(primeiras: {amostra_ilegiveis_migr}) — nao entram na contagem de pins "
+              "vivos nem de divida anterior.", file=sys.stderr)
+
+    if ok:
+        print(f"check-reorder-nao-invalida-pin-de-shard: pass — {len(lotes)} lote(s) / "
+              f"{len(shards_alvo)} shard(s) conferido(s), nenhum tem fila viva.")
+        if divida_anterior:
+            total_stale = sum(d["linhas_afetadas"] for d in divida_anterior)
+            print(f"  ({total_stale} pin(s) ja divergente(s) do disco antes desta verificacao — "
+                  "divida anterior, nao reprova por ela; ver JSON 'divida_anterior')")
+        imprime_nao_coberto()
+        return 0
+
+    print("check-reorder-nao-invalida-pin-de-shard: FAIL", file=sys.stderr)
+    for malformado in malformados:
+        print(f"  - manifesto malformado: {malformado}", file=sys.stderr)
+    for item in conflitos:
+        print(f"  - shard {item['shard']} (slug={item['slug']}): {item['linhas_afetadas']} "
+              f"linha(s)/registro(s) com pin VIVO em {item['ledger']}", file=sys.stderr)
+    print("\n  Shard com fila de reescrita VIVA nao se reordena: o lote deve SAIR do "
+          "manifesto mecanico (data/ops/writing_mechanical_reorder_todo.jsonl), nunca a "
+          "fila ser drenada as pressas para permitir o reorder.", file=sys.stderr)
+    imprime_nao_coberto()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

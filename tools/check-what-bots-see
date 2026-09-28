@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""check-what-bots-see — o que cada visitante recebe de verdade: pessoa, Googlebot, IA.
+
+POR QUE EXISTE: o portal promete a mesma pagina para todo mundo — humano no
+celular, Googlebot, OAI-SearchBot, Claude-User — sem custo de renderizacao e sem
+JavaScript. Promessa nao verificada e so promessa. Este check pede a MESMA URL
+com cada User-Agent real e compara byte a byte.
+
+O QUE ELE PROVA (ou desmente):
+
+  1. MESMO CONTEUDO PARA TODOS. Servir HTML diferente para robo de busca e para
+     pessoa e cloaking, punido pelo Google, e pode acontecer sem ninguem querer —
+     um rate limit que devolve 429 so para certo UA, um proxy que varia por
+     Accept, um cache envenenado. O teste e comparacao de SHA-256, nao inspecao
+     de codigo.
+
+  2. NENHUM ROBO VALIOSO E BARRADO. 429 para Googlebot custa crawl budget; para
+     um dominio novo com 9.400 paginas a descobrir, e o dano mais caro que a
+     infra pode causar. Por ordem do titular (2026-08-06) bot valioso e
+     ILIMITADO — aqui se confere em rajada, nao no papel (so no ORIGIN; pela
+     BORDA a prova vem de telemetria real, ver a nota de 2026-09-03 abaixo).
+
+  3. A PAGINA E LEVE E COMPLETA NO PRIMEIRO RESPONSE. title, meta description,
+     h1, canonical, JSON-LD e links internos presentes; zero <script> executavel;
+     dentro do teto de 50 KB. Se o conteudo dependesse de JavaScript, o robo de
+     IA veria uma casca — e a maioria nao executa JS.
+
+Read-only. Requisicoes com X-Bot-Simulation: true, gravadas fora da contagem de
+trafego real (internal/httpserver/access_log.go) — conferir o proprio portal
+nunca pode inflar a metrica dele.
+
+UA POR ALVO, NUNCA UA DE BOT REAL CONTRA HOST REMOTO (2026-09-03). Ate aqui,
+--borda mandava o MESMO Googlebot/GPTBot/PerplexityBot/etc. da tabela PERFIS
+contra o dominio publico — exatamente o que o contrato do dono proibe
+("PROIBIDO self-warming/requests com User-Agent de bots reais — FRAUDE",
+CLAUDE.md). A borda NAO le X-Bot-Simulation (so a origem le, ver
+internal/httpserver/access_log.go), entao aquele X-Bot-Simulation: true nao
+protegia nada nesse modo — a Cloudflare via UA de Googlebot de verdade e
+contava a visita como tal. Medido pelo maestro em 2026-09-02: dezenas de
+requisicoes/dia com UA de Perplexity e Claude saindo do IP desta casa contra
+a borda.
+
+Agora a decisao e por ALVO (funcao cabecalhos_para), nunca pela flag: contra
+127.0.0.1 o UA continua sendo o do bot de verdade (e por isso continua
+testando o roteamento por classe do nginx); contra QUALQUER host remoto o UA
+e sempre wikijuridica-superficie-probe/1.0 (simula: <perfil>), com
+X-Warming-Request: true, e a requisicao entra em
+data/ops/edge_probe_requests.jsonl para sair de organic_requests — o mesmo
+ledger que tools/check-superficie-bots-live ja usa. Consequencia: pela
+borda, as secoes 1 (anti-cloaking por classe) e 3 (bloqueio de bot real) nao
+sao mais medidas por este modo — ver os avisos impressos em cada uma.
+
+POR QUE O ALVO PADRAO E O ORIGIN, E NAO O DOMINIO. Ate 2026-08-06 este check
+batia em https://wikijuridica.com.br, ou seja, saia pela internet e voltava pelo
+Cloudflare. O X-Bot-Simulation protege o log do Go, mas a BORDA nao le esse
+cabecalho: ela ve o User-Agent do Googlebot e o contabiliza como visita de robo.
+Uma execucao sao ~180 requisicoes com UA de crawler real; no dia da medicao,
+915 das 1.966 requisicoes da borda (47%) eram este check, e o painel passou a
+mostrar ChatGPT, Claude e Perplexity "rastreando" um site que eles nunca
+visitaram. Contra o origin o teste prova exatamente o mesmo (o HTML e byte a
+byte identico ao publico) e ainda escapa do cache da borda, entao mede o
+servidor de verdade.
+
+O QUE SO A BORDA PROVA, com as limitacoes de 2026-09-03 registradas acima: se
+a borda injeta JavaScript na pagina (Web Analytics), e como o publico recebe
+cache/headers/peso de verdade. NAO prova mais bloqueio de bot real nem
+cloaking por classe — isso exigiria UA de bot real contra o dominio publico,
+que esta ferramenta nao manda mais. Use --borda sabendo disso: as
+requisicoes saem com UA proprio, marcadas X-Warming-Request e descontadas em
+data/ops/edge_probe_requests.jsonl (nao poluem organic_requests).
+
+Uso:
+    tools/check-what-bots-see                 # origin: conteudo, peso, cloaking, bloqueio
+    tools/check-what-bots-see --url /familia/  # outra pagina
+    tools/check-what-bots-see --borda          # camada Cloudflare, com UA proprio
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from collections import Counter
+from datetime import datetime, timezone
+
+# User-Agents REAIS, como os provedores os publicam. Aproximacao inventada aqui
+# testaria o roteamento errado.
+PERFIS = [
+    ("humano-mobile", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1", "pessoa"),
+    ("humano-android", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36", "pessoa"),
+    ("humano-desktop", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", "pessoa"),
+    ("googlebot-mobile", "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.175 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)", "busca"),
+    ("googlebot-desktop", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html) Chrome/125.0.6422.175 Safari/537.36", "busca"),
+    ("google-inspection", "Mozilla/5.0 (compatible; Google-InspectionTool/1.0;)", "busca"),
+    ("bingbot", "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)", "busca"),
+    ("duckduckbot", "Mozilla/5.0 (compatible; DuckDuckBot-Https/1.1; https://duckduckgo.com/duckduckbot)", "busca"),
+    ("applebot", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)", "busca"),
+    ("yandexbot", "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)", "busca"),
+    ("oai-searchbot", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot", "ia"),
+    ("chatgpt-user", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot", "ia"),
+    ("claude-searchbot", "Mozilla/5.0 (compatible; Claude-SearchBot/1.0; +claudebot@anthropic.com)", "ia"),
+    ("claude-user", "Mozilla/5.0 (compatible; Claude-User/1.0; +Claude-User@anthropic.com)", "ia"),
+    ("perplexitybot", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot", "ia"),
+    ("gptbot-treino", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; GPTBot/1.1; +https://openai.com/gptbot", "treino"),
+]
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Origin que o tunel serve ao publico (ops/cloudflared/config.yml: ingress ->
+# http://127.0.0.1:8088). Bater aqui evita a borda e evita o cache.
+ORIGIN_HOST = "http://127.0.0.1:8088"
+DEFAULT_URL = "/previdenciario/maternidade-homem/"
+
+# UA proprio para QUALQUER alvo remoto — ver cabecalhos_para(). Mesmo literal
+# que tools/check-superficie-bots-live usa, de proposito: um humano lendo o
+# access log ve um UNICO prefixo marcando toda sonda de primeira parte.
+UA_PROPRIO_BORDA = "wikijuridica-superficie-probe/1.0"
+
+# Mesmo ledger que tools/check-superficie-bots-live grava, mesmo schema
+# (edge_probe_requests_v1). tools/check-edge-traffic:LEDGERS_PROPRIOS soma os
+# dois; ledger novo nao ganha copia da regra, entra AQUI.
+LEDGER_PROPRIO = os.path.join(ROOT, "data/ops/edge_probe_requests.jsonl")
+
+
+def dominio_publico():
+    """URL publica do site.json — nunca hardcoded (contrato do repositorio)."""
+    try:
+        with open(os.path.join(ROOT, "content/site.json"), encoding="utf-8") as handle:
+            return json.load(handle)["base_url"].rstrip("/")
+    except (OSError, ValueError, KeyError):
+        return ""
+
+
+def eh_local(host):
+    return "127.0.0.1" in host or "localhost" in host or "[::1]" in host
+
+
+def cabecalhos_para(host, nome_perfil, ua_real):
+    """Decide o User-Agent e os cabecalhos extras de uma sonda, PELO ALVO
+    (host) — nunca pelo modo escolhido em linha de comando, para que
+    `--host https://...` fique tao seguro quanto `--borda`.
+
+    REGRA (2026-09-03, CLAUDE.md: "PROIBIDO self-warming/requests com
+    User-Agent de bots reais — FRAUDE"). UA de bot real (Googlebot, GPTBot,
+    PerplexityBot etc.) SO sai contra 127.0.0.1: a origem le X-Bot-Simulation
+    e exclui a visita do trafego real. Contra QUALQUER alvo remoto — a borda
+    publica, que NAO le X-Bot-Simulation — o UA e sempre PROPRIO e declarado;
+    a identidade simulada viaja so no UA (sufixo "(simula: <perfil>)").
+
+    O valor de X-Bot-Simulation fica SEMPRE "true", nas duas camadas — nunca o
+    nome do bot. internal/httpserver/access_log.go:isWarmingRequest confere
+    IGUALDADE EXATA (case-insensitive) com "true"; um valor diferente faria a
+    origem gravar bot_simulation=false numa requisicao que, contra a borda,
+    pode atravessar ate um MISS de cache e chegar aqui — contaminando o
+    proprio ledger de trafego real que este cabecalho existe para blindar.
+    X-Warming-Request: true e quem risca a requisicao remota de
+    organic_requests (ver LEDGER_PROPRIO)."""
+    if eh_local(host):
+        return ua_real, {"X-Bot-Simulation": "true"}
+    return (
+        "%s (simula: %s)" % (UA_PROPRIO_BORDA, nome_perfil),
+        {"X-Warming-Request": "true", "X-Bot-Simulation": "true"},
+    )
+
+
+def pedir(host, caminho, nome_perfil, ua_real, timeout=20.0):
+    ua, extras = cabecalhos_para(host, nome_perfil, ua_real)
+    cabecalhos = {
+        "User-Agent": ua,
+        "Accept-Encoding": "identity",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    cabecalhos.update(extras)
+    if eh_local(host):
+        # Sem o Host correto o nginx cai no server block errado e o canonical
+        # sai com 127.0.0.1 — o teste mediria uma pagina que ninguem recebe.
+        publico = dominio_publico()
+        if publico:
+            cabecalhos["Host"] = publico.split("//", 1)[-1]
+    pedido = urllib.request.Request(host.rstrip("/") + caminho, headers=cabecalhos)
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            corpo = resposta.read()
+            return resposta.status, corpo, dict(resposta.headers)
+    except urllib.error.HTTPError as erro:
+        return erro.code, b"", {}
+    except Exception as erro:
+        return 0, str(erro)[:80].encode(), {}
+
+
+def analisar(corpo):
+    texto = corpo.decode("utf-8", "replace")
+    def achar(padrao):
+        achado = re.search(padrao, texto, re.I | re.S)
+        return achado.group(1).strip() if achado else ""
+    scripts = re.findall(r"<script([^>]*)>", texto, re.I)
+    # Três categorias, e a distinção importa para saber QUEM consertar:
+    #   JSON-LD          — dado estruturado, não executa nada, é o esperado
+    #   injetado na borda — o Cloudflare adiciona o beacon do Web Analytics na
+    #                       resposta; não está no HTML do repositório e só o
+    #                       titular da conta pode desligar
+    #   do projeto        — JS que o render emitiu: violação de contrato nossa
+    naolds = [s for s in scripts if "application/ld+json" not in s.lower()]
+    borda = [s for s in naolds if "cloudflareinsights.com" in s.lower() or "cf-beacon" in s.lower()]
+    # QUARTA categoria, desde 2026-08-19: o registro de ferramentas WebMCP, que e
+    # script executavel AUTORIZADO (emenda do dono para integracao de agente de
+    # IA), inline, sem atributos, e liberado na CSP por hash sha256. Ele nao e
+    # violacao de contrato — e superficie de agente deliberada. O gate byte a byte
+    # vive no Go; aqui desconta-se pelo marcador unico do corpo.
+    webmcp = 1 if "document.modelContext||navigator.modelContext" in texto else 0
+    executaveis = [s for s in naolds if s not in borda]
+    if webmcp and executaveis:
+        # a tag do WebMCP e `<script>` sem atributos: remove UMA ocorrencia vazia
+        for i, atributos in enumerate(executaveis):
+            if not atributos.strip():
+                del executaveis[i]
+                break
+    return {
+        "title": achar(r"<title>(.*?)</title>"),
+        "meta": achar(r'<meta name="description" content="(.*?)"'),
+        "h1": re.sub(r"<[^>]+>", "", achar(r"<h1[^>]*>(.*?)</h1>")),
+        "canonical": achar(r'<link rel="canonical" href="(.*?)"'),
+        "robots": achar(r'<meta name="robots" content="(.*?)"'),
+        "jsonld": len(re.findall(r'application/ld\+json', texto, re.I)),
+        "links_internos": len(re.findall(r'href="/[a-z]', texto)),
+        "js_executavel": len(executaveis),
+        "js_da_borda": len(borda),
+        "whatsapp": texto.count("wa.me"),
+        "relacionados": 1 if "Conteúdos relacionados" in texto else 0,
+        "texto_visivel": len(re.sub(r"<[^>]+>", " ", texto).split()),
+    }
+
+
+def cf_cache_status(headers):
+    """Le cf-cache-status de um dict de headers HTTP, sem depender de caixa —
+    `dict(resposta.headers)` preserva a caixa que o servidor mandou
+    (Cloudflare envia "CF-Cache-Status"), e um .get() literal minusculo
+    perderia o valor. 2026-09-03: sem isto, o modo --borda nao dizia se a
+    requisicao foi respondida pela BORDA (HIT) ou alcancou a origem (MISS) —
+    exatamente o que prova qual camada respondeu de verdade."""
+    for chave, valor in headers.items():
+        if chave.lower() == "cf-cache-status":
+            return valor
+    return "-"
+
+
+def registrar_ledger_borda(contagem_por_status, total_urls, inicio_iso):
+    """Grava o que ESTA execucao mandou a um alvo remoto, no MESMO schema que
+    tools/check-superficie-bots-live usa (edge_probe_requests_v1) — para
+    tools/check-edge-traffic descontar de organic_requests. Sem flag para
+    pular: toda passada que sai daqui para fora de 127.0.0.1 se registra
+    (2026-09-03, mesma regra do topo do arquivo)."""
+    os.makedirs(os.path.dirname(LEDGER_PROPRIO), exist_ok=True)
+    with open(LEDGER_PROPRIO, "a", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "schema_version": "edge_probe_requests_v1",
+            "ferramenta": "tools/check-what-bots-see",
+            "started_at": inicio_iso,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "urls": total_urls,
+            "status": dict(contagem_por_status),
+            "user_agent": UA_PROPRIO_BORDA,
+            "warming_header": True,
+            "counts_as_audience": False,
+            "motivo": "sonda de comparacao de perfis (check-what-bots-see) contra alvo "
+                      "remoto; atravessa a Cloudflare e por isso precisa ser descontada "
+                      "de organic_requests",
+        }, ensure_ascii=False) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=None,
+                        help="alvo explicito; por padrao o origin (%s)" % ORIGIN_HOST)
+    parser.add_argument("--borda", action="store_true",
+                        help="medir pelo dominio publico, atravessando o Cloudflare, com UA "
+                             "PROPRIO (2026-09-03: nunca mais UA de bot real fora de "
+                             "127.0.0.1). Prova cache/headers/JS injetado; NAO prova "
+                             "cloaking por classe nem bloqueio de bot real — ver secoes "
+                             "1 e 3 da saida.")
+    parser.add_argument("--url", default=DEFAULT_URL)
+    parser.add_argument("--rajada", type=int, default=15,
+                        help="requisicoes seguidas por bot valioso para provar que nao ha bloqueio")
+    args = parser.parse_args()
+
+    if args.host is None:
+        if args.borda:
+            # Cair para o origin aqui seria pior que falhar: o modo pedido nao
+            # aconteceria e a saida ainda diria "modo ORIGIN", como se fosse
+            # escolha de quem chamou.
+            args.host = dominio_publico()
+            if not args.host:
+                print("check-what-bots-see: --borda pedido, mas content/site.json nao "
+                      "informou base_url", file=sys.stderr)
+                return 2
+        else:
+            args.host = ORIGIN_HOST
+    pela_borda = not eh_local(args.host)
+
+    print("=== O QUE CADA VISITANTE RECEBE ===")
+    print("url: %s%s" % (args.host, args.url))
+    inicio_iso = datetime.now(timezone.utc).isoformat()
+    contagem_status_borda = Counter()
+    contagem_cache_borda = Counter()
+    if pela_borda:
+        # Numero declarado antes de gastar: 15 perfis + 1 releitura p/ peso.
+        # Nao ha mais rajada pela borda (2026-09-03): ver secao 3 abaixo.
+        custo = len(PERFIS) + 1
+        print("modo BORDA: ~%d requisicoes com UA PROPRIO (%s) vao para a borda," % (custo, UA_PROPRIO_BORDA))
+        print("            marcadas X-Warming-Request e registradas em")
+        print("            data/ops/edge_probe_requests.jsonl para sair de organic_requests.")
+        print("            Nenhum UA de bot real sai daqui contra este alvo — secoes 1 e 3")
+        print("            abaixo ficam com prova parcial nesse modo.")
+    else:
+        print("modo ORIGIN: fora da borda — nao entra na analytics do Cloudflare")
+    print()
+
+    resultados = {}
+    cabecalho_tabela = "%-20s %-8s %-9s %-8s %-7s %s" % ("PERFIL", "HTTP", "BYTES", "PALAVRAS", "JSONLD", "SHA-256")
+    if pela_borda:
+        cabecalho_tabela += "  %s" % "CF-CACHE"
+    print(cabecalho_tabela)
+    for nome, ua, classe in PERFIS:
+        status, corpo, headers = pedir(args.host, args.url, nome, ua)
+        cache = cf_cache_status(headers) if pela_borda else None
+        if pela_borda:
+            contagem_status_borda[str(status)] += 1
+            contagem_cache_borda[cache] += 1
+        if status != 200:
+            linha = "%-20s %-8s %s" % (nome, status, "SEM RESPOSTA — " + corpo.decode("utf-8", "replace")[:50])
+            if pela_borda:
+                linha += "  cf-cache=%s" % cache
+            print(linha)
+            resultados[nome] = None
+            continue
+        sha = hashlib.sha256(corpo).hexdigest()
+        dados = analisar(corpo)
+        resultados[nome] = (sha, dados, classe)
+        linha = "%-20s %-8s %-9s %-8s %-7s %s" % (
+            nome, status, len(corpo), dados["texto_visivel"], dados["jsonld"], sha[:16])
+        if pela_borda:
+            linha += "  %s" % cache
+        print(linha)
+
+    validos = {n: v for n, v in resultados.items() if v}
+    if not validos:
+        if pela_borda:
+            registrar_ledger_borda(contagem_status_borda, len(PERFIS), inicio_iso)
+        print("\nnenhum perfil obteve resposta — o site esta fora?")
+        return 1
+
+    problemas = []
+
+    # 1. Mesmo conteudo para todos.
+    shas = {v[0] for v in validos.values()}
+    print("\n--- 1. MESMO CONTEUDO PARA TODOS (anti-cloaking) ---")
+    if len(shas) == 1:
+        print("  OK: os %d perfis receberam bytes IDENTICOS." % len(validos))
+        if pela_borda:
+            print("  NAO PROVA ausencia de cloaking por classe de bot: pela borda TODO")
+            print("  perfil usa o MESMO UA proprio (2026-09-03 — a identidade so viaja no")
+            print("  UA/header, que a borda nao le para roteamento). Isto prova so que o")
+            print("  caminho servido nao varia entre sondagens; a prova por classe exige")
+            print("  rodar no ORIGIN (modo padrao, sem --borda / --host remoto).")
+    else:
+        problemas.append("conteudo diferente por User-Agent (%d versoes)" % len(shas))
+        porsha = {}
+        for nome, (sha, _, _) in validos.items():
+            porsha.setdefault(sha, []).append(nome)
+        for sha, nomes in porsha.items():
+            print("  %s : %s" % (sha[:16], ", ".join(nomes)))
+
+    faltando = [n for n, v in resultados.items() if v is None]
+    if faltando:
+        problemas.append("perfis sem resposta 200: %s" % ", ".join(faltando))
+
+    # 2. Conteudo completo no primeiro response.
+    print("\n--- 2. PAGINA COMPLETA E LEVE NO PRIMEIRO RESPONSE ---")
+    exemplo = next(iter(validos.values()))[1]
+    for campo, rotulo in [("title", "title"), ("meta", "meta description"),
+                          ("h1", "h1"), ("canonical", "canonical")]:
+        valor = exemplo[campo]
+        if valor:
+            print("  %-16s %s" % (rotulo, valor[:72]))
+        else:
+            problemas.append("%s ausente" % rotulo)
+            print("  %-16s AUSENTE" % rotulo)
+    print("  %-16s %s" % ("robots", exemplo["robots"] or "AUSENTE"))
+    print("  %-16s %d bloco(s)" % ("JSON-LD", exemplo["jsonld"]))
+    print("  %-16s %d" % ("links internos", exemplo["links_internos"]))
+    print("  %-16s %d" % ("WhatsApp", exemplo["whatsapp"]))
+    print("  %-16s %s" % ("relacionados", "sim" if exemplo["relacionados"] else "nao"))
+    print("  %-16s %d palavras" % ("texto visivel", exemplo["texto_visivel"]))
+    if exemplo["js_executavel"]:
+        problemas.append("%d <script> executavel emitido pelo projeto — o contrato e zero JS" % exemplo["js_executavel"])
+        print("  %-16s %d  <-- PROBLEMA (emitido pelo render)" % ("JS do projeto", exemplo["js_executavel"]))
+    else:
+        print("  %-16s 0 (so JSON-LD)" % "JS do projeto")
+    if exemplo["js_da_borda"]:
+        # Não entra em `problemas`: o repositório não pode consertar sozinho, e
+        # tratar como falha deixaria o check permanentemente vermelho. Mas fica
+        # visível toda vez, porque é JavaScript de terceiro numa página que
+        # promete não ter nenhum, e é conexão extra em Core Web Vitals.
+        print("  %-16s %d  <-- injetado pelo Cloudflare (Web Analytics), NAO esta no repo"
+              % ("JS da borda", exemplo["js_da_borda"]))
+        print("  %-16s so o titular da conta desliga: painel Cloudflare > Analytics > Web Analytics"
+              % "")
+    elif not pela_borda:
+        # Silencio aqui nao e aprovacao: a injecao do Web Analytics acontece NA
+        # BORDA, entao medindo o origin ela e invisivel por construcao. Dizer
+        # "zero JS" sem essa ressalva seria afirmar o que nao foi medido.
+        print("  %-16s nao verificavel pelo origin — rode --borda apos mexer em "
+              "Web Analytics" % "JS da borda")
+
+    status_peso, corpo, headers_peso = pedir(args.host, args.url, PERFIS[0][0], PERFIS[0][1])
+    if pela_borda:
+        contagem_status_borda[str(status_peso)] += 1
+        contagem_cache_borda[cf_cache_status(headers_peso)] += 1
+    bytes_pagina = len(corpo)
+    if bytes_pagina > 50000:
+        problemas.append("pagina com %d bytes, acima do teto de 50 KB" % bytes_pagina)
+    print("  %-16s %d bytes (teto 50.000)" % ("peso", bytes_pagina))
+
+    if pela_borda:
+        # A prova de qual CAMADA respondeu: HIT nunca toca a origem (o UA
+        # proprio nem chega ao access log do nginx); MISS atravessa ate aqui,
+        # com bot_sim=true e warm=true gravados pelo Go — conferido ao vivo em
+        # 2026-09-03 (ver relato da tarefa). Sem esta contagem, --borda nao
+        # provava qual camada respondeu de verdade (achado do maestro).
+        resumo_cache = ", ".join("%s=%d" % (k, v) for k, v in sorted(contagem_cache_borda.items()))
+        print("  %-16s %s" % ("cf-cache", resumo_cache))
+
+    # 3. Rajada: bot valioso nao pode ser barrado.
+    #
+    # QUEM BARRA UM CRAWLER, NA PRATICA, E A BORDA — rate limit do Cloudflare,
+    # managed challenge, Bot Fight Mode. Testar isso de verdade exige a
+    # identidade que o WAF da Cloudflare reconhece, ou seja, o proprio UA do
+    # bot — e mandar esse UA contra o dominio publico e exatamente o que o
+    # CLAUDE.md proibe (self-warming com UA de bot real = fraude de metrica,
+    # regra reafirmada em 2026-09-03). Por isso, pela BORDA, esta secao NAO
+    # RODA: nao ha substituto seguro para "o Cloudflare bloqueia Googlebot?"
+    # que nao seja pedir com o UA do Googlebot. Quem precisa dessa resposta usa
+    # telemetria real (tools/check-perfil-por-bot,
+    # data/ops/edge_bot_agents_daily.jsonl) — bot verificado que de fato
+    # rastreia todo santo dia prova ausencia de bloqueio melhor que uma sonda.
+    #
+    # No ORIGIN a rajada continua identica: prova que a politica DESTE
+    # repositorio (internal/crawl) nao barra — nada diz sobre o que acontece
+    # antes da requisicao chegar aqui.
+    if pela_borda:
+        print("\n--- 3. BOT VALIOSO NAO E BARRADO PELA BORDA ---")
+        print("  NAO MEDIVEL com UA proprio: bloqueio por identidade so e testavel com o")
+        print("  UA real que a Cloudflare reconhece, e mandar esse UA contra o dominio")
+        print("  publico e a fraude que este arquivo existe para nao cometer (CLAUDE.md,")
+        print("  2026-09-03). Confirme bloqueio/ausencia por telemetria real:")
+        print("  tools/check-perfil-por-bot (le data/ops/edge_bot_agents_daily.jsonl).")
+    else:
+        onde = "NO ORIGIN (a borda nao foi consultada)"
+        print("\n--- 3. BOT VALIOSO NAO E BARRADO %s (%d requisicoes seguidas) ---"
+              % (onde, args.rajada))
+        for nome, ua, classe in PERFIS:
+            if classe not in ("busca", "ia"):
+                continue
+            ok = sum(1 for _ in range(args.rajada)
+                     if pedir(args.host, args.url, nome, ua)[0] == 200)
+            marca = "" if ok == args.rajada else "   <-- BARRADO"
+            if ok != args.rajada:
+                problemas.append("%s recebeu bloqueio em %d de %d" % (nome, args.rajada - ok, args.rajada))
+            print("  %-20s 200 em %d/%d%s" % (nome, ok, args.rajada, marca))
+
+    if pela_borda:
+        registrar_ledger_borda(contagem_status_borda, len(PERFIS) + 1, inicio_iso)
+
+    print()
+    if problemas:
+        print("REPROVADO:")
+        for problema in problemas:
+            print("  - %s" % problema)
+        return 1
+    if pela_borda:
+        print("OK pela borda: todos os perfis receberam a mesma pagina, completa e leve,")
+        print("com UA proprio (nenhum UA de bot real saiu daqui).")
+        print("NAO MEDIDO aqui: cloaking por classe de bot e bloqueio de bot real na")
+        print("borda — os dois exigiriam UA de bot real contra o dominio publico, que e")
+        print("a fraude que este modo existe para nao cometer. Rode sem --borda para a")
+        print("prova por classe (origin) e consulte tools/check-perfil-por-bot para")
+        print("bloqueio real.")
+    else:
+        print("OK no origin: todos os perfis recebem a mesma pagina completa e leve,")
+        print("e o portal nao barra nenhum deles.")
+        print("NAO MEDIDO aqui: bloqueio na borda e JS injetado pelo Cloudflare —")
+        print("para esses dois, rode com --borda.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

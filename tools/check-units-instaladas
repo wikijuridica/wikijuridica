@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""check-units-instaladas — a unit que o repositório declara é a unit que o systemd carrega?
+
+READ-ONLY. Sai 1 quando uma unit de `ops/systemd/` está em estado que o systemd
+não consegue honrar; sai 2 quando NÃO CONSEGUE medir (diretório ausente,
+`systemctl` indisponível sem `--sem-systemctl`) — indisponibilidade de ambiente
+nunca é reprovação neste repositório.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTE GATE EXISTE, com o incidente que o obriga
+
+Em 2026-09-01 17:31 `ops/systemd/wikijuridica-server.service` ganhou
+`Requires=wikijuridica-server.socket` e `Type=notify`, e o arquivo
+`wikijuridica-server.socket` nasceu ao lado — sem ser instalado em
+`/etc/systemd/system`, e sem o binário ser recompilado. Como a unit do serviço
+é symlink para o repositório, o `Requires=` entrou em vigor no reboot de 18:36
+apontando para uma unit que o systemd não conhecia:
+
+    Failed to schedule restart job: Unit wikijuridica-server.socket not found
+
+`Restart=always` ficou inerte (NRestarts=0), o serviço passou 17 h em `failed`,
+toda rota dinâmica (gêmeas Markdown, /mcp, /a2a, /api/v1, /.well-known) devolveu
+503 a todo bot, e o watchdog tentou 448 restarts fúteis com a mesma mensagem.
+Nenhum gate lia `/etc/systemd/system` nem `LoadState`. Este lê.
+
+No mesmo dia, `wikijuridica-sitemap-shard-grace.timer` existia em `ops/systemd`
+há dias e nunca fora instalado: a série disco × índice do sitemap parou em 30/08
+sem ninguém notar. Mesma classe, mesmo silêncio.
+
+────────────────────────────────────────────────────────────────────────────
+AS REGRAS, cada uma com o defeito que apanha
+
+  instalada        unit esperada instalada (timer, referenciada por outra unit,
+                   ou com [Install]) sem symlink em /etc/systemd/system. Cópia
+                   regular idêntica é AVISO (funciona hoje, deriva amanhã);
+                   cópia divergente é REPROVA (o repo diz uma coisa e o systemd
+                   faz outra); cópia ilegível é AVISO com o motivo.
+  dependencia      Requires=/Wants=/After=/Before=/BindsTo=/OnFailure= apontando
+                   para unit do projeto sem arquivo em ops/systemd, ou carregada
+                   pelo systemd como `not-found`. É o defeito de 01/09.
+  daemon_reload    unit carregada com NeedDaemonReload=yes: o arquivo mudou e o
+                   systemd ainda executa a versão antiga.
+  notify_binario   Type=notify cujo ExecStart aponta para binário sem a string
+                   NOTIFY_SOCKET: nunca manda READY=1, morre em TimeoutStartSec
+                   e entra em loop.
+  socket_binario   serviço com Requires=/Wants= de um .socket cujo binário não
+                   contém LISTEN_FDS: faz bind próprio e falha EADDRINUSE em
+                   loop com a porta em LISTEN (medido em 02/09: 40 s de loop até
+                   ser parado à mão).
+  timer_inativo    .timer em ops/systemd que o systemd conhece mas não está
+                   `enabled`+`active`.
+
+O que este gate NÃO faz: instalar, recarregar ou reiniciar nada. Quem cura é
+`tools/check-portal-health --repair` (classifica a falha e instala a
+dependência) e o passo 0a de `tools/deploy-publico`.
+
+Uso:
+    tools/check-units-instaladas                 # produção
+    tools/check-units-instaladas --json
+    tools/check-units-instaladas --sem-systemctl --dir X --etc Y   # teste, só regras de arquivo
+"""
+
+import argparse
+import datetime
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR_UNITS = os.path.join(RAIZ, "ops/systemd")
+DIR_ETC = "/etc/systemd/system"
+PREFIXOS_PROJETO = ("wikijuridica-", "cloudflared-wikijuridica")
+ARQ_ADIAMENTOS = os.path.join(RAIZ, "ops/systemd/timers-adiados.jsonl")
+CHAVES_DEPENDENCIA = ("Requires", "Wants", "After", "Before", "BindsTo", "OnFailure", "Also")
+SUFIXOS_UNIT = (".service", ".socket", ".timer", ".slice", ".target", ".path")
+
+# O parser de unit é o mesmo de check-units-alarme: rastreia seção, ignora
+# comentário, nunca casa por substring. Um segundo parser envelheceria sozinho.
+_alarme = SourceFileLoader("check_units_alarme", os.path.join(RAIZ, "tools/check-units-alarme")).load_module()
+le_unit = _alarme.le_unit
+
+
+class AdiamentoIlegivel(Exception):
+    """Registro de adiamento que nao da para ler.
+
+    NAO se degrada para "nenhum adiamento": isso transformaria um arquivo
+    corrompido em silencio, e silencio aqui vira reprovacao de timer que estava
+    legitimamente adiado — ou, pior, aprovacao de um que nao estava. Quem chama
+    sai 2 ("NAO MEDIDO"), que e o codigo de "o instrumento nao mediu".
+    """
+
+
+CAMPOS_ADIAMENTO = ("unit", "motivo", "destrava", "adiado_em", "vence_em")
+_DATA_ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def le_adiamentos(caminho):
+    """Le ops/systemd/timers-adiados.jsonl -> {unit: registro}.
+
+    Arquivo ausente e um estado legitimo e comum: significa que nada esta
+    adiado. Arquivo presente e ilegivel, nao.
+    """
+    if not os.path.exists(caminho):
+        return {}
+    registros = {}
+    with io.open(caminho, encoding="utf-8") as fh:
+        for n, linha in enumerate(fh, 1):
+            linha = linha.strip()
+            if not linha or linha.startswith("#"):
+                continue
+            try:
+                reg = json.loads(linha)
+            except ValueError as erro:
+                raise AdiamentoIlegivel(f"{caminho}:{n}: JSON invalido ({erro})")
+            if not isinstance(reg, dict):
+                raise AdiamentoIlegivel(f"{caminho}:{n}: a linha nao e um objeto JSON")
+            faltando = [c for c in CAMPOS_ADIAMENTO if not reg.get(c)]
+            if faltando:
+                raise AdiamentoIlegivel(f"{caminho}:{n}: campo(s) obrigatorio(s) ausente(s) ou vazio(s): "
+                                        + ", ".join(faltando))
+            for campo in ("adiado_em", "vence_em"):
+                if not _DATA_ISO.match(reg[campo]):
+                    raise AdiamentoIlegivel(f"{caminho}:{n}: {campo}={reg[campo]!r} nao e AAAA-MM-DD")
+            if reg["vence_em"] < reg["adiado_em"]:
+                raise AdiamentoIlegivel(f"{caminho}:{n}: vence_em ({reg['vence_em']}) e anterior a "
+                                        f"adiado_em ({reg['adiado_em']})")
+            if reg["unit"] in registros:
+                raise AdiamentoIlegivel(f"{caminho}:{n}: {reg['unit']} adiada duas vezes; "
+                                        "qual linha vale nao e derivavel do arquivo")
+            registros[reg["unit"]] = reg
+    return registros
+
+
+def e_do_projeto(nome):
+    return nome.startswith(PREFIXOS_PROJETO)
+
+
+def arquivo_da_unit(nome):
+    """Instância `x@y.service` vive no arquivo do template `x@.service`."""
+    if "@" in nome:
+        base, _, resto = nome.partition("@")
+        sufixo = resto[resto.rfind("."):] if "." in resto else ""
+        return f"{base}@{sufixo}"
+    return nome
+
+
+def dependencias(diretivas):
+    for d in diretivas:
+        if d["secao"] not in ("Unit", "Install") or d["chave"] not in CHAVES_DEPENDENCIA:
+            continue
+        for alvo in d["valor"].split():
+            if "%" in alvo:  # %N, %i: só resolvível por instância
+                continue
+            if e_do_projeto(alvo):
+                yield d["chave"], alvo, d["linha"]
+
+
+def systemctl_show(unit, props):
+    try:
+        r = subprocess.run(["systemctl", "show", unit, "-p", ",".join(props)],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    saida = {}
+    for linha in r.stdout.splitlines():
+        k, _, v = linha.partition("=")
+        saida[k] = v
+    return saida
+
+
+def binario_do_execstart(diretivas):
+    for d in diretivas:
+        if d["secao"] == "Service" and d["chave"] == "ExecStart":
+            token = d["valor"].split()[0] if d["valor"].split() else ""
+            return token.lstrip("-@+!:")
+    return ""
+
+
+def binario_contem(caminho, marca):
+    try:
+        with open(caminho, "rb") as fh:
+            return marca in fh.read()
+    except OSError:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Reprova unit do repositório que o systemd não consegue honrar.")
+    ap.add_argument("--dir", default=DIR_UNITS, help="diretório das units do repositório")
+    ap.add_argument("--etc", default=DIR_ETC, help="diretório de instalação do systemd")
+    ap.add_argument("--sem-systemctl", action="store_true",
+                    help="só regras de arquivo (teste); as de runtime saem como não medidas")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--adiamentos", default=ARQ_ADIAMENTOS,
+                    help="registro de timers adiados (JSONL); ausente = nada adiado")
+    ap.add_argument("--hoje", default=None,
+                    help="data AAAA-MM-DD a usar como hoje (teste); padrao = data do sistema")
+    args = ap.parse_args()
+
+    hoje = args.hoje or datetime.date.today().isoformat()
+    try:
+        adiamentos = le_adiamentos(args.adiamentos)
+    except AdiamentoIlegivel as erro:
+        # NAO MEDIDO, nunca "nada adiado": ver AdiamentoIlegivel.
+        print(f"INCONCLUSIVO: registro de adiamento ilegivel: {erro}", file=sys.stderr)
+        return 2
+
+    if not os.path.isdir(args.dir):
+        print(f"INCONCLUSIVO: {args.dir} não existe", file=sys.stderr)
+        return 2
+    com_systemctl = not args.sem_systemctl
+    if com_systemctl and systemctl_show("basic.target", ["LoadState"]) is None:
+        print("INCONCLUSIVO: systemctl indisponível (use --sem-systemctl para as regras de arquivo)",
+              file=sys.stderr)
+        return 2
+
+    arquivos = sorted(f for f in os.listdir(args.dir) if f.endswith(SUFIXOS_UNIT))
+    if not arquivos:
+        print(f"INCONCLUSIVO: nenhuma unit em {args.dir}", file=sys.stderr)
+        return 2
+
+    unidades = {}
+    referenciadas = set()
+    for nome in arquivos:
+        linhas, diretivas = le_unit(os.path.join(args.dir, nome))
+        unidades[nome] = diretivas
+        for _, alvo, _ in dependencias(diretivas):
+            referenciadas.add(arquivo_da_unit(alvo))
+
+    problemas, avisos, nao_medidas = [], [], []
+
+    def reprova(unit, regra, detalhe):
+        problemas.append({"unit": unit, "regra": regra, "detalhe": detalhe})
+
+    for nome, diretivas in unidades.items():
+        caminho_repo = os.path.realpath(os.path.join(args.dir, nome))
+        tem_install = any(d["secao"] == "Install" for d in diretivas)
+        esperada = nome.endswith(".timer") or nome in referenciadas or tem_install
+
+        # instalada
+        caminho_etc = os.path.join(args.etc, nome)
+        if esperada:
+            if os.path.islink(caminho_etc):
+                alvo = os.path.realpath(caminho_etc)
+                if alvo != caminho_repo:
+                    reprova(nome, "instalada", f"{caminho_etc} é symlink para {alvo}, não para {caminho_repo}")
+            elif os.path.isfile(caminho_etc):
+                try:
+                    with open(caminho_etc, "rb") as a, open(caminho_repo, "rb") as b:
+                        iguais = a.read() == b.read()
+                    if iguais:
+                        avisos.append(f"{nome}: instalada como CÓPIA idêntica (funciona hoje; symlink evita deriva)")
+                    else:
+                        reprova(nome, "instalada", f"{caminho_etc} é cópia DIVERGENTE do repositório: "
+                                                   f"o systemd executa outra versão")
+                except OSError as erro:
+                    avisos.append(f"{nome}: instalada como cópia ilegível ({erro}); não dá para conferir deriva")
+            else:
+                reprova(nome, "instalada", f"esperada em {args.etc} (timer, referenciada ou com [Install]) e ausente. "
+                                           f"Remédio: sudo ln -sf {caminho_repo} {args.etc}/ && sudo systemctl daemon-reload")
+
+        # dependencia
+        for chave, alvo, linha in dependencias(diretivas):
+            arq = arquivo_da_unit(alvo)
+            if arq not in unidades:
+                reprova(nome, "dependencia", f"linha {linha}: {chave}={alvo} sem arquivo {arq} em {args.dir}")
+                continue
+            if com_systemctl and "@" not in alvo:
+                props = systemctl_show(alvo, ["LoadState"])
+                if props is not None and props.get("LoadState") == "not-found":
+                    reprova(nome, "dependencia", f"linha {linha}: {chave}={alvo} carregada como not-found — "
+                                                 f"o systemd não consegue (re)iniciar {nome}. "
+                                                 f"Remédio: sudo ln -sf {os.path.join(args.dir, arq)} {args.etc}/ && sudo systemctl daemon-reload")
+
+        # daemon_reload
+        if com_systemctl and "@" not in nome:
+            props = systemctl_show(nome, ["LoadState", "NeedDaemonReload", "ActiveState", "UnitFileState"])
+            if props and props.get("LoadState") == "loaded" and props.get("NeedDaemonReload") == "yes":
+                reprova(nome, "daemon_reload", "arquivo mudou e o systemd executa a versão antiga; "
+                                              "remédio: sudo systemctl daemon-reload")
+            if nome.endswith(".timer") and props and props.get("LoadState") == "loaded":
+                inativo = (props.get("UnitFileState") not in ("enabled", "static")
+                           or props.get("ActiveState") != "active")
+                adiado = adiamentos.get(nome)
+                estado = (f"UnitFileState={props.get('UnitFileState')} "
+                          f"ActiveState={props.get('ActiveState')}")
+                if inativo and adiado and adiado["vence_em"] >= hoje:
+                    # ADIAMENTO VALIDO: o timer parado nao e defeito hoje. O aviso
+                    # sai da regra de arquivo, que roda inclusive sem systemctl, e
+                    # por isso nao se repete aqui.
+                    pass
+                elif inativo:
+                    # Vencido tambem cai aqui, e esta certo: a serie ESTA parada. O
+                    # prazo estourado e cobrado a parte, por `adiamento_vencido`,
+                    # que nomeia o registro em vez do timer.
+                    reprova(nome, "timer_inativo",
+                            f"{estado}; a série que ele produz está parada. "
+                            f"Remédio: sudo systemctl enable --now {nome}")
+                elif adiado:
+                    # Registro que sobreviveu ao proprio motivo: o timer ja roda.
+                    # Deixa-lo no arquivo e mentira a espera de leitor.
+                    reprova(nome, "adiamento_obsoleto",
+                            f"{estado} — o timer está ativo e ainda há adiamento declarado em "
+                            f"{os.path.relpath(args.adiamentos, RAIZ)} (vence_em={adiado['vence_em']}). "
+                            f"Remédio: remova a linha de {nome} desse arquivo.")
+        elif not com_systemctl:
+            nao_medidas.append(nome)
+
+        # notify_binario / socket_binario
+        if nome.endswith(".service"):
+            tipo = next((d["valor"] for d in diretivas if d["secao"] == "Service" and d["chave"] == "Type"), "simple")
+            binario = binario_do_execstart(diretivas)
+            exige_socket = any(alvo.endswith(".socket") for _, alvo, _ in dependencies_list(diretivas))
+            if binario and os.path.isfile(binario):
+                if tipo == "notify":
+                    tem = binario_contem(binario, b"NOTIFY_SOCKET")
+                    if tem is False:
+                        reprova(nome, "notify_binario", f"Type=notify mas {binario} não contém NOTIFY_SOCKET: "
+                                                        f"nunca manda READY=1 e morre em TimeoutStartSec")
+                if exige_socket:
+                    tem = binario_contem(binario, b"LISTEN_FDS")
+                    if tem is False:
+                        reprova(nome, "socket_binario", f"exige um .socket mas {binario} não contém LISTEN_FDS: "
+                                                        f"faz bind próprio e falha EADDRINUSE em loop com a porta em LISTEN. "
+                                                        f"Remédio: recompilar ANTES de ativar o socket (tools/deploy-publico --sem-republicar)")
+
+    veredito = "FAIL" if problemas else "OK"
+    # AS REGRAS DE ARQUIVO DO ADIAMENTO — rodam SEMPRE, inclusive sem systemctl.
+    #
+    # Prazo vencido e defeito que se enxerga sem tocar no systemd: quem declarou o
+    # adiamento declarou tambem ate quando ele valia. Por isso a cobranca de prazo
+    # mora aqui, e nao no ramo de runtime — la ela dependeria de o systemd reportar
+    # a unit, e um adiamento eterno passaria despercebido em toda maquina onde o
+    # systemctl nao respondesse.
+    rel_registro = os.path.relpath(args.adiamentos, RAIZ)
+    for unit, reg in sorted(adiamentos.items()):
+        if unit not in unidades:
+            # Linha morta num registro de excecao e o comeco do deposito.
+            reprova(unit, "adiamento_orfao",
+                    f"há adiamento declarado em {rel_registro} (vence_em={reg['vence_em']}) para uma "
+                    f"unit que não existe em {os.path.relpath(args.dir, RAIZ)}. "
+                    f"Remédio: remova a linha ou corrija o nome.")
+            continue
+        if reg["vence_em"] < hoje:
+            reprova(unit, "adiamento_vencido",
+                    f"o adiamento declarado em {rel_registro} VENCEU em {reg['vence_em']} (hoje é {hoje}). "
+                    f"Motivo registrado: {reg['motivo']} Destrava: {reg['destrava']} — "
+                    f"execute o que destrava, ou reescreva a linha dizendo por que o prazo anterior "
+                    f"não bastou. Adiamento que se renova sozinho é allowlist.")
+            continue
+        # ADIAMENTO VALIDO: aparece em TODA execucao. Guarda que filtra em silencio
+        # cria ponto cego invisivel — o aviso e o que a mantem auditavel.
+        avisos.append(f"{unit}: ADIADO ate {reg['vence_em']} (declarado em {reg['adiado_em']}) — "
+                      f"{reg['motivo']} Destrava: {reg['destrava']}")
+
+    if args.json:
+        print(json.dumps({"veredito": veredito, "units_total": len(unidades), "esperadas_instaladas":
+                          len([n for n, d in unidades.items() if n.endswith(".timer") or n in referenciadas
+                               or any(x["secao"] == "Install" for x in d)]),
+                          "problemas": problemas, "avisos": avisos, "nao_medidas_sem_systemctl": nao_medidas},
+                         ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if problemas else 0
+
+    print(f"units em {args.dir}: {len(unidades)} · com systemctl: {'sim' if com_systemctl else 'não (só regras de arquivo)'}")
+    for a in avisos:
+        print(f"  aviso: {a}")
+    if problemas:
+        print("\ncheck-units-instaladas: FAIL")
+        for p in problemas:
+            print(f"  - [{p['regra']}] {p['unit']}")
+            print(f"      {p['detalhe']}")
+        print("\n  Unit que o repositório declara e o systemd não honra é o portal fora do ar")
+        print("  com o journal dizendo 'Unit not found' — 17 h em 01-02/09/2026.")
+        return 1
+    print("\ncheck-units-instaladas: OK (toda unit esperada está instalada como symlink, toda "
+          "dependência carrega, nenhum daemon-reload pendente, binário coerente com Type=/socket)")
+    return 0
+
+
+def dependencies_list(diretivas):
+    return list(dependencias(diretivas))
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2: sem ela uma excecao nao tratada sairia 1, que aqui e o
+    # codigo de "medi e ha unit que o systemd nao honra" — um traceback passaria
+    # por veredito sobre as units. Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

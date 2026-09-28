@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""check-oom-protecao — a produção sobrevive à falta de memória, ou só parece?
+
+READ-ONLY. Sai 1 quando uma das três defesas de OOM está ausente ou inerte; sai
+2 quando NÃO CONSEGUE medir (sem /proc, sem systemctl) — indisponibilidade de
+ambiente nunca é reprovação neste repositório.
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTE GATE EXISTE, com os três defeitos que o obrigam
+
+Em 2026-09-04 uma auditoria de memória encontrou três coisas ao mesmo tempo, e
+NENHUMA delas tinha gate. Todas eram invisíveis por construção: não produzem
+log, não falham nenhum teste, e só aparecem no dia em que a memória acaba.
+
+1. `vm.overcommit_memory = 1` foi declarado em `ops/sysctl.d/` com justificativa
+   escrita ANTES de qualquer medição ("o servidor Go faz alocações grandes e
+   esparsas"). Medido depois: 70,8% do VmSize do servidor é PROT_NONE, que o
+   kernel não contabiliza em modo algum, e o maior pedido contabilizável dele é
+   66,9× menor que o limiar do modo heurístico. O parâmetro não destravava
+   nada — ele REMOVIA a única recusa que o kernel oferece antes do OOM killer.
+   Ver `ops/probe-overcommit.py`, que reproduz a medição nos dois modos.
+
+2. O SIGKILL do earlyoom estava INERTE. `-s 100` define o limiar de SIGTERM em
+   100% e deixa o de SIGKILL no default PERCENT/2 = 50%, e a condição do
+   earlyoom é conjuntiva (`man earlyoom`: "It sends SIGKILL once BOTH are below
+   their respective KILL_PERCENT"). O daemon imprimia os dois limiares no boot
+   e ninguém lia. O defeito não é "o swap nunca chegaria a 50%" — amostra
+   horária não limita queda dentro da hora, e o mínimo observado, 77,34%
+   (14.023 de 18.131 MiB), prova só que não ocorreu. O defeito é que o estágio
+   de escalonamento estava MORTO: com swap acima de 50%, vítima que ignora o
+   SIGTERM nunca vira SIGKILL — o earlyoom dorme 1 s e reenvia SIGTERM para
+   sempre. Correção: `-s 100,100`.
+
+3. As units críticas rodavam com `OOMScoreAdjust=0`. O `--avoid` do earlyoom
+   governa a escolha DO EARLYOOM e não existe para o OOM killer DO KERNEL —
+   que é quem age quando a memória acaba mais rápido que a sondagem de 100 ms
+   do daemon. Medido, o servidor Go marcava oom_score 671 contra 676–678 dos
+   agentes de desenvolvimento: cinco pontos.
+
+   E a primeira tentativa de corrigir isso pôs `OOMScoreAdjust=` na seção
+   [Unit] de três das quatro units, onde o systemd IGNORA EM SILÊNCIO. Esta é
+   a mesma armadilha que a wikijuridica-server.service já documentava para
+   StartLimitIntervalSec. Por isso a regra `secao` abaixo existe: ela apanha o
+   defeito que quase passou.
+
+────────────────────────────────────────────────────────────────────────────
+AS REGRAS, cada uma com o defeito que apanha
+
+  secao         unit crítica com OOMScoreAdjust fora de [Service] — o systemd
+                aceita o arquivo e ignora a chave. Defeito nº 3 acima.
+  declarado     unit crítica sem OOMScoreAdjust, ou com valor mais fraco que o
+                mínimo exigido. Vale para o PRÓXIMO start.
+  vivo          processo em execução com oom_score_adj diferente do declarado —
+                a chave só age no exec, então uma unit que já estava no ar
+                quando a linha entrou continua desprotegida até o restart.
+  earlyoom      daemon parado, ou com o SIGKILL preso atrás do swap (`-s N` sem
+                KILL_PERCENT). Defeito nº 2 acima.
+  overcommit    vm.overcommit_memory != 0. O modo 1 desarma a recusa pré-OOM do
+                kernel, e neste host não tem lastro. Defeito nº 1 acima.
+                A MESMA regra confere ainda o valor DECLARADO em sysctl.d
+                contra o vivo — ver o defeito nº 4, abaixo.
+
+────────────────────────────────────────────────────────────────────────────
+DEFEITO Nº 4, achado em 2026-09-04 pela auditoria de junções
+
+A versão original desta regra lia só `/proc/sys/vm/overcommit_memory`, ou seja,
+"como o host está AGORA". Sysctl não age agora: age no boot. Enquanto um agente
+removia o `vm.overcommit_memory=1` do arquivo declarado e aplicava 0 ao vivo,
+o checklist de reboot escrito por outro agente ainda mandava ESPERAR 1 — as
+duas metades da máquina discordavam e o gate ficava VERDE, porque olhava
+exatamente a metade que estava certa (commits d75b34ce e a52fa4df).
+
+Gate que confere só o vivo não consegue reprovar um host que sobe diferente do
+que roda. Agora a regra compara os dois e reprova a divergência, dizendo qual
+arquivo declara o quê — que é a pergunta que o checklist de reboot precisa
+responder ANTES de reiniciar, não depois.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# unit -> (teto de oom_score_adj aceito, padrão para achar os processos vivos)
+# O teto é "no máximo isto": -900 passa onde se exige -500, o contrário não.
+CRITICAS = {
+    "wikijuridica-server.service": -500,
+    "wikijuridica-nginx.service": -900,
+    "cloudflared-wikijuridica.service": -900,
+    "cloudflared-wikijuridica-replica@.service": -900,
+}
+
+
+def systemctl(*args):
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        r = subprocess.run(("systemctl",) + args, capture_output=True,
+                           text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip()
+
+
+def secao_da_chave(texto, chave):
+    """Devolve (secao, valor) de cada ocorrência da chave, na ordem do arquivo."""
+    achados = []
+    secao = None
+    for linha in texto.splitlines():
+        cru = linha.strip()
+        if cru.startswith("[") and cru.endswith("]"):
+            secao = cru
+        elif cru.startswith(chave + "="):
+            achados.append((secao, cru.split("=", 1)[1].strip()))
+    return achados
+
+
+def processos_por_unit():
+    """PID -> unit, lido de /proc/PID/cgroup. Não depende de systemctl."""
+    mapa = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cgroup") as fh:
+                cg = fh.read()
+        except OSError:
+            continue
+        m = re.search(r"/([A-Za-z0-9@_.\\-]+\.service)", cg)
+        if m:
+            mapa.setdefault(m.group(1), []).append(int(pid))
+    return mapa
+
+
+def ler_int(caminho):
+    try:
+        with open(caminho) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def regra_units(problemas, avisos):
+    diretorio = os.path.join(RAIZ, "ops", "systemd")
+    if not os.path.isdir(diretorio):
+        return "sem ops/systemd"
+    for unit, teto in CRITICAS.items():
+        caminho = os.path.join(diretorio, unit)
+        if not os.path.exists(caminho):
+            avisos.append(f"{unit}: não existe em ops/systemd (unit removida?)")
+            continue
+        with open(caminho, encoding="utf-8") as fh:
+            texto = fh.read()
+        achados = secao_da_chave(texto, "OOMScoreAdjust")
+        if not achados:
+            problemas.append({
+                "regra": "declarado", "unit": unit,
+                "detalhe": f"não declara OOMScoreAdjust; exigido <= {teto}. "
+                           "Sem ele a unit entra no próximo boot com 0, e o OOM "
+                           "killer do kernel a trata como qualquer processo.",
+            })
+            continue
+        for secao, valor in achados:
+            if secao != "[Service]":
+                problemas.append({
+                    "regra": "secao", "unit": unit,
+                    "detalhe": f"OOMScoreAdjust={valor} está em {secao}, não em "
+                               "[Service]. O systemd ACEITA o arquivo e IGNORA a "
+                               "chave (systemd-analyze verify: \"Unknown key ... "
+                               "in section [Unit], ignoring\").",
+                })
+                continue
+            try:
+                n = int(valor)
+            except ValueError:
+                problemas.append({"regra": "declarado", "unit": unit,
+                                  "detalhe": f"OOMScoreAdjust={valor!r} não é inteiro"})
+                continue
+            if n > teto:
+                problemas.append({
+                    "regra": "declarado", "unit": unit,
+                    "detalhe": f"OOMScoreAdjust={n} é mais fraco que o mínimo "
+                               f"exigido ({teto}).",
+                })
+            if n <= -1000:
+                problemas.append({
+                    "regra": "declarado", "unit": unit,
+                    "detalhe": "OOMScoreAdjust=-1000 faz oom_badness() devolver "
+                               "LONG_MIN e o kernel PULAR a tarefa. Se nada for "
+                               "matável o kernel entra em pânico, que aqui vira "
+                               "reboot por kernel.panic=10.",
+                })
+    return None
+
+
+def regra_vivo(problemas, avisos):
+    if not os.path.isdir("/proc/1"):
+        return "sem /proc"
+    mapa = processos_por_unit()
+    for unit, teto in CRITICAS.items():
+        # a unit template casa as instâncias: cloudflared-...-replica@20251.service
+        base = unit[:-len("@.service")] if unit.endswith("@.service") else None
+        alvos = []
+        for nome, pids in mapa.items():
+            if nome == unit or (base and nome.startswith(base + "@")):
+                alvos.extend(pids)
+        if not alvos:
+            avisos.append(f"{unit}: nenhum processo em execução (unit parada?)")
+            continue
+        maus = []
+        for pid in alvos:
+            adj = ler_int(f"/proc/{pid}/oom_score_adj")
+            if adj is None:
+                continue
+            if adj > teto:
+                try:
+                    with open(f"/proc/{pid}/comm") as fh:
+                        comm = fh.read().strip()
+                except OSError:
+                    comm = "?"
+                maus.append(f"{pid} ({comm}) adj={adj}")
+        if maus:
+            problemas.append({
+                "regra": "vivo", "unit": unit,
+                "detalhe": f"exigido <= {teto}, mas em execução: {', '.join(maus[:12])}. "
+                           "OOMScoreAdjust só age no exec — processo que já estava "
+                           "no ar quando a linha entrou segue desprotegido até o "
+                           "restart. Aplicar ao vivo: "
+                           "echo N | sudo tee /proc/PID/oom_score_adj",
+            })
+    return None
+
+
+def regra_earlyoom(problemas, avisos):
+    ativo = systemctl("is-active", "earlyoom")
+    if ativo is None:
+        return "sem systemctl"
+    if ativo != "active":
+        problemas.append({
+            "regra": "earlyoom", "unit": "earlyoom.service",
+            "detalhe": f"is-active={ativo!r}. É o único anteparo que age ANTES do "
+                       "OOM killer do kernel; parado, a primeira reação à falta de "
+                       "memória é o kernel escolhendo vítima.",
+        })
+        return None
+    pid = systemctl("show", "earlyoom", "-p", "MainPID", "--value")
+    if not pid or not pid.isdigit() or pid == "0":
+        avisos.append("earlyoom: MainPID indisponível, não deu para ler os argumentos")
+        return None
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        avisos.append(f"earlyoom: /proc/{pid}/cmdline ilegível")
+        return None
+    veredito, detalhe = analisa_swap_do_earlyoom(argv)
+    if veredito == "problema":
+        problemas.append({"regra": "earlyoom", "unit": "earlyoom.service",
+                          "detalhe": detalhe})
+    elif veredito == "aviso":
+        avisos.append(f"earlyoom: {detalhe}")
+    return None
+
+
+def analisa_swap_do_earlyoom(argv):
+    """Puro: dado o argv do earlyoom, o SIGKILL está armado?
+
+    Devolve ("problema"|"aviso"|"ok", detalhe). Separado do resto para poder ser
+    testado sem um earlyoom em execução — ver tools/test_oom_protecao.py.
+    """
+    swap = None
+    for i, a in enumerate(argv):
+        if a == "-s" and i + 1 < len(argv):
+            swap = argv[i + 1]
+        elif a.startswith("-s") and len(a) > 2:
+            swap = a[2:]
+    if swap is None:
+        return ("aviso", "sem -s; vale o default de 10% de swap livre nos dois "
+                         "estágios, que é conjuntivo com a RAM")
+    partes = swap.split(",")
+    termo = partes[0]
+    kill = partes[1] if len(partes) > 1 else None
+    if kill is None:
+        try:
+            metade = f"{float(termo) / 2:g}"
+        except ValueError:
+            return ("problema", f"-s {swap!r}: limiar de swap ilegível")
+        return ("problema",
+                f"-s {swap} define o limiar de SIGTERM em {termo}% e deixa o de "
+                f"SIGKILL no default PERCENT/2 = {metade}%. A condição do earlyoom "
+                "é CONJUNTIVA (mem E swap), então o SIGKILL só dispara com o swap "
+                "abaixo desse valor. O estágio de escalonamento fica morto: vítima "
+                "que ignora o SIGTERM nunca vira SIGKILL, o daemon dorme 1 s e "
+                "reenvia SIGTERM para sempre, e quem age a seguir é o OOM killer do "
+                "kernel, que não conhece o --avoid. "
+                f"Use -s {termo},{termo}.")
+    if termo != kill:
+        return ("aviso", f"-s {swap} usa limiares diferentes para SIGTERM ({termo}%) "
+                         f"e SIGKILL ({kill}%); confira se é intencional")
+    return ("ok", "")
+
+
+DIRS_SYSCTL = ("/etc/sysctl.d", "/run/sysctl.d", "/usr/lib/sysctl.d")
+
+
+def sysctl_declarado(chave, dirs=DIRS_SYSCTL):
+    """Último valor DECLARADO para `chave`, na ordem em que o boot aplica.
+
+    Recebe os diretórios para poder ser testado sem tocar em /etc. Reproduz a
+    precedência do sysctl.d(5): os arquivos de TODOS os diretórios entram numa
+    lista única ordenada por NOME DE ARQUIVO (não por diretório), /etc vence
+    /run que vence /usr/lib quando o mesmo nome aparece em mais de um, e dentro
+    de um arquivo a última atribuição vence. Devolve (valor, arquivo) ou
+    (None, None).
+
+    Segue symlink de propósito: nesta máquina /etc/sysctl.d/zzz-wikijuridica.conf
+    é symlink para o repo, e é o conteúdo do ALVO que o boot aplica.
+    """
+    por_nome = {}
+    for d in dirs:
+        try:
+            nomes = os.listdir(d)
+        except OSError:
+            continue
+        for nome in nomes:
+            if nome.endswith(".conf"):
+                por_nome.setdefault(nome, os.path.join(d, nome))
+    valor = arquivo = None
+    for nome in sorted(por_nome):
+        caminho = por_nome[nome]
+        try:
+            with open(caminho, encoding="utf-8", errors="replace") as fh:
+                texto = fh.read()
+        except OSError:
+            continue
+        for linha in texto.splitlines():
+            cru = linha.strip()
+            if not cru or cru[0] in "#;" or "=" not in cru:
+                continue
+            k, _, v = cru.partition("=")
+            # sysctl.d aceita o prefixo "-" (falha de leitura não é fatal)
+            if k.strip().lstrip("-") == chave:
+                valor, arquivo = v.strip(), caminho
+    return valor, arquivo
+
+
+def regra_overcommit(problemas, avisos):
+    modo = ler_int("/proc/sys/vm/overcommit_memory")
+    if modo is None:
+        return "sem /proc/sys/vm/overcommit_memory"
+    if modo == 1:
+        problemas.append({
+            "regra": "overcommit", "unit": "vm.overcommit_memory",
+            "detalhe": "modo 1 (always overcommit) desarma a recusa pré-OOM do "
+                       "kernel: nenhum mmap falha, e a pressão só aparece no OOM "
+                       "killer. Medido em 2026-09-04, este host não tem lastro "
+                       "para isso — o maior pedido contabilizável do servidor Go "
+                       "é 66,9× menor que o limiar do modo heurístico. Reproduza "
+                       "com ops/probe-overcommit.py antes de redeclarar.",
+        })
+    elif modo == 2:
+        avisos.append("vm.overcommit_memory=2 (strict): CommitLimit passa a "
+                      "governar; confira Committed_AS antes de manter")
+
+    # ── o valor VIVO não é o que o próximo boot vai aplicar ──────────────
+    # Esta regra nasceu de um defeito de JUNÇÃO em 2026-09-04: um agente
+    # removeu `vm.overcommit_memory=1` do arquivo declarado e aplicou 0 ao
+    # vivo, enquanto o checklist de reboot de outro agente ainda mandava
+    # ESPERAR 1 (commit a52fa4df). As duas metades da máquina discordavam e
+    # nenhum gate olhava as duas ao mesmo tempo. Sysctl só age no boot:
+    # conferir /proc responde "como está agora", nunca "como vai subir".
+    declarado, arquivo = sysctl_declarado("vm.overcommit_memory")
+    if declarado is None:
+        return None
+    try:
+        n = int(declarado)
+    except ValueError:
+        problemas.append({
+            "regra": "overcommit", "unit": "vm.overcommit_memory",
+            "detalhe": f"{arquivo} declara {declarado!r}, que não é inteiro. O "
+                       "systemd-sysctl recusa a linha no boot e o modo fica no "
+                       "que o kernel trouxer, sem ninguém perceber.",
+        })
+        return None
+    if n != modo:
+        problemas.append({
+            "regra": "overcommit", "unit": "vm.overcommit_memory",
+            "detalhe": f"vivo={modo}, mas {arquivo} declara {n}. Sysctl só é "
+                       f"aplicado no boot: este host roda em {modo} agora e sobe "
+                       f"em {n} no próximo reboot. Ou um `sysctl -w` não foi "
+                       "declarado, ou a declaração não foi aplicada — nos dois "
+                       "casos a máquina muda de comportamento sozinha na próxima "
+                       "partida. Alinhe os dois ANTES do reboot.",
+        })
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--json", action="store_true", help="saída em JSON")
+    args = ap.parse_args()
+
+    problemas, avisos = [], []
+    impedimentos = []
+    for regra in (regra_units, regra_vivo, regra_earlyoom, regra_overcommit):
+        motivo = regra(problemas, avisos)
+        if motivo:
+            impedimentos.append(f"{regra.__name__}: {motivo}")
+
+    if impedimentos and not problemas:
+        print("check-oom-protecao: NÃO MEDIDO")
+        for i in impedimentos:
+            print(f"  - {i}")
+        return 2
+
+    if args.json:
+        print(json.dumps({"problemas": problemas, "avisos": avisos,
+                          "impedimentos": impedimentos},
+                         ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if problemas else 0
+
+    print(f"units críticas conferidas: {len(CRITICAS)}")
+    for a in avisos:
+        print(f"  aviso: {a}")
+    for i in impedimentos:
+        print(f"  não medido: {i}")
+    if problemas:
+        print("\ncheck-oom-protecao: FAIL")
+        for p in problemas:
+            print(f"  - [{p['regra']}] {p['unit']}")
+            print(f"      {p['detalhe']}")
+        print("\n  Defesa de OOM que existe no papel e não age é igual a nenhuma:")
+        print("  ela só é exercida no dia em que a memória acaba.")
+        return 1
+    print("\ncheck-oom-protecao: OK (units declaram OOMScoreAdjust em [Service], "
+          "os processos no ar carregam o valor, o SIGKILL do earlyoom está armado "
+          "e o overcommit está no modo heurístico)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

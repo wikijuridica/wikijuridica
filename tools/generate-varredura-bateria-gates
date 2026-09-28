@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""generate-varredura-bateria-gates — mede o exit code REAL de cada tools/check-*.
+
+Escreve um JSONL, uma linha por gate, e RETOMA de onde parou: gate ja presente no
+arquivo de saida nao e remedido. E o instrumento do BUG-109 -- o mapa de quais
+gates da bateria estao vermelhos, por que, e quais estao vermelhos por defeito do
+proprio detector.
+
+    tools/generate-varredura-bateria-gates a .agents/runtime/caca/varredura.jsonl
+    tools/generate-varredura-bateria-gates b .agents/runtime/caca/varredura-b.jsonl
+
+TIER "a" = orcamento declarado abaixo de 120 s (o grosso da bateria).
+TIER "b" = orcamento de 120 s ou mais (SCA, transacoes autorais, languagetool).
+Separar os dois permite rodar os dois em paralelo sem que um gate de 300 s
+segure a fila inteira.
+
+DECISOES DE MEDICAO, e o defeito medido que motivou cada uma:
+
+1. GATE CUJO WRAPPER E SO `exec run-check NOME "$@"` RODA DIRETO NO BINARIO JA
+   COMPILADO. O wrapper re-deriva o grafo de dependencias do Go a CADA invocacao
+   (BUG-140, 2.458 ms de overhead por gate). Sob carga esse overhead sozinho
+   estourava o orcamento e produzia EXIT=124 falso: medido em 2026-08-29,
+   check-agent-context-ledger deu 124 em 33 s pelo wrapper e passou em 8,5 s no
+   binario. Gate com logica propria no wrapper (teste de contrato, envelope
+   pesado, cache de marcador) roda pelo wrapper, sem atalho.
+
+2. TETO DE TEMPO EXTERNO, com piso de 90 s. `timeout` externo mantem a semantica
+   limpa: 124 e inequivocamente "nao terminou". O piso existe porque orcamento de
+   3 s mais folga transformava contencao da maquina em falso vermelho -- e falso
+   vermelho e exatamente o que esta varredura existe para eliminar.
+
+3. ORDEM EMBARALHADA COM SEMENTE FIXA (109). Se a janela da sessao nao cobrir os
+   ~460 gates, a parte medida e uma AMOSTRA UNIFORME da bateria, e nao um prefixo
+   alfabetico. Semente fixa mantem tudo reproduzivel (R3 do contrato de dado real).
+
+4. `check-all` FICA DE FORA, nomeado. Ele dispara `go test` full-tree, proibido
+   pelo contrato do repositorio. E a UNICA exclusao: nenhum outro gate e cortado
+   em silencio.
+
+5. nice 15 e execucao SEQUENCIAL sao a contencao. Paralelismo mediria a
+   contencao entre os proprios gates, nao o gate.
+
+Read/execute-only sobre o repositorio: escreve unicamente o JSONL de saida.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RAIZ = Path(__file__).resolve().parent.parent
+BINARIO = RAIZ / ".cache" / "check-bin" / "check"
+LEDGER = RAIZ / "data" / "ops" / "check_performance_ledger.jsonl"
+CABECALHO = re.compile(
+    r'^(ROOT=|PATH=|export |set -|\)|\(|unset CDPATH|cd --|cd "\$ROOT"$|GOCACHE=|cd "\$\{ROOT\}"$)'
+)
+TRIVIAL = re.compile(
+    r'^exec "\$ROOT/tools/run-check" ([a-z0-9-]+)((?: --[a-z0-9-]+(?:=\S+)?)*) "\$@"$'
+)
+SEMENTE = 109
+PISO_TIMEOUT_S = 90
+TETO_TIMEOUT_S = 150
+TIMEOUT_TIER_B_S = 190
+FRONTEIRA_TIER_B_MS = 120000
+
+
+def orcamentos() -> dict[str, int]:
+    melhor: dict[str, int] = {}
+    with open(LEDGER, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError:
+                continue
+            nome = registro.get("check_name")
+            if not nome:
+                continue
+            valor = int(registro.get("budget_ms") or registro.get("expected_duration_ms") or 0)
+            melhor[nome] = max(melhor.get(nome, 0), valor)
+    return melhor
+
+
+def plano() -> list[dict]:
+    entradas: list[dict] = []
+    for caminho in sorted((RAIZ / "tools").glob("check-*")):
+        if not caminho.is_file():
+            continue
+        if caminho.name == "check-all":
+            continue
+        texto = caminho.read_text(encoding="utf-8", errors="replace")
+        corpo = [l.strip() for l in texto.splitlines() if l.strip() and not l.strip().startswith("#")]
+        resto = [l for l in corpo if not CABECALHO.match(l)]
+        casado = TRIVIAL.match(resto[0]) if len(resto) == 1 else None
+        if casado:
+            entradas.append({
+                "gate": caminho.name,
+                "modo": "bin",
+                "argv": [casado.group(1)] + shlex.split(casado.group(2)),
+            })
+        else:
+            entradas.append({"gate": caminho.name, "modo": "wrapper", "argv": []})
+    return entradas
+
+
+def medidos(saida: Path) -> set[str]:
+    if not saida.exists():
+        return set()
+    vistos: set[str] = set()
+    with open(saida, encoding="utf-8") as handle:
+        for linha in handle:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                vistos.add(json.loads(linha)["gate"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return vistos
+
+
+# EXIGE_ARGUMENTO casa a mensagem de "faltou parametro" que NAO usa o prefixo
+# `uso:`. Ela nunca decide sozinha: so vale junto de exit 2 e das duas primeiras
+# linhas da saida (ver o uso, abaixo).
+def aplicavel_sem_argumento(texto: str, codigo: int) -> bool:
+    """O gate rodou de verdade, ou so disse que a CHAMADA faltou parametro?
+
+    GATE QUE EXIGE ARGUMENTO NAO E GATE VERMELHO, e a distincao muda a conta
+    inteira. Medido em 2026-08-30: check-baseline-testes-vermelhos e
+    check-server-binary-smoke sairam com exit 2 em 83 ms e 6 ms, imprimindo
+    apenas "uso: <ferramenta> <argumento>". Esta varredura chama todo
+    tools/check-* sem argumento — correto para a esmagadora maioria, que roda
+    sozinha —, mas os que pedem parametro nao estao reprovando.
+
+    Conta-los como vermelho infla o numero que esta varredura existe para
+    apurar, e manda o leitor investigar defeito que nao existe.
+
+    DUAS FORMAS DE ANUNCIAR A FALTA, e a segunda entrou em 2026-09-10:
+
+    1. o prefixo `uso:`/`usage:`, que o argparse e os wrappers escrevem;
+    2. exigencia explicita de FLAG LONGA com exit 2. `check-onda-avanca` sai
+       com exit 2 escrevendo "informe --antes ou --depois", sem prefixo nenhum,
+       e escapava da primeira regra — entrou na conta de 177 vermelhos da
+       primeira varredura completa. O numero real era 149.
+
+    A segunda regra exige TRES coisas ao mesmo tempo, e a conjuncao e o que a
+    mantem estreita: exit 2 (o codigo que este repositorio usa para "nao
+    conclusivo", nunca para reprovacao de conteudo), mencao a flag longa, e
+    verbo de exigencia. `check-v2-portfolio-source-hints` tambem sai com exit 2
+    e CONTINUA contando como vermelho, porque fala de catalogo irresoluvel e
+    nao pede parametro nenhum.
+
+    SO AS DUAS PRIMEIRAS LINHAS: mensagem de uso no rodape de um relatorio de
+    reprovacao nao pode converter o veredito, senao qualquer gate que imprima a
+    propria ajuda no fim vira "nao aplicavel".
+    """
+    for linha_de_uso in texto.strip().splitlines()[:2]:
+        enxuta = linha_de_uso.strip().lower()
+        if enxuta.startswith("uso:") or enxuta.startswith("usage:") or ": uso:" in enxuta or ": usage:" in enxuta:
+            return False
+        if codigo == 2 and EXIGE_ARGUMENTO.search(enxuta):
+            return False
+    return True
+
+
+EXIGE_ARGUMENTO = re.compile(
+    r"(?:informe|indique|forne[cç]a|passe|use)\s+(?:o\s+|a\s+)?--[a-z0-9][\w-]*"
+    r"|--[a-z0-9][\w-]*\s+(?:e|é|eh)\s+obrigat"
+    r"|\bobrigat[oó]ri[oa]\b.{0,24}--[a-z0-9][\w-]*"
+    r"|--[a-z0-9][\w-]*\s+is\s+required",
+    re.IGNORECASE,
+)
+
+
+# Codigo de erro desta casa: snake_case, longo o bastante para nao casar palavra
+# comum, e sempre no comeco de uma linha de diagnostico.
+CODIGO_DE_ERRO_NA_LINHA = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+){2,})\b")
+
+
+def linhas_de_erro(texto: str) -> list:
+    """TODAS as linhas de diagnostico, nao a ultima.
+
+    O `tail` de 700 bytes guarda o FIM da saida, e o fim e onde mora o motivo
+    mais raso. Medido em 2026-09-11: `check-ptbr-confusables-quality` saiu na
+    varredura como `ptbr_confusables_live_metrics_stale` — "evidencia velha, e
+    so regenerar" — enquanto o que estava embaixo era
+    `ptbr_confusables_blockers: dangerous=1`, um homoglifo cirilico numa pagina
+    PUBLICADA. A triagem leu o rotulo do instrumento e nao viu o do dado, e a
+    varredura foi cumplice: ela gravou o motivo raso e a proxima leitura herdou
+    o ponto cego.
+
+    Guarda contra crescimento: no maximo 40 linhas, e cada uma cortada em 300
+    caracteres. Gate que imprime mil linhas de diagnostico tem outro problema, e
+    nao e este arquivo que o resolve.
+    """
+    saida = []
+    for linha in (texto or "").splitlines():
+        linha = linha.strip()
+        if not linha or not CODIGO_DE_ERRO_NA_LINHA.search(linha):
+            continue
+        saida.append(linha[:300])
+        if len(saida) >= 40:
+            break
+    return saida
+
+
+def main() -> int:
+    if len(sys.argv) != 3 or sys.argv[1] not in ("a", "b"):
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("uso: generate-varredura-bateria-gates <a|b> <arquivo.jsonl>", file=sys.stderr)
+        return 2
+    tier = sys.argv[1]
+    saida = Path(sys.argv[2])
+    saida.parent.mkdir(parents=True, exist_ok=True)
+
+    budget = orcamentos()
+    entradas = plano()
+    random.Random(SEMENTE).shuffle(entradas)
+    ja_medidos = medidos(saida)
+
+    with open(saida, "a", encoding="utf-8") as destino:
+        for entrada in entradas:
+            gate = entrada["gate"]
+            if gate in ja_medidos:
+                continue
+            orcamento = budget.get(gate[len("check-"):], 0)
+            if orcamento >= FRONTEIRA_TIER_B_MS:
+                if tier != "b":
+                    continue
+                teto = TIMEOUT_TIER_B_S
+            else:
+                if tier != "a":
+                    continue
+                teto = min(max(orcamento // 1000 + 30, PISO_TIMEOUT_S), TETO_TIMEOUT_S)
+
+            if entrada["modo"] == "bin" and os.access(BINARIO, os.X_OK):
+                argv = [str(BINARIO)] + entrada["argv"]
+                backend = "bin"
+            else:
+                argv = [str(RAIZ / "tools" / gate)]
+                backend = "wrapper"
+
+            comeco = time.time()
+            try:
+                executado = subprocess.run(
+                    argv, cwd=str(RAIZ), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=teto,
+                )
+                codigo = executado.returncode
+                texto = executado.stdout.decode("utf-8", "replace")
+            except subprocess.TimeoutExpired as expirou:
+                codigo = 124
+                texto = (expirou.output or b"").decode("utf-8", "replace")
+            except OSError as erro:
+                codigo = 126
+                texto = f"erro de execucao: {erro}"
+            # GATE QUE EXIGE ARGUMENTO NAO E GATE VERMELHO, e a distincao muda a
+            # conta inteira. Medido em 2026-08-30: check-baseline-testes-vermelhos
+            # e check-server-binary-smoke sairam com exit 2 em 83 ms e 6 ms,
+            # imprimindo apenas "uso: <ferramenta> <argumento>". A varredura chama
+            # todo tools/check-* sem argumento -- e correto para a esmagadora
+            # maioria, que roda sozinha --, mas os que pedem parametro nao estao
+            # reprovando: estao dizendo que a chamada e que faltou.
+            #
+            # Contá-los como vermelho infla o numero que esta varredura existe
+            # para apurar, e manda o leitor investigar defeito que nao existe --
+            # eu mesmo fui investigar os dois.
+            aplicavel = aplicavel_sem_argumento(texto, codigo)
+            destino.write(json.dumps({
+                "gate": gate, "backend": backend, "exit": codigo,
+                "aplicavel_sem_argumento": aplicavel,
+                "wall_ms": int((time.time() - comeco) * 1000),
+                "budget_ms": orcamento, "timeout_s": teto,
+                "tail": texto[-700:],
+                "erros": linhas_de_erro(texto),
+            }, ensure_ascii=False) + "\n")
+            destino.flush()
+    print(f"varredura tier {tier} concluida: {saida}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

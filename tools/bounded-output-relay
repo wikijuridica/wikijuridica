@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Stream stdin to one terminal descriptor and retain a bounded binary tail.
+
+This is deliberately a relay, not a timeout or process supervisor.  It keeps
+draining stdin even after the downstream terminal consumer closes so a
+producer cannot become stuck on a full pipe.  A downstream or persistence
+failure is nevertheless reported with a non-zero exit status after EOF.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import os
+import resource
+import stat
+import sys
+from dataclasses import dataclass
+
+
+DEFAULT_TAIL_BYTES = 1024 * 1024
+MAX_TAIL_BYTES = 64 * 1024 * 1024
+READ_CHUNK_BYTES = 64 * 1024
+
+EX_USAGE = 2
+EX_CANTCREAT = 73
+EX_IOERR = 74
+
+
+class SafeTailPathError(RuntimeError):
+    """The requested tail path cannot be opened without following aliases."""
+
+
+def positive_tail_size(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("tail size must be an integer") from exc
+    if parsed < 1 or parsed > MAX_TAIL_BYTES:
+        raise argparse.ArgumentTypeError(
+            f"tail size must be between 1 and {MAX_TAIL_BYTES} bytes"
+        )
+    return parsed
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="relay binary stdin while retaining a private bounded tail"
+    )
+    parser.add_argument("--tail-file", required=True, help="private regular tail file")
+    parser.add_argument(
+        "--tail-bytes",
+        type=positive_tail_size,
+        default=DEFAULT_TAIL_BYTES,
+        help=f"maximum retained bytes (default: {DEFAULT_TAIL_BYTES})",
+    )
+    parser.add_argument(
+        "--target-fd",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="stream destination: 1 for stdout (default), 2 for stderr",
+    )
+    return parser.parse_args(argv)
+
+
+def close_inherited_descriptors() -> None:
+    """Close every inherited descriptor except stdin/stdout/stderr.
+
+    The relay is single-threaded at this point, so enumerating procfs cannot
+    race another thread opening a descriptor.  The portable fallback closes
+    the complete descriptor range reported by RLIMIT_NOFILE.
+    """
+
+    try:
+        inherited = [int(name) for name in os.listdir("/proc/self/fd")]
+    except (OSError, ValueError):
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit == resource.RLIM_INFINITY:
+            try:
+                soft_limit = os.sysconf("SC_OPEN_MAX")
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("cannot determine inherited descriptor range") from exc
+        if not isinstance(soft_limit, int) or soft_limit < 3:
+            raise RuntimeError("invalid inherited descriptor range")
+        os.closerange(3, soft_limit)
+        return
+
+    for descriptor in inherited:
+        if descriptor <= 2:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            # The descriptor used internally by listdir may already be gone.
+            if exc.errno != errno.EBADF:
+                raise
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+@dataclass
+class OpenTailFile:
+    descriptor: int
+    parent_descriptor: int
+    name: str
+    device: int
+    inode: int
+
+    def verify_path_identity(self) -> None:
+        opened = os.fstat(self.descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SafeTailPathError("opened tail descriptor stopped being regular")
+        if opened.st_uid != os.geteuid() or opened.st_nlink != 1:
+            raise SafeTailPathError("opened tail descriptor stopped being private")
+        if stat.S_IMODE(opened.st_mode) & 0o077:
+            raise SafeTailPathError("opened tail descriptor permissions changed")
+        try:
+            current = os.stat(
+                self.name,
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise SafeTailPathError("tail path disappeared during relay") from exc
+        if not stat.S_ISREG(current.st_mode):
+            raise SafeTailPathError("tail path stopped being a regular file")
+        if (current.st_dev, current.st_ino) != (self.device, self.inode):
+            raise SafeTailPathError("tail path identity changed during relay")
+
+    def close(self) -> None:
+        first_error: OSError | None = None
+        for descriptor in (self.descriptor, self.parent_descriptor):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
+def _split_safe_path(path: str) -> tuple[bool, list[str]]:
+    if not path or "\x00" in path or path.endswith(os.sep):
+        raise SafeTailPathError("tail path must name a file")
+    absolute = os.path.isabs(path)
+    parts: list[str] = []
+    for component in path.split(os.sep):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            raise SafeTailPathError("tail path may not traverse '..'")
+        parts.append(component)
+    if not parts:
+        raise SafeTailPathError("tail path must name a file")
+    return absolute, parts
+
+
+def open_private_tail_file(path: str) -> OpenTailFile:
+    absolute, parts = _split_safe_path(path)
+    parent_fd = os.open(os.sep if absolute else ".", _directory_flags())
+    try:
+        for component in parts[:-1]:
+            next_fd = os.open(component, _directory_flags(), dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+
+        name = parts[-1]
+        before: os.stat_result | None
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            before = None
+        if before is not None:
+            if not stat.S_ISREG(before.st_mode):
+                raise SafeTailPathError("existing tail path is not a regular file")
+            if before.st_uid != os.geteuid():
+                raise SafeTailPathError("existing tail file has a different owner")
+            if stat.S_IMODE(before.st_mode) & 0o077:
+                raise SafeTailPathError("existing tail file is not private")
+            if before.st_nlink != 1:
+                raise SafeTailPathError("existing tail file has multiple hard links")
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        if before is None:
+            flags |= os.O_CREAT | os.O_EXCL
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise SafeTailPathError("opened tail path is not a regular file")
+            if opened.st_uid != os.geteuid():
+                raise SafeTailPathError("opened tail file has a different owner")
+            if opened.st_nlink != 1:
+                raise SafeTailPathError("opened tail file has multiple hard links")
+            if before is not None and (opened.st_dev, opened.st_ino) != (
+                before.st_dev,
+                before.st_ino,
+            ):
+                raise SafeTailPathError("tail path changed while it was opened")
+            os.fchmod(descriptor, 0o600)
+            os.ftruncate(descriptor, 0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return OpenTailFile(
+            descriptor=descriptor,
+            parent_descriptor=parent_fd,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+        )
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _pwrite_all(descriptor: int, payload: memoryview, offset: int) -> None:
+    written = 0
+    while written < len(payload):
+        try:
+            count = os.pwrite(descriptor, payload[written:], offset + written)
+        except InterruptedError:
+            continue
+        if count <= 0:
+            raise OSError(errno.EIO, "zero-length write to tail file")
+        written += count
+
+
+def _stream_write_all(descriptor: int, payload: bytes) -> None:
+    written = 0
+    while written < len(payload):
+        try:
+            count = os.write(descriptor, payload[written:])
+        except InterruptedError:
+            continue
+        if count <= 0:
+            raise OSError(errno.EIO, "zero-length terminal write")
+        written += count
+
+
+class BoundedTail:
+    """A fixed-allocation circular tail mirrored to a bounded regular file."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.buffer = bytearray(capacity)
+        self.filled = 0
+        self.write_position = 0
+
+    def append(self, descriptor: int | None, payload: bytes) -> None:
+        if len(payload) >= self.capacity:
+            suffix = memoryview(payload)[-self.capacity :]
+            self.buffer[:] = suffix
+            self.filled = self.capacity
+            self.write_position = 0
+            if descriptor is not None:
+                _pwrite_all(descriptor, suffix, 0)
+                os.ftruncate(descriptor, self.capacity)
+            return
+
+        first = min(len(payload), self.capacity - self.write_position)
+        second = len(payload) - first
+        self.buffer[self.write_position : self.write_position + first] = payload[:first]
+        if second:
+            self.buffer[:second] = payload[first:]
+        if descriptor is not None:
+            _pwrite_all(descriptor, memoryview(payload)[:first], self.write_position)
+            if second:
+                _pwrite_all(descriptor, memoryview(payload)[first:], 0)
+        self.write_position = (self.write_position + len(payload)) % self.capacity
+        self.filled = min(self.capacity, self.filled + len(payload))
+
+    def finalize(self, descriptor: int) -> None:
+        """Rewrite the on-disk circular representation in chronological order."""
+
+        os.ftruncate(descriptor, 0)
+        if self.filled == 0:
+            os.fsync(descriptor)
+            return
+        if self.filled < self.capacity:
+            _pwrite_all(descriptor, memoryview(self.buffer)[: self.filled], 0)
+        else:
+            first = memoryview(self.buffer)[self.write_position :]
+            second = memoryview(self.buffer)[: self.write_position]
+            _pwrite_all(descriptor, first, 0)
+            if second:
+                _pwrite_all(descriptor, second, len(first))
+        os.ftruncate(descriptor, self.filled)
+        os.fsync(descriptor)
+
+
+def _diagnostic(message: str) -> None:
+    try:
+        os.write(2, ("bounded-output-relay: " + message + "\n").encode())
+    except OSError:
+        pass
+
+
+def relay(tail_file: OpenTailFile, tail_bytes: int, target_fd: int) -> int:
+    tail = BoundedTail(tail_bytes)
+    consumer_error: OSError | None = None
+    persistence_error: OSError | None = None
+    input_error: OSError | None = None
+
+    while True:
+        try:
+            payload = os.read(0, READ_CHUNK_BYTES)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            input_error = exc
+            break
+        if not payload:
+            break
+
+        if consumer_error is None:
+            try:
+                _stream_write_all(target_fd, payload)
+            except OSError as exc:
+                consumer_error = exc
+
+        try:
+            tail.append(
+                tail_file.descriptor if persistence_error is None else None,
+                payload,
+            )
+        except OSError as exc:
+            persistence_error = exc
+            # append() updates memory before mirroring it; later chunks keep
+            # advancing the same ring without retrying the failed filesystem.
+
+    if persistence_error is None:
+        try:
+            tail.finalize(tail_file.descriptor)
+            tail_file.verify_path_identity()
+        except (OSError, SafeTailPathError) as exc:
+            persistence_error = OSError(errno.EIO, str(exc))
+
+    if input_error is not None:
+        _diagnostic(f"stdin read failed: {input_error}")
+    if consumer_error is not None:
+        _diagnostic(f"target fd {target_fd} closed or failed; stdin was drained")
+    if persistence_error is not None:
+        _diagnostic(f"tail persistence failed: {persistence_error}")
+    return EX_IOERR if any((input_error, consumer_error, persistence_error)) else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        close_inherited_descriptors()
+    except (OSError, RuntimeError) as exc:
+        _diagnostic(f"cannot close inherited descriptors: {exc}")
+        return EX_IOERR
+
+    try:
+        tail_file = open_private_tail_file(arguments.tail_file)
+    except (OSError, SafeTailPathError) as exc:
+        _diagnostic(f"cannot open private tail file: {exc}")
+        return EX_CANTCREAT
+
+    status = EX_IOERR
+    try:
+        status = relay(tail_file, arguments.tail_bytes, arguments.target_fd)
+    finally:
+        try:
+            tail_file.close()
+        except OSError as exc:
+            _diagnostic(f"cannot close tail file: {exc}")
+            status = EX_IOERR
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

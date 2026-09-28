@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""ai-tokens — consumo REAL de tokens do Claude Code: sessao principal e agentes.
+
+POR QUE
+  O dono ve RAM e load na barra, mas token e o recurso que ele realmente paga.
+  Sem enxergar, nao da para decidir onde vale gastar. A regra e clara: gastar
+  pode — gastar com lixo, nao. Este medidor existe para orientar a decisao, NUNCA
+  para limitar: ele so mede e mostra, jamais bloqueia agente.
+
+FONTE
+  Os transcripts .jsonl do proprio Claude Code registram `message.usage` por
+  resposta: input_tokens, output_tokens, cache_creation_input_tokens e
+  cache_read_input_tokens. Isso e o consumo faturado real, nao estimativa.
+
+CUSTO
+  Varredura INCREMENTAL: guarda o offset ja lido de cada arquivo em
+  ~/.claude/ai-terminal/token-state.json e soma so o que chegou depois. Um
+  transcript de 300MB e lido uma vez; nos ciclos seguintes le so o delta.
+
+USO
+  ai-tokens                 relatorio (sessao atual, agentes, total do dia)
+  ai-tokens --oneline       uma linha compacta (status-bar do tmux)
+  ai-tokens --by-agent      detalhe por agente/workflow ativo
+  ai-tokens --session ID    so uma sessao
+  ai-tokens --reset         zera o cache incremental (recontagem completa)
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+PROJECTS = HOME / ".claude" / "projects"
+STATE_DIR = HOME / ".claude" / "ai-terminal"
+STATE = STATE_DIR / "token-state.json"
+
+# Precos publicos por milhao de tokens (USD): (input, output, cache-write, cache-read).
+# Aplicados POR MODELO — misturar Opus e Haiku num preco so erra por ordem de
+# grandeza. Assinatura Max nao cobra por token; estes valores servem para comparar
+# o peso relativo das frentes, nao para prever fatura.
+PRICES = {
+    "opus":   (15.00, 75.00, 18.75, 1.50),
+    "sonnet": (3.00, 15.00, 3.75, 0.30),
+    "haiku":  (1.00, 5.00, 1.25, 0.10),
+    "fable":  (3.00, 15.00, 3.75, 0.30),
+}
+DEFAULT_PRICE = PRICES["opus"]
+
+
+def price_for(model):
+    m = (model or "").lower()
+    for key, val in PRICES.items():
+        if key in m:
+            return val
+    return DEFAULT_PRICE
+
+
+def human(n):
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.0f}k"
+    return str(int(n))
+
+
+def load_state():
+    try:
+        with STATE.open() as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"files": {}}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    try:
+        with tmp.open("w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def scan_file(path, entry, by_day):
+    """Le so o que ainda nao foi lido.
+
+    Cada linha nova e contabilizada em DOIS lugares: no total do arquivo e no
+    agregado global by_day[data][modelo]. Como cada linha e lida uma unica vez na
+    vida (o offset avanca), somar nos dois lugares nao duplica nada — e e o que
+    permite responder "quanto gastei HOJE" sem reprocessar 1.2GB de transcript.
+    """
+    tot = {"in": 0, "out": 0, "cw": 0, "cr": 0, "msgs": 0}
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return tot, entry, False
+
+    offset = entry.get("offset", 0)
+    # Arquivo encolheu => foi rotacionado/reescrito: reconta do zero.
+    if size < offset:
+        offset = 0
+        entry = {}
+
+    prev = entry.get("tot")
+    if prev and size == offset:
+        return prev, entry, False
+
+    acc = dict(prev) if prev else dict(tot)
+    try:
+        with path.open("rb") as f:
+            f.seek(offset)
+            for raw in f:
+                if not raw.strip():
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue  # linha parcial: o proximo ciclo relê a partir do offset gravado
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                u = msg.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                vals = (u.get("input_tokens", 0) or 0,
+                        u.get("output_tokens", 0) or 0,
+                        u.get("cache_creation_input_tokens", 0) or 0,
+                        u.get("cache_read_input_tokens", 0) or 0)
+                acc["in"] += vals[0]
+                acc["out"] += vals[1]
+                acc["cw"] += vals[2]
+                acc["cr"] += vals[3]
+                acc["msgs"] += 1
+                # O preco depende do modelo (Opus custa ~12x um Haiku): agregar por
+                # modelo e o que torna o custo honesto em vez de chute.
+                day = str(d.get("timestamp", ""))[:10] or "sem-data"
+                model = msg.get("model") or "desconhecido"
+                slot = by_day.setdefault(day, {}).setdefault(model, {"in": 0, "out": 0, "cw": 0, "cr": 0, "msgs": 0})
+                slot["in"] += vals[0]
+                slot["out"] += vals[1]
+                slot["cw"] += vals[2]
+                slot["cr"] += vals[3]
+                slot["msgs"] += 1
+            new_offset = f.tell()
+    except OSError:
+        return acc, entry, False
+
+    return acc, {"offset": new_offset, "tot": acc, "mtime": path.stat().st_mtime}, True
+
+
+def cost(t, model=None):
+    pin, pout, pcw, pcr = price_for(model)
+    return (t["in"] * pin + t["out"] * pout + t["cw"] * pcw + t["cr"] * pcr) / 1_000_000
+
+
+def add(a, b):
+    for k in ("in", "out", "cw", "cr", "msgs"):
+        a[k] = a.get(k, 0) + b.get(k, 0)
+    return a
+
+
+def collect():
+    """Varre transcripts e classifica em sessao principal vs agente."""
+    state = load_state()
+    files = state.get("files", {})
+    by_day = state.setdefault("by_day", {})
+    now = time.time()
+    sessions, agents = {}, {}
+    active_cut = now - 120  # escreveu nos ultimos 2 min = trabalhando agora
+    dirty = False
+
+    if not PROJECTS.is_dir():
+        return sessions, agents, state
+
+    for path in PROJECTS.rglob("*.jsonl"):
+        key = str(path)
+        entry = files.get(key, {})
+        tot, new_entry, changed = scan_file(path, entry, by_day)
+        if changed:
+            files[key] = new_entry
+            dirty = True
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        rec = {"tot": tot, "mtime": mtime, "active": mtime >= active_cut, "path": path}
+        # subagents/ => agente; caso contrario e a sessao principal daquele projeto
+        if "subagents" in path.parts:
+            agents[key] = rec
+        else:
+            sessions[key] = rec
+
+    state["files"] = files
+    # Grava SO quando algum transcript avancou. Antes gravava a cada execucao:
+    # o state tem ~1.1 MB e a status-bar do tmux chamava isto a cada 45 s, o que
+    # dava ~84 MB/h de escrita em disco apenas para desenhar uma linha de status —
+    # exatamente o tipo de gasto sem retorno que nao pode existir. Em repouso
+    # (nenhum agente escrevendo) agora nao ha escrita nenhuma.
+    if dirty:
+        save_state(state)
+    return sessions, agents, state
+
+
+def main():
+    args = sys.argv[1:]
+    if "--reset" in args:
+        try:
+            STATE.unlink()
+            print("cache de tokens zerado")
+        except OSError:
+            print("nada a zerar")
+        return
+
+    sessions, agents, state = collect()
+    by_day = state.get("by_day", {})
+    today = time.strftime("%Y-%m-%d")
+
+    def day_totals(day):
+        t = {"in": 0, "out": 0, "cw": 0, "cr": 0, "msgs": 0}
+        usd = 0.0
+        for model, v in (by_day.get(day) or {}).items():
+            add(t, v)
+            usd += cost(v, model)
+        return t, usd
+
+    if "--today" in args or "--hoje" in args:
+        t, usd = day_totals(today)
+        print(f"\n  HOJE ({today})\n")
+        for model, v in sorted((by_day.get(today) or {}).items(), key=lambda kv: -kv[1]["out"]):
+            print(f"  {model[:34]:34s} in {human(v['in']):>7s}  out {human(v['out']):>7s}  "
+                  f"cache-r {human(v['cr']):>8s}  US$ {cost(v, model):>7.2f}")
+        print(f"  {'-'*92}")
+        print(f"  {'TOTAL':34s} in {human(t['in']):>7s}  out {human(t['out']):>7s}  "
+              f"cache-r {human(t['cr']):>8s}  US$ {usd:>7.2f}\n")
+        return
+
+    sess_tot = {"in": 0, "out": 0, "cw": 0, "cr": 0, "msgs": 0}
+    for r in sessions.values():
+        add(sess_tot, r["tot"])
+    ag_tot = {"in": 0, "out": 0, "cw": 0, "cr": 0, "msgs": 0}
+    for r in agents.values():
+        add(ag_tot, r["tot"])
+    grand = add(dict(sess_tot), ag_tot)
+
+    act_sessions = [r for r in sessions.values() if r["active"]]
+    act_agents = [r for r in agents.values() if r["active"]]
+
+    if "--oneline" in args:
+        # Status-bar: o que importa para decidir AGORA e o gasto de HOJE, nao o
+        # acumulado historico. out = tokens gerados (o caro); ag = agentes ativos.
+        # Sem contagem de agentes aqui: quem exibe a barra (ai-status) ja mostra,
+        # e numero repetido na mesma linha e ruido.
+        t, usd = day_totals(today)
+        print(f"tok {human(t['in'] + t['out'] + t['cw'] + t['cr'])} "
+              f"out {human(t['out'])} US${usd:.0f}")
+        return
+
+    if "--by-agent" in args:
+        rows = sorted(agents.values(), key=lambda r: r["tot"]["out"], reverse=True)[:25]
+        print(f"{'AGENTE':46s} {'IN':>8s} {'OUT':>8s} {'CACHE-R':>9s} {'USD':>7s}  ATIVO")
+        for r in rows:
+            t = r["tot"]
+            if t["msgs"] == 0:
+                continue
+            name = r["path"].name.replace("agent-", "").replace(".jsonl", "")[:44]
+            wf = r["path"].parent.name
+            if wf.startswith("wf_"):
+                name = f"{wf[:12]}/{name[:30]}"
+            print(f"{name:46s} {human(t['in']):>8s} {human(t['out']):>8s} "
+                  f"{human(t['cr']):>9s} {cost(t):>7.2f}  {'sim' if r['active'] else '-'}")
+        return
+
+    def line(label, t, extra=""):
+        print(f"  {label:22s} in {human(t['in']):>7s}  out {human(t['out']):>7s}  "
+              f"cache-w {human(t['cw']):>7s}  cache-r {human(t['cr']):>8s}  "
+              f"US$ {cost(t):>7.2f}  {extra}")
+
+    print("\n  CONSUMO DE TOKENS — Claude Code\n")
+    line("sessoes principais", sess_tot, f"({len(sessions)} arquivos, {len(act_sessions)} ativas)")
+    line("agentes/workflows", ag_tot, f"({len(agents)} arquivos, {len(act_agents)} ativos)")
+    print(f"  {'-'*104}")
+    line("TOTAL", grand)
+
+    total_all = grand["in"] + grand["out"] + grand["cw"] + grand["cr"]
+    if total_all:
+        share = 100 * (ag_tot["in"] + ag_tot["out"] + ag_tot["cw"] + ag_tot["cr"]) / total_all
+        print(f"\n  agentes respondem por {share:.0f}% do consumo total")
+        # Cache read e o token barato (10x menos que input): proporcao alta e SINAL BOM.
+        print(f"  cache-read = {100*grand['cr']/total_all:.0f}% do volume "
+              f"(token barato: quanto maior, melhor o reaproveitamento de contexto)")
+
+    # Por dia: o unico corte que orienta decisao no presente.
+    dias = sorted((d for d in by_day if d != "sem-data"), reverse=True)[:7]
+    if dias:
+        print(f"\n  ULTIMOS DIAS")
+        for d in dias:
+            t, usd = day_totals(d)
+            marca = "  <- hoje" if d == today else ""
+            print(f"  {d}   in {human(t['in']):>7s}  out {human(t['out']):>7s}  "
+                  f"cache-r {human(t['cr']):>8s}  US$ {usd:>8.2f}{marca}")
+        print(f"\n  detalhe por modelo:  ai-tokens --today   |  por agente:  ai-tokens --by-agent")
+    else:
+        print("\n  (sem corte por dia ainda — rode 'ai-tokens --reset' uma vez para\n"
+              "   reconstruir o historico com data e modelo)")
+    print()
+
+
+if __name__ == "__main__":
+    main()

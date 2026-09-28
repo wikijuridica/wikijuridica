@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""measure-tunnel-gaps — quanto tempo o portal ficou SEM nenhuma conexão de túnel.
+
+POR QUE EXISTE, e por que a medição obvia engana. Olhar o journal do cloudflared
+e contar reconexões não diz nada sobre disponibilidade: reconexão é rotina, a
+borda da Cloudflare recicla conexão de propósito, e um túnel saudável reconecta
+o dia inteiro sem servir um único erro. O que importa é **outra coisa**: houve
+algum instante em que TODAS as conexões estavam fora ao mesmo tempo?
+
+Enquanto não há nenhuma conexão viva, a Cloudflare devolve **530** (erro 1033,
+"tunnel not connected") a todo visitante — inclusive ao crawler. E servir erro a
+crawler não custa o tempo do erro: custa semanas de rastreio. Em 2026-08-11 00Z
+o Googlebot levou 19 respostas 530 e 8 respostas 502, e nas seis horas seguintes
+o rastreio caiu de ~300 requisições/hora para 2, patamar que persistiu mais de
+um dia com o host já limpo.
+
+O QUE ESTA FERRAMENTA MEDE: ela reconstrói, evento a evento, o CONJUNTO de
+conexões vivas ao longo do tempo, e reporta cada intervalo em que esse conjunto
+ficou vazio. É contagem de estado, não de evento — a diferença entre "reconectou
+40 vezes" (irrelevante) e "ficou 41 segundos sem ninguém" (é o defeito).
+
+PRIMEIRA MEDIÇÃO, 2026-08-12, com UMA instância (4 conexões): **10 janelas de
+zero conexão em 48 h**, ~121 s somados, a maior de 41 s. Todas as quatro conexões
+caíam no MESMO segundo e voltavam no MESMO segundo — porque nasciam do mesmo
+processo. Quatro conexões de uma instância só não são quatro pontos de falha
+independentes; são um. Daí a frota de réplicas
+(`ops/systemd/cloudflared-wikijuridica-replica@.service`).
+
+CONTA COM VÁRIAS UNITS: passe `--unit` mais de uma vez. Com a frota, a pergunta
+certa é se o conjunto vivo de TODAS as instâncias esvaziou — uma réplica sozinha
+pode cair à vontade sem que o visitante perceba, e contá-la isolada produziria
+alarme falso.
+
+Uso:
+    tools/measure-tunnel-gaps --horas 48
+    tools/measure-tunnel-gaps --horas 48 --unit cloudflared-wikijuridica \\
+        --unit 'cloudflared-wikijuridica-replica@*'
+    tools/measure-tunnel-gaps --horas 6 --json
+"""
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SERIE = os.path.join(ROOT, "data", "ops", "tunnel_gaps.jsonl")
+RAIZ = os.environ.get("WIKI_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SCHEMA = "tunnel_gaps_v1"
+
+# O journal em `-o short-iso` comeca com o carimbo ISO; o resto da linha e do
+# cloudflared. `connIndex` identifica a conexao DENTRO de uma instancia, entao a
+# chave real de uma conexao e (instancia, connIndex).
+#
+# E A INSTANCIA E O **PID**, nao o nome que aparece na linha. A armadilha, pega
+# ao testar esta propria ferramenta: o identificador de syslog e o nome do
+# BINARIO (`cloudflared-2026.7.3`), identico para as 25 instancias da frota.
+# Chavear por ele faria a replica @20251 e a @20252 colidirem no connIndex 0, o
+# conjunto vivo encolheria sozinho e a ferramenta inventaria janelas de queda
+# que nunca existiram — justo a ferramenta que existe para nao inventar.
+# O PID entre colchetes e unico por processo e resolve isso sem ambiguidade.
+REGISTRA = re.compile(r"^(?P<ts>\S+) \S+ \S+\[(?P<pid>\d+)\]:.*Registered tunnel connection connIndex=(?P<idx>\d+)")
+DERRUBA = re.compile(r"^(?P<ts>\S+) \S+ \S+\[(?P<pid>\d+)\]:.*(?:Unregistered tunnel connection|Connection terminated).*connIndex=(?P<idx>\d+)")
+
+
+def eventos_do_journal(units, horas):
+    """Le o journal das units e devolve [(datetime, chave, viva?)] ordenado."""
+    comando = ["journalctl", "--no-pager", "-o", "short-iso",
+               "--since", "%d hours ago" % horas]
+    for unit in units:
+        comando += ["-u", unit]
+    saida = subprocess.run(comando, capture_output=True, text=True, timeout=180)
+    if saida.returncode != 0:
+        return [], saida.stderr.strip()[:200]
+    eventos = []
+    for linha in saida.stdout.splitlines():
+        achado = REGISTRA.match(linha)
+        viva = True
+        if not achado:
+            achado = DERRUBA.match(linha)
+            viva = False
+        if not achado:
+            continue
+        try:
+            quando = datetime.datetime.fromisoformat(achado.group("ts"))
+        except ValueError:
+            continue
+        eventos.append((quando, (achado.group("pid"), achado.group("idx")), viva))
+    eventos.sort(key=lambda e: e[0])
+    return eventos, ""
+
+
+def janelas_vazias(eventos):
+    """Intervalos em que o conjunto de conexoes vivas ficou VAZIO.
+
+    O primeiro evento de todos e ignorado como inicio de janela: antes dele nao
+    se sabe o estado (o journal pode comecar no meio da vida do processo), e
+    contar esse desconhecido como queda inventaria uma janela que ninguem viu.
+    """
+    vivas = set()
+    janelas = []
+    vazio_desde = None
+    primeiro = True
+    for quando, chave, viva in eventos:
+        if viva:
+            vivas.add(chave)
+        else:
+            vivas.discard(chave)
+        if not vivas and vazio_desde is None and not primeiro:
+            vazio_desde = quando
+        elif vivas and vazio_desde is not None:
+            janelas.append((vazio_desde, quando, (quando - vazio_desde).total_seconds()))
+            vazio_desde = None
+        primeiro = False
+    return janelas, vivas
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# RECONCILIAÇÃO COM O ESTADO OBSERVADO (2026-09-03)
+#
+# A reconstrução por evento tem um modo de falha que só aparece confrontando-a
+# com outra fonte: um `Unregistered` cuja conexão foi registrada ANTES do início
+# da janela esvazia o conjunto vivo sem que nada tenha caído — a Cloudflare
+# recicla conexão de rotina, e o `Registered` correspondente fica fora do
+# recorte. Medido em 2026-09-03 sobre 09-01: esta ferramenta declarou uma janela
+# de 2.267 s (37,8 min) "sem nenhuma conexão", e no MESMO intervalo
+# `data/ops/tunnel_health.jsonl` tem 92 amostras dizendo `ha_connections=4`,
+# `frota_vivas=25`, `degradado=false`, e `data/ops/edge_live.jsonl` tem 24
+# sondas externas respondendo 200. O túnel estava no ar o tempo todo.
+#
+# O custo desse falso positivo não é teórico: foi a medição de 12/08 desta mesma
+# ferramenta ("10 janelas / 121 s") que motivou subir a frota para 25 réplicas —
+# decisão de infraestrutura tomada sobre janela que provavelmente não existiu.
+#
+# A partir daqui, cada janela candidata é CONFRONTADA com a série de saúde:
+#   • amostra com ha_connections > 0 dentro da janela  -> REFUTADA (não conta)
+#   • nenhuma amostra no intervalo                     -> SEM AMOSTRA (declarada,
+#                                                         não conta, e o registro
+#                                                         diz que não conta)
+#   • amostras, todas com ha_connections == 0          -> CONFIRMADA
+# A disponibilidade passa a sair só das confirmadas, e as outras duas listas
+# ficam no registro para quem quiser auditar a discordância entre as fontes.
+def amostras_de_saude(raiz):
+    """[(datetime, ha_connections)] de data/ops/tunnel_health.jsonl, ordenado."""
+    caminho = os.path.join(raiz, "data", "ops", "tunnel_health.jsonl")
+    saida = []
+    try:
+        with open(caminho, encoding="utf-8") as handle:
+            for bruto in handle:
+                bruto = bruto.strip()
+                if not bruto:
+                    continue
+                try:
+                    registro = json.loads(bruto)
+                except ValueError:
+                    continue
+                quando = registro.get("checked_at")
+                if not quando:
+                    continue
+                try:
+                    instante = datetime.datetime.fromisoformat(quando)
+                except ValueError:
+                    continue
+                if instante.tzinfo is None:
+                    instante = instante.replace(tzinfo=datetime.timezone.utc)
+                saida.append((instante, int(registro.get("ha_connections") or 0),
+                              int(registro.get("frota_vivas") or 0)))
+    except OSError:
+        return []
+    saida.sort(key=lambda item: item[0])
+    return saida
+
+
+def confronta_com_saude(janelas, saude):
+    """Separa as janelas candidatas em (confirmadas, refutadas, sem_amostra)."""
+    confirmadas, refutadas, sem_amostra = [], [], []
+    for inicio, fim, segundos in janelas:
+        dentro = [(q, ha, vivas) for q, ha, vivas in saude if inicio <= q <= fim]
+        if not dentro:
+            sem_amostra.append((inicio, fim, segundos, 0, None))
+            continue
+        com_conexao = [item for item in dentro if item[1] > 0]
+        if com_conexao:
+            refutadas.append((inicio, fim, segundos, len(dentro), max(i[1] for i in com_conexao)))
+        else:
+            confirmadas.append((inicio, fim, segundos, len(dentro), 0))
+    return confirmadas, refutadas, sem_amostra
+
+
+# TOLERANCIA DE LACUNA DA SERIE DE SAUDE, medida e nao arbitrada (2026-09-10).
+#
+# data/ops/tunnel_health.jsonl na janela de 48h tem 5.245 amostras: intervalo
+# mediano 33,8 s, p95 35,0 s e MAXIMO 40,2 s; a borda inicial ficou a 22 s do
+# comeco da janela e a final a 10 s de agora. 300 s e ~7x a pior lacuna
+# observada — folga suficiente para jitter do sondador e apertada o bastante
+# para que uma PARADA real do sondador (que amostra a cada ~30 s) reprove a
+# cobertura em vez de virar disponibilidade inventada.
+TOLERANCIA_LACUNA_S = 300.0
+
+
+def disponibilidade_pela_saude(saude, inicio, fim, tolerancia=TOLERANCIA_LACUNA_S):
+    """Disponibilidade derivada da FONTE POSITIVA, para quando o journal nao
+    tem evento de conexao na janela.
+
+    POR QUE ISTO EXISTE (2026-09-10). Sem evento, esta ferramenta saia 3 e a
+    unit ficava `failed` todo dia — e o exit 3 esta CERTO enquanto a unica
+    fonte for a reconstrucao por evento: frota estavel nao gera churn, e
+    journalctl sem permissao devolve o mesmo silencio. Mas a ferramenta ja le
+    uma SEGUNDA fonte, positiva, para refutar janela falsa. Quando essa fonte
+    COBRE a janela inteira, ela responde a pergunta sozinha: nao e ausencia de
+    dado, e dado de outra origem. O exit 3 fica para quando as DUAS faltam —
+    que e a hipotese que o exit 3 sempre quis nomear.
+
+    Devolve (coberta, segundos_sem_conexao, amostras, maior_lacuna, motivo).
+    Cobertura exige amostra dentro da janela e nenhuma lacuna — inclusive nas
+    duas bordas — acima da tolerancia. O tempo sem conexao e integrado como
+    funcao-degrau: cada amostra vale ate a proxima.
+    """
+    dentro = [(q, ha, vivas) for q, ha, vivas in saude if inicio <= q <= fim]
+    if not dentro:
+        return False, 0.0, 0, None, ("a serie de saude nao tem nenhuma amostra "
+                                     "na janela")
+    marcos = [inicio] + [q for q, _ha, _v in dentro] + [fim]
+    lacunas = [(marcos[i + 1] - marcos[i]).total_seconds() for i in range(len(marcos) - 1)]
+    maior = max(lacunas)
+    if maior > tolerancia:
+        return False, 0.0, len(dentro), maior, (
+            "a serie de saude tem lacuna de %.0f s na janela, acima da "
+            "tolerancia de %.0f s: cobertura parcial nao prova disponibilidade"
+            % (maior, tolerancia))
+    sem_conexao = 0.0
+    for i, (quando, ha, _vivas) in enumerate(dentro):
+        proximo = dentro[i + 1][0] if i + 1 < len(dentro) else fim
+        if ha <= 0:
+            sem_conexao += (proximo - quando).total_seconds()
+    return True, sem_conexao, len(dentro), maior, ""
+
+
+def serializa_janelas(itens):
+    return [{"inicio": a.isoformat(timespec="seconds"), "fim": b.isoformat(timespec="seconds"),
+             "segundos": round(s, 1), "amostras_de_saude": n,
+             "maior_ha_connections_observado": ha} for a, b, s, n, ha in itens]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--horas", type=int, default=48)
+    parser.add_argument("--unit", action="append", default=[],
+                        help="pode repetir; default = principal + frota de replicas")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--sem-registro", action="store_true",
+                        help="nao grava a linha de evidencia")
+    args = parser.parse_args()
+
+    units = args.unit or ["cloudflared-wikijuridica",
+                          "cloudflared-wikijuridica-replica@*"]
+    eventos, erro = eventos_do_journal(units, args.horas)
+    if erro:
+        print("measure-tunnel-gaps: journalctl falhou: %s" % erro, file=sys.stderr)
+        return 2
+
+    janelas, vivas = janelas_vazias(eventos)
+    saude = amostras_de_saude(RAIZ)
+    confirmadas, refutadas, sem_amostra = confronta_com_saude(janelas, saude)
+    janelas = [(a, b, s) for a, b, s, _n, _ha in confirmadas]
+    por_processo = collections.Counter(chave[0] for chave in vivas)
+    total_fora = sum(j[2] for j in janelas)
+    segundos_janela = args.horas * 3600
+
+    # SEM EVENTO NA JANELA NAO E 100% DE DISPONIBILIDADE — e ausencia de dado.
+    # A reconstrucao so conhece conexao que tenha um evento `Registered` DENTRO
+    # da janela. Com a frota estavel, as conexoes vivem dias sem churn: uma
+    # janela de 2h, 6h ou 24h le ZERO evento e a formula devolvia
+    # disponibilidade_pct=100.0, indistinguivel de saude real. O mesmo silencio
+    # sai de um journalctl sem permissao, que devolve vazio com exit 0. Esse
+    # falso-verde ja enganou uma decisao de engenharia em 2026-08-13: a medicao
+    # "--horas 2 -> 0 janelas" foi lida como prova de tunel sao quando era
+    # cegueira. Agora a ausencia de dado se declara, e o exit code recusa o
+    # verde.
+    # Sem evento no journal, a FONTE POSITIVA decide antes de declarar
+    # ausencia de dado (ver disponibilidade_pela_saude). exit 3 fica so quando
+    # as duas fontes faltam.
+    fim_janela = datetime.datetime.now(datetime.timezone.utc)
+    inicio_janela = fim_janela - datetime.timedelta(hours=args.horas)
+    fonte = "eventos_do_journal"
+    saude_coberta, saude_sem_conexao, saude_amostras, saude_maior_lacuna, saude_motivo = (
+        False, 0.0, 0, None, "")
+    if not eventos:
+        (saude_coberta, saude_sem_conexao, saude_amostras,
+         saude_maior_lacuna, saude_motivo) = disponibilidade_pela_saude(
+            saude, inicio_janela, fim_janela)
+        if saude_coberta:
+            fonte = "saude"
+            total_fora = saude_sem_conexao
+    sem_dados = not eventos and not saude_coberta
+
+    registro = {
+        "schema_version": SCHEMA,
+        "medido_em": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "janela_horas": args.horas,
+        "units": units,
+        "eventos_de_conexao": len(eventos),
+        "conexoes_vivas_ao_fim": len(vivas),
+        "instancias_vivas_ao_fim": len(por_processo),
+        "janelas_sem_conexao": len(janelas),
+        "segundos_sem_conexao": round(total_fora, 1),
+        "sem_dados": sem_dados,
+        "fonte_da_disponibilidade": fonte,
+        "amostras_de_saude_na_janela": saude_amostras,
+        "maior_lacuna_de_saude_segundos": (
+            None if saude_maior_lacuna is None else round(saude_maior_lacuna, 1)),
+        "tolerancia_lacuna_saude_segundos": TOLERANCIA_LACUNA_S,
+        "disponibilidade_pct": (
+            None if sem_dados
+            else round(100.0 * (segundos_janela - total_fora) / segundos_janela, 5)
+        ),
+        "maior_janela_segundos": round(max((j[2] for j in janelas), default=0.0), 1),
+        "janelas": [{"inicio": a.isoformat(timespec="seconds"),
+                     "fim": b.isoformat(timespec="seconds"),
+                     "segundos": round(s, 1)} for a, b, s in janelas],
+        # As três listas do confronto com o estado observado (ver o bloco acima).
+        "confronto_com_saude": "data/ops/tunnel_health.jsonl (amostra a cada ~30 s)",
+        "amostras_de_saude_lidas": len(saude),
+        "janelas_confirmadas": serializa_janelas(confirmadas),
+        "janelas_refutadas_pela_saude": serializa_janelas(refutadas),
+        "janelas_sem_amostra_de_saude": serializa_janelas(sem_amostra),
+    }
+    if sem_dados:
+        registro["sem_dados_motivo"] = (
+            "nenhum evento de conexao na janela de %dh: as conexoes podem estar "
+            "vivas desde antes dela (frota estavel nao gera churn), ou o journal "
+            "pode estar inacessivel para este usuario. E %s. Sem NENHUMA das "
+            "duas fontes nao ha base para afirmar disponibilidade — amplie "
+            "--horas, confira o acesso ao journal ou veja por que o sondador de "
+            "saude parou." % (args.horas, saude_motivo or
+                              "a serie de saude tambem nao cobre a janela")
+        )
+
+    if not args.sem_registro:
+        os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+        with open(SERIE, "a", encoding="utf-8") as saida:
+            saida.write(json.dumps(registro, sort_keys=True, ensure_ascii=False) + "\n")
+
+    if args.json:
+        print(json.dumps(registro, sort_keys=True, ensure_ascii=False, indent=1))
+        return 3 if sem_dados else 0
+
+    print("measure-tunnel-gaps — janela de %dh" % args.horas)
+    print("  eventos de conexao lidos          : %d" % len(eventos))
+    print("  conexoes vivas ao fim             : %d em %d instancias"
+          % (len(vivas), len(por_processo)))
+    print("  JANELAS SEM NENHUMA CONEXAO       : %d" % len(janelas))
+    print("  tempo total sem conexao           : %.1f s" % total_fora)
+    print("  maior janela                      : %.1f s" % registro["maior_janela_segundos"])
+    if sem_dados:
+        print("  disponibilidade do tunel          : SEM DADOS")
+        print("\n  SEM DADOS — %s" % registro["sem_dados_motivo"])
+        return 3
+    if fonte == "saude":
+        print("  fonte da disponibilidade          : serie de saude "
+              "(%d amostras, maior lacuna %.0f s)"
+              % (saude_amostras, saude_maior_lacuna or 0.0))
+    print("  disponibilidade do tunel          : %.5f%%" % registro["disponibilidade_pct"])
+    for a, b, s in janelas:
+        print("    %s -> %s  = %.0f s" % (a.strftime("%m-%d %H:%M:%S"),
+                                          b.strftime("%H:%M:%S"), s))
+    if not janelas and fonte == "saude":
+        print("\n  Nenhum evento de conexao no journal — frota estavel nao gera churn.")
+        print("  A disponibilidade acima vem da serie de saude, que COBRE a janela:")
+        print("  toda amostra tem ha_connections > 0, logo o tunel nunca ficou sem conexao.")
+    elif not janelas:
+        print("\n  Nenhuma janela: em todo o periodo havia ao menos uma conexao viva,")
+        print("  logo a borda nunca precisou servir 530 por tunel desconectado.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

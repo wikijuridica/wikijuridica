@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""check-revalidacao-por-encoding — o 304 sobrevive a troca de Accept-Encoding?
+
+POR QUE EXISTE (medido em 2026-08-28). O Googlebot manda `Accept-Encoding: br`.
+Quando a borda vai a origem -- 83% das requisicoes dele, porque o HIT medido e de
+17% -- ele revalida com o validador que guardou e recebe a variante comprimida.
+Se os validadores divergem entre variantes, a revalidacao devolve o corpo inteiro
+em vez de 304, e o orcamento de rastreio e gasto em bytes que ele ja tem.
+
+O QUE JA FOI CORRIGIDO, e o que sobra: `tools/generate-brotli-static` dava ao
+`.br` o mtime do fonte + 1 s, e por isso `Last-Modified` E ETag divergiam em 100%
+dos 10.340 pares. Com o espelhamento exato, o `Last-Modified` passou a ser
+identico nas tres variantes. O ETag do nginx, porem, e `mtime-size`: o tamanho
+difere por natureza entre comprimido e identity, e NAO ha como unifica-lo.
+
+Este gate mede as duas revalidacoes, cruzando as variantes:
+  - If-Modified-Since  -> tem de devolver 304 em TODAS as combinacoes.
+  - If-None-Match      -> informativo; 200 aqui e esperado enquanto o nginx
+                          emitir ETag por tamanho nas locations estaticas.
+
+Reprova quando o IMS cruzado falha, que e a condicao que quebra o 304 do crawler.
+
+Sonda com UA proprio e X-Warming-Request, nunca com UA de bot real.
+"""
+import argparse
+import sys
+import urllib.error
+import urllib.request
+
+UA = "wikijuridica-superficie-probe/1.0"
+VARIANTES = ("identity", "gzip", "br")
+
+
+def cabecalhos(url, host, encoding, condicional=None):
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", UA)
+    req.add_header("X-Warming-Request", "true")
+    req.add_header("Accept-Encoding", encoding)
+    if host:
+        req.add_header("Host", host)
+    if condicional:
+        req.add_header(*condicional)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, dict(resp.headers)
+    except urllib.error.HTTPError as erro:
+        return erro.code, dict(erro.headers)
+    except (urllib.error.URLError, OSError) as erro:
+        # Erro de rede NAO e defeito de revalidacao. Exit 2 = inconclusivo,
+        # nunca reprovacao -- a licao do check-edge-vary-contract, que
+        # diagnosticava tunel oscilando como envenenamento de cache.
+        print(f"  INCONCLUSIVO: {erro}", file=sys.stderr)
+        sys.exit(2)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--url", default="http://127.0.0.1:8088/sitemaps/pages-0027.xml")
+    ap.add_argument("--host", default="wikijuridica.com.br")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    print(f"sonda: {args.url}")
+    validadores = {}
+    for enc in VARIANTES:
+        status, cab = cabecalhos(args.url, args.host, enc)
+        if status != 200:
+            print(f"  INCONCLUSIVO: {enc} devolveu {status}", file=sys.stderr)
+            return 2
+        validadores[enc] = (cab.get("ETag"), cab.get("Last-Modified"))
+        print(f"  {enc:<9} ETag={cab.get('ETag')}  Last-Modified={cab.get('Last-Modified')}")
+
+    lms = {lm for _, lm in validadores.values()}
+    print(f"  Last-Modified identico nas 3 variantes: {len(lms) == 1}")
+
+    falhas_ims, avisos_inm = [], []
+    for origem in VARIANTES:
+        etag, lastmod = validadores[origem]
+        for destino in VARIANTES:
+            if origem == destino:
+                continue
+            if lastmod:
+                st, _ = cabecalhos(args.url, args.host, destino,
+                                   ("If-Modified-Since", lastmod))
+                if st != 304:
+                    falhas_ims.append(f"{origem}->{destino} IMS={st}")
+            if etag:
+                st, _ = cabecalhos(args.url, args.host, destino,
+                                   ("If-None-Match", etag))
+                if st != 304:
+                    avisos_inm.append(f"{origem}->{destino} INM={st}")
+
+    # NAO ANUNCIE O QUE NAO FOI MEDIDO.
+    #
+    # Ate 2026-08-28 este bloco imprimia "If-None-Match cruzado: 6/6 devolveram
+    # 304" mesmo quando NENHUMA requisicao INM tinha sido feita: com `etag off`
+    # no vhost, `etag` e None, o `if etag:` nunca entra, `avisos_inm` fica vazia
+    # e `6 - 0` da 6. O gate anunciava verde numa sonda que nao disparou --
+    # exatamente o que R3 proibe. Apanhado por auditoria adversarial.
+    tentativas_ims = sum(1 for origem in VARIANTES for destino in VARIANTES
+                         if origem != destino and validadores[origem][1])
+    tentativas_inm = sum(1 for origem in VARIANTES for destino in VARIANTES
+                         if origem != destino and validadores[origem][0])
+    if tentativas_ims:
+        print(f"  If-Modified-Since cruzado: {tentativas_ims - len(falhas_ims)}/{tentativas_ims} devolveram 304")
+    else:
+        print("  If-Modified-Since cruzado: NAO MEDIDO (nenhuma variante trouxe Last-Modified)")
+    if tentativas_inm:
+        print(f"  If-None-Match cruzado:     {tentativas_inm - len(avisos_inm)}/{tentativas_inm} devolveram 304"
+              + ("  (esperado: o ETag do nginx inclui o tamanho)" if avisos_inm else ""))
+    else:
+        print("  If-None-Match cruzado:     NAO MEDIDO (sem ETag na origem — `etag off` no vhost)")
+
+    if not tentativas_ims:
+        print("\nINCONCLUSIVO: nenhuma variante trouxe Last-Modified; sem validador de")
+        print("  data nao ha o que cruzar, e sem ETag (etag off) nao sobra validador")
+        print("  nenhum. Isso NAO e sucesso — e ausencia de instrumento.")
+        return 2
+
+    if falhas_ims:
+        print("\nFALHA: a revalidacao por data nao sobrevive a troca de encoding.")
+        for f in falhas_ims:
+            print(f"  {f}")
+        print("  O Googlebot manda Accept-Encoding: br; com isso ele recebe o corpo")
+        print("  inteiro no lugar de 304. Conferir tools/generate-brotli-static:")
+        print("  precisa()/poda() comparam com != e os.utime espelha o mtime do fonte?")
+        return 1
+
+    print("\nrevalidacao por encoding: sem defeito")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

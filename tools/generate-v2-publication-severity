@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+"""generate-v2-publication-severity — decide, por pagina, o que publica.
+
+Substitui o gate binario do repo por uma PARTICAO POR SEVERIDADE, na regra
+dada pelo dono em 2026-08-06: publica o que nao tem erro grave ou critico;
+erro medio publica e refina depois.
+
+Por que nao um score 0-100: um numero inventado viraria o proximo gate
+suspeito. Aqui cada pagina carrega os motivos que a classificaram, e a
+porcentagem sai da particao — nunca o contrario.
+
+DOIS UNIVERSOS DISJUNTOS (verificado por igualdade de conjuntos:
+v2_ids - quality_vectors_ids == rewrite_queue_ids):
+  A = 7.959 paginas com sinais authorial_mass_* (promise_risk,
+      antitemplate, naturalness)
+  B = 1.763 paginas na v2_rewrite_queue, com `reasons[]` e SEM nenhuma
+      varredura de risco OAB — por isso este script roda o detector de
+      promessa de resultado sobre elas.
+
+CRITICO (nao publica): sem corpo; campo obrigatorio ausente; promessa de
+resultado (OAB Prov. 205/2021); defeito de encoding; intent_id colidindo
+entre shards (duas paginas disputando a mesma rota); REPROVADA em
+auditoria humana; veredito conflitante.
+
+MEDIO (publica): fonte insuficiente; word_count baixo; anti-template
+"review_required" e batch_global_similarity — os dois ultimos refutados
+por tools/measure-v2-uniqueness (0 pares similares em 9.620 paginas).
+
+Uso:
+    tools/generate-v2-publication-severity
+    tools/generate-v2-publication-severity --write
+"""
+import collections
+import glob
+import json
+import os
+import re
+import stat
+import sys
+import unicodedata
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+PAGES_GLOB = os.path.join(ROOT, "data/editorial/v2_pages/*.jsonl")
+REWRITE_QUEUE = os.path.join(ROOT, "data/editorial/v2_rewrite_queue.jsonl")
+READINESS = os.path.join(ROOT, "data/editorial/authorial_mass_publication_readiness.jsonl")
+QUALITY_VECTORS = os.path.join(ROOT, "data/editorial/authorial_mass_editorial_quality_vectors.jsonl")
+UNIQUENESS = os.path.join(ROOT, "data/ops/v2_uniqueness_20260806.json")
+OUT = os.path.join(ROOT, "data/editorial/v2_publication_severity.jsonl")
+SUMMARY_OUT = os.path.join(ROOT, "data/ops/v2_publication_severity_summary.json")
+
+MIN_WORDS_HARD = 250     # abaixo disso nao e pagina, e nota
+MIN_WORDS_SOFT = 400     # piso do contrato; entre HARD e SOFT e medio
+
+# Catalogo curado da home (internal/render/home_areas.go). Area que nao casa
+# com um destes slugs nao aparece na home — por isso a normalizacao importa.
+CATALOG = {
+    "consumidor", "bancario", "telecom-energia", "aereo", "seguros",
+    "investimentos", "trabalhista", "previdenciario", "saude", "servidor",
+    "autonomos", "imobiliario", "transito", "familia", "sucessoes",
+    "cidadania", "educacao", "empresarial", "tributario", "inpi", "lgpd",
+    "digital", "criminal", "procedimentos", "leis", "sumulas", "glossario",
+    # Areas reais do acervo ausentes do catalogo original — entram nele.
+    "administrativo", "constitucional",
+    # Secao aberta em 2026-08-20 para precedente qualificado derivado de fonte
+    # oficial (STJ). Sem esta linha, derive_area devolve "" para os intent_id
+    # "jur-*", o censo marca "area_nao_derivavel" e o lote inteiro deixa de
+    # publicar — em silencio, porque a pagina simplesmente nao aparece.
+    "jurisprudencia",
+    # Secao de noticia diaria de tribunal, aberta em 2026-08-20. Sem esta linha
+    # derive_area devolve "" para os intent_id "not-*" e o censo marca
+    # "area_nao_derivavel" -- o lote inteiro deixa de publicar, em silencio.
+    "noticias",
+    # Panorama diario de diarios municipais, aberto em 2026-08-20.
+    "diarios",
+}
+
+# Prefixo de intent_id -> area. So para o que o nome do shard nao resolve.
+INTENT_PREFIX_AREA = {
+    "pi": "inpi", "sfb": "empresarial", "seguro": "seguros",
+    "proc": "procedimentos", "trib": "tributario", "banc": "bancario",
+    "cons": "consumidor", "trab": "trabalhista", "prev": "previdenciario",
+    "imob": "imobiliario", "fam": "familia", "suc": "sucessoes",
+    "serv": "servidor", "crim": "criminal", "emp": "empresarial",
+    "dig": "digital", "educ": "educacao", "cid": "cidadania",
+    "aut": "autonomos", "seg": "seguros", "tra": "transito",
+    "adm": "administrativo", "const": "constitucional", "sum": "sumulas",
+    "jur": "jurisprudencia", "not": "noticias", "dia": "diarios",
+    "gloss": "glossario", "inv": "investimentos", "tel": "telecom-energia",
+}
+
+# Promessa de resultado: proibida pelo Provimento 205/2021 da OAB.
+# Cuidado deliberado com falso positivo — "a lei garante", "a CF assegura"
+# sao afirmacoes juridicas legitimas e NAO podem casar. So casa promessa
+# dirigida ao leitor ou feita em nome de quem escreve.
+PROMISE_PATTERNS = [
+    (r"\b(garantimos|asseguramos|prometemos)\b", "promessa_primeira_pessoa"),
+    # O verbo de ligação no meio ("o resultado É garantido") escapava da forma
+    # adjacente e foi apanhado pelo controle positivo de check-promise-detector.
+    (r"\b(resultado|êxito|exito|sucesso|vitória|vitoria|ganho)\s+(é|e|está|esta|fica)?\s*(garantid|assegurad)", "resultado_garantido"),
+    (r"\b(êxito|exito|sucesso|vitória|vitoria|ganho)\s+(é|e|está|esta)?\s*cert", "resultado_garantido"),
+    (r"\bgarantia\s+de\s+(resultado|êxito|exito|ganho|vitória|vitoria)", "garantia_de_resultado"),
+    (r"\bvocê\s+(vai|irá|ira)\s+(receber|ganhar|conseguir|ter\s+direito)\b", "futuro_categorico_ao_leitor"),
+    (r"\bvocê\s+(receberá|ganhará|conseguirá)\b", "futuro_categorico_ao_leitor"),
+    (r"\b(com\s+certeza|sem\s+dúvida|certamente)\s+você\b", "certeza_ao_leitor"),
+    (r"\b100%\s+de\s+(chance|êxito|exito|sucesso)", "percentual_de_exito"),
+    (r"\b(sempre|com certeza)\s+(é|e)\s+possível\s+(reverter|anular|cancelar)", "sempre_reversivel"),
+]
+PROMISE_RE = [(re.compile(p, re.IGNORECASE), tag) for p, tag in PROMISE_PATTERNS]
+
+SOFT_HYPHEN = "­"
+MOJIBAKE_RE = re.compile(r"[ÃÂ][-¿]")
+
+# TERCEIRA CLASSE DE ENCODING QUEBRADO: os C1 crus do cp1252 (2026-09-10).
+#
+# MOJIBAKE_RE pega UTF-8 lido como latin1 ("A©") e o U+FFFD pega o que o
+# decodificador desistiu de ler. Nenhum dos dois pega o texto que veio de cp1252
+# e ficou com o BYTE C1 no lugar do caractere: U+0096 (travessao), U+0093 e
+# U+0094 (aspas curvas), U+0092 (apostrofo). Eles nao desenham NADA no
+# navegador, entao o defeito e invisivel na revisao visual e so aparece no byte.
+#
+# Medido no dia em que esta classe entrou: 145 artigos em 20 arquivos de
+# data/legal-corpus/ e SEIS paginas ja publicadas servindo o texto do Codigo
+# Penal como "Pena <U+0096> reclusao, de 1 (um) a 5 (cinco) anos" -- para o
+# leitor e para o crawler, a pena do artigo aparecia como "Pena  reclusao".
+#
+# O conserto do DADO e decodificar para o caractere real, nunca apagar o byte:
+# apagar deixa a frase mutilada que ja foi ao ar. Este detector so acusa.
+#
+# C0 legitimo (tab, CR, LF) fica de fora de proposito: texto de lei transcrito
+# os usa, e acusa-los reprovaria o acervo inteiro.
+MOJIBAKE_C1_RE = re.compile("[\u0080-\u009f]")
+
+
+def grava_atomico(caminho, escritor):
+    """Grava por arquivo temporário + os.replace, nunca truncando o vivo.
+
+    ★ POR QUE (2026-09-16). `open(caminho, "w")` TRUNCA antes de escrever, e
+    este censo tem ~5 MB. Quem o lê é `internal/v2publish.LoadSeverity`
+    (v2publish.go:239), durante a publicação. Um leitor que pegue o arquivo no
+    meio da escrita vê um censo PARCIAL: `SelectPublishable` (v2publish.go:391)
+    pula todo intent que faltar com `sem_linha_no_censo`, e o publicador
+    REESCREVE o `published_manifest` a partir do que sobrou — exatamente o
+    estado que `cmd/publish-v2-direct` documenta como "o servidor não sobe"
+    (main.go, bloco do --limit). A janela era pequena e passou a importar
+    quando `tools/deploy-publico` passou a regenerar o censo no passo 0.5/7.
+
+    `os.replace` é atômico dentro do mesmo filesystem: o leitor concorrente vê
+    o arquivo antigo INTEIRO ou o novo INTEIRO, nunca meio de cada.
+    """
+    diretorio = os.path.dirname(caminho) or "."
+    os.makedirs(diretorio, exist_ok=True)
+    temporario = os.path.join(
+        diretorio, ".%s.parcial.%d" % (os.path.basename(caminho), os.getpid()))
+    modo_anterior = None
+    if os.path.exists(caminho):
+        modo_anterior = stat.S_IMODE(os.stat(caminho).st_mode)
+    try:
+        with open(temporario, "w", encoding="utf-8") as handle:
+            escritor(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if modo_anterior is not None:
+            os.chmod(temporario, modo_anterior)
+        os.replace(temporario, caminho)
+    except BaseException:
+        # Falhou no meio: o parcial não pode ficar no disco com cara de censo.
+        # O arquivo vivo continua intocado, que é o ponto desta função.
+        if os.path.exists(temporario):
+            os.unlink(temporario)
+        raise
+
+
+def read_jsonl(path, key):
+    """Indexa um JSONL por uma chave, tolerando linha malformada."""
+    index = {}
+    if not os.path.exists(path):
+        return index
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            value = record.get(key)
+            if value:
+                index[value] = record
+    return index
+
+
+def visible_text(record):
+    """Todo o texto que o visitante lê.
+
+    O FAQ usa as chaves `q` e `a` — NÃO `question`/`answer`. Enquanto esta
+    função pediu os nomes longos, ela devolveu string vazia para o FAQ inteiro,
+    e todo detector que se apoia nela (promessa de resultado do Provimento OAB
+    205/2021, encoding, PT-BR) foi cego a essa parte da página. Uma promessa
+    escrita numa resposta de FAQ passaria sem ser vista.
+    """
+    parts = [
+        record.get("title") or "", record.get("meta_description") or "",
+        record.get("h1") or "", record.get("opening") or "",
+    ]
+    for section in record.get("sections") or []:
+        parts.append(section.get("heading") or "")
+        parts.append(section.get("text") or "")
+    for item in record.get("faq") or []:
+        parts.append(item.get("q") or "")
+        parts.append(item.get("a") or "")
+    return "\n".join(parts)
+
+
+def _tokens(value):
+    """Tokenização idêntica à de normalizedWords (internal/v2ingest/validate.go).
+
+    Fold PT-BR (remove acento, minúsculas) e depois tudo que não é letra nem
+    dígito separa. `[^\\W_]+` sobre texto sem acento reproduz o critério do Go
+    `!unicode.IsLetter(r) && !unicode.IsDigit(r)`, mantendo o underscore como
+    separador.
+    """
+    folded = unicodedata.normalize("NFKD", (value or "").lower())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return re.findall(r"[^\W_]+", folded, re.UNICODE)
+
+
+def body_word_count(record):
+    """Fórmula do gate: bodyWordCount, internal/v2ingest/validate.go:984.
+
+    O censo contava apenas `opening` + `sections[].text`, com `.split()` sobre o
+    texto cru. O gate conta também o HEADING de cada seção e o Q/A de cada item
+    de FAQ, tokenizando sobre o texto sem acentos — foi o mesmo erro corrigido
+    nos geradores em 3fd10fca, que ficou aqui.
+
+    O efeito da subcontagem não era cosmético: o censo classificava 3.243
+    páginas como "corpo entre 250 e 400 palavras" quando a fórmula oficial vê
+    1.258, e marcava como CRÍTICAS páginas cujo corpo passa de 250 palavras. A
+    priorização de todo o trabalho editorial saía desse número.
+    """
+    total = len(_tokens(record.get("opening")))
+    for section in record.get("sections") or []:
+        total += len(_tokens(section.get("heading")))
+        total += len(_tokens(section.get("text")))
+    for item in record.get("faq") or []:
+        total += len(_tokens(item.get("q")))
+        total += len(_tokens(item.get("a")))
+    return total
+
+
+# Contextos que INVERTEM o sentido de um padrao de promessa. Sem isto o
+# detector reprova justamente as paginas bem escritas: a primeira versao
+# acusou 46 paginas e as 46 eram falso positivo — "sem garantia de
+# resultado" (a pagina NEGANDO promessa, que e o texto sobrio que a OAB
+# exige), "publicidade que promete ganho garantido" (a pagina DESCREVENDO
+# a pratica irregular que a CVM fiscaliza) e um bootcamp cujo anuncio
+# abusivo a pagina cita entre aspas para analisar.
+NEGATION_BEFORE = re.compile(
+    r"(sem|não\s+há|nao\s+ha|nenhum[a]?|jamais|nunca|proíbe|proibe|veda|"
+    r"impede|ilegal|abusiv[ao]|irregular)\s*$", re.IGNORECASE)
+
+# A NEGACAO QUASE NUNCA ENCOSTA NO GATILHO.
+#
+# NEGATION_BEFORE exige a particula colada ao padrao (`\s*$`), e por isso deixou
+# passar as formas que o texto sobrio de fato usa: "sem confundir chance
+# processual com garantia de resultado", "Nenhuma dessas ferramentas transforma
+# uma pista incompleta em resultado garantido", "em vez de tratar o verbete como
+# garantia de vitoria", "Pedido nao tem resultado garantido". Nas quatro ha
+# palavras entre a negacao e o gatilho — o detector via so o gatilho e reprovava
+# a pagina JUSTAMENTE por ela avisar que nao ha garantia.
+#
+# Resultado medido em 2026-08-06: 29 paginas bloqueadas, 29 falso positivo. Onze
+# delas ja tinham human_verdict APROVADA — o detector contradisse auditoria
+# humana ja feita. E o mesmo perfil do precedente registrado no CLAUDE.md, em que
+# 46 paginas foram acusadas e as 46 eram inocentes.
+#
+# A correcao e olhar a SENTENCA INTEIRA, nao a vizinhanca imediata.
+NEGATION_IN_SENTENCE = re.compile(
+    r"\b(sem|não|nao|nem|nenhum[a]?|jamais|nunca|proíbe|proibe|veda[m]?|vedad[ao]|"
+    r"impede|ilegal|abusiv[ao]|irregular|em\s+vez\s+de|ao\s+invés\s+de|ao\s+inves\s+de|"
+    r"longe\s+de|deixa\s+de|evite|evitar|desconfie|cuidado\s+com|golpe|fraude)\b",
+    re.IGNORECASE)
+
+# Termos em que "garantia" e vocabulario JURIDICO, nao promessa: garantia real
+# (penhor, hipoteca), garantia legal do CDC, garantia irredutivel do art. 618 do
+# Codigo Civil, fundo garantidor. Reprovar isso e reprovar o uso correto da
+# lingua tecnica que a pagina precisa usar.
+LEGAL_GUARANTEE_TERM = re.compile(
+    r"garantia\s+(real|legal|contratual|estendida|fiduciári[ao]|fiduciari[ao]|"
+    r"bancária|bancaria|irredutível|irredutivel|do\s+produto|de\s+fábrica|de\s+fabrica)|"
+    r"fundo\s+garantidor|crédito[s]?\s+com\s+garantia|credito[s]?\s+com\s+garantia|"
+    r"garantia\s+de\s+cinco\s+anos", re.IGNORECASE)
+THIRD_PARTY_BEFORE = re.compile(
+    r"(anunci[ao]|promete|prometia|publicidade|propaganda|oferta|golpe|"
+    r"empresa|loja|banco|bootcamp|curso|clínica|clinica|escritório|escritorio|"
+    r"site|aplicativo|vendedor|corretor)\w*\s+(que\s+)?[\w\s,]{0,40}$",
+    re.IGNORECASE)
+
+# Quem PROMETE é outra pessoa, e a página está analisando isso.
+#
+# THIRD_PARTY_BEFORE exige o sujeito logo antes do gatilho, e por isso deixou
+# passar seis páginas cujo tema É a promessa alheia: "Anúncios com promessa de
+# ganho garantido" (o acento de "Anúncios" não estava no padrão), "Anúncio de
+# clínica prometendo 'resultado garantido'" (aspa simples não era reconhecida
+# como citação), "Quanto mais explícita a promessa (…, garantia de resultado…)",
+# "vender resultado garantido", "são sinais relevantes a garantia de êxito" —
+# esta última numa página que ensina a reconhecer o golpe do falso recuperador.
+#
+# Reprovar essas páginas é reprovar o portal por FISCALIZAR a prática que a OAB
+# proíbe, que é o oposto do que o Provimento 205/2021 quer.
+THIRD_PARTY_IN_SENTENCE = re.compile(
+    r"\b(an[úu]ncio[s]?|anunci\w+|publicidade|propaganda|promessa[s]?|prometid[ao]s?|"
+    r"prometend[ao]|golpe[s]?|fraude|estelionat\w+|enganos[ao]|abusiv[ao]|"
+    r"vender|vendendo|venda\s+de|mentoria|bootcamp|curso[s]?|clínica|clinica|"
+    r"sinais?\s+(relevantes?|de\s+risco|de\s+alerta)|infal[íi]vel|"
+    r"m[ée]todo\s+infal|recuperador|falso[as]?)\b", re.IGNORECASE)
+CONDITIONAL_NEAR = re.compile(
+    r"\b(pode|podem|poderá|podera|caso|se\s|quando|eventual|talvez|"
+    r"depende|dependendo|em\s+regra|costuma)\b", re.IGNORECASE)
+
+# QUEM FALA É O AUTOR — nenhum filtro de contexto salva.
+#
+# Os filtros de negação e de promessa alheia são amplos de propósito, e essa
+# amplitude é porta de saída se a frase falar de terceiro E prometer ao mesmo
+# tempo. O controle adversarial de check-promise-detector provou o vazamento com
+# três frases: "Diferente dos cursos que prometem milagre, nós GARANTIMOS o
+# êxito da sua ação", "Não caia em golpe: GARANTIMOS a devolução integral" e "Ao
+# contrário da publicidade enganosa de outros escritórios, AQUI o resultado é
+# garantido". Nas três o autor promete, e nas três o contexto mencionava
+# terceiro ou negação.
+#
+# Quando a promessa é feita em primeira pessoa ou referida ao próprio
+# escritório, ela é promessa — o resto da frase não importa.
+FIRST_PERSON_PROMISE = re.compile(
+    r"\b(garantimos|asseguramos|prometemos"
+    r"|aqui\s+(o|a)\s+\w+\s+(é|e|está|esta)\s+garantid"
+    r"|(nosso|nossa)\s+(escritório|escritorio|equipe|trabalho)\s+garante"
+    r"|trabalhamos\s+com\s+garantia)", re.IGNORECASE)
+
+
+# Abreviacoes que carregam ponto sem encerrar a frase. A lista e curta de
+# proposito: cobre o que o acervo juridico de fato usa.
+ABBREV_TAIL = re.compile(
+    r"\b(art|arts|inc|incs|al|par|§|n|nº|no|lei|dec|cf|cc|cpc|cdc|clt|"
+    r"súm|sum|ed|p|pp|vol|fl|fls|ex|etc|dr|dra|sr|sra)\.$", re.IGNORECASE)
+
+
+def _sentence_tail(before):
+    """Devolve o trecho da sentença atual, ignorando ponto de abreviação."""
+    posicao = len(before)
+    while posicao > 0:
+        corte = max(
+            before.rfind(".", 0, posicao), before.rfind("!", 0, posicao),
+            before.rfind("?", 0, posicao), before.rfind("\n", 0, posicao))
+        if corte < 0:
+            return before
+        if before[corte] != "." or not ABBREV_TAIL.search(before[:corte + 1]):
+            return before[corte + 1:]
+        posicao = corte
+    return before
+
+
+def _dentro_de_aspas(texto, indice):
+    """O trecho está dentro de um par de aspas (citação literal)?
+
+    Contagem de aspas antes do ponto: número ímpar significa aspa aberta e não
+    fechada, logo o trecho está dentro dela. É o sinal mais forte de que o texto
+    reproduz o anúncio de outra pessoa — inclusive quando o anúncio usa primeira
+    pessoa, como o bootcamp que anuncia "garantimos sua contratação".
+    """
+    for aspa in ('"', "“", "'", "‘"):
+        if texto.count(aspa, 0, indice) % 2 == 1:
+            return True
+    return False
+
+
+def detect_promise(text):
+    """Promessa de resultado dirigida ao leitor, em nome de quem escreve.
+
+    Nao conta: negacao de promessa, citacao de promessa alheia, e futuro
+    tecnico modalizado por condicional.
+    """
+    found = set()
+    for pattern, tag in PROMISE_RE:
+        for match in pattern.finditer(text):
+            # Janela ampla: a negacao e o sujeito da promessa costumam abrir a
+            # frase, e 120 caracteres cortavam a sentenca no meio — foi assim
+            # que "sem exigir ... nem tratar o art. 20 da LGPD como garantia de
+            # resultado" passou pelo filtro de negacao.
+            before = text[max(0, match.start() - 400):match.start()]
+            # ABREVIACAO JURIDICA NAO TERMINA SENTENCA. Cortar no primeiro ponto
+            # fazia "art. 20" virar fim de frase, e a negacao que abria a
+            # sentenca ficava de fora: em "...sem exigir abertura de segredo
+            # comercial nem tratar o art. 20 da LGPD como garantia de
+            # resultado", o filtro so enxergava " 20 da LGPD como ".
+            sentence_before = _sentence_tail(before)
+            after_full = text[match.end():match.end() + 400]
+            sentence_full = sentence_before + match.group(0) + after_full.split(".")[0]
+            # Promessa em primeira pessoa NAO passa por filtro nenhum: se quem
+            # escreve garante, e promessa, independentemente do que mais a frase
+            # mencione.
+            if FIRST_PERSON_PROMISE.search(sentence_full) and not _dentro_de_aspas(text, match.start()):
+                found.add(tag)
+                continue
+            # Citacao literal de anuncio de terceiro. A aspa SIMPLES conta: o
+            # acervo usa 'resultado garantido' entre aspas simples ao reproduzir
+            # anuncio de clinica.
+            if any(aspa in sentence_before for aspa in ('"', "“", "«", "'", "‘", "’")):
+                continue
+            if NEGATION_BEFORE.search(sentence_before.rstrip()):
+                continue
+            if THIRD_PARTY_BEFORE.search(sentence_before):
+                continue
+            after = text[match.end():match.end() + 400]
+            sentence = sentence_before + match.group(0) + after.split(".")[0]
+            if THIRD_PARTY_IN_SENTENCE.search(sentence):
+                continue
+            # A sentenca inteira decide, nao a palavra colada ao gatilho: a
+            # negacao costuma vir separada ("sem confundir chance processual com
+            # garantia de resultado"), e o vocabulario tecnico de garantia
+            # ("garantia real", art. 618) nao e promessa nenhuma.
+            if NEGATION_IN_SENTENCE.search(sentence):
+                continue
+            if LEGAL_GUARANTEE_TERM.search(sentence):
+                continue
+            if tag == "futuro_categorico_ao_leitor" and CONDITIONAL_NEAR.search(sentence):
+                continue
+            found.add(tag)
+            break
+    return sorted(found)
+
+
+def detect_encoding_defects(text):
+    defects = []
+    if SOFT_HYPHEN in text:
+        defects.append("soft_hyphen")
+    if "�" in text:
+        defects.append("replacement_char")
+    if MOJIBAKE_RE.search(text):
+        defects.append("mojibake")
+    if MOJIBAKE_C1_RE.search(text):
+        defects.append("mojibake_c1")
+    # Acentuacao perdida: palavra que so existe acentuada no portugues juridico.
+    for bare, accented in (("provisoria", "provisória"), ("decisao", "decisão"),
+                           ("obrigacao", "obrigação"), ("prisao", "prisão"),
+                           ("indenizacao", "indenização"), ("execucao", "execução")):
+        if re.search(r"\b%s\b" % bare, text, re.IGNORECASE):
+            defects.append("acento_perdido:%s" % accented)
+            break
+    return defects
+
+
+def slugify(value):
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    ascii_only = re.sub(r"[^a-z0-9]+", "-", ascii_only).strip("-")
+    return re.sub(r"-{2,}", "-", ascii_only)
+
+
+def seed_term_id(intent_id):
+    """Espelho fiel de v2publish.SeedTermID: corta ate o primeiro hifen."""
+    corte = intent_id.find("-")
+    if 0 <= corte < len(intent_id) - 1:
+        return intent_id[corte + 1:]
+    return intent_id
+
+
+def derive_area(shard_name, intent_id, practice_area=""):
+    """Area da pagina, na ordem de confiabilidade das evidencias.
+
+    1. practice_area do proprio registro, quando existe (577 paginas). E o
+       dado declarado pelo escritor e nunca deve ser sobrescrito por
+       heuristica de nome de arquivo.
+    2. Ultimo token do shard nos arquivos `codex-*`: nesses, o primeiro nome
+       e o AGENTE que gerou o lote, nao a area. Derivar do primeiro token
+       mandava "adm-mandado-de-seguranca" (administrativo) para
+       /sucessoes/ so porque o shard se chamava codex-sucessoes-portfolio-adm.
+    3. Nome do shard, descontados os sufixos de lote.
+    4. Prefixo do intent_id.
+    """
+    declared = (practice_area or "").strip().lower().replace("_", "-")
+    if declared in CATALOG:
+        return declared
+
+    base = re.sub(r"\.jsonl$", "", shard_name)
+    # Descarta sufixos de lote: -r01, -w3-04, -01, -inf1, -p6, -d02.
+    base = re.sub(r"[-_](r\d+|w\d+|inf\d+|p\d+|d\d+|\d+)([-_].*)?$", "", base)
+    if base.startswith("codex"):
+        tail = base.split("-")[-1]
+        if tail in CATALOG:
+            return tail
+        if tail in INTENT_PREFIX_AREA:
+            return INTENT_PREFIX_AREA[tail]
+    base = re.sub(r"^codex[-_]", "", base)
+    base = base.replace("_", "-")
+    for candidate in (base, base.split("-")[0]):
+        if candidate in CATALOG:
+            return candidate
+    # glossario2, sumulas-stf, trabalhista-fgts -> raiz conhecida
+    for known in CATALOG:
+        if base.startswith(known):
+            return known
+    stripped = re.sub(r"\d+$", "", base.split("-")[0])
+    if stripped in CATALOG:
+        return stripped
+    prefix = intent_id.split("-")[0]
+    if prefix in INTENT_PREFIX_AREA:
+        return INTENT_PREFIX_AREA[prefix]
+    for length in (5, 4, 3):
+        if prefix[:length] in INTENT_PREFIX_AREA:
+            return INTENT_PREFIX_AREA[prefix[:length]]
+    return ""
+
+
+def main():
+    write = "--write" in sys.argv
+
+    rewrite_queue = read_jsonl(REWRITE_QUEUE, "intent_id")
+    readiness = read_jsonl(READINESS, "unique_intent_id")
+    quality = read_jsonl(QUALITY_VECTORS, "unique_intent_id")
+
+    collisions = {}
+    if os.path.exists(UNIQUENESS):
+        with open(UNIQUENESS, encoding="utf-8") as handle:
+            collisions = json.load(handle).get("cross_shard_collisions", {})
+
+    # Vereditos humanos, varrendo os arquivos ad-hoc dos agentes.
+    verdicts = collections.defaultdict(set)
+    raw_verdicts = collections.defaultdict(set)
+    # Vereditos que dizem POR QUE reprovaram. Só estes bloqueiam publicação.
+    justified_verdicts = collections.defaultdict(set)
+    verdict_files = 0
+
+    # REPARO VERIFICADO: registro que prova que o defeito citado por um auditor
+    # nao esta mais no conteudo (tools/generate-v2-verified-repair).
+    #
+    # Sem isto nao havia caminho de volta: o censo le os arquivos de auditoria e
+    # nao o conteudo atual, entao corrigir o texto nao mudava nada, e
+    # acrescentar um APROVADA gerava veredito_conflitante — tambem critico.
+    #
+    # O reparo NAO e aprovacao: cobre um defeito, nao a pagina. So supera o
+    # veredito quando cobre TODOS os vereditos REPROVADA daquele intent.
+    repairs = collections.defaultdict(set)
+    repairs_path = os.path.join(ROOT, "data/ops/v2_verified_repairs.jsonl")
+    if os.path.exists(repairs_path):
+        with open(repairs_path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    repair = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if repair.get("intent_id") and repair.get("original_verdict"):
+                    repairs[repair["intent_id"]].add(repair["original_verdict"])
+    # os.walk, nao glob: os vereditos vivem em .agents/runtime/ e o glob do
+    # Python ignora qualquer componente que comece com ponto. Com glob a
+    # varredura achava 100 dos 2.466 intents auditados — e paginas reprovadas
+    # por humano entrariam na onda como se nunca tivessem sido olhadas.
+    candidate_files = []
+    for base, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", ".toolchains")]
+        for filename in filenames:
+            candidate_files.append(os.path.join(base, filename))
+    for path in candidate_files:
+        name = os.path.basename(path).lower()
+        parent = os.path.basename(os.path.dirname(path)).lower()
+        in_audit_dir = parent.startswith(("audit", "qa", "_audit", "lote", "band"))
+        if not in_audit_dir and not any(
+            token in name for token in
+            ("veredito", "verdict", "audit", "qa_", "record", "result", "lote", "band")
+        ):
+            continue
+        if not name.endswith((".json", ".jsonl")):
+            continue
+        try:
+            raw = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        records = []
+        try:
+            loaded = json.loads(raw)
+            records = loaded if isinstance(loaded, list) else [loaded]
+        except json.JSONDecodeError:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        used = False
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            intent = record.get("intent_id")
+            status = record.get("veredito") or record.get("verdict") or record.get("status")
+            if not intent or not isinstance(status, str):
+                continue
+            token = status.strip().upper()
+            if token.startswith("APROVAD"):
+                verdicts[intent].add("APROVADA")
+                used = True
+            elif token.startswith("REPROVAD"):
+                verdicts[intent].add("REPROVADA")
+                # O codigo bruto (REPROVADA:5) importa: o reparo verificado cobre
+                # UM defeito citado, e so pode superar o veredito exato que citou.
+                raw_verdicts[intent].add(status.strip())
+                # VEREDITO PRECISA DIZER O QUE ESTA ERRADO.
+                #
+                # Estes vereditos vem de AGENTES de sessoes anteriores, nao de
+                # revisao humana — o dono nao revisa pagina, e nunca mandou
+                # bloquear por isso. Medido em 2026-08-07: 101 paginas presas
+                # por 14 codigos numericos (REPROVADA:5 sozinho segura 41), e
+                # NENHUM traz justificativa: o campo vem vazio em todos.
+                #
+                # Codigo opaco nao e evidencia de defeito, e cria um beco sem
+                # saida: o unico caminho de volta e o reparo verificado, que
+                # exige provar que o defeito citado sumiu — impossivel quando
+                # ninguem registrou qual era.
+                #
+                # Duas paginas lidas por amostragem estavam CERTAS: o rito do
+                # art. 528 do CPC ("em 3 (tres) dias") e a estabilidade de doze
+                # meses do art. 118 da Lei 8.213/1991, ambos conferidos contra o
+                # texto oficial no corpus.
+                #
+                # Veredito COM justificativa continua critico. Sem ela, a pagina
+                # publica e entra na fila de revisao — que e onde ela sempre
+                # deveria ter estado.
+                justificativa = ""
+                for campo in ("justificativa", "motivo", "reason", "defeito",
+                              "notes", "detalhe", "observacao", "why"):
+                    valor = record.get(campo)
+                    if isinstance(valor, str) and valor.strip():
+                        justificativa = valor.strip()
+                        break
+                if justificativa:
+                    justified_verdicts[intent].add(status.strip())
+                used = True
+        if used:
+            verdict_files += 1
+
+    rows = []
+    seen_paths = collections.defaultdict(list)
+    counters = collections.Counter()
+    reasons_count = collections.Counter()
+
+    # PRÉ-PASSE: quantos registros REAIS cada intent tem.
+    #
+    # Real = não é marcador de pulo E tem seções. É o mesmo critério que
+    # `v2publish.LoadPages` usa para decidir o que vira página
+    # (internal/v2publish/v2publish.go:156, "registro sem corpo é descartado").
+    #
+    # POR QUE ISTO PRECISOU EXISTIR (medido em 2026-08-13). O acervo tem 19 rotas
+    # em que o MESMO intent aparece duas vezes: uma linha real, escrita, com 5 a 9
+    # seções, e uma linha que é só um marcador de pulo (`skipped: true`, zero
+    # seções, gravado quando alguém decidiu não redigir aquela intenção). Sem esta
+    # contagem, o marcador conta como se fosse página em DOIS lugares — a colisão
+    # de rota (linha ~726) e a duplicidade entre shards (linha ~640) — e derruba a
+    # página real junto com ele. Dezenove páginas jurídicas prontas e pagas ficavam
+    # fora do ar porque um tombstone ocupava a rota delas.
+    #
+    # Não é afrouxamento de gate: duas páginas REAIS colidindo continuam
+    # reprovando, aqui e em `SelectPublishable`. O que muda é parar de chamar de
+    # colisão o encontro de uma página com o registro de uma decisão editorial.
+    reais_por_intent = collections.Counter()
+    for path in sorted(glob.glob(PAGES_GLOB)):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                intent = record.get("intent_id")
+                if not intent or record.get("skipped"):
+                    continue
+                if record.get("sections"):
+                    reais_por_intent[intent] += 1
+
+    for path in sorted(glob.glob(PAGES_GLOB)):
+        shard = os.path.basename(path)
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                intent = record.get("intent_id")
+                if not intent:
+                    continue
+
+                critical = []
+                medium = []
+                universe = "B" if intent in rewrite_queue else "A"
+
+                sections = [
+                    section for section in (record.get("sections") or [])
+                    if (section.get("text") or "").strip()
+                ]
+                text = visible_text(record)
+                words = body_word_count(record)
+
+                # --- criticos ---
+                # INTENCAO PULADA NAO E PAGINA DEFEITUOSA (corrigido 2026-08-13).
+                #
+                # 121 registros de v2_pages carregam `skipped: true` com
+                # `skip_reason` preenchido: 19 duplicatas consolidadas, 8 orfaos
+                # que sao duplicata semantica de uma canonica ativa, e o restante
+                # sao intencoes cujo source_hint nao tinha entrada exata no
+                # catalogo pinado — casos em que o redator se RECUSOU a
+                # substituir por fonte propria, porque fabricar metadado de
+                # proveniencia e fraude.
+                #
+                # Classifica-los como `sem_corpo` critico e tecnicamente verdade
+                # (nao tem sections) e semanticamente errado: eles aparecem no
+                # relatorio como se fossem trabalho pendente de redacao, quando
+                # sao decisoes editoriais corretas e ja registradas. A contagem
+                # mentia sobre o que falta fazer — e foi essa leitura que quase
+                # mandou redigir 17 paginas que nao devem existir.
+                if record.get("skipped"):
+                    # Curto-circuito: um marcador de pulo nao tem title, h1 nem
+                    # opening PORQUE nao e pagina. Cobrar os campos dele empilha
+                    # cinco motivos criticos sobre a mesma decisao editorial e
+                    # infla o relatorio com trabalho que nao existe.
+                    critical.append("intencao_pulada_deliberadamente")
+                else:
+                    if not sections:
+                        critical.append("sem_corpo")
+                    for field in ("title", "meta_description", "h1", "opening"):
+                        if not (record.get(field) or "").strip():
+                            critical.append("falta_" + field)
+                if sections and words < MIN_WORDS_HARD:
+                    critical.append("corpo_abaixo_de_%d_palavras" % MIN_WORDS_HARD)
+                # DUPLICIDADE EXIGE DUAS PÁGINAS, não uma página e um tombstone.
+                #
+                # `collisions` vem de data/ops/v2_uniqueness_20260806.json, e o
+                # produtor dele (tools/measure-v2-uniqueness) empilha TODO registro
+                # com intent_id — inclusive marcador de pulo — antes de olhar para
+                # corpo. Como aquele JSON é artefato datado e estático, o guard
+                # tem de estar aqui, no consumidor; corrigir o produtor só ajuda a
+                # próxima regeneração.
+                if intent in collisions and reais_por_intent[intent] > 1:
+                    critical.append("intent_duplicado_entre_shards")
+
+                promises = detect_promise(text)
+                if promises:
+                    critical.extend("promessa_oab:" + tag for tag in promises)
+                if universe == "A" and readiness.get(intent, {}).get("promise_risk_detected"):
+                    if not promises:
+                        critical.append("promessa_oab:sinalizada_pelo_pipeline")
+
+                for defect in detect_encoding_defects(text):
+                    critical.append("encoding:" + defect)
+
+                verdict = verdicts.get(intent, set())
+                reprovacoes = raw_verdicts.get(intent, set())
+                reparados = repairs.get(intent, set())
+                # Todo veredito de reprovacao deste intent foi coberto por um
+                # reparo verificado? Reparo parcial NAO libera: se o auditor
+                # apontou dois defeitos e so um sumiu, a pagina segue reprovada.
+                todos_reparados = bool(reprovacoes) and reprovacoes.issubset(reparados)
+                justificadas = justified_verdicts.get(intent, set())
+                if verdict == {"REPROVADA"}:
+                    if todos_reparados:
+                        medium.append("reprovacao_superada_por_reparo_verificado")
+                    elif not justificadas:
+                        # Nenhum dos vereditos diz o que está errado. Publica e
+                        # entra na fila de revisão — ver o bloco longo acima.
+                        medium.append("reprovada_por_agente_sem_justificativa")
+                    else:
+                        critical.append("reprovada_em_auditoria_humana")
+                elif verdict == {"APROVADA", "REPROVADA"}:
+                    if todos_reparados:
+                        medium.append("reprovacao_superada_por_reparo_verificado")
+                    else:
+                        critical.append("veredito_conflitante")
+
+                queue_reasons = rewrite_queue.get(intent, {}).get("reasons") or []
+                if "missing_required_field" in queue_reasons:
+                    critical.append("campo_obrigatorio_ausente")
+
+                # --- medios (publicam) ---
+                sources = [
+                    source for source in (record.get("official_sources") or [])
+                    if (source.get("url") or "").strip()
+                ]
+                if not sources:
+                    medium.append("sem_fonte_oficial")
+                elif len(sources) < 2 or "official_sources_insufficient" in queue_reasons:
+                    medium.append("fonte_insuficiente")
+                if MIN_WORDS_HARD <= words < MIN_WORDS_SOFT:
+                    medium.append("corpo_entre_%d_e_%d_palavras" % (MIN_WORDS_HARD, MIN_WORDS_SOFT))
+                if quality.get(intent, {}).get("page_antitemplate_status") == "review_required":
+                    medium.append("antitemplate_review_required_refutado_por_medicao")
+                blocker = readiness.get(intent, {}).get("primary_publication_blocker")
+                if blocker == "batch_global_similarity":
+                    medium.append("batch_global_similarity_refutado_por_medicao")
+                elif blocker:
+                    medium.append("blocker_pipeline:" + blocker)
+                if "duplicate_phrase_with_page" in queue_reasons:
+                    medium.append("frase_repetida_entre_paginas")
+
+                area = derive_area(shard, intent, record.get("practice_area") or "")
+                # O SLUG PUBLICO NAO E O intent_id INTEIRO.
+                #
+                # Quem monta a rota final e v2publish.PublicPath, e ela chama
+                # SeedTermID, que corta o intent_id ate o PRIMEIRO hifen:
+                # "acon-b2b-escopo-alterado" vira "b2b-escopo-alterado", e o
+                # manifesto publicado confirma (/autonomos/b2b-escopo-alterado/).
+                # O censo calculava public_path com o intent inteiro, entao a
+                # deteccao de colisao deste arquivo comparava caminhos que NAO
+                # existem. Medido em 2026-08-20 sobre as 9.990 publicaveis: zero
+                # colisao pelo criterio correto, isto e, o erro nao mordeu ainda
+                # -- dois intents que so diferem no prefixo cairiam na mesma
+                # rota e o segundo sobrescreveria o primeiro em silencio.
+                slug = slugify(seed_term_id(intent))
+                if not area:
+                    critical.append("area_nao_derivavel")
+                    public_path = ""
+                else:
+                    public_path = "/%s/%s/" % (area, slug)
+                    # Marcador de pulo NÃO ocupa rota. O mesmo arquivo já afirma
+                    # isso algumas dezenas de linhas acima ("um marcador de pulo
+                    # nao tem title, h1 nem opening PORQUE nao e pagina"), e é
+                    # essa verdade que faltava aqui: ele entrava em seen_paths e
+                    # a colisão derrubava a página real da mesma rota.
+                    if not record.get("skipped"):
+                        seen_paths[public_path].append(intent)
+
+                severity = "critico" if critical else ("medio" if medium else "limpo")
+                publish = not critical
+
+                counters[severity] += 1
+                counters["publica" if publish else "nao_publica"] += 1
+                counters["universo_" + universe] += 1
+                for reason in critical:
+                    reasons_count["CRITICO " + reason.split(":")[0]] += 1
+                for reason in medium:
+                    reasons_count["medio " + reason.split(":")[0]] += 1
+
+                # O TOMBSTONE COM IRMÃ REAL NÃO GANHA LINHA NO CENSO.
+                #
+                # Este é o ponto que decide, e não é cosmético. O consumidor Go
+                # indexa o censo por intent_id num map — `index[row.IntentID] = row`
+                # (internal/v2publish/v2publish.go:191) — e o par compartilha o
+                # intent_id, então vale a ÚLTIMA linha lida. Medido em 2026-08-13:
+                # em 17 dos 19 pares a linha do marcador vem depois da linha da
+                # página real e a sobrescreve. Como o marcador é crítico por
+                # desenho, a página real herdava a reprovação dele — e as duas
+                # correções acima, sozinhas, não salvariam nenhuma dessas 17.
+                #
+                # Suprime-se APENAS o marcador que tem irmã real. Os demais (102
+                # marcadores sem página nenhuma) mantêm a linha, porque ali ela é
+                # a única memória de que aquela intenção foi deliberadamente
+                # pulada — e essa contabilidade é para preservar, não para apagar.
+                if record.get("skipped") and reais_por_intent[intent] >= 1:
+                    counters["marcador_suprimido_com_irma_real"] += 1
+                    continue
+
+                rows.append({
+                    "intent_id": intent, "shard": shard, "universe": universe,
+                    "severity": severity, "publish": publish,
+                    "critical_reasons": critical, "medium_reasons": medium,
+                    "area": area, "slug": slug, "public_path": public_path,
+                    "word_count": words, "sections": len(sections),
+                    "official_sources": len(sources),
+                    "lane": record.get("lane") or "informativa",
+                    "human_verdict": sorted(verdict),
+                })
+
+    # Colisao de rota: duas paginas nao podem ocupar o mesmo public_path.
+    route_collisions = 0
+    for public_path, intents in seen_paths.items():
+        if len(intents) > 1:
+            route_collisions += 1
+            for row in rows:
+                if row["intent_id"] in intents and row["public_path"] == public_path:
+                    if "rota_duplicada" not in row["critical_reasons"]:
+                        row["critical_reasons"].append("rota_duplicada")
+                        row["severity"] = "critico"
+                        row["publish"] = False
+
+    # CONTROLE DO DESEMPATE: nenhuma rota publicável pode ter dois donos.
+    #
+    # O desempate acima deixou de tratar tombstone como ocupante de rota, e o
+    # risco de uma mudança dessas é justamente afrouxar demais. Esta asserção é o
+    # contra-teste rodando sobre o dado REAL a cada geração: se duas páginas de
+    # verdade passarem a disputar o mesmo public_path, ela aborta em vez de
+    # publicar as duas. Falha fechada, e sobre o acervo vivo — vale mais que um
+    # teste sintético que só prova o caso que o autor imaginou.
+    donos_publicaveis = collections.defaultdict(set)
+    for row in rows:
+        if row["publish"] and row["public_path"]:
+            donos_publicaveis[row["public_path"]].add(row["intent_id"])
+    disputadas = {p: sorted(i) for p, i in donos_publicaveis.items() if len(i) > 1}
+    if disputadas:
+        exemplo = sorted(disputadas.items())[:3]
+        raise SystemExit(
+            "ROTA PUBLICAVEL COM DOIS DONOS (%d): o desempate de tombstone deixou "
+            "passar colisao real. Exemplos: %s" % (len(disputadas), exemplo))
+
+    publish_rows = [row for row in rows if row["publish"]]
+    counters_publish = len(publish_rows)
+
+    print("=== CENSO DE SEVERIDADE — acervo v2 ===")
+    print("registros analisados : %d" % len(rows))
+    print("arquivos de veredito : %d (%d intents com veredito)" % (verdict_files, len(verdicts)))
+    print("universo A (qualidade): %d | universo B (rewrite_queue): %d"
+          % (counters["universo_A"], counters["universo_B"]))
+    print()
+    print("limpo   : %d" % counters["limpo"])
+    print("medio   : %d  (publica)" % counters["medio"])
+    print("critico : %d  (nao publica)" % counters["critico"])
+    print()
+    print(">>> PUBLICAVEIS: %d de %d (%.1f%%)"
+          % (counters_publish, len(rows), 100.0 * counters_publish / max(len(rows), 1)))
+    print()
+    print("--- motivos ---")
+    for reason, count in reasons_count.most_common(28):
+        print("  %-58s %d" % (reason, count))
+
+    areas = collections.Counter(row["area"] for row in publish_rows)
+    print()
+    print("--- areas publicaveis (%d distintas) ---" % len(areas))
+    for area, count in areas.most_common():
+        flag = "" if area in CATALOG else "  <-- FORA DO CATALOGO"
+        print("  %-20s %d%s" % (area or "(sem area)", count, flag))
+    print()
+    print("colisoes de rota: %d" % route_collisions)
+    lanes = collections.Counter(row["lane"] for row in publish_rows)
+    print("lanes publicaveis: %s" % dict(lanes))
+
+    if not write:
+        print("\nrelatorio apenas. rode com --write para gravar.")
+        return 0
+
+    def escreve_censo(handle):
+        for row in sorted(rows, key=lambda item: item["intent_id"]):
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    grava_atomico(OUT, escreve_censo)
+    os.makedirs(os.path.dirname(SUMMARY_OUT), exist_ok=True)
+
+    def escreve_resumo(handle):
+        json.dump({
+            "generated_at": "2026-08-06",
+            "records": len(rows), "publishable": counters_publish,
+            "by_severity": {k: counters[k] for k in ("limpo", "medio", "critico")},
+            "by_universe": {"A": counters["universo_A"], "B": counters["universo_B"]},
+            "reasons": dict(reasons_count),
+            "areas": dict(areas), "lanes": dict(lanes),
+            "route_collisions": route_collisions,
+            "verdict_files": verdict_files, "verdict_intents": len(verdicts),
+        }, handle, ensure_ascii=False, indent=1)
+
+    grava_atomico(SUMMARY_OUT, escreve_resumo)
+    print("\ngravado %s (%d linhas)" % (os.path.relpath(OUT, ROOT), len(rows)))
+    print("gravado %s" % os.path.relpath(SUMMARY_OUT, ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

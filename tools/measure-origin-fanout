@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""measure-origin-fanout — mede quantas vezes a origem e buscada pela MESMA URL.
+
+POR QUE EXISTE: em 2026-08-12 mediu-se que **2.007 de 2.010** requisicoes de bot
+verificado tocaram a origem (99,9%), porque o cache da Cloudflare e **por colo** e
+o rastreio entra por **18 colos em 4 continentes** — Google por DFW, Yandex por
+FRA/MXP/TLL, OpenAI por ATL/GRU, Amazon por IAD. Por GIG (Rio), que e o unico
+colo que o nosso aquecedor esquenta, nao chega praticamente ninguem.
+
+O Smart Tiered Cache foi ligado no mesmo dia para que os colos passem a buscar de
+um **upper tier** unico em vez de cada um ir a origem.
+
+POR QUE O LOG DO NGINX E NAO A API: o dataset da borda no plano Free **nega** as
+dimensoes `coloCode` e `upperTierColoName` (erro de authz), entao hit ratio por
+colo e imensuravel por la. Mas toda requisicao que CHEGA a origem carrega o
+`cf_ray`, e uma requisicao que chega e, por definicao, uma que o cache nao
+serviu. O log da origem e o complemento exato do que a API esconde.
+
+────────────────────────────────────────────────────────────────────────────
+CORRECAO DE 2026-08-12, e ela invalida o teste que esta ferramenta propunha
+
+O criterio original dizia: "com tiered cache, a variedade de colos no log da
+origem COLAPSA para o upper tier". **Isso e infalsificavel neste projeto e nao
+deve ser usado.**
+
+O motivo e o tunel. O `cloudflared` desta zona registra conexao SO em GIG
+(medido: gig02, gig09, gig10, gig11 no journal do servico), entao a origem e
+sempre alcancada por GIG, com ou sem tiered cache. E o sufixo do `cf_ray` que
+chega ao nginx e o colo de **ENTRADA** do cliente — IAD, AMS, DUS —, nao o colo
+que conversou com a origem. Logo a "variedade de colos" no log mede por onde o
+robo entrou na rede, e ela nao muda quando o tiered cache liga.
+
+Pelo mesmo motivo o `fan_out_medio` e fraco aqui: ele ja era **1,05** na linha de
+base, porque os crawlers buscam URLs DIFERENTES, nao a mesma URL de varios
+lugares. Nao ha busca duplicada para o tiered cache eliminar.
+
+O TESTE QUE VALE, e o unico: para uma familia de robo que entra por um colo
+distante, comparar **quantas requisicoes a borda registrou** contra **quantas
+chegaram a origem**. Em 2026-08-12, com o seletor de topologia ligado e o
+interruptor mestre ainda desligado, a medicao deu 494 chegadas na origem contra
+511 registradas na borda — **96,7% atravessaram**, e cinco amostras conferidas
+uma a uma mostraram o objeto ja cacheado em GIG HORAS antes de o robo pedir por
+IAD. Prova direta de que o upper tier nao estava servindo nada.
+
+Por isso `colos_na_origem` continua sendo impresso — e informacao util sobre por
+onde o rastreio entra — mas **nao e mais criterio de sucesso de tiered cache**,
+e quem o usar assim vai concluir errado.
+
+COMO LER O RESULTADO:
+  - `fan_out_medio` = buscas na origem / URLs distintas buscadas. Neste projeto
+    fica perto de 1 por natureza do trafego; nao espere que caia.
+  - `colos_na_origem` = por onde o rastreio ENTRA na rede da Cloudflare. Nao diz
+    quem falou com a origem (com tunel, quem fala e sempre GIG).
+  - `atravessaram_pct` = a medida que importa: requisicoes na origem dividido
+    pelas que a borda registrou para a mesma familia e janela.
+  - A comparacao honesta e ANTES x DEPOIS na mesma janela de horas, nao um numero
+    isolado: o trafego de crawler varia muito por hora do dia.
+
+Uso:
+    tools/measure-origin-fanout --horas 6
+    tools/measure-origin-fanout --horas 24 --json
+    tools/measure-origin-fanout --marco antes-do-tiered-cache   # grava linha de base
+"""
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import botagents  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+LOG = "/var/log/nginx/wikijuridica/access.log"
+SERIE = os.path.join(ROOT, "data", "ops", "origin_fanout.jsonl")
+SCHEMA = "origin_fanout_v1"
+
+# Formato wj_main, documentado no topo de ops/nginx/wikijuridica.conf. O cf_ray
+# vem como "<id>-<COLO>"; o colo sao os caracteres depois do ultimo hifen.
+LINHA = re.compile(
+    r'^(?P<ip>\S+) - \[(?P<data>[^\]]+)\] host=(?P<host>\S+) "(?P<req>[^"]*)" '
+    r'(?P<status>\d{3}) (?P<bytes>\d+) "(?P<ua>[^"]*)" '
+    r'allow=(?P<allow>\S+) bot_sim=(?P<sim>\S+) rt=(?P<rt>\S+) cf_ray=(?P<ray>\S+)'
+)
+DATA_LOG = "%d/%b/%Y:%H:%M:%S %z"
+
+# `warm=` nao esta na LINHA acima porque ele so entrou no log_format em
+# 2026-08-27, depois desta ferramenta. Ate 2026-08-29 o desconto daqui era
+# `bot_sim` + prefixo de User-Agent, e o aquecimento de borda que NAO casa o
+# prefixo passava por rastreio real — o mesmo buraco que `botagents.ip_nao_publico`
+# existe para tapar. Regex proprio, tolerante a ausencia do campo.
+MARCA_WARM = re.compile(r"\bwarm=(?P<warm>\S*)")
+
+
+def parse_data(bruto):
+    try:
+        return datetime.datetime.strptime(bruto, DATA_LOG)
+    except ValueError:
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--horas", type=int, default=6, help="janela examinada (padrão 6)")
+    parser.add_argument("--marco", default="", help="rótulo desta medição no registro")
+    parser.add_argument("--json", action="store_true", help="saída em JSON")
+    parser.add_argument("--sem-registro", action="store_true", help="não anexa ao JSONL")
+    args = parser.parse_args()
+
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    corte = agora - datetime.timedelta(hours=args.horas)
+
+    try:
+        arquivo = open(LOG, encoding="utf-8", errors="replace")
+    except OSError as erro:
+        print("measure-origin-fanout: %s ilegivel (%s)" % (LOG, erro), file=sys.stderr)
+        return 2
+
+    urls = collections.Counter()
+    colos = collections.Counter()
+    total = 0
+    descartadas = 0
+    bruto = 0
+    fora_da_borda = 0
+    por_motivo = collections.Counter()
+    with arquivo:
+        for linha in arquivo:
+            achou = LINHA.match(linha)
+            if not achou:
+                continue
+            quando = parse_data(achou.group("data"))
+            if quando is None or quando < corte:
+                continue
+            bruto += 1
+            # Sonda nossa e aquecimento nao sao "a origem sendo buscada pela
+            # borda": sao nos mesmos. Conta-los inverteria o sinal da medida. O
+            # criterio e o UNICO do repositorio (botagents.motivo_de_desconto),
+            # e o motivo sai NOMEADO — "descartadas" agregava quatro causas
+            # diferentes num numero so, e uma delas (sem cf_ray) nem e trafego
+            # interno: e acesso local que simplesmente nao passou pela borda.
+            marca = MARCA_WARM.search(linha)
+            motivo = botagents.motivo_de_desconto(
+                bot_sim=achou.group("sim"),
+                warm=marca.group("warm") if marca else None,
+                ip=achou.group("ip"),
+                user_agent=achou.group("ua"),
+            )
+            if motivo:
+                por_motivo[motivo] += 1
+                descartadas += 1
+                continue
+            ray = achou.group("ray")
+            if ray in ("-", ""):
+                # Sem cf_ray a requisicao nao veio pela borda (acesso local
+                # direto), entao nao diz nada sobre fan-out de cache. NAO entra
+                # no desconto de trafego interno: e outra pergunta.
+                por_motivo["sem_cf_ray_nao_veio_da_borda"] += 1
+                fora_da_borda += 1
+                continue
+            partes = achou.group("req").split()
+            caminho = partes[1] if len(partes) >= 2 else achou.group("req")
+            urls[caminho.split("?", 1)[0]] += 1
+            colos[ray.rsplit("-", 1)[-1]] += 1
+            total += 1
+
+    distintas = len(urls)
+    fan_out = (total / distintas) if distintas else 0.0
+    registro = {
+        "colos_na_origem": len(colos),
+        "colos_top": dict(colos.most_common(12)),
+        "descartadas_sonda_ou_local": descartadas,
+        "descartadas_por_motivo": dict(sorted(por_motivo.items())),
+        # O par (bruto, liquido) com o criterio na propria linha (BUG-070). Aqui
+        # o "liquido" desconta so o trafego DESTA CASA; o que nao veio pela borda
+        # sai em campo separado, porque some do fan-out por outra razao.
+        "denominador": botagents.denominador(bruto, descartadas),
+        "fora_da_borda_sem_cf_ray": fora_da_borda,
+        "fan_out_medio": round(fan_out, 3),
+        "janela_horas": args.horas,
+        "marco": args.marco,
+        "medido_em": agora.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "requisicoes_na_origem": total,
+        "schema_version": SCHEMA,
+        "urls_distintas": distintas,
+        "urls_mais_buscadas": dict(urls.most_common(8)),
+    }
+
+    if not args.sem_registro:
+        os.makedirs(os.path.dirname(SERIE), exist_ok=True)
+        with open(SERIE, "a", encoding="utf-8") as saida:
+            saida.write(json.dumps(registro, sort_keys=True, ensure_ascii=False) + "\n")
+
+    if args.json:
+        print(json.dumps(registro, sort_keys=True, ensure_ascii=False, indent=1))
+    else:
+        print("measure-origin-fanout (janela de %dh%s)"
+              % (args.horas, ", marco=%s" % args.marco if args.marco else ""))
+        print("  requisicoes que CHEGARAM a origem pela borda : %d" % total)
+        print("  URLs distintas buscadas                      : %d" % distintas)
+        print("  FAN-OUT medio (buscas por URL)               : %.3f" % fan_out)
+        print("  colos por onde o rastreio ENTROU na rede     : %d" % len(colos))
+        if colos:
+            print("    " + "  ".join("%s=%d" % (c, n) for c, n in colos.most_common(10)))
+        print("  " + botagents.denominador_em_uma_linha(
+            registro["denominador"], "denominador do log de origem"))
+        print("  fora da borda (sem cf_ray, acesso local direto)   : %d" % fora_da_borda)
+        if por_motivo:
+            print("  desconto por motivo: "
+                  + ", ".join("%s=%d" % (m, n) for m, n in sorted(por_motivo.items())))
+        print("\n  ATENCAO: o colo do cf_ray e o de ENTRADA do cliente, nao quem")
+        print("  falou com a origem — com tunel, quem fala e sempre GIG. Colapso")
+        print("  de colo NAO e teste de tiered cache; ver o cabecalho do arquivo.")
+        print("  O teste que vale: requisicoes na origem / requisicoes na borda,")
+        print("  pela mesma familia de robo e mesma janela.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

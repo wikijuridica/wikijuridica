@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""generate-baseline-bot-nao-confirmado — a linha de base do tráfego com UA de
+bot que a borda NÃO CONFIRMA.
+
+POR QUE EXISTE, medido em 2026-09-10. `tools/check-perfil-por-bot` reprovava com
+`--max-spoof 0` aplicado à SOMA de `requests_estimated_unverified_ua` ao longo da
+janela inteira. Duas coisas estavam erradas nesse veredito, e as duas foram
+medidas antes desta ferramenta nascer:
+
+  1. A ARITMÉTICA. Teto absoluto sobre soma de janela faz o limiar depender do
+     tamanho da janela: com `--dias 8`, UMA requisição não confirmada em oito
+     dias reprovava; com `--dias 30` o mesmo bot reprovaria por um terço do
+     ruído. Em 2026-09-10 o gate acusava 15 agentes de 15 — 1.000 para o
+     bingbot, que é 842 (06/09) + 158 (07/09), dois dias e um só IP.
+
+  2. A ATRIBUIÇÃO. "A Cloudflare não confirmou" não é "nós regredimos". O
+     volume de impostor que a borda absorve é comportamento de TERCEIRO: quem
+     decide mandar 842 requisições com o User-Agent do bingbot de
+     132.196.1.195 não somos nós, e nenhuma correção nossa o faz parar. O que
+     é observável, acionável e nosso é a REGRESSÃO — o dia em que esse volume
+     passa do que já se observou.
+
+O QUE ESTA FERRAMENTA **NÃO** É. Não é anistia. O número continua medido,
+continua impresso pelo check em toda execução (reprovando ou não) e continua
+nomeado por agente, por dia e por país. O que muda é o VEREDITO: reprova por
+regressão contra esta linha de base datada, e não por um teto zero que nenhuma
+engenharia nossa consegue atender.
+
+O QUE A LINHA DE BASE ABSORVE, DECLARADO. A janela de referência é a mesma
+linha do tempo em que o v4 da série existe (a perna de faixa de IP entrou em
+2026-09-02, `edge_bot_agents_daily_v4`): não há janela v4 anterior de onde
+tirar um baseline "limpo". Logo esta linha de base ABSORVE os episódios já
+medidos — inclusive o pico de 842 do bingbot em 06/09 e a rotação de identidade
+de 08/09 saída de um único host em Singapura (34.158.60.234,
+`bc.googleusercontent.com`). Isso é deliberado e não é silencioso: cada agente
+guarda `dia_do_maximo` e `paises_no_dia_do_maximo`, e esta ferramenta IMPRIME o
+que absorveu ao gravar. Quem ler o arquivo vê que o teto do bingbot é um dia de
+ataque, não a rotina dele.
+
+POR QUE NÃO ENTRA NO `run-qualidade-diaria`: linha de base regenerada todo dia
+se abençoa sozinha — o pico de ontem vira o normal de hoje e o gate nunca mais
+reprova. Ela se regenera por decisão, com a saída lida por quem a decidiu. O
+check reprova quando ela envelhece além do teto (`--baseline-max-idade-dias`),
+que é o único sinal de apodrecimento que uma série ruidosa admite.
+
+FONTE ÚNICA: `tools/edgetelemetry.serie_saneada`, o mesmo leitor que o check
+usa — descarta a linha fisicamente impossível e deduplica por (date, agent_key)
+mantendo a ÚLTIMA linha, que é a convenção declarada pelo produtor para o
+arquivo append-only. Reimplementar a leitura de uma série é como este repo
+acumulou três números diferentes para o mesmo dia.
+
+Uso:
+    ./tools/generate-baseline-bot-nao-confirmado
+    ./tools/generate-baseline-bot-nao-confirmado --dias 8
+    ./tools/generate-baseline-bot-nao-confirmado --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import statistics
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import edgetelemetry  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+RAIZ_PADRAO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SERIE_REL = os.path.join("data", "ops", "edge_bot_agents_daily.jsonl")
+BASELINE_REL = os.path.join("data", "ops", "baseline_bot_nao_confirmado.json")
+SCHEMA = "baseline_bot_nao_confirmado_v1"
+DIAS_PADRAO = 8
+
+CRITERIO = (
+    "por (agent_key, dia): requests_estimated_unverified_ua da linha deduplicada "
+    "por edgetelemetry.serie_saneada (ULTIMA linha do dia). A linha de base de um "
+    "agente e o MAXIMO DIARIO observado na janela de referencia — nunca a soma da "
+    "janela, que faria o limiar depender do tamanho dela."
+)
+
+
+def sha256_arquivo(caminho: str) -> str:
+    """Identidade do insumo. Sem ela, o baseline nao diz de que arquivo saiu."""
+    digestor = hashlib.sha256()
+    try:
+        with open(caminho, "rb") as handle:
+            for bloco in iter(lambda: handle.read(1 << 20), b""):
+                digestor.update(bloco)
+    except OSError:
+        return ""
+    return digestor.hexdigest()
+
+
+def _inteiro(valor) -> int:
+    """Contador da serie como inteiro, sem inventar numero.
+
+    `requests_estimated_unverified_ua` e gravado por `round()` pelo produtor,
+    mas linha de schema antigo pode nao ter o campo — e ausencia NUNCA vira
+    zero silencioso aqui: quem chama decide, olhando `tem_perna_faixa_ip`.
+    """
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return 0
+    return int(valor)
+
+
+def levantar(raiz: str, dias: int, serie: str | None = None) -> dict:
+    """Levanta a linha de base a partir da serie da borda.
+
+    A janela e definida pelas ULTIMAS `dias` datas PRESENTES na serie, e nao
+    por "hoje menos N": data que a coleta perdeu (timer parado, janela de
+    retencao estourada) nao pode encolher a janela em silencio nem empurrar
+    para dentro dela um dia que nao existe.
+    """
+    registros, descartadas = edgetelemetry.serie_saneada(raiz, caminho=serie)
+    datas = sorted({data for data, _agente in registros})
+    janela = datas[-dias:] if dias > 0 else datas
+    conjunto = set(janela)
+
+    por_agente: dict = {}
+    for (data, agente), registro in registros.items():
+        if data not in conjunto:
+            continue
+        acumulado = por_agente.setdefault(agente, {
+            "por_dia": {},
+            "ip_range_operator": None,
+            "ip_range_prefixes_total": 0,
+            "dias_sem_perna_faixa_ip": [],
+        })
+        tem_perna = "requests_estimated_ip_range" in registro
+        if not tem_perna:
+            acumulado["dias_sem_perna_faixa_ip"].append(data)
+        acumulado["por_dia"][data] = {
+            "nao_confirmado": _inteiro(registro.get("requests_estimated_unverified_ua")),
+            "confirmado_cloudflare": _inteiro(
+                registro.get("requests_estimated_cloudflare_verified")),
+            "confirmado_faixa_ip": _inteiro(registro.get("requests_estimated_ip_range")),
+            "paises_nao_confirmado": dict(registro.get("countries_unverified_ua") or {}),
+            "tem_perna_faixa_ip": tem_perna,
+        }
+        operador = registro.get("ip_range_operator")
+        if operador:
+            acumulado["ip_range_operator"] = operador
+            acumulado["ip_range_prefixes_total"] = _inteiro(
+                registro.get("ip_range_prefixes_total"))
+
+    agentes: dict = {}
+    for agente, acumulado in sorted(por_agente.items()):
+        dias_dados = acumulado["por_dia"]
+        valores = [d["nao_confirmado"] for d in dias_dados.values()]
+        maximo = max(valores) if valores else 0
+        # Empate resolve pela data MAIS RECENTE: o dia que o leitor precisa
+        # olhar primeiro e o ultimo em que o teto foi atingido.
+        dia_do_maximo = ""
+        for data in sorted(dias_dados):
+            if dias_dados[data]["nao_confirmado"] == maximo:
+                dia_do_maximo = data
+        pico = dias_dados.get(dia_do_maximo, {})
+        agentes[agente] = {
+            "max_diario": maximo,
+            "dia_do_maximo": dia_do_maximo,
+            "paises_no_dia_do_maximo": pico.get("paises_nao_confirmado", {}),
+            "confirmado_cloudflare_no_dia_do_maximo": pico.get("confirmado_cloudflare", 0),
+            "confirmado_faixa_ip_no_dia_do_maximo": pico.get("confirmado_faixa_ip", 0),
+            "mediana_diaria": int(statistics.median(valores)) if valores else 0,
+            "dias_observados": len(valores),
+            "dias_com_nao_confirmado": sum(1 for v in valores if v > 0),
+            "total_janela": sum(valores),
+            "ip_range_operator": acumulado["ip_range_operator"],
+            "ip_range_prefixes_total": acumulado["ip_range_prefixes_total"],
+            "dias_sem_perna_faixa_ip": sorted(acumulado["dias_sem_perna_faixa_ip"]),
+        }
+
+    caminho_serie = serie or os.path.join(raiz, SERIE_REL)
+    try:
+        linhas = sum(1 for linha in open(caminho_serie, encoding="utf-8") if linha.strip())
+    except OSError:
+        linhas = 0
+
+    return {
+        "schema_version": SCHEMA,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "fonte": os.path.relpath(caminho_serie, raiz),
+        "fonte_sha256": sha256_arquivo(caminho_serie),
+        "fonte_linhas": linhas,
+        "fonte_linhas_descartadas": len(descartadas),
+        "janela_referencia": {
+            "inicio": janela[0] if janela else "",
+            "fim": janela[-1] if janela else "",
+            "dias_pedidos": dias,
+            "dias_com_dado": len(janela),
+            "datas": janela,
+        },
+        "criterio": CRITERIO,
+        "aviso_de_absorcao": (
+            "Esta linha de base ABSORVE os episodios ja medidos na janela acima — "
+            "inclusive pico de impostor. Cada agente declara dia_do_maximo e "
+            "paises_no_dia_do_maximo justamente para que o leitor veja de que dia "
+            "veio o teto. Baseline nao e absolvicao: o check imprime o numero "
+            "absoluto em TODA execucao, reprovando ou nao."
+        ),
+        "agentes": agentes,
+    }
+
+
+def imprimir(documento: dict) -> None:
+    janela = documento["janela_referencia"]
+    print("=" * 78)
+    print("LINHA DE BASE — trafego com UA de bot NAO CONFIRMADO na borda")
+    print("=" * 78)
+    print("fonte      : %s (%d linha(s), %d descartada(s) por implausibilidade)"
+          % (documento["fonte"], documento["fonte_linhas"],
+             documento["fonte_linhas_descartadas"]))
+    print("sha256     : %s" % (documento["fonte_sha256"] or "(ilegivel)"))
+    print("janela     : %s .. %s (%d dia(s) com dado, %d pedido(s))"
+          % (janela["inicio"] or "-", janela["fim"] or "-",
+             janela["dias_com_dado"], janela["dias_pedidos"]))
+    print("\n%-26s %9s %12s %9s %9s  paises no dia do maximo"
+          % ("agente", "max/dia", "dia do max", "mediana", "dias>0"))
+    print("-" * 78)
+    for agente, dados in sorted(documento["agentes"].items(),
+                                key=lambda kv: -kv[1]["max_diario"]):
+        if not dados["max_diario"]:
+            continue
+        paises = ", ".join("%s=%d" % (p, n) for p, n in
+                           sorted(dados["paises_no_dia_do_maximo"].items(),
+                                  key=lambda kv: -kv[1])[:3]) or "-"
+        print("%-26s %9d %12s %9d %9d  %s"
+              % (agente, dados["max_diario"], dados["dia_do_maximo"] or "-",
+                 dados["mediana_diaria"], dados["dias_com_nao_confirmado"], paises))
+    zerados = [a for a, d in documento["agentes"].items() if not d["max_diario"]]
+    if zerados:
+        print("\nagentes com ZERO nao-confirmado na janela (%d): %s"
+              % (len(zerados), ", ".join(sorted(zerados))))
+    sem_faixa = [a for a, d in documento["agentes"].items()
+                 if d["max_diario"] and not d["ip_range_operator"]]
+    if sem_faixa:
+        print("\nsem faixa oficial em data/ops/bot_ip_ranges/ — a segunda verificacao")
+        print("(por clientIP) e IMPOSSIVEL para estes, entao o nao-confirmado deles")
+        print("mede tambem a nossa lacuna de instrumento: %s" % ", ".join(sorted(sem_faixa)))
+    print("\nABSORVIDO NESTA LINHA DE BASE:")
+    print("  " + documento["aviso_de_absorcao"].replace(". ", ".\n  "))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Linha de base do trafego com UA de bot nao confirmado na borda.")
+    ap.add_argument("--raiz", default=RAIZ_PADRAO,
+                    help="raiz do repositorio (padrao: a deste arquivo)")
+    ap.add_argument("--serie", default=None,
+                    help="caminho da serie da borda (padrao: <raiz>/%s)" % SERIE_REL)
+    ap.add_argument("--saida", default=None,
+                    help="arquivo da linha de base (padrao: <raiz>/%s)" % BASELINE_REL)
+    ap.add_argument("--dias", type=int, default=DIAS_PADRAO,
+                    help="ultimas N datas PRESENTES na serie (padrao: %d)" % DIAS_PADRAO)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="levanta e imprime, sem gravar")
+    ap.add_argument("--json", action="store_true", help="emitir o documento em JSON")
+    args = ap.parse_args()
+
+    documento = levantar(args.raiz, args.dias, serie=args.serie)
+    if not documento["agentes"]:
+        print("generate-baseline-bot-nao-confirmado: serie da borda vazia ou ilegivel "
+              "em %s — nada a registrar" % (args.serie or os.path.join(args.raiz, SERIE_REL)),
+              file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(documento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        imprimir(documento)
+
+    if args.dry_run:
+        print("\n--dry-run: NADA foi gravado.")
+        return 0
+
+    saida = args.saida or os.path.join(args.raiz, BASELINE_REL)
+    os.makedirs(os.path.dirname(saida), exist_ok=True)
+    with open(saida, "w", encoding="utf-8") as handle:
+        json.dump(documento, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    print("\ngravado: %s (%d agente(s))"
+          % (os.path.relpath(saida, args.raiz), len(documento["agentes"])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

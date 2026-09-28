@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""check-cache-rule-viva — a Cache Rule da zona esta VIVA, e e a versionada?
+
+READ-ONLY. So faz GET na API da Cloudflare, com a MESMA credencial de leitura que
+tools/apply-cache-rules usa (as funcoes `ambiente`, `_credenciais` e `chamar` sao
+importadas dali, nao copiadas, para que a forma de autenticar viva num lugar
+so). Nenhuma linha deste arquivo escreve na zona.
+
+POR QUE EXISTE, com o numero. De 2026-08-22T13:10Z a 2026-08-26T15:55Z a fase
+`http_request_cache_settings` da zona ficou com ZERO regras (ruleset na versao 14;
+o ledger data/ops/edge_rule_apply.jsonl guarda `regras_antes: []` nas duas
+aplicacoes de 26/08). Medido em data/ops/edge_bot_status_daily.jsonl, respostas
+200 do Googlebot por `cache_status`:
+
+    2026-08-21  dynamic  7,4%   (regra viva)
+    2026-08-22  dynamic 58,8%   (esvaziada as 13:10Z)
+    2026-08-24  dynamic 63,3%
+    2026-08-25  dynamic 72,7%
+    2026-08-26  dynamic 71,4%   (reaplicada as 15:55Z)
+    2026-08-27  dynamic  0,0%
+
+Durante esses cinco dias NENHUM gate reprovou. A versao de entao de
+`tools/check-edge-vary-contract` (7a2a30e6, de 19/08) iterava a lista de regras
+conferindo a forma do bloco `vary` -- com lista vazia nao havia o que conferir e
+ele saia verde: gate verde sobre mundo vazio. Em 28/08 (8a6b4652) a camada 1
+virou veredito duro, mas ela so reprova quando a sonda de rede tambem negocia
+Markdown, e sai 2 quando a sonda falha: e um gate de ENVENENAMENTO, nao de
+vitalidade. E `tools/check-edge-rule-drift` nasceu em 26/08 as 15:45Z
+(1bb8b7aa), dez minutos antes da reaplicacao: foi o unico que pegou, e so
+existiu para pegar o fim.
+
+O que este gate acrescenta ao irmao check-edge-rule-drift: exit 2 (NAO RODOU)
+em vez de 1 quando nao ha credencial ou a API nao responde -- reprovar sem ter
+lido ensina o operador a ignorar, e passar seria o buraco de novo --, fixture
+por --ruleset-json para provar o caso ruim sem escrever na zona, e a
+comparacao restrita aos campos que decidem comportamento, impressos vivo x
+versionado.
+
+O QUE ESTE GATE REPROVA (exit 1), e so isso:
+  - a fase tem 0 regras (lista vazia OU chave `rules` ausente -- os dois sao o
+    mesmo estado: ruleset sem regra; ausencia NUNCA e aprovacao);
+  - a quantidade de regras vivas difere da versionada (regra a mais e template
+    de painel, como v9-v11 de agosto; regra a menos e o acervo sem cache);
+  - em qualquer regra, um CAMPO QUE DECIDE COMPORTAMENTO diverge do versionado:
+    `enabled`, `action`, `expression`, `cache`, `edge_ttl`, `browser_ttl` e
+    `vary.headers.accept`. Metadado (`id`, `ref`, `version`, `last_updated`,
+    `description`) e impresso e NUNCA reprova -- a descricao e texto humano e o
+    id muda a cada PUT.
+
+O QUE E "NAO RODOU" (exit 2), nunca pass: sem credencial em .env.local, API
+fora do ar, HTTP != 2xx, `success:false`, envelope sem `result`, canonico
+ausente/ilegivel/sem regra, fixture ilegivel. Nada disso e prova de que a regra
+esta viva, e um gate que sai 0 nesses casos e o mesmo buraco de agosto por
+outra porta.
+
+VIVO x VERSIONADO sao impressos lado a lado, campo a campo, para que o
+operador leia o que esta no ar sem abrir o painel.
+
+Uso:
+    tools/check-cache-rule-viva                       # le a zona real (GET)
+    tools/check-cache-rule-viva --json
+    tools/check-cache-rule-viva --ruleset-json f.json # sem rede: f.json e o
+        envelope que a API devolve ({"success":true,"result":{...}}) ou o
+        proprio `result` ({"rules":[...],"version":...}); o parser e o MESMO
+        do caminho de producao.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import urllib.error
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+CANONICO_PADRAO = os.path.join(RAIZ, "ops/cloudflare/cache-rules.json")
+FASE = "http_request_cache_settings"
+ZONA_PADRAO = "b2e1366a94c5dcac97f2fc264f18928f"
+
+# Os campos que decidem comportamento, na ordem em que sao impressos. Cada um e
+# um caminho dentro da regra ja normalizada por `essencia()`.
+CAMPOS = (
+    "enabled",
+    "action",
+    "expression",
+    "cache",
+    "edge_ttl",
+    "browser_ttl",
+    "vary.headers.accept",
+)
+
+NOME = "check-cache-rule-viva"
+
+
+def _apply_cache_rules():
+    """Importa tools/apply-cache-rules como modulo para reusar a autenticacao.
+
+    O arquivo nao tem extensao .py, por isso o SourceFileLoader. Importar nao
+    executa `main()` (esta atras de `__name__ == "__main__"`), e daqui so se
+    chamam `ambiente()`, `_credenciais(env)` -- que, sem `precisa_escrever`,
+    devolve o Bearer de zona, o menor escopo -- e `chamar(url, cab)`, cujo
+    metodo padrao e GET. Nenhum outro metodo HTTP e passado por este gate.
+    """
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apply-cache-rules")
+    loader = importlib.machinery.SourceFileLoader("apply_cache_rules", caminho)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)
+    return modulo
+
+
+def le_canonico(caminho):
+    """Devolve a lista de regras versionadas. Levanta ValueError quando nao ha o
+    que comparar: sem canonico o gate nao pode dizer nada sobre a zona."""
+    with open(caminho, encoding="utf-8") as f:
+        corpo = json.load(f)
+    regras = corpo.get("rules") if isinstance(corpo, dict) else None
+    if not isinstance(regras, list) or not regras:
+        raise ValueError(f"{caminho} nao declara nenhuma regra em `rules`")
+    return regras
+
+
+def extrai_ruleset(corpo):
+    """Aceita o envelope da API ou o `result` nu. Devolve (ruleset, motivo);
+    exatamente um dos dois e None."""
+    if not isinstance(corpo, dict):
+        return None, "corpo nao e um objeto JSON"
+    if "success" in corpo or "result" in corpo:
+        if not corpo.get("success"):
+            return None, f"API sem sucesso: {corpo.get('errors')}"
+        resultado = corpo.get("result")
+        if not isinstance(resultado, dict):
+            return None, "envelope com success:true mas sem `result`"
+        return resultado, None
+    if "rules" in corpo or "phase" in corpo or "version" in corpo:
+        return corpo, None
+    return None, "JSON sem `success`/`result` e sem cara de ruleset (`rules`/`phase`/`version`)"
+
+
+def essencia(regra):
+    """So o que decide comportamento. `enabled` ausente e True porque e assim
+    que a API trata a omissao; `expression` com espacos colapsados porque o
+    painel reindenta sem mudar o significado."""
+    ap = regra.get("action_parameters") or {}
+    vary = ap.get("vary") or {}
+    return {
+        "enabled": regra.get("enabled", True),
+        "action": regra.get("action"),
+        "expression": " ".join((regra.get("expression") or "").split()),
+        "cache": ap.get("cache"),
+        "edge_ttl": ap.get("edge_ttl"),
+        "browser_ttl": ap.get("browser_ttl"),
+        "vary.headers.accept": (vary.get("headers") or {}).get("accept"),
+    }
+
+
+def avalia(ruleset, canonicas):
+    """Funcao PURA: recebe o ruleset (vivo ou fixture) e as regras versionadas,
+    devolve (codigo, relatorio). Separada da rede para que o teste prove o
+    caso ruim reprovando sem tocar a zona."""
+    vivas = ruleset.get("rules")
+    if not isinstance(vivas, list):
+        vivas = []
+    relatorio = {
+        "ruleset": ruleset.get("name"),
+        "version": ruleset.get("version"),
+        "last_updated": ruleset.get("last_updated"),
+        "phase": ruleset.get("phase"),
+        "regras_vivas": len(vivas),
+        "regras_versionadas": len(canonicas),
+        "regras": [],
+        "divergencias": [],
+        "motivos": [],
+    }
+    if ruleset.get("phase") not in (None, FASE):
+        # Ruleset de outra fase nao diz nada sobre cache: comparar seria medir
+        # a coisa errada e concluir certo por acaso.
+        relatorio["motivos"].append(
+            f"ruleset da fase {ruleset.get('phase')!r}, esperado {FASE!r}")
+        return 2, relatorio
+
+    if not vivas:
+        relatorio["motivos"].append(
+            f"a fase {FASE} esta com ZERO regras (ruleset version {ruleset.get('version')}); "
+            f"o repositorio declara {len(canonicas)}. Todo o acervo atravessa o tunel a cada "
+            "requisicao e o Googlebot recebe cacheStatus=dynamic -- o estado de 22 a 26/08.")
+        return 1, relatorio
+
+    if len(vivas) != len(canonicas):
+        relatorio["motivos"].append(
+            f"{len(vivas)} regra(s) no ar contra {len(canonicas)} versionada(s)")
+
+    for i in range(max(len(vivas), len(canonicas))):
+        viva = vivas[i] if i < len(vivas) else None
+        canon = canonicas[i] if i < len(canonicas) else None
+        linha = {
+            "indice": i,
+            "id_vivo": (viva or {}).get("id"),
+            "descricao_viva": ((viva or {}).get("description") or "")[:120],
+            "descricao_versionada": ((canon or {}).get("description") or "")[:120],
+            "campos": {},
+        }
+        if viva is None:
+            relatorio["divergencias"].append(
+                {"indice": i, "campo": "*", "vivo": None, "versionado": "(regra versionada ausente no ar)"})
+            relatorio["regras"].append(linha)
+            continue
+        if canon is None:
+            relatorio["divergencias"].append(
+                {"indice": i, "campo": "*", "vivo": "(regra a mais no ar)", "versionado": None})
+            relatorio["regras"].append(linha)
+            continue
+        ev, ec = essencia(viva), essencia(canon)
+        for campo in CAMPOS:
+            igual = ev[campo] == ec[campo]
+            linha["campos"][campo] = {"vivo": ev[campo], "versionado": ec[campo], "igual": igual}
+            if not igual:
+                relatorio["divergencias"].append(
+                    {"indice": i, "campo": campo, "vivo": ev[campo], "versionado": ec[campo]})
+        relatorio["regras"].append(linha)
+
+    if relatorio["divergencias"]:
+        relatorio["motivos"].append(
+            f"{len(relatorio['divergencias'])} campo(s) que decidem comportamento divergem do versionado")
+        return 1, relatorio
+    return 0, relatorio
+
+
+def _curto(valor, largura=70):
+    texto = json.dumps(valor, ensure_ascii=False, sort_keys=True)
+    return texto if len(texto) <= largura else texto[: largura - 3] + "..."
+
+
+def imprime(relatorio, codigo, fonte, canonico):
+    print(f"zona      : {relatorio.get('zona')}")
+    print(f"fonte     : {fonte}")
+    if codigo == 2:
+        print(f"{NOME}: NAO RODOU (exit 2, isto NAO e aprovacao)")
+        for m in relatorio.get("motivos") or []:
+            print(f"  - {m}")
+        return
+    print(f"ruleset   : {relatorio.get('ruleset')} (version {relatorio.get('version')}, "
+          f"last_updated {relatorio.get('last_updated')})")
+    print(f"regras    : vivas={relatorio['regras_vivas']} | versionadas={relatorio['regras_versionadas']} "
+          f"({os.path.relpath(canonico, RAIZ) if canonico.startswith(RAIZ) else canonico})")
+    for r in relatorio["regras"]:
+        print(f"regra {r['indice']}   : id_vivo={r['id_vivo']}")
+        if r["descricao_viva"]:
+            print(f"  descricao viva      : {r['descricao_viva']}")
+        if not r["campos"]:
+            continue
+        print(f"  {'campo':22s} {'vivo':44s} versionado")
+        for campo, c in r["campos"].items():
+            marca = " " if c["igual"] else "!"
+            print(f"{marca} {campo:22s} {_curto(c['vivo'], 44):44s} {_curto(c['versionado'], 44)}")
+    if codigo == 0:
+        print(f"{NOME}: OK ({relatorio['regras_vivas']} regra(s) viva(s), "
+              f"{len(CAMPOS)} campos identicos ao versionado, fonte: {fonte})")
+        return
+    print(f"{NOME}: FAIL")
+    for m in relatorio["motivos"]:
+        print(f"  - {m}")
+    for d in relatorio["divergencias"]:
+        print(f"    regra {d['indice']} {d['campo']}: no ar={_curto(d['vivo'], 90)} | "
+              f"versionado={_curto(d['versionado'], 90)}")
+    print("  Reaplicar e do chefe: tools/apply-cache-rules (este gate nao escreve na zona).")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--ruleset-json", metavar="ARQUIVO",
+                    help="envelope da API (ou `result` nu) lido do disco em vez da zona")
+    ap.add_argument("--canonico", default=CANONICO_PADRAO,
+                    help="corpo versionado (padrao: ops/cloudflare/cache-rules.json)")
+    ap.add_argument("--json", dest="como_json", action="store_true")
+    args = ap.parse_args()
+
+    relatorio = {"zona": None, "fonte": None, "motivos": []}
+
+    def sai(codigo, fonte):
+        relatorio["fonte"] = fonte
+        relatorio["codigo"] = codigo
+        if args.como_json:
+            print(json.dumps(relatorio, ensure_ascii=False, indent=2))
+        else:
+            imprime(relatorio, codigo, fonte, args.canonico)
+        return codigo
+
+    try:
+        canonicas = le_canonico(args.canonico)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        relatorio["motivos"].append(f"canonico ilegivel: {e}")
+        return sai(2, "nenhuma")
+
+    if args.ruleset_json:
+        fonte = f"fixture {args.ruleset_json}"
+        try:
+            with open(args.ruleset_json, encoding="utf-8") as f:
+                corpo = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            relatorio["motivos"].append(f"--ruleset-json ilegivel: {e}")
+            return sai(2, fonte)
+    else:
+        irmao = _apply_cache_rules()
+        env = irmao.ambiente()
+        relatorio["zona"] = env.get("CLOUDFLARE_ZONE_ID", ZONA_PADRAO)
+        cabecalhos, rotulo = irmao._credenciais(env, precisa_escrever=False)
+        fonte = f"API viva ({rotulo})"
+        if cabecalhos is None:
+            relatorio["motivos"].append(
+                "sem credencial Cloudflare (.env.local sem CLOUDFLARE_ZONE_TOKEN nem "
+                "CLOUDFLARE_EMAIL+CLOUDFLARE_API_TOKEN): nada foi lido da zona")
+            return sai(2, fonte)
+        url = f"{irmao.API}/zones/{relatorio['zona']}/rulesets/phases/{FASE}/entrypoint"
+        try:
+            corpo = irmao.chamar(url, cabecalhos)
+        except urllib.error.HTTPError as e:
+            relatorio["motivos"].append(f"API respondeu {e.code} {e.reason}")
+            return sai(2, fonte)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            relatorio["motivos"].append(f"nao consegui ler o ruleset: {type(e).__name__}: {e}")
+            return sai(2, fonte)
+
+    ruleset, motivo = extrai_ruleset(corpo)
+    if ruleset is None:
+        relatorio["motivos"].append(motivo)
+        return sai(2, fonte)
+
+    codigo, avaliacao = avalia(ruleset, canonicas)
+    relatorio.update(avaliacao)
+    return sai(codigo, fonte)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

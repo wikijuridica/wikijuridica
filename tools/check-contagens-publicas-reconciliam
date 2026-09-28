@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""check-contagens-publicas-reconciliam — READ-ONLY.
+
+Reprova quando os números que o portal publica sobre si mesmo deixam de fechar
+entre si.
+
+O PROBLEMA QUE ISTO RESOLVE — o "número órfão". O plano de superfície de bots
+(T8.8, 2026-08-26) registrou `total_indexado: 10.077`, devolvido pelo servidor
+MCP, como "o único número realmente órfão: não bate com 10.070 (manifesto) nem
+com 10.294 (sitemap)". Órfão é um veredito sobre o que ninguém MEDIU, não sobre
+o dado. Medido em 2026-08-26, nenhum dos quatro é órfão — cada um é um conjunto
+diferente, e os quatro fecham por identidade exata:
+
+    published_manifest.jsonl                      10.070   (só o acervo v2)
+    sitemap (public/sitemaps/pages-*.xml)         10.294
+      acervo   10.070
+      fatias      185   (/{área}/pagina/N/)
+      hubs         32   (/{área}/)
+      institucionais 6  (/sobre/ /metodologia/ /fontes/ /aviso-legal/
+                         /privacidade/ /termos/)
+      home          1
+    IsIndexable(content/pages.json)               10.077   (10.080 − 3 noindex:
+      /fontes/planalto/, /buscar/, /contato/advogado/)
+    total_indexado do MCP / da busca interna      10.077   (medido ao vivo)
+    llms.txt, preâmbulo                           10.070
+
+E as identidades que amarram tudo:
+
+    (1) sitemap  = acervo + fatias + hubs + institucionais + home
+    (2) acervo do sitemap = linhas do published_manifest
+    (3) IsIndexable(pages.json) = manifesto + institucionais + home
+    (4) o número do preâmbulo do llms.txt = manifesto
+
+A (3) é a que explica o 10.077: o índice Bleve da busca é construído em
+`search.NewManagerWithContentSignature` (internal/search/manager.go:93-100),
+que filtra `repository.Pages` por `editorial.IsIndexable` — e `repository.Pages`
+é content/pages.json, que TEM a home e as institucionais e NÃO tem hub nem
+fatia (elas são sintéticas, montadas em runtime por internal/render/area_hub.go).
+`total_indexado` é `idx.index.DocCount()` (internal/search/index.go:356),
+devolvido ao cliente MCP em internal/httpserver/mcp.go:83.
+
+POR QUE UM GATE, e não uma nota no plano: número que ninguém reconcilia volta a
+ser chamado de órfão na próxima auditoria, e alguém "corrige" o que está certo.
+Foi exatamente o que quase aconteceu aqui.
+
+O que este gate NÃO faz: não julga se 10.070 é o número CERTO de páginas
+publicadas — isso é do p0-cycle-close-indexable-10k. Ele julga se os quatro
+números contam a mesma história.
+
+CUSTO: lê content/pages.json (72,9 MB) inteiro. Rode com `nice -n 19`.
+
+PROVA DE QUE REPROVA: `--fatias-esperadas N` com N errado força a identidade (1)
+a quebrar e devolve exit 1 — é o mesmo caminho de código que uma divergência
+real percorre.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wikiuniverso  # noqa: E402
+
+BASE_PADRAO = "https://wikijuridica.com.br"
+
+
+def classifica(caminho: str, institucionais: set[str]) -> str:
+    if caminho == "/":
+        return "home"
+    segmentos = [s for s in caminho.strip("/").split("/") if s]
+    if len(segmentos) == 1:
+        return "institucional" if caminho in institucionais else "hub"
+    if len(segmentos) == 3 and segmentos[1] == "pagina":
+        return "fatia"
+    if len(segmentos) == 2:
+        return "acervo"
+    return "outro"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="reprova quando manifesto, sitemap, indice de busca e llms.txt deixam de fechar"
+    )
+    parser.add_argument("--root", default=None, help="raiz do repositorio")
+    parser.add_argument("--fatias-esperadas", type=int, default=None,
+                        help="numero de fatias de paginacao esperado; use para provar que o gate reprova")
+    args = parser.parse_args()
+
+    raiz = os.path.abspath(args.root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    falhas: list[str] = []
+
+    # 1) published_manifest — uma linha por página do acervo v2.
+    manifesto = 0
+    caminho_manifesto = os.path.join(raiz, "data/editorial/published_manifest.jsonl")
+    with open(caminho_manifesto, encoding="utf-8") as fh:
+        for linha in fh:
+            if linha.strip():
+                manifesto += 1
+
+    # 2) sitemap — a verdade sobre o que o portal OFERECE ao crawler.
+    #    A chave é o conjunto de <loc>, não a contagem por arquivo: shard em
+    #    carência e shard recém-criado mudam a distribuição sem mudar o total.
+    # O UNIVERSO VEM DO ÍNDICE, e aqui a diferença muda o veredito.
+    #
+    # Este trecho globava public/sitemaps/pages-*.xml — o DEPÓSITO, com 62
+    # arquivos — enquanto o public/sitemap.xml anuncia 34. Os 28 a mais são
+    # shards aposentados em carência, que o portal ainda serve mas NÃO oferece
+    # mais ao crawler. Reconciliar o manifesto contra o depósito compara coisas
+    # diferentes: o comentário logo acima diz, corretamente, que o sitemap é "a
+    # verdade sobre o que o portal OFERECE ao crawler" — e quem responde isso é
+    # o índice.
+    try:
+        urls: set[str] = set(wikiuniverso.urls_publicas(raiz))
+    except wikiuniverso.UniversoIndisponivel as erro:
+        print(f"check-contagens-publicas-reconciliam: {erro}", file=sys.stderr)
+        return 2
+    if not urls:
+        print("check-contagens-publicas-reconciliam: o indice public/sitemap.xml nao anuncia URL alguma",
+              file=sys.stderr)
+        return 2
+
+    # 3) content/pages.json — a fonte do índice de busca.
+    #    As institucionais saem DAQUI, por page_type/rota conhecida no arquivo,
+    #    nunca de uma lista escrita à mão neste script: é o mesmo critério que
+    #    o llms.txt usa (institucional indexável que não é a raiz).
+    with open(os.path.join(raiz, "content/pages.json"), encoding="utf-8") as fh:
+        paginas = json.load(fh)
+    indexaveis = [p for p in paginas
+                  if p.get("status") == "published" and p.get("index_policy") == "index"]
+    institucionais = {p["path"] for p in indexaveis
+                      if p["path"] != "/" and p["path"].count("/") == 2}
+
+    por_classe: dict[str, int] = {}
+    for url in urls:
+        caminho = url[len(BASE_PADRAO):] if url.startswith(BASE_PADRAO) else url
+        classe = classifica(caminho, institucionais)
+        por_classe[classe] = por_classe.get(classe, 0) + 1
+
+    acervo = por_classe.get("acervo", 0)
+    fatias = por_classe.get("fatia", 0)
+    hubs = por_classe.get("hub", 0)
+    inst = por_classe.get("institucional", 0)
+    home = por_classe.get("home", 0)
+    outros = por_classe.get("outro", 0)
+
+    print(f"check-contagens-publicas-reconciliam: manifesto={manifesto} sitemap={len(urls)} "
+          f"indexaveis_pages_json={len(indexaveis)}")
+    print(f"  sitemap por classe: acervo={acervo} fatias={fatias} hubs={hubs} "
+          f"institucionais={inst} home={home} outros={outros}")
+
+    # IDENTIDADE (1) — o sitemap é a soma das classes, sem sobra.
+    if outros:
+        falhas.append(f"{outros} URL(s) do sitemap nao caem em nenhuma classe conhecida "
+                      f"(acervo/fatia/hub/institucional/home)")
+    if acervo + fatias + hubs + inst + home != len(urls):
+        falhas.append(f"a soma das classes ({acervo + fatias + hubs + inst + home}) "
+                      f"nao fecha com o sitemap ({len(urls)})")
+
+    # IDENTIDADE (2) — o acervo do sitemap É o manifesto, um para um.
+    if acervo != manifesto:
+        falhas.append(f"o acervo no sitemap ({acervo}) diverge do published_manifest ({manifesto}) "
+                      f"-- pagina no indice sem linha de manifesto, ou o contrario")
+
+    # IDENTIDADE (3) — a que explica o 10.077 e mata o rotulo de "orfao".
+    esperado_busca = manifesto + inst + home
+    if len(indexaveis) != esperado_busca:
+        falhas.append(f"IsIndexable(pages.json)={len(indexaveis)} nao fecha com "
+                      f"manifesto+institucionais+home={esperado_busca}: e este o numero que o MCP "
+                      f"devolve como total_indexado, e divergencia aqui e que o faz parecer orfao")
+
+    # IDENTIDADE (4) — o llms.txt declara o acervo, não o sitemap.
+    caminho_llms = os.path.join(raiz, "public/llms.txt")
+    if os.path.isfile(caminho_llms):
+        with open(caminho_llms, encoding="utf-8", errors="replace") as fh:
+            cabeca = fh.read(2048)
+        casamento = re.search(r"com\s+(\d+)\s+p[áa]ginas", cabeca)
+        if not casamento:
+            falhas.append("o preambulo do llms.txt nao declara mais o numero de paginas")
+        elif int(casamento.group(1)) != manifesto:
+            falhas.append(f"o llms.txt declara {casamento.group(1)} paginas e o manifesto tem "
+                          f"{manifesto} -- o artefato publico mente sobre o tamanho do acervo")
+
+    if args.fatias_esperadas is not None and fatias != args.fatias_esperadas:
+        falhas.append(f"fatias de paginacao: {fatias} no sitemap, {args.fatias_esperadas} esperadas")
+
+    if not falhas:
+        print("OK: manifesto, sitemap, indice de busca e llms.txt contam a mesma historia.")
+        print(f"    total_indexado esperado do MCP/busca: {len(indexaveis)}")
+        return 0
+    for falha in falhas:
+        print(f"FALHA: {falha}", file=sys.stderr)
+    print(f"check-contagens-publicas-reconciliam: {len(falhas)} divergencia(s)", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

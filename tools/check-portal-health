@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""check-portal-health — o portal esta de pe, e o servico esta saudavel ou em loop?
+
+POR QUE EXISTE: ate 2026-08-06 nao havia NENHUM timer de vigia para o
+wikijuridica. Os 29 timers do host (divorcio-5xx-monitor, divorcio-fast-monitor,
+tunnel-health-minimal...) pertencem ao projeto vizinho e nunca tocam este
+servico — verificado: `systemctl list-timers --all | grep -c wiki` -> 0. Se o
+site caisse, a deteccao dependia de alguem abrir o navegador.
+
+O QUE ELE VERIFICA, em ordem de gravidade:
+  1. ACERVO NO AR      — paginas estaticas servidas pelo nginx. Desde o cutover
+                         de 2026-08-06 elas nao dependem do processo Go; se isto
+                         falhar, o problema e nginx, tunel ou disco.
+  2. BUSCA VIVA        — /buscar/ e /healthz, que dependem do Go. Busca fora do
+                         ar e erro visivel para o visitante.
+  3. RESTART EM LOOP   — NRestarts crescendo entre execucoes. Com Restart=always
+                         e StartLimitIntervalSec=0, uma falha DETERMINISTICA
+                         (manifesto incoerente derruba o boot por log.Fatal) nao
+                         aparece como "servico parado": aparece como servico que
+                         sobe e morre para sempre, queimando CPU. "Esta rodando"
+                         seria um falso verde — dai medir a DERIVADA, nao o
+                         estado.
+
+ANTI-FRAUDE: toda requisicao vai com User-Agent proprio e
+`X-Warming-Request: true`, e por isso e gravada com warming=true
+(internal/httpserver/access_log.go:73) FORA da contagem de trafego real. Vigia
+que se conta como visita e fraude de metrica.
+
+O estado entre execucoes vive em data/ops/portal_health_state.json e o historico
+em data/ops/portal_health.jsonl — no repo, versionavel, nunca em /tmp.
+
+--repair reinicia o servico Go quando a busca esta fora E nao ha loop de restart
+em curso. Reiniciar um servico que ja esta em loop e desperdicio, nao conserto.
+
+Uso:
+    tools/check-portal-health                 # so verifica, exit != 0 se algo falhou
+    tools/check-portal-health --repair        # tenta reiniciar o Go se a busca caiu
+    tools/check-portal-health --json
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ESTADO = os.path.join(ROOT, "data/ops/portal_health_state.json")
+HISTORICO = os.path.join(ROOT, "data/ops/portal_health.jsonl")
+NOTIFICADOR = os.path.join(ROOT, "tools/notify-owner")
+
+SERVICO = "wikijuridica-server"
+NGINX = "http://127.0.0.1:8088"
+SNI = "wikijuridica.com.br"
+GO = "http://127.0.0.1:8089"
+
+# A REDE SOCIAL E O SEGUNDO ALVO DESTE VIGIA (2026-09-05).
+#
+# Ate hoje `grep 8091` neste arquivo e em tools/check-http-smoke devolvia ZERO
+# nos dois: o portal tinha timer de saude, watchdog e smoke, e nenhum deles
+# olhava para o processo que serve /redesocial/. Somado ao .service que estava
+# `linked` e nao `enabled`, isso queria dizer que a rede social podia cair — ou
+# simplesmente nao voltar de um reboot — sem que uma linha fosse escrita em
+# lugar nenhum, com visitante real ja na pagina.
+#
+# O incidente da rede social e SEPARADO do incidente do acervo, e por isso tem
+# unit propria, chave de alerta propria e nunca entra na decisao de reparo do
+# wikijuridica-server: reiniciar o binario do acervo porque a rede social caiu
+# seria o reparo que nao le o motivo da falha, e foi ele que produziu 448
+# restarts futeis em 24 h.
+SERVICO_SOCIAL = "wikijuridica-social"
+SOCIAL = "http://127.0.0.1:8091"
+USER_AGENT = "wikijuridica-watchdog/1.0 (+interno; nao-indexar)"
+
+# Limiar de loop: mais que isto de restarts entre duas execucoes do timer
+# significa que o servico esta subindo e morrendo, nao se recuperando.
+LIMITE_RESTARTS = 3
+
+# REPARO CLASSIFICADO (2026-09-02). Ate hoje o unico reparo era `systemctl
+# restart`, repetido a cada 2 min. Medido em 01-02/09: 448 restarts futeis em
+# 24 h com a MESMA mensagem ("Unit wikijuridica-server.socket not found"),
+# zero escalada, portal 17 h fora para todo bot. Reparo que nao le o motivo da
+# falha nao e reparo, e ruido com sudo. Agora o vigia:
+#   (a) le Requires=/Wants= da unit e HABILITA (systemctl enable + daemon-reload)
+#       a unit que existe em ops/systemd e o systemd carrega como not-found — a
+#       causa exata de 01/09. Desde 2026-09-05 a varredura inclui a unit do
+#       PROPRIO servico (se ela sumir, `show -p Requires` devolve vazio e a
+#       dependencia ficaria invisivel) e usa `enable`, nao `ln -sf`: o `ln`
+#       deixava a unit em `linked`, viva ate o proximo reboot e ausente depois
+#       dele. tools/check-social-units-enabled reprova esse estado;
+#   (b) recusa reiniciar quando a unit exige um .socket e o binario instalado
+#       nao contem LISTEN_FDS: reiniciar faria bind proprio contra a porta em
+#       LISTEN e entraria em loop de EADDRINUSE (medido 02/09 10:47, 40 s ate
+#       ser parado a mao). Em vez disso dispara UM deploy --sem-republicar sob
+#       `flock -n` e avisa com a chave `binario-desatualizado`;
+#   (c) para de repetir o mesmo reparo depois de LIMITE_REPAROS_IGUAIS falhas
+#       identicas seguidas e escala com a chave `portal-reparo-esgotado`.
+LIMITE_REPAROS_IGUAIS = 3
+DIR_UNITS_REPO = os.path.join(ROOT, "ops/systemd")
+DIR_UNITS_ETC = "/etc/systemd/system"
+SUFIXOS_UNIT = (".service", ".socket", ".timer", ".target", ".path", ".slice", ".mount")
+BINARIO = os.path.join(ROOT, "bin/wikijuridica-server")
+LOCK_PESADO = "/tmp/opt-wiki-agent-heavy.lock"
+DEPLOY = os.path.join(ROOT, "tools/deploy-publico")
+
+
+def unidades_dependentes(servico):
+    """Nomes em Requires= e Wants= da unit viva, pelo systemd (nao pelo arquivo)."""
+    try:
+        r = subprocess.run(["systemctl", "show", servico, "-p", "Requires,Wants"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    nomes = []
+    for linha in r.stdout.splitlines():
+        _, _, valor = linha.partition("=")
+        nomes.extend(v for v in valor.split() if v.startswith("wikijuridica-"))
+    return nomes
+
+
+def load_state(nome):
+    """LoadState pelo systemd, ou "" quando nao da para perguntar."""
+    try:
+        r = subprocess.run(["systemctl", "show", nome, "-p", "LoadState", "--value"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return ""
+    return r.stdout.strip()
+
+
+def nome_de_arquivo(unit):
+    """`wikijuridica-server` -> `wikijuridica-server.service`.
+
+    O systemd aceita o nome sem sufixo e resolve para .service; ops/systemd nao:
+    la o arquivo tem o sufixo. Sem esta traducao, instalar a unit do PROPRIO
+    servico procuraria `ops/systemd/wikijuridica-server` e nao acharia nada.
+    """
+    return unit if unit.endswith(SUFIXOS_UNIT) else unit + ".service"
+
+
+def dependencias_nao_carregadas(servico):
+    """As units que o systemd carrega como `not-found` — a do proprio servico
+    PRIMEIRO, depois as que ele exige.
+
+    A ordem e obrigatoria e nao e detalhe: com a unit do servico ausente,
+    `systemctl show <servico> -p Requires` devolve vazio, e a dependencia dela
+    fica invisivel. Instalada a unit do servico e recarregado o systemd, o
+    Requires= aparece — e e a segunda passada de quem chama que a apanha.
+    """
+    faltam = []
+    if load_state(servico) == "not-found":
+        faltam.append(nome_de_arquivo(servico))
+    for nome in unidades_dependentes(servico):
+        if load_state(nome) == "not-found":
+            faltam.append(nome)
+    return faltam
+
+
+def instalar_unit(nome):
+    """`systemctl enable <caminho no repo>` + daemon-reload. Devolve (ok, detalhe).
+
+    ENABLE, e nao o `ln -sf` que estava aqui ate 2026-09-05. O `ln` criava so o
+    symlink em /etc/systemd/system, que e o estado `linked`: o systemd passa a
+    CONHECER a unit e `systemctl start` a sobe — mas nada a sobe no boot, porque
+    o symlink que o boot le e o de <target>.wants/, e so o `enable` o cria. O
+    reparo devolvia o portal ao ar e deixava a unit fora do proximo reboot; o
+    defeito sobreviveria calado ate a maquina reiniciar, que e o pior momento
+    para descobri-lo. `enable` com caminho absoluto faz as duas coisas numa
+    chamada. Quem prova o resultado e tools/check-social-units-enabled.
+    """
+    origem = os.path.join(DIR_UNITS_REPO, nome)
+    if not os.path.isfile(origem):
+        return False, "sem arquivo em ops/systemd"
+    try:
+        r = subprocess.run(["sudo", "-n", "systemctl", "enable", "--", origem],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return False, (r.stderr.strip() or "enable falhou")[:120]
+        r = subprocess.run(["sudo", "-n", "systemctl", "daemon-reload"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return False, (r.stderr.strip() or "daemon-reload falhou")[:120]
+    except Exception as erro:
+        return False, str(erro)[:120]
+    # Codigo de saida zero nao e prova (R2 do contrato do dado real): pergunta ao
+    # systemd, depois do reload, se ele agora CARREGA a unit e se ela sobe no
+    # BOOT. Um `enable` que sai 0 sem pousar o symlink deixaria o vigia
+    # declarando cura que nao houve, e a proxima noticia seria o portal fora do
+    # ar depois de um reboot — com o journal repetindo `Unit ... not found`.
+    if load_state(nome) == "not-found":
+        return False, "enable saiu 0 e o systemd segue com %s not-found (conferir %s)" % (nome, DIR_UNITS_ETC)
+    estado = is_enabled(nome)
+    if estado and estado != "enabled":
+        return False, "enable saiu 0 e is-enabled devolveu `%s`: a unit nao sobe no boot" % estado
+    return True, "enable + daemon-reload"
+
+
+def is_enabled(unit):
+    """Palavra literal de `systemctl is-enabled`, ou "" quando nao da para medir.
+
+    O comando sai != 0 para disabled/not-found e ainda assim imprime a palavra:
+    o que vale e a saida, nao o codigo.
+    """
+    try:
+        r = subprocess.run(["systemctl", "is-enabled", "--", unit],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return ""
+    linhas = (r.stdout or r.stderr).strip().splitlines()
+    return linhas[-1].strip() if linhas else ""
+
+
+def servico_exige_socket(servico):
+    return any(n.endswith(".socket") for n in unidades_dependentes(servico))
+
+
+def binario_herda_socket():
+    try:
+        with open(BINARIO, "rb") as fh:
+            return b"LISTEN_FDS" in fh.read()
+    except OSError:
+        return None
+
+
+def disparar_deploy(agora):
+    """Um deploy --sem-republicar, desacoplado, sob flock -n: se outro deploy ou
+    comando pesado segura o lock, nao faz nada (e diz)."""
+    os.makedirs(os.path.join(ROOT, ".agents/runtime"), exist_ok=True)
+    log = os.path.join(ROOT, ".agents/runtime/watchdog-deploy-%s.log" % agora.strftime("%Y%m%d-%H%M%S"))
+    cmd = "flock -n %s %s --sem-republicar > %s 2>&1" % (LOCK_PESADO, DEPLOY, log)
+    try:
+        subprocess.Popen(["bash", "-c", cmd], cwd=ROOT, start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as erro:
+        return "deploy_nao_disparou:%s" % str(erro)[:80]
+    return "deploy_disparado:%s" % os.path.relpath(log, ROOT)
+
+
+def pedir(url, host=None, timeout=10.0):
+    cabecalhos = {"User-Agent": USER_AGENT, "X-Warming-Request": "true"}
+    if host:
+        cabecalhos["Host"] = host
+    pedido = urllib.request.Request(url, headers=cabecalhos)
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            return resposta.status, len(resposta.read())
+    except urllib.error.HTTPError as erro:
+        return erro.code, 0
+    except Exception:
+        return 0, 0
+
+
+# Falhas de leitura do systemd nesta execucao. Lista e nao booleano porque o
+# vigia consulta VARIAS propriedades de DUAS units, e a mensagem tem de dizer
+# qual leitura falhou — "systemd ilegivel" sem o nome manda o proximo leitor
+# reproduzir a investigacao inteira.
+FALHAS_SYSTEMD = []
+
+
+def systemd_propriedade(nome, unidade=None):
+    """Le uma propriedade do systemd. `unidade` default e o servico do acervo.
+
+    O parametro nasceu quando a rede social virou o segundo alvo do vigia
+    (2026-09-05): sem ele, perguntar o ActiveState do wikijuridica-social
+    devolveria o do wikijuridica-server, e o vigia diria que a rede social esta
+    de pe lendo o estado de OUTRO processo. O default preserva as chamadas que
+    ja existiam, que nao passam unidade nenhuma.
+    """
+    try:
+        saida = subprocess.run(
+            ["systemctl", "show", unidade or SERVICO, "-p", nome, "--value"],
+            capture_output=True, text=True, timeout=10)
+        return saida.stdout.strip()
+    except Exception as erro:
+        # A FALHA PASSA A DEIXAR RASTRO, e este `return ""` deixa de ser mudo.
+        #
+        # Ate 2026-09-16 a excecao era engolida e a funcao devolvia "". O efeito
+        # no chamador era invisivel e grave: `int("" or 0)` = 0, entao NRestarts
+        # virava 0, o delta virava 0 e o detector de LACO DE RESTART — que e o
+        # unico instrumento da classe (A) descrita em
+        # ops/systemd/wikijuridica-social.service:85-95, e o que pegou os 87
+        # restarts da rede social — ficava permanentemente cego dizendo "OK".
+        #
+        # `systemctl show` devolve rc 0 ate para unit inexistente (medido em
+        # 2026-09-16), entao rc nao serve de sinal. So a excepcao (binario
+        # ausente, timeout) distingue INSTRUMENTO INDISPONIVEL de unit parada, e
+        # e essa distincao que vira exit 2 no fim do main.
+        FALHAS_SYSTEMD.append("%s de %s: %s" % (nome, unidade or SERVICO, erro))
+        return ""
+
+
+def carregar_estado():
+    try:
+        with open(ESTADO, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+
+
+def ler_estado_anterior():
+    try:
+        with open(ESTADO, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def avisar_dono(chave, severidade, titulo, mensagem, evidencia, resolvido=False):
+    """Entrega o veredito pelo canal unico do repo (tools/notify-owner).
+
+    Falha do canal nao derruba o vigia: o registro JSONL ja aconteceu e e ele
+    que sustenta a serie.
+    """
+    comando = [NOTIFICADOR, "--chave", chave, "--titulo", titulo,
+               "--mensagem", mensagem, "--origem", "check-portal-health"]
+    if resolvido:
+        comando.append("--resolvido")
+    else:
+        comando += ["--severidade", severidade, "--evidencia", evidencia]
+    try:
+        subprocess.run(comando, capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repair", action="store_true",
+                        help="reinicia o servico Go quando a busca esta fora e nao ha loop")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    agora = datetime.datetime.now(datetime.timezone.utc)
+    problemas = []
+
+    # 1. Acervo estatico — nao depende do Go.
+    home_status, home_bytes = pedir(NGINX + "/", SNI)
+    pagina_status, _ = pedir(NGINX + "/previdenciario/maternidade-homem/", SNI)
+    sitemap_status, _ = pedir(NGINX + "/sitemap.xml", SNI)
+    if home_status != 200 or home_bytes < 1000:
+        problemas.append("acervo_fora:home=%s bytes=%d" % (home_status, home_bytes))
+    if pagina_status != 200:
+        problemas.append("acervo_fora:pagina=%s" % pagina_status)
+    if sitemap_status != 200:
+        problemas.append("acervo_fora:sitemap=%s" % sitemap_status)
+
+    # 2. Busca e saude do Go.
+    health_status, _ = pedir(GO + "/healthz")
+    busca_status, _ = pedir(NGINX + "/buscar/?q=usucapiao", SNI, timeout=20.0)
+    go_fora = health_status != 200
+    busca_fora = busca_status != 200
+    if go_fora:
+        problemas.append("go_fora:healthz=%s" % health_status)
+    if busca_fora:
+        problemas.append("busca_fora:status=%s" % busca_status)
+
+    # SONDAS PELO PROXY (2026-09-02). Ate hoje o vigia pedia /healthz DIRETO ao Go
+    # (:8089) e /buscar/ pelo nginx — e a busca sai `no-store`, nunca passa pelo
+    # proxy_cache. Quando var/nginx/cache voltou a nobody e os workers tomaram
+    # EACCES (11:19-11:32), a gemea Markdown, os cards e o lote responderam 500
+    # por 13 min e o vigia imprimiu OK: nenhuma sonda dele atravessava o caminho
+    # que quebrou. Estas duas atravessam: gemea de hub (texto, > 1 KB) e card do
+    # agente (JSON valido), ambas por :8088 com Host, ambas cacheaveis.
+    gemea_status, gemea_bytes = pedir(NGINX + "/familia/index.md", host=SNI)
+    card_status, card_bytes = pedir(NGINX + "/.well-known/agent-card.json", host=SNI)
+    proxy_quebrado = (gemea_status != 200 or gemea_bytes < 1024 or card_status != 200 or card_bytes < 200)
+    if proxy_quebrado:
+        problemas.append("nginx_proxy_quebrado:gemea=%s/%dB card=%s/%dB"
+                         % (gemea_status, gemea_bytes, card_status, card_bytes))
+
+    # 2-bis. A REDE SOCIAL (cmd/social, :8091).
+    #
+    # Sonda PELO NGINX, e nao so direto no Go, pela mesma licao de 2026-09-02
+    # registrada acima: houve 13 min em que o Go respondia e o proxy nao, e
+    # nenhuma sonda do vigia atravessava o caminho que quebrou. A gemea Markdown
+    # entra junto porque ela e o canal de maquina — se /redesocial/index.md cai,
+    # MCP, A2A e lote caem com ela, e o HTML sozinho nao denuncia isso.
+    #
+    # O piso de bytes existe porque 200 com corpo vazio e pior que 502: o
+    # aquecedor guarda a resposta vazia na borda por uma hora.
+    social_health_status, _ = pedir(SOCIAL + "/healthz")
+    social_home_status, social_home_bytes = pedir(NGINX + "/redesocial/", host=SNI)
+    social_gemea_status, social_gemea_bytes = pedir(NGINX + "/redesocial/index.md", host=SNI)
+    social_ativo = systemd_propriedade("ActiveState", unidade=SERVICO_SOCIAL)
+    social_fora = (
+        social_health_status != 200
+        or social_home_status != 200
+        or social_home_bytes < 1024
+        or social_gemea_status != 200
+        or social_gemea_bytes < 512
+    )
+    problemas_sociais = []
+    if social_fora:
+        problemas_sociais.append(
+            "redesocial_fora:healthz=%s home=%s/%dB gemea=%s/%dB servico=%s"
+            % (social_health_status, social_home_status, social_home_bytes,
+               social_gemea_status, social_gemea_bytes, social_ativo or "desconhecido"))
+    elif social_ativo not in ("active", "activating"):
+        # O processo responde mas o systemd nao o considera vivo: e o caso do
+        # binario iniciado a mao, que morre no proximo reboot sem voltar.
+        problemas_sociais.append("redesocial_servico_%s" % (social_ativo or "desconhecido"))
+
+    # 3. Loop de restart — derivada, nao estado.
+    ativo = systemd_propriedade("ActiveState")
+    try:
+        restarts = int(systemd_propriedade("NRestarts") or 0)
+    except ValueError:
+        restarts = 0
+    anterior = carregar_estado()
+    delta = restarts - int(anterior.get("nrestarts", restarts))
+    em_loop = delta > LIMITE_RESTARTS
+    if em_loop:
+        problemas.append("restart_em_loop:delta=%d desde=%s" % (delta, anterior.get("checked_at", "?")))
+
+    # O LACO DE RESTART DA REDE SOCIAL, que o ActiveState sozinho NAO denuncia.
+    #
+    # A unit social tem Restart=always com StartLimitIntervalSec=0 -- laco sem
+    # teto por desenho. Um processo que sobe, atende por dois segundos e morre
+    # aparece como `active` em qualquer instante em que o vigia olhe, e o
+    # /healthz responde justamente nesses segundos: o incidente fica invisivel
+    # aos dois instrumentos ao mesmo tempo.
+    #
+    # O que denuncia e a DERIVADA -- quantos restarts entre duas execucoes do
+    # timer --, e ela precisa do contador da unit social, nao do acervo.
+    try:
+        restarts_sociais = int(systemd_propriedade("NRestarts", unidade=SERVICO_SOCIAL) or 0)
+    except ValueError:
+        restarts_sociais = 0
+    delta_social = restarts_sociais - int(anterior.get("nrestarts_redesocial", restarts_sociais))
+    social_em_loop = delta_social > LIMITE_RESTARTS
+
+    # ---- TERCEIRO ESTADO: NAO MEDI (exit 2), aqui e nao no fim do main.
+    #
+    # Este ponto e logo depois da ULTIMA leitura do systemd e ANTES de alertar,
+    # reparar e gravar estado — e a posicao importa. Sem NRestarts nao ha
+    # derivada, e sem derivada o laco de restart e invisivel para este vigia
+    # (e ele e o unico instrumento da classe (A) de
+    # ops/systemd/wikijuridica-social.service:85-95, o que pegou os 87 restarts).
+    # Gravar estado a partir de uma leitura que falhou envenenaria a derivada da
+    # PROXIMA execucao tambem, e o reparo agiria no escuro.
+    if FALHAS_SYSTEMD:
+        print("NAO MEDIDO: nao consegui ler o systemd (%s)." % "; ".join(FALHAS_SYSTEMD[:3]),
+              file=sys.stderr)
+        print("  Sem NRestarts nao ha derivada, e sem derivada o laco de restart e", file=sys.stderr)
+        print("  invisivel para este vigia. Nao ha veredito a dar, e gravar estado a partir", file=sys.stderr)
+        print("  de uma leitura falhada estragaria a derivada da proxima execucao.", file=sys.stderr)
+        return 2
+    if social_em_loop:
+        problemas_sociais.append(
+            "redesocial_restart_em_loop:delta=%d desde=%s"
+            % (delta_social, anterior.get("checked_at", "?")))
+    if ativo not in ("active", "activating"):
+        problemas.append("servico_%s" % (ativo or "desconhecido"))
+
+    # JANELA DE MANUTENCAO: durante um deploy o servico FICA fora de proposito.
+    #
+    # Sem esta guarda o vigia vira sabotador, e virou: em 2026-08-06 o
+    # deploy-publico parou o servico para trocar o binario, o timer disparou no
+    # intervalo, viu a busca fora, reiniciou o processo — e o `cp` do binario
+    # novo falhou com "Text file busy", abortando o deploy. Vigia que atrapalha o
+    # conserto e pior que vigia nenhum.
+    #
+    # O lock e o mesmo arquivo que o deploy cria e remove; se ele ficar orfao,
+    # envelhece e deixa de valer, para que uma falha de deploy nao desligue a
+    # vigilancia para sempre.
+    deploy_lock = os.path.join(ROOT, "data/ops/.deploy-em-curso.lock")
+    em_manutencao = False
+    if os.path.exists(deploy_lock):
+        idade = agora.timestamp() - os.path.getmtime(deploy_lock)
+        em_manutencao = idade < 1800  # 30 min: mais que qualquer deploy real
+        if not em_manutencao:
+            problemas.append("lock de deploy orfao ha %d min — vigilancia normal retomada"
+                             % int(idade / 60))
+
+    # Os problemas da rede social entram DEPOIS da janela de manutencao, e pela
+    # mesma razao que os do acervo: durante um deploy o 8091 tambem fica fora de
+    # proposito, e um alerta ali seria o vigia acusando o conserto.
+    if problemas_sociais and not em_manutencao:
+        problemas.extend(problemas_sociais)
+    elif problemas_sociais:
+        problemas_sociais = []
+
+    # Reparo: reiniciar quem esta em loop e desperdicio, nao conserto — e
+    # reiniciar sem ler o motivo da falha anterior tambem nao e (ver o
+    # comentario de LIMITE_REPAROS_IGUAIS).
+    reparo = ""
+    reparo_falhas_seguidas = int(anterior.get("reparo_falhas_seguidas", 0))
+    reparo_anterior = anterior.get("reparo_ultimo", "")
+    if args.repair and em_manutencao and (go_fora or busca_fora):
+        reparo = "adiado: deploy em curso"
+    elif args.repair and proxy_quebrado and not (go_fora or busca_fora):
+        # O Go responde e o caminho pelo nginx nao: reiniciar o Go nao cura. A
+        # causa conhecida e dono errado em var/nginx/* (EACCES nos workers, que
+        # rodam como o usuario da unit) — `sudo nginx -t` como root re-atribuia
+        # os diretorios a nobody. Cura: devolver os diretorios ao usuario e
+        # recarregar o nginx; se nao curar, escala (a chave ja e critica).
+        passos = []
+        try:
+            dirs = [os.path.join(ROOT, "var/nginx", d) for d in ("cache", "proxy", "body", "fastcgi", "scgi", "uwsgi")]
+            import pwd
+            dono = pwd.getpwuid(os.getuid()).pw_name
+            r = subprocess.run(["sudo", "-n", "chown", "-R", "%s:%s" % (dono, dono)] + [d for d in dirs if os.path.isdir(d)],
+                               capture_output=True, text=True, timeout=60)
+            passos.append("chown_var_nginx_ok" if r.returncode == 0 else "chown_var_nginx_falhou:%s" % r.stderr.strip()[:80])
+            r = subprocess.run(["sudo", "-n", "systemctl", "reload", "wikijuridica-nginx"],
+                               capture_output=True, text=True, timeout=60)
+            passos.append("nginx_reload_ok" if r.returncode == 0 else "nginx_reload_falhou:%s" % r.stderr.strip()[:80])
+        except Exception as erro:
+            passos.append("reparo_proxy_erro:%s" % str(erro)[:80])
+        reparo = "; ".join(passos)
+    elif args.repair and (go_fora or busca_fora) and not em_loop:
+        passos = []
+        # (a) unit ausente instalada ANTES de reiniciar — a do proprio servico ou
+        # a que ele exige. Duas passadas, e no maximo duas: enquanto a unit do
+        # servico nao existe o systemd nao expoe o Requires= dela, entao a
+        # dependencia so fica visivel DEPOIS de a primeira passada instalar o
+        # servico e recarregar o systemd. Repetir alem disso seria o laco que
+        # este bloco existe para nao repetir.
+        instaladas = set()
+        for _passada in (1, 2):
+            faltantes = [d for d in dependencias_nao_carregadas(SERVICO) if d not in instaladas]
+            if not faltantes:
+                break
+            for dep in faltantes:
+                instaladas.add(dep)
+                ok, detalhe = instalar_unit(dep)
+                passos.append(("dependencia_instalada:%s" if ok else "dependencia_nao_instalada:%s(%s)")
+                              % ((dep, detalhe) if not ok else dep))
+        # (b) socket exigido e binario que nao o herda: restart seria pior que a falha.
+        if servico_exige_socket(SERVICO) and binario_herda_socket() is False:
+            passos.append("binario_desatualizado:sem LISTEN_FDS")
+            if reparo_anterior.startswith("binario_desatualizado") and reparo_falhas_seguidas >= 1:
+                passos.append("deploy_ja_disparado_antes")
+            else:
+                passos.append(disparar_deploy(agora))
+        else:
+            try:
+                resultado = subprocess.run(["sudo", "-n", "systemctl", "restart", SERVICO],
+                                           capture_output=True, text=True, timeout=120)
+                if resultado.returncode == 0:
+                    passos.append("restart_ok")
+                else:
+                    erro = resultado.stderr.strip()
+                    m = re.search(r"Unit (\S+) not found", erro)
+                    if m:
+                        passos.append("unit-dependencia-ausente:%s" % m.group(1))
+                    passos.append("restart_falhou:%s" % (erro[:120] or resultado.returncode))
+            except Exception as erro:
+                passos.append("restart_erro:%s" % str(erro)[:120])
+        reparo = "; ".join(passos)
+        # (c) o mesmo reparo falhando repetidamente nao e persistencia, e loop.
+        if reparo.startswith(("restart_falhou", "dependencia_nao_instalada", "binario_desatualizado",
+                              "unit-dependencia-ausente", "deploy_nao_disparou")) or "restart_falhou" in reparo:
+            reparo_falhas_seguidas = reparo_falhas_seguidas + 1 if reparo.split(";")[0] == reparo_anterior.split(";")[0] else 1
+        else:
+            reparo_falhas_seguidas = 0
+        if reparo_falhas_seguidas >= LIMITE_REPAROS_IGUAIS:
+            avisar_dono("portal-reparo-esgotado", "critica", "Vigia esgotou o reparo automatico",
+                        "%d falhas seguidas do mesmo reparo: %s. O vigia para de repetir; "
+                        "precisa de engenharia." % (reparo_falhas_seguidas, reparo[:200]),
+                        "tools/check-portal-health --repair; journalctl -u %s -n 40" % SERVICO)
+        if "binario_desatualizado" in reparo:
+            avisar_dono("binario-desatualizado", "critica", "Binario do servidor nao herda o socket",
+                        "bin/wikijuridica-server sem LISTEN_FDS enquanto a unit exige "
+                        "wikijuridica-server.socket: restart faria EADDRINUSE em loop. Reparo: %s" % reparo[:200],
+                        "strings bin/wikijuridica-server | grep -c LISTEN_FDS")
+
+    registro = {
+        "schema_version": "portal_health_v1",
+        "checked_at": agora.isoformat(),
+        "acervo_home": home_status,
+        "acervo_pagina": pagina_status,
+        "acervo_sitemap": sitemap_status,
+        "go_healthz": health_status,
+        "busca": busca_status,
+        "gemea_markdown_via_nginx": gemea_status,
+        "agent_card_via_nginx": card_status,
+        # Campos da rede social: ADITIVOS ao portal_health_v1, de proposito.
+        # Acrescentar chave nao quebra leitor nenhum; mudar o significado de uma
+        # que ja existe quebraria — e e por isso que o schema nao sobe de versao
+        # aqui. Ausencia destes campos numa linha antiga significa "o vigia ainda
+        # nao olhava para o 8091", nunca "a rede social estava fora".
+        "redesocial_healthz": social_health_status,
+        "redesocial_home_via_nginx": social_home_status,
+        "redesocial_gemea_via_nginx": social_gemea_status,
+        "redesocial_service_state": social_ativo,
+        "redesocial_nrestarts": restarts_sociais,
+        "redesocial_nrestarts_delta": delta_social,
+        "redesocial_restart_loop": social_em_loop,
+        "redesocial_problems": problemas_sociais,
+        "service_state": ativo,
+        "nrestarts": restarts,
+        "nrestarts_delta": delta,
+        "restart_loop": em_loop,
+        "deploy_em_curso": em_manutencao,
+        "repair": reparo,
+        "problems": problemas,
+        "ok": not problemas,
+    }
+
+    # AVISAR O DONO. Este vigia detecta e repara desde 2026-08-06 e nunca avisou
+    # ninguem: o veredito ficava no journal, que so alguem procurando encontra, e
+    # `SuccessExitStatus=0 1` na unit impede ate que o systemd marque falha. O
+    # dono pediu, textualmente, um vigia "que me avise quando algo der errado
+    # para ele reiniciar ou se curar sozinho" — avisar sempre foi metade do
+    # pedido, e era a metade ausente.
+    _estado_anterior = ler_estado_anterior()
+    anterior_ok = _estado_anterior.get("ok", True)
+    # As chaves que a execucao anterior deixou ABERTAS. Sem isto, a normalizacao
+    # nao sabe o que fechar e fechava uma chave fixa -- o defeito das 263 h.
+    # Estado antigo (sem o campo) cai na chave historica, para nao perder o
+    # fechamento de um alerta aberto antes desta correcao.
+    chaves_abertas_anteriores = set(_estado_anterior.get("chaves_abertas") or [])
+    if not chaves_abertas_anteriores and not anterior_ok:
+        chaves_abertas_anteriores = {"portal-fora", "portal-degradado", "redesocial-fora",
+                                     "portal-proxy-quebrado", "portal-loop-restart"}
+    chave_aberta = ""
+    if problemas:
+        # Chave por classe: o portal fora do ar e o vigia em loop de restart sao
+        # incidentes diferentes e nao podem disputar o mesmo canal.
+        if em_loop:
+            chave, severidade = "portal-loop-restart", "critica"
+        elif go_fora:
+            chave, severidade = "portal-fora", "critica"
+        elif proxy_quebrado:
+            chave, severidade = "portal-proxy-quebrado", "critica"
+        elif problemas_sociais and len(problemas) == len(problemas_sociais):
+            # So a rede social esta fora: incidente proprio, canal proprio. Se
+            # dividisse a chave com o acervo, o cooldown de um silenciaria o
+            # outro e a queda do 8091 chegaria como "portal degradado" — o
+            # nome errado manda o dono olhar o processo errado.
+            chave, severidade = "redesocial-fora", "alta"
+        else:
+            chave, severidade = "portal-degradado", "alta"
+        acao = (" Reparo: %s." % reparo) if reparo else ""
+        avisar_dono(chave, severidade, "Portal degradado",
+                    "; ".join(problemas)[:400] + acao,
+                    "tools/check-portal-health -> home=%s pagina=%s sitemap=%s "
+                    "healthz=%s busca=%s servico=%s"
+                    % (home_status, pagina_status, sitemap_status,
+                       health_status, busca_status, ativo))
+        chave_aberta = chave
+    elif not anterior_ok:
+        # RESOLVE A CHAVE QUE FOI ABERTA, nao uma fixa.
+        #
+        # DEFEITO MEDIDO EM 2026-09-16, com 263 HORAS de alerta aberto: este
+        # ramo abria com CINCO chaves possiveis (portal-loop-restart,
+        # portal-fora, portal-proxy-quebrado, redesocial-fora,
+        # portal-degradado) e resolvia SEMPRE com "portal-fora". Quem abriu como
+        # `redesocial-fora` ficava aberto para sempre, enquanto o gate fechava
+        # uma chave que podia nem estar aberta.
+        #
+        # A evidencia do proprio alerta dizia `home=200 pagina=200 sitemap=200
+        # healthz=200 busca=200 servico=active` -- tudo verde. O portal estava
+        # sao havia dias e o alerta continuava vermelho no painel do dono.
+        #
+        # E o custo nao e cosmetico: alerta que nunca fecha ensina o dono a
+        # ignorar o canal, e ai o proximo incidente de verdade chega no mesmo
+        # lugar onde ele parou de olhar. Alarme que mente nos dois sentidos e
+        # pior que alarme nenhum.
+        #
+        # A chave aberta PERSISTE no estado, pelo mesmo motivo que
+        # nrestarts_redesocial persiste: sem isso a execucao seguinte nao sabe o
+        # que a anterior abriu.
+        for chave_a_resolver in sorted(chaves_abertas_anteriores or {"portal-fora"}):
+            avisar_dono(chave_a_resolver, "info", "Portal normalizado",
+                        "home, pagina, sitemap, healthz e busca respondendo",
+                        "tools/check-portal-health -> home=%s pagina=%s sitemap=%s "
+                        "healthz=%s busca=%s servico=%s"
+                        % (home_status, pagina_status, sitemap_status,
+                           health_status, busca_status, ativo),
+                        resolvido=True)
+
+    if chave_aberta:
+        chaves_abertas = sorted(set(chaves_abertas_anteriores) | {chave_aberta})
+    else:
+        chaves_abertas = []
+
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    with open(ESTADO, "w", encoding="utf-8") as handle:
+        # nrestarts_redesocial precisa PERSISTIR, senao o delta da rede social
+        # compara o contador de agora consigo mesmo e da zero para sempre --
+        # um laco de restart seria invisivel exatamente como era antes.
+        json.dump({"checked_at": agora.isoformat(), "nrestarts": restarts,
+                   "nrestarts_redesocial": restarts_sociais,
+                   "ok": not problemas,
+                   "chaves_abertas": chaves_abertas,
+                   "reparo_ultimo": reparo, "reparo_falhas_seguidas": reparo_falhas_seguidas}, handle)
+    # Historico so cresce quando ha o que contar: uma linha por problema ou
+    # reparo, e uma marca a cada hora cheia para provar que o vigia rodou.
+    if problemas or reparo or agora.minute < 5:
+        with open(HISTORICO, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if args.json:
+        print(json.dumps(registro, ensure_ascii=False, indent=2))
+    else:
+        estado = "OK" if not problemas else "PROBLEMA"
+        # A rede social entra NA LINHA, e nao so no ledger: esta e a linha que o
+        # dono le, e o que nao aparece aqui e o que ninguem olha.
+        print("[%s] %s | acervo=%s pagina=%s sitemap=%s | go=%s busca=%s | "
+              "redesocial=%s/%s/%s %s | %s restarts=%d(+%d)"
+              % (agora.strftime("%Y-%m-%d %H:%M:%SZ"), estado, home_status, pagina_status,
+                 sitemap_status, health_status, busca_status,
+                 social_health_status, social_home_status, social_gemea_status,
+                 social_ativo or "?", ativo, restarts, delta))
+        for problema in problemas:
+            print("  - %s" % problema)
+        if reparo:
+            print("  reparo: %s" % reparo)
+
+    return 1 if problemas else 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Prova a medicao de audiencia num navegador REAL, com a CSP servida aplicada.
+
+O QUE ESTE GATE ADICIONA AOS OUTROS TRES: check-analytics-loader executa o JS num
+DOM sintetico (prova a logica); check-analytics-contract compara o corpo servido
+com a constante Go (prova o artefato); check-csp-hash-servido confere o hash do
+header contra o script da resposta (prova a autorizacao). Nenhum deles carrega a
+pagina num motor de verdade — e e no motor que a CSP e aplicada, que o parser
+decide o que e script, e que `document.querySelector`, `closest` e `localStorage`
+se comportam como se comportam.
+
+Ele nao gera trafego falso no painel: as requisicoes para googletagmanager e
+clarity.ms sao ABORTADAS. O que se prova e que o carregador enfileira o que
+deveria — nao que a Microsoft recebeu, que seria medicao inventada.
+
+Uso:
+  ./tools/check-medicao-no-navegador
+  ./tools/check-medicao-no-navegador --base http://127.0.0.1:8088 --rotas / /buscar/
+"""
+import argparse
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+NODE_DIR = RAIZ / "tools" / "publicador-social"
+CACHE = pathlib.Path.home() / ".cache" / "ms-playwright"
+
+RUNNER = r"""
+import { chromium } from 'playwright-core';
+const CFG = JSON.parse(process.env.WJ_CFG);
+const navegador = await chromium.launch({
+  headless: true, executablePath: CFG.executavel,
+  args: ['--host-resolver-rules=MAP wikijuridica.com.br 127.0.0.1',
+         '--disable-blink-features=AutomationControlled'],
+});
+const saida = [];
+for (const rota of CFG.rotas) {
+  const ctx = await navegador.newContext({
+    userAgent: 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36',
+    extraHTTPHeaders: { 'X-Warming-Request': 'true' },
+  });
+  // O Playwright marca navigator.webdriver=true e a guarda de automacao do
+  // Loader barra isso — corretamente. Para provar o caminho do VISITANTE a marca
+  // e removida; o cenario "robo nao mede" ja e provado por check-analytics-loader.
+  await ctx.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+  const page = await ctx.newPage();
+  const erros = [];
+  page.on('console', m => { if (m.type() === 'error') erros.push(m.text().slice(0, 300)); });
+  page.on('pageerror', e => erros.push('pageerror: ' + String(e).slice(0, 300)));
+  await page.route('**://*.googletagmanager.com/**', r => r.abort());
+  await page.route('**://*.clarity.ms/**', r => r.abort());
+  // NOTA: aqui o Clarity e abortado de proposito — este bloco prova o LOADER, e
+  // nao a entrega. A entrega e provada no cenario de payload, mais abaixo, que
+  // precisa deixar a rede passar. Abortar o /collect impede a fila de ser drenada,
+  // e uma medicao feita assim conclui, erradamente, que os eventos nao chegam.
+  await page.goto(CFG.base + rota, { waitUntil: 'domcontentloaded' });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 400)));
+  const estado = await page.evaluate(() => {
+    const fila = (window.clarity && window.clarity.q ? window.clarity.q : [])
+      .map(a => Array.prototype.slice.call(a));
+    const dl = (window.dataLayer || []).map(a => Array.prototype.slice.call(a));
+    const cfg = dl.find(c => c[0] === 'config');
+    return {
+      executou: Array.isArray(window.dataLayer),
+      etiquetas: Object.fromEntries(fila.filter(c => c[0] === 'set').map(c => [c[1], c[2]])),
+      pageLocation: cfg ? cfg[2].page_location : null,
+      pageTitle: cfg ? (cfg[2].page_title || null) : null,
+      metaDimensoes: (document.querySelector('meta[name="wj-pagina"]') || {}).content || null,
+      metaReferrer: (document.querySelector('meta[name="referrer"]') || {}).content || null,
+      unmask: !!document.querySelector('main[data-clarity-unmask="true"]'),
+      mask: !!document.querySelector('form[data-clarity-mask="true"]'),
+      consentDefaults: dl.filter(c => c[0] === 'consent').length,
+    };
+  });
+  estado.rota = rota;
+  estado.cspRecusou = erros.filter(e => /content security policy|refused to execute/i.test(e));
+  estado.errosOutros = erros.filter(e => !/ERR_FAILED|net::|ERR_ABORTED/i.test(e));
+  saida.push(estado);
+  await ctx.close();
+}
+await navegador.close();
+console.log(JSON.stringify(saida));
+"""
+
+
+# Runner do cenario de ENTREGA: deixa o Clarity carregar de verdade, le o payload
+# (gzip) e diz o que ele contem. Gera UMA sessao real por execucao, e por isso ela
+# se identifica com a etiqueta `diagnostico` — sessao de teste que nao se anuncia e
+# ruido; anunciada, e filtravel no painel.
+RUNNER_PAYLOAD = r"""
+import { chromium } from 'playwright-core';
+import zlib from 'node:zlib';
+const CFG = JSON.parse(process.env.WJ_CFG);
+const nav = await chromium.launch({ headless: true, executablePath: CFG.executavel,
+  args: ['--host-resolver-rules=MAP wikijuridica.com.br 127.0.0.1',
+         '--disable-blink-features=AutomationControlled'] });
+const ctx = await nav.newContext({
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  extraHTTPHeaders: { 'X-Warming-Request': 'true' },
+});
+await ctx.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+const page = await ctx.newPage();
+const bufs = [];
+// O GA4 fica de fora: nao ha por que sujar a propriedade do Google num gate.
+await page.route('**://*.google-analytics.com/**', r => r.abort());
+await page.route('**://*.googletagmanager.com/**', r => r.abort());
+// O UPLOAD E LIDO E NAO E ENTREGUE, e a diferenca importa: `r.continue()`
+// mandaria o payload ao servidor do Clarity, e cada execucao deste gate viraria
+// UMA SESSAO REAL no painel do dono — com ~25 sessoes humanas por dia, uma
+// bateria de testes distorce a leitura da semana e fere "metrica reflete so
+// trafego real". `fulfill` responde 204 sinteticamente: o cliente considera
+// enviado e DRENA A FILA (que e o que o gate precisa observar), sem que um byte
+// chegue a Microsoft. O payload vem do REQUEST, nao da resposta, entao ler antes
+// de responder nao perde nada.
+await page.route('**://*.clarity.ms/collect**', async r => {
+  const b = r.request().postDataBuffer(); if (b) bufs.push(b);
+  await r.fulfill({ status: 204, body: '' });
+});
+await page.goto(CFG.base + CFG.rota, { waitUntil: 'domcontentloaded' });
+await page.evaluate(() => { if (window.clarity) window.clarity('set', 'diagnostico', 'gate-medicao-no-navegador'); });
+await page.evaluate(() => new Promise(r => setTimeout(r, 4000)));
+// Clique numa ancora do sumario: a pagina NAO navega, e este e o unico evento
+// customizado que o Clarity registra de forma confiavel neste portal.
+const temToc = await page.evaluate(() => !!document.querySelector('nav.toc a'));
+if (temToc) await page.evaluate(() => { document.querySelector('nav.toc a').click(); });
+await page.evaluate(() => new Promise(r => setTimeout(r, 6000)));
+
+// O EVENTO DE NEGOCIO, com clique REAL e navegacao REAL — o cenario que
+// escondeu o defeito por nao existir.
+//
+// Ate 2026-08-29 o botao abria na MESMA aba, e o Clarity perdia o evento SEMPRE:
+// ele bufferiza e agenda flush entre 100 ms e 30 s, a fila e memoria pura, e a
+// pagina era destruida antes. Medido: 0 payloads no clique imediato, e 1 payload
+// SEM o evento com a tag carregada ha 4 s. Com target="_blank" a pagina de
+// origem continua viva, o flush acontece e o evento chega.
+//
+// Este cenario e o que impede a volta silenciosa: tirar o target faria
+// `whatsapp_click` sumir daqui, e nada mais no projeto acusaria.
+//
+// wa.me e respondido localmente: abrir conversa de verdade a cada execucao do
+// gate seria mandar mensagem ao escritorio por engano.
+await ctx.route('**://wa.me/**', r => r.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>stub</title>' }));
+const temCTA = await page.evaluate(() => !!document.querySelector('.wa-float-link'));
+let abriuAba = false;
+if (temCTA) {
+  const [aba] = await Promise.all([
+    ctx.waitForEvent('page', { timeout: 8000 }).catch(() => null),
+    page.click('.wa-float-link'),
+  ]);
+  abriuAba = !!aba;
+  if (aba) await aba.close();
+  // A pagina de ORIGEM continua viva; e ela que drena a fila.
+  await page.evaluate(() => new Promise(r => setTimeout(r, 6000)));
+}
+let texto = '';
+for (const b of bufs) { try { texto += zlib.gunzipSync(b).toString('utf8'); } catch { texto += b.toString('utf8'); } }
+const etiquetas = {};
+for (const m of texto.matchAll(/"(content_group|lane|tipo|superficie|fontes)",\["([^"]*)"\]/g)) etiquetas[m[1]] = m[2];
+console.log(JSON.stringify({
+  payloads: bufs.length, bytes: texto.length, temToc, temCTA, abriuAba,
+  eventos: [...new Set([...texto.matchAll(/\[\d+,24,"([^"]+)"\]/g)].map(m => m[1]))],
+  etiquetas,
+}));
+await nav.close();
+"""
+
+
+def executavel():
+    for candidato in sorted(CACHE.glob("chromium-*/chrome-linux*/chrome"), reverse=True):
+        return str(candidato)
+    for candidato in sorted(CACHE.glob("chromium_headless_shell-*/chrome-linux*/headless_shell"), reverse=True):
+        return str(candidato)
+    return ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--base", default="http://127.0.0.1:8088")
+    parser.add_argument("--rota-payload", default="/familia/abandono-afetivo-indenizacao/",
+                        help="rota do cenario de entrega (precisa ter sumario para exercitar indice_click)")
+    parser.add_argument("--rotas", nargs="*",
+                        default=["/", "/familia/abandono-afetivo-indenizacao/", "/buscar/", "/privacidade/"])
+    args = parser.parse_args()
+
+    if not shutil.which("node"):
+        print("REPROVADO: node nao encontrado — sem ele nao ha como carregar a pagina num motor real")
+        return 2
+    chrome = executavel()
+    if not chrome:
+        print(f"REPROVADO: nenhum Chromium do Playwright em {CACHE}")
+        return 2
+    if not (NODE_DIR / "node_modules" / "playwright-core").is_dir():
+        print(f"REPROVADO: playwright-core ausente em {NODE_DIR}/node_modules")
+        return 2
+
+    cfg = {"base": args.base.rstrip("/"), "rotas": args.rotas, "executavel": chrome}
+    runner = NODE_DIR / ".check-medicao-runner.mjs"
+    runner.write_text(RUNNER, encoding="utf-8")
+    try:
+        import os
+        proc = subprocess.run(["node", str(runner)], cwd=str(NODE_DIR), capture_output=True,
+                              text=True, timeout=180, env=dict(os.environ, WJ_CFG=json.dumps(cfg)))
+    finally:
+        runner.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        print(f"REPROVADO: o navegador falhou: {proc.stderr.strip()[-500:]}")
+        return 2
+    try:
+        resultados = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        print(f"REPROVADO: saida ilegivel do navegador: {proc.stdout[-300:]}")
+        return 2
+
+    falhas = []
+
+    def exige(nome, condicao, detalhe=""):
+        if condicao:
+            print(f"  ok    {nome}")
+            return
+        falhas.append(nome)
+        print(f"  FALHA {nome}: {detalhe}")
+
+    for r in resultados:
+        rota = r["rota"]
+        exige(f"{rota} script executa", r["executou"], "dataLayer nao existe — o motor recusou o script")
+        exige(f"{rota} CSP nao recusa", not r["cspRecusou"], str(r["cspRecusou"]))
+        exige(f"{rota} sem erro de console", not r["errosOutros"], str(r["errosOutros"][:2]))
+        exige(f"{rota} consent default antes da tag", r["consentDefaults"] >= 2,
+              f"apenas {r['consentDefaults']} declaracoes de consent")
+        exige(f"{rota} meta de dimensoes presente", bool(r["metaDimensoes"]), "sem <meta wj-pagina>")
+        if r["metaDimensoes"]:
+            esperado = dict(par.split("=", 1) for par in r["metaDimensoes"].split(";") if "=" in par)
+            exige(f"{rota} etiquetas batem com a meta", r["etiquetas"] == esperado,
+                  f"meta={esperado} enfileirado={r['etiquetas']}")
+        if rota.startswith("/buscar/"):
+            exige(f"{rota} titulo redigido", r["pageTitle"] == "Busca interna", f"page_title={r['pageTitle']!r}")
+            exige(f"{rota} politica de referrer", r["metaReferrer"] == "origin", f"meta referrer={r['metaReferrer']!r}")
+        else:
+            exige(f"{rota} sem politica de referrer", r["metaReferrer"] is None,
+                  f"meta referrer={r['metaReferrer']!r} fora da busca")
+            exige(f"{rota} conteudo publico legivel", r["unmask"], "main sem data-clarity-unmask")
+        exige(f"{rota} campo de busca mascarado", r["mask"], "form sem data-clarity-mask")
+
+    # --- cenario de ENTREGA: o que de fato chega a Microsoft ---
+    cfgP = {"base": args.base.rstrip("/"), "rota": args.rota_payload, "executavel": chrome}
+    runnerP = NODE_DIR / ".check-medicao-payload.mjs"
+    runnerP.write_text(RUNNER_PAYLOAD, encoding="utf-8")
+    try:
+        import os as _os
+        procP = subprocess.run(["node", str(runnerP)], cwd=str(NODE_DIR), capture_output=True,
+                               text=True, timeout=180, env=dict(_os.environ, WJ_CFG=json.dumps(cfgP)))
+    finally:
+        runnerP.unlink(missing_ok=True)
+    print()
+    if procP.returncode != 0:
+        exige("entrega/o navegador conseguiu medir", False, procP.stderr.strip()[-300:])
+    else:
+        try:
+            e = json.loads(procP.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            e = None
+            exige("entrega/saida legivel", False, procP.stdout[-200:])
+        if e:
+            exige("entrega/o Clarity fez upload", e["payloads"] > 0, f"payloads={e['payloads']}")
+            exige("entrega/as etiquetas chegam a Microsoft",
+                  set(e["etiquetas"]) >= {"content_group", "lane", "tipo", "superficie", "fontes"},
+                  f"etiquetas no payload={e['etiquetas']}")
+            if e["temToc"]:
+                exige("entrega/indice_click chega (ancora nao navega)",
+                      "indice_click" in e["eventos"], f"eventos no payload={e['eventos']}")
+            else:
+                print(f"  aviso {args.rota_payload} nao tem sumario; indice_click nao exercitado")
+            # O EVENTO DE NEGOCIO, que so chega porque o botao abre em nova aba.
+            # Ver o comentario do RUNNER_PAYLOAD: sem `target="_blank"` a pagina e
+            # destruida antes do flush e `whatsapp_click` chega ZERO, sempre.
+            if e.get("temCTA"):
+                exige("entrega/o CTA abre em nova aba (a pagina de origem sobrevive)",
+                      e.get("abriuAba"),
+                      "o clique nao abriu aba: sem target=_blank a pagina morre antes do flush")
+                exige("entrega/whatsapp_click sobrevive ao clique",
+                      "whatsapp_click" in e["eventos"],
+                      f"eventos no payload={e['eventos']}")
+            else:
+                print(f"  aviso {args.rota_payload} nao tem botao de WhatsApp; whatsapp_click nao exercitado")
+
+    print()
+    if falhas:
+        print(f"REPROVADO: {len(falhas)} verificacao(oes) num navegador real")
+        return 1
+    print(f"APROVADO: {len(resultados)} rota(s) provadas num motor de verdade, com a CSP aplicada")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,630 @@
+#!/usr/bin/env bash
+# ai-session-reaper — encerra sessão de terminal que o dono já fechou.
+#
+# ─── POR QUE EXISTE (medido em 2026-08-19) ────────────────────────────────────
+# O `ai-process-reaper` roda a cada 15 min e só considera órfão processo com
+# PPID==1. Às 15:36 ele reportou "nenhum órfão" enquanto havia QUATRO sessões
+# Claude Code penduradas, somando ~4 GB. Nenhuma tinha PPID==1: estavam em panes
+# de sessões tmux que aquele reaper protege por regra.
+#
+# O tmux sobrevive ao fechamento do terminal — é o propósito dele — e o launcher
+# cria uma sessão NOVA por janela. Fechar a janela do WezTerm deixa a sessão viva
+# e sem cliente, com o Claude Code inteiro dentro. Em quatro dias acumularam-se
+# 18 sessões; o dono via "MCP órfão" e o que havia era isso.
+#
+# ─── POR QUE ELE TEM ESTADO (a primeira versão matava trabalho) ───────────────
+# A v1 decidia por `session_activity` do tmux, supondo que o pane de um processo
+# ativo repinta e renova o campo. MEDIDO E FALSO: numa sessão detached imprimindo
+# uma linha por segundo, `session_activity` avançou 0s em 40s. Ele mede interação
+# de CLIENTE — teclado, attach —, então numa sessão sem cliente fica congelado no
+# instante do detach. A "carência de 90 min" virava um cronômetro de execução
+# começando quando o dono fecha a janela.
+#
+# Pior, uma decisão tomada numa amostra instantânea é roleta: entre dois tool
+# calls, os únicos filhos vivos de um Claude são servidores de MCP — todos
+# excluídos por desenho —, então a sessão parece parada mesmo trabalhando.
+#
+# A correção não é trocar de campo, é parar de ser stateless. Cada execução grava
+# uma OBSERVAÇÃO por sessão; só se encerra quando N observações consecutivas,
+# cobrindo a carência inteira, todas disserem "parada". Um Claude trabalhando
+# escapa em qualquer uma delas: o streaming muda a tela, os tool calls acumulam
+# CPU. Três sinais independentes, e basta um acusar vida:
+#
+#   hash do capture-pane  — o conteúdo da tela mudou desde a última observação?
+#   ΔCPU da árvore        — utime+stime somados avançaram?
+#   filhos de trabalho    — há processo que não é MCP nem shell parado?
+#
+# `window_activity` entra como quarto sinal (medido: avança 40s em 40s de output,
+# e fica em 0 por 120s com o TUI ocioso), mas nenhum sozinho decide.
+#
+# ─── ARMADILHA DO TARGET `=` (medida, tmux 3.5a) ──────────────────────────────
+# O prefixo `=` pede match EXATO de nome, e por isso parece a escolha segura em
+# todo comando. Não é: metade deles não o entende e falha em SILÊNCIO, devolvendo
+# string vazia em vez de erro.
+#
+#   funciona:  list-panes · has-session · kill-session
+#   quebra:    show-options · capture-pane · display-message
+#
+# Custou três bugs nesta mesma ferramenta: o `@ai_keep` do dono lido como
+# inexistente (opt-out ignorado), o hash da tela sempre igual ao sha256 da string
+# vazia, e uma medição inteira que "provou" que o Claude não repinta quando não
+# estava lendo nada. Ao editar, confira em qual lista o comando está.
+#
+# ─── NUNCA TOCA ───────────────────────────────────────────────────────────────
+#   sessão attached · com `@ai_keep` · fora do prefixo `ai-` · com trabalho vivo
+#   · daemon com pai vivo ou cujo criador não se pode provar morto
+#
+# Dry-run por padrão. Só age com --apply.
+
+set -uo pipefail
+
+APPLY=0
+CLAUDE_GRACE_MIN=90
+SHELL_GRACE_MIN=15
+PREFIX="ai-"
+MAX_KILLS=3
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ai-session-reaper"
+LEDGER="$STATE_DIR/ledger.jsonl"
+# O lock acompanha o STATE_DIR. Global, ele atravessava `--state-dir`: a suíte de
+# testes e o timer disputavam o mesmo arquivo, e o run perdedor saía MUDO com
+# exit 0 — que a suíte lia como "sessão ausente" e reportava falha falsa. Foi a
+# causa dos vermelhos intermitentes que pareciam variabilidade de startup.
+LOCK="" # definido após o parse, a partir de STATE_DIR
+# Quantas observações consecutivas de "parada" são exigidas, além de cobrirem a
+# carência. Duas seriam frágeis com o timer de 15 min; três dão ~45 min de
+# evidência acumulada antes mesmo de a carência entrar na conta.
+MIN_OBS=3
+# Espaçamento mínimo entre observações que contam para a série. Sem ele, três
+# execuções seguidas em nove segundos satisfaziam MIN_OBS — o red-team formou
+# 1/3 → 2/3 → 3/3 em 9s. O comentário que prometia "~45 min de evidência" era
+# falso: a carência era o único gate temporal. Com o timer de 15 min, 300s não
+# atrapalha nada e barra a rajada.
+MIN_GAP_S=300
+# Acima de quantos jiffies/s a árvore conta como trabalhando. O piso medido de um
+# Claude ocioso é 1,50 jiffies/s; 8 dá mais de cinco vezes de margem.
+CPU_VIVO_JPS=8
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--apply) APPLY=1 ;;
+	--claude-grace-minutes)
+		shift
+		CLAUDE_GRACE_MIN="${1:-90}"
+		;;
+	--claude-grace-minutes=*) CLAUDE_GRACE_MIN="${1#*=}" ;;
+	--shell-grace-minutes)
+		shift
+		SHELL_GRACE_MIN="${1:-15}"
+		;;
+	--shell-grace-minutes=*) SHELL_GRACE_MIN="${1#*=}" ;;
+	--min-observations)
+		shift
+		MIN_OBS="${1:-3}"
+		;;
+	--min-observations=*) MIN_OBS="${1#*=}" ;;
+	--min-gap-seconds)
+		shift
+		MIN_GAP_S="${1:-300}"
+		;;
+	--min-gap-seconds=*) MIN_GAP_S="${1#*=}" ;;
+	--cpu-vivo-jps)
+		shift
+		CPU_VIVO_JPS="${1:-8}"
+		;;
+	--cpu-vivo-jps=*) CPU_VIVO_JPS="${1#*=}" ;;
+	--max-kills)
+		shift
+		MAX_KILLS="${1:-3}"
+		;;
+	--max-kills=*) MAX_KILLS="${1#*=}" ;;
+	--prefix)
+		shift
+		PREFIX="${1:-ai-}"
+		;;
+	--prefix=*) PREFIX="${1#*=}" ;;
+	--state-dir)
+		shift
+		STATE_DIR="${1}"
+		LEDGER="$STATE_DIR/ledger.jsonl"
+		;;
+	--state-dir=*)
+		STATE_DIR="${1#*=}"
+		LEDGER="$STATE_DIR/ledger.jsonl"
+		;;
+	-h | --help)
+		grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
+		exit 0
+		;;
+	*)
+		echo "arg desconhecido: $1" >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+LOCK="${LOCK:-$STATE_DIR/.lock}"
+[ -n "$LOCK" ] || LOCK="$STATE_DIR/.lock"
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+command -v tmux >/dev/null 2>&1 || {
+	echo "ai-session-reaper: tmux ausente."
+	exit 0
+}
+tmux has-session 2>/dev/null || {
+	echo "ai-session-reaper: nenhum servidor tmux."
+	exit 0
+}
+
+# Execuções concorrentes decidiriam sobre o mesmo estado e poderiam matar duas
+# vezes a mesma árvore, ou agir sobre snapshot obsoleto enquanto a outra espera
+# os 8s do TERM. Uma por vez; a segunda simplesmente desiste.
+exec 9>>"$LOCK" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+	flock -n 9 || {
+		echo "ai-session-reaper: outra execução em andamento."
+		exit 0
+	}
+fi
+
+mkdir -p "$STATE_DIR" 2>/dev/null
+now=$(date +%s)
+claude_grace_s=$((CLAUDE_GRACE_MIN * 60))
+shell_grace_s=$((SHELL_GRACE_MIN * 60))
+
+descendants() {
+	ps -eo pid,ppid --no-headers 2>/dev/null | awk -v r="$1" '
+    {p[$1]=$2}
+    END{ n=1; q[1]=r; seen[r]=1
+      for(i=1;i<=n;i++){ for(k in p){ if(p[k]==q[i] && !(k in seen)){ seen[k]=1; q[++n]=k } } }
+      for(i=2;i<=n;i++) print q[i] }'
+}
+
+cmd_de() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//'; }
+
+# É o TUI do Claude Code? Testa o PRIMEIRO token.
+# O launcher chama `claude` pelo PATH, então o cmdline vem sem caminho; exigir
+# `/local/bin/claude` classificava a sessão como casca e lhe dava a carência
+# curta. Casar "claude" na linha inteira é o erro oposto: os plugins moram em
+# ~/.claude/plugins/ e entrariam junto.
+e_claude_tui() {
+	local exe="${1%% *}"
+	case "$exe" in
+	claude | */claude | */share/claude/versions/*) : ;;
+	*) return 1 ;;
+	esac
+	# `claude -p` / `--print` NÃO é o TUI: é execução headless, ou seja TRABALHO.
+	# É como `ai-pane run` e os subagentes se materializam. Isentá-la da contagem
+	# tornava invisível um `claude -p 'tarefa' > saida.json` rodando de verdade —
+	# o red-team demonstrou um a 4,8 jiffies/s, três vezes o piso ocioso, sendo
+	# classificado como sessão parada.
+	case " $1 " in
+	*" -p "* | *" --print "* | *" --output-format "*) return 1 ;;
+	esac
+	return 0
+}
+
+e_shell_puro() {
+	case "$1" in
+	bash | -bash | /bin/bash | /usr/bin/bash | zsh | -zsh | /bin/zsh | sh | -sh | /bin/sh) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Servidor de MCP se reconhece por ONDE é executado, nunca pelo nome do produto.
+# A v1 filtrava por substring ('convex|playwright|semgrep|lumen'...) e com isso um
+# `semgrep --config auto` de verdade, um `npx playwright test` ou qualquer comando
+# com essas palavras no argumento viravam "MCP" — trabalho real ficava invisível,
+# e a sessão ainda era rebaixada para a carência de casca. Demonstrado pelo
+# red-team com três iscas.
+e_caminho_mcp() {
+	case "$1" in
+	*/.npm/_npx/* | */.cache/uv/* | */.claude/plugins/*) return 0 ;;
+	"docker run"* | */uv\ tool* | *uvx\ * | *npm\ exec\ *) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Conta processos de trabalho no pane.
+#
+# Um MCP é filho DIRETO do TUI, e leva junto toda a sua subárvore (npm exec →
+# sh -c → node). Por isso a varredura marca a subárvore inteira de cada filho-MCP
+# e só depois pergunta pelo resto — parentesco decide, não nome.
+trabalho_no_pane() {
+	local pane="$1" p cmd tui="" n=0
+	local todos
+	todos="$pane $(descendants "$pane")"
+
+	for p in $todos; do
+		cmd=$(cmd_de "$p")
+		[ -n "$cmd" ] || continue
+		if e_claude_tui "$cmd"; then
+			tui="$p"
+			break
+		fi
+	done
+
+	local ignorar=" "
+	if [ -n "$tui" ]; then
+		ignorar="$ignorar$tui "
+		for p in $(descendants "$tui"); do
+			# só os filhos diretos do TUI são candidatos a raiz de MCP
+			local pai
+			pai=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
+			[ "$pai" = "$tui" ] || continue
+			cmd=$(cmd_de "$p")
+			[ -n "$cmd" ] || continue
+			if e_caminho_mcp "$cmd" || e_shell_puro "$cmd"; then
+				ignorar="$ignorar$p "
+				for q in $(descendants "$p"); do ignorar="$ignorar$q "; done
+			fi
+		done
+	fi
+
+	for p in $todos; do
+		case "$ignorar" in *" $p "*) continue ;; esac
+		cmd=$(cmd_de "$p")
+		[ -n "$cmd" ] || continue
+		e_claude_tui "$cmd" && continue
+		e_shell_puro "$cmd" && continue
+		n=$((n + 1))
+	done
+	echo "$n"
+}
+
+cpu_da_arvore() {
+	local root="$1" p total=0 u s
+	for p in "$root" $(descendants "$root"); do
+		read -r u s < <(awk '{print $14, $15}' "/proc/$p/stat" 2>/dev/null) || continue
+		total=$((total + ${u:-0} + ${s:-0}))
+	done
+	echo "$total"
+}
+
+# starttime_de imprime o campo 22 de /proc/<pid>/stat — o instante de criação do
+# processo em ticks desde o boot. É o discriminador canônico contra PID
+# reciclado: o número pode voltar, o starttime não.
+#
+# O campo 2 (`comm`) vem entre parênteses e PODE conter espaço, então a contagem
+# de campos só é confiável depois do `)`. Por isso o corte é pelo último `)` e a
+# numeração recomeça no campo 3 — o starttime é o 20º dali em diante.
+starttime_de() {
+	local stat resto
+	stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	resto=${stat##*\) }
+	# shellcheck disable=SC2086
+	set -- $resto
+	printf '%s' "${20:-}"
+}
+
+encerrar_arvore() {
+	local root="$1" p vivos alvos esperou
+	alvos=$(descendants "$root")
+	# IDENTIDADE GRAVADA NO INSTANTE DO WALK. Entre apurar a lista e mandar o
+	# SIGKILL passam 8 s, e nesse intervalo os alvos estão justamente morrendo —
+	# que é exatamente quando o kernel recicla PID. `[ -d /proc/$p ]` prova que
+	# existe UM processo com aquele número, não que é o MESMO. Sem esta
+	# reconferência, o SIGKILL poderia atingir processo de outra sessão, que é o
+	# que o contrato proíbe e o que a guarda de `kill` existe para impedir.
+	local identidade=""
+	for p in $alvos "$root"; do
+		identidade="$identidade $p:$(starttime_de "$p")"
+	done
+	# shellcheck disable=SC2086
+	kill -TERM $alvos "$root" 2>/dev/null
+	# O CONTADOR E LIDO, e nao e enfeite: ele e o unico registro de quanto o
+	# TERM foi esperado antes do SIGKILL. Ate 2026-09-11 este laco era
+	# `for i in 1 2 3 4 5 6 7 8` com `i` nunca usado, e a linha do kill -9 nao
+	# dizia se tinha esperado 1 s ou 8 s — que e justamente o numero que
+	# distingue "o processo demora" de "o processo ignora o TERM".
+	esperou=0
+	while [ "$esperou" -lt 8 ]; do
+		vivos=""
+		for p in $alvos $root; do [ -d "/proc/$p" ] && vivos="$vivos $p"; done
+		[ -z "${vivos// /}" ] && return 0
+		command sleep 1
+		esperou=$((esperou + 1))
+	done
+	# medido: bg-pty-host ignora o TERM do pai E o TERM direto
+	local confirmados="" reciclados="" agora
+	for p in $vivos; do
+		agora=$(starttime_de "$p")
+		case " $identidade " in
+		*" $p:$agora "*) confirmados="$confirmados $p" ;;
+		*) reciclados="$reciclados $p" ;;
+		esac
+	done
+	if [ -n "${reciclados// /}" ]; then
+		printf 'ai-session-reaper: PID%s reciclado na janela de %ss — NAO recebe sinal\n' \
+			"$reciclados" "$esperou" >&2
+	fi
+	if [ -n "${confirmados// /}" ]; then
+		printf 'ai-session-reaper: SIGKILL em%s apos %ss de SIGTERM ignorado\n' \
+			"$confirmados" "$esperou" >&2
+		# shellcheck disable=SC2086
+		kill -9 $confirmados 2>/dev/null
+	fi
+	return 0
+}
+
+alvos=0
+mantidas=0
+mortas=0
+
+while IFS='|' read -r sess att; do
+	[ -n "$sess" ] || continue
+	arq="$STATE_DIR/$(printf '%s' "$sess" | tr -c 'A-Za-z0-9_.-' '_').obs"
+
+	case "$sess" in
+	"$PREFIX"*) : ;;
+	*)
+		mantidas=$((mantidas + 1))
+		continue
+		;;
+	esac
+
+	if [ "$att" != "0" ]; then
+		: >"$arq" 2>/dev/null # alguém usou: zera o histórico de parada
+		echo "  MANTÉM  $sess — attached (alguém está nela)"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+
+	# ATENÇÃO ao target: `-t "=$sess"` (match exato) funciona em kill-session e
+	# list-panes, mas em `show-options` devolve VAZIO — medido. Com o `=` aqui, o
+	# opt-out do dono era silenciosamente ignorado e a sessão marcada seria
+	# encerrada assim mesmo. Sem o `=`, lê corretamente.
+	keep=$(tmux show-options -qv -t "$sess" @ai_keep 2>/dev/null)
+	if [ -n "$keep" ] && [ "$keep" != "0" ]; then
+		echo "  MANTÉM  $sess — marcada com @ai_keep"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+
+	# --- observação desta execução ---
+	# `display-message` devolve a janela ATIVA apenas. Numa sessão multi-janela
+	# (o padrão de `ai-pane grid`), output numa janela não-ativa não avançava o
+	# campo, e o quarto sinal ficava cego para N-1 janelas. `list-windows` traz
+	# todas; interessa a mais recente.
+	wa=$(tmux list-windows -t "$sess" -F '#{window_activity}' 2>/dev/null | sort -rn | head -1)
+	tela=""
+	cpu=0
+	trab=0
+	tem_claude=0
+	for pp in $(tmux list-panes -s -t "=$sess" -F '#{pane_pid}' 2>/dev/null); do
+		[ -d "/proc/$pp" ] || continue
+		cpu=$((cpu + $(cpu_da_arvore "$pp")))
+		trab=$((trab + $(trabalho_no_pane "$pp")))
+		for p in "$pp" $(descendants "$pp"); do
+			e_claude_tui "$(cmd_de "$p")" && {
+				tem_claude=1
+				break
+			}
+		done
+	done
+	for w in $(tmux list-panes -s -t "=$sess" -F '#{pane_id}' 2>/dev/null); do
+		tela="$tela$(tmux capture-pane -p -t "$w" 2>/dev/null | sha256sum | cut -c1-16)"
+	done
+	tela=$(printf '%s' "$tela" | sha256sum | cut -c1-16)
+
+	ant=$(tail -1 "$arq" 2>/dev/null)
+	# Observação cedo demais depois da anterior não acrescenta evidência: repete a
+	# última em vez de empilhar. Sem isso, N execuções rápidas viram N observações.
+	if [ -n "$ant" ]; then
+		_ts_ant=$(printf '%s' "$ant" | cut -d' ' -f1)
+		if [ $((now - ${_ts_ant:-0})) -lt "$MIN_GAP_S" ] && [ "$(printf '%s' "$ant" | awk '{print $NF}')" = "1" ]; then
+			_n=$(awk '{u[NR]=$NF} END{n=0; for(i=NR;i>=1;i--){ if(u[i]=="1") n++; else break } print n+0}' "$arq" 2>/dev/null)
+			_ini=$(awk -v n="${_n:-0}" '{l[NR]=$1} END{ if(n>0 && NR-n+1>=1) print l[NR-n+1] }' "$arq" 2>/dev/null)
+			echo "  MANTÉM  $sess — observação a menos de ${MIN_GAP_S}s da anterior (série em ${_n:-0}/$MIN_OBS)"
+			mantidas=$((mantidas + 1))
+			continue
+		fi
+	fi
+	parada=1
+	motivo=""
+	if [ -n "$ant" ]; then
+		a_ts=$(echo "$ant" | cut -d' ' -f1)
+		a_tela=$(echo "$ant" | cut -d' ' -f2)
+		a_cpu=$(echo "$ant" | cut -d' ' -f3)
+		a_wa=$(echo "$ant" | cut -d' ' -f5)
+		# salto de relógio (suspend/resume) invalida a série: sem isso, todas as
+		# sessões estourariam a carência no mesmo tick
+		if [ $((now - a_ts)) -gt 3600 ]; then
+			: >"$arq"
+			ant=""
+			motivo="série reiniciada (salto de relógio)"
+		else
+			[ "$tela" != "$a_tela" ] && {
+				parada=0
+				motivo="tela mudou"
+			}
+			# CPU por TAXA, não por delta absoluto. Um Claude OCIOSO queima
+			# 1,50 jiffies/s de forma muito estável (medido em
+			# tools/check-claude-idle-cpu: 1.13, 1.50, 1.51, 1.50) — event loop, timers
+			# e hooks. Com limiar absoluto de 2 jiffies entre observações, ele acusava
+			# vida em toda amostra e a sessão nunca era encerrada. O piso é 1,5; o
+			# limiar fica em CPU_VIVO_JPS, mais de cinco vezes acima, com folga para
+			# não confundir ruído de fundo com trabalho.
+			dt_obs=$((now - a_ts))
+			if [ "$dt_obs" -gt 0 ]; then
+				taxa=$(awk -v a="$cpu" -v b="$a_cpu" -v t="$dt_obs" 'BEGIN{printf "%d", ((a-b)*100)/t}')
+				[ "$taxa" -gt $((CPU_VIVO_JPS * 100)) ] && {
+					parada=0
+					motivo="CPU a $(awk -v x="$taxa" 'BEGIN{printf "%.1f", x/100}') jiffies/s"
+				}
+			fi
+			[ -n "$wa" ] && [ -n "$a_wa" ] && [ "$wa" != "$a_wa" ] && {
+				parada=0
+				motivo="window_activity avançou"
+			}
+		fi
+	fi
+	[ "$trab" -gt 0 ] && {
+		parada=0
+		motivo="$trab processo(s) de trabalho"
+	}
+
+	# Escrita ATÔMICA. Antes era append → truncate → regrava, e morrer entre os dois
+	# comandos deixava resíduo que a contagem lia como série válida. Agora o arquivo
+	# inteiro é montado num tmp e trocado com `mv`, que é atômico no mesmo
+	# filesystem: ou o estado antigo, ou o novo, nunca metade.
+	linha="$now $tela $cpu $trab ${wa:-0} $parada"
+	tmpobs="$arq.tmp.$$"
+	if [ "$parada" -eq 0 ]; then
+		printf '%s\n' "$linha" >"$tmpobs"
+	else
+		{
+			[ -f "$arq" ] && cat "$arq"
+			printf '%s\n' "$linha"
+		} >"$tmpobs"
+	fi
+	mv -f "$tmpobs" "$arq" 2>/dev/null || rm -f "$tmpobs" 2>/dev/null
+
+	if [ "$parada" -eq 0 ]; then
+		echo "  MANTÉM  $sess — viva: $motivo"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+
+	# --- série de paradas consecutivas ---
+	# Conta a série a partir do FIM do arquivo, parando na primeira linha que não
+	# seja de parada. `grep -c ' 1$'` somava linhas NÃO consecutivas: a gravação é
+	# append → truncate → regrava, e morrer entre os dois comandos (kill -9, OOM,
+	# reboot) deixa resíduo `[1, 1, 0]`. O red-team reproduziu e obteve
+	# "ENCERRARIA … cobrindo 117min" com 63 segundos de evidência real, atravessando
+	# uma observação em que o próprio arquivo registrava a sessão VIVA.
+	n_obs=$(awk '{u[NR]=$NF} END{n=0; for(i=NR;i>=1;i--){ if(u[i]=="1") n++; else break } print n+0}' "$arq" 2>/dev/null)
+	n_obs=${n_obs:-0}
+	ini=$(awk -v n="$n_obs" '{l[NR]=$1} END{ if(n>0 && NR-n+1>=1) print l[NR-n+1] }' "$arq" 2>/dev/null)
+	cobertura=$((now - ${ini:-$now}))
+	if [ "$tem_claude" -eq 1 ]; then
+		limite=$claude_grace_s
+		rotulo="claude"
+	else
+		limite=$shell_grace_s
+		rotulo="casca"
+	fi
+
+	if [ "$n_obs" -lt "$MIN_OBS" ] || [ "$cobertura" -lt "$limite" ]; then
+		echo "  MANTÉM  $sess — $rotulo parado: $n_obs/$MIN_OBS observações, $((cobertura / 60))min de $((limite / 60))min"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+
+	alvos=$((alvos + 1))
+	if [ "$APPLY" -ne 1 ]; then
+		echo "  ENCERRARIA $sess — $rotulo parado em $n_obs observações cobrindo $((cobertura / 60))min"
+		continue
+	fi
+	if [ "$mortas" -ge "$MAX_KILLS" ]; then
+		echo "  ADIA    $sess — teto de $MAX_KILLS encerramentos por execução atingido"
+		continue
+	fi
+
+	# Releitura imediatamente antes de agir: entre a decisão e aqui podem ter
+	# passado segundos (ou minutos, se outra sessão foi encerrada antes) e o dono
+	# pode ter reatado a sessão nesse intervalo.
+	att2=$(tmux display-message -p -t "$sess" '#{session_attached}' 2>/dev/null)
+	keep2=$(tmux show-options -qv -t "$sess" @ai_keep 2>/dev/null)
+	if [ "${att2:-0}" != "0" ] || { [ -n "$keep2" ] && [ "$keep2" != "0" ]; }; then
+		echo "  ABORTA  $sess — mudou de estado entre a decisão e o encerramento"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+	# Revalidar VIDA, não só attached. Entre a observação e este ponto cabem os 8s
+	# de espera do TERM de cada sessão encerrada antes desta, mais o dump — tempo
+	# de sobra para um wakeup ou uma notificação disparar. Refaz os sinais agora e
+	# desiste se algum acusar movimento.
+	tela2=""
+	for w in $(tmux list-panes -s -t "=$sess" -F '#{pane_id}' 2>/dev/null); do
+		tela2="$tela2$(tmux capture-pane -p -t "$w" 2>/dev/null | sha256sum | cut -c1-16)"
+	done
+	tela2=$(printf '%s' "$tela2" | sha256sum | cut -c1-16)
+	wa2=$(tmux list-windows -t "$sess" -F '#{window_activity}' 2>/dev/null | sort -rn | head -1)
+	trab2=0
+	for pp in $(tmux list-panes -s -t "=$sess" -F '#{pane_pid}' 2>/dev/null); do
+		[ -d "/proc/$pp" ] && trab2=$((trab2 + $(trabalho_no_pane "$pp")))
+	done
+	if [ "$tela2" != "$tela" ] || [ "${wa2:-0}" != "${wa:-0}" ] || [ "$trab2" -gt 0 ]; then
+		echo "  ABORTA  $sess — voltou a dar sinal de vida entre a decisão e o encerramento"
+		: >"$arq" 2>/dev/null
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+
+	# A evidência do que a sessão fazia morre junto com ela: guarda o tail antes.
+	dump="$STATE_DIR/tail-$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$sess" | tr -c 'A-Za-z0-9_.-' '_').txt"
+	{
+		echo "# $sess — encerrada em $(date -Iseconds)"
+		for w in $(tmux list-panes -s -t "=$sess" -F '#{pane_id}' 2>/dev/null); do
+			# `-S -` pega o scrollback inteiro, não só a tela visível. Sem isso, o
+			# resultado de um `ai-pane run` de horas morria sem cópia — e o ponto de
+			# guardar o tail é justamente não perder o que a sessão fazia.
+			echo "--- pane $w ---"
+			tmux capture-pane -p -S - -t "$w" 2>/dev/null | tail -400
+		done
+	} >"$dump" 2>/dev/null
+
+	for pp in $(tmux list-panes -s -t "=$sess" -F '#{pane_pid}' 2>/dev/null); do
+		[ -d "/proc/$pp" ] && encerrar_arvore "$pp"
+	done
+	tmux kill-session -t "=$sess" 2>/dev/null
+	rm -f "$arq" 2>/dev/null
+	mortas=$((mortas + 1))
+	printf '{"ts":"%s","sessao":"%s","tipo":"%s","observacoes":%s,"cobertura_s":%s,"tail":"%s"}\n' \
+		"$(date -Iseconds)" "$sess" "$rotulo" "$n_obs" "$cobertura" "$dump" >>"$LEDGER"
+	echo "  ENCERRA $sess — $rotulo parado em $n_obs observações cobrindo $((cobertura / 60))min (tail em $dump)"
+done < <(tmux list-sessions -F '#{session_name}|#{session_attached}' 2>/dev/null)
+
+# --- daemon órfão -------------------------------------------------------------
+# Duas condições necessárias, e a ordem em que se falha importa: PPID==1 (daemon
+# com pai vivo tem dono) E criador declarado em --spawned-by comprovadamente
+# morto. Se o pid do criador não puder ser extraído, PROTEGE — a v1 fazia o
+# contrário e matou um daemon-isca do red-team na primeira execução real.
+# `pgrep -f 'claude daemon run'` casa a frase em QUALQUER lugar da linha de
+# comando: um `bash -c` de análise que mencione a expressão entra na lista. O
+# red-team tropeçou nisso duas vezes (um pgrep devolveu o próprio shell dele, e
+# um pkill análogo matou o shell com exit 144). Aqui o primeiro token precisa ser
+# o executável do Claude E o segundo precisa ser literalmente `daemon`.
+for d in $(pgrep -f 'daemon run' 2>/dev/null); do
+	cmd=$(cmd_de "$d")
+	_exe="${cmd%% *}"
+	_resto="${cmd#* }"
+	_arg1="${_resto%% *}"
+	case "$_exe" in claude | */claude | */share/claude/versions/*) : ;; *) continue ;; esac
+	[ "$_arg1" = "daemon" ] || continue
+	ppid_d=$(awk '/^PPid:/{print $2}' "/proc/$d/status" 2>/dev/null)
+	if [ "${ppid_d:-0}" != "1" ]; then
+		echo "  MANTÉM  daemon $d — tem pai vivo (ppid ${ppid_d:-?})"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+	spawner=$(printf '%s' "$cmd" | grep -o '"pid":[0-9]*' | head -1 | cut -d: -f2)
+	if [ -z "$spawner" ]; then
+		echo "  MANTÉM  daemon $d — sem --spawned-by legível; não dá para provar orfandade"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+	if [ -d "/proc/$spawner" ]; then
+		echo "  MANTÉM  daemon $d — criador $spawner vivo"
+		mantidas=$((mantidas + 1))
+		continue
+	fi
+	alvos=$((alvos + 1))
+	if [ "$APPLY" -eq 1 ] && [ "$mortas" -lt "$MAX_KILLS" ]; then
+		encerrar_arvore "$d"
+		mortas=$((mortas + 1))
+		printf '{"ts":"%s","daemon":%s,"criador":%s}\n' "$(date -Iseconds)" "$d" "$spawner" >>"$LEDGER"
+		echo "  ENCERRA daemon $d — órfão (ppid 1) e criador $spawner morto"
+	else
+		echo "  ENCERRARIA daemon $d — órfão (ppid 1) e criador $spawner morto"
+	fi
+done
+
+echo
+if [ "$APPLY" -eq 1 ]; then
+	echo "ai-session-reaper: $mortas encerrada(s), $mantidas mantida(s)."
+else
+	echo "ai-session-reaper: $alvos alvo(s), $mantidas mantida(s) — dry-run (use --apply)."
+fi
+exit 0

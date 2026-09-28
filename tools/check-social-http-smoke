@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Smoke HTTP da rede social (cmd/social, 127.0.0.1:8091).
+#
+# POR QUE ESTE GATE EXISTE, e por que ele sonda porta em vez de montar o
+# handler em processo como o `http-smoke` do acervo faz:
+#
+# `cmd/social` e `package main`, que Go nao deixa importar. Montar o handler
+# dentro de `internal/checks` exigiria mover o roteador para um pacote
+# importavel -- refatoracao que `internal/socialisolation` vigia de perto,
+# porque o fecho do `cmd/server` nao pode referenciar estado social. Sondar a
+# porta prova mais, e sem tocar naquela fronteira: prova que o binario
+# INSTALADO subiu, adotou o socket e serve. Handler em processo passaria verde
+# com o servico morto -- que e exatamente o buraco medido em 2026-09-05, quando
+# `check-http-smoke` e `check-portal-health` nao tinham UMA ocorrencia de 8091
+# e a rede social podia cair sem que nada avisasse.
+#
+# A folha de estilo NAO e sondada por caminho fixo: o nome dela carrega o hash
+# do conteudo e muda a cada alteracao de CSS. O gate extrai o href do HTML
+# servido e sonda o que a pagina realmente pede. Caminho fixo aqui envelheceria
+# no primeiro commit de design e o gate passaria a medir uma folha morta.
+set -uo pipefail
+
+BASE="${WIKI_SOCIAL_SMOKE_BASE:-http://127.0.0.1:8091}"
+UA='wikijuridica-superficie-probe/1.0'
+falhas=0
+
+# Sonda interna JAMAIS forja User-Agent de bot real, e vai marcada como
+# aquecimento para nao contaminar a metrica de trafego humano.
+codigo_de() {
+	curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+		-A "$UA" -H 'X-Warming-Request: true' "$1"
+}
+
+corpo_de() {
+	curl -s --max-time 8 -A "$UA" -H 'X-Warming-Request: true' "$1"
+}
+
+cabecalho_de() {
+	curl -sI --max-time 8 -A "$UA" -H 'X-Warming-Request: true' "$1"
+}
+
+exige() {
+	local rota="$1" esperado="$2" obtido
+	obtido="$(codigo_de "$BASE$rota")"
+	if [ "$obtido" != "$esperado" ]; then
+		echo "social_http_smoke_status: $rota devolveu $obtido, esperado $esperado"
+		falhas=$((falhas + 1))
+	fi
+}
+
+# 1. Infra: se estas duas caem, o servico nao esta no ar e o resto e ruido.
+if [ "$(codigo_de "$BASE/healthz")" != "200" ]; then
+	echo "social_http_smoke_fora_do_ar: $BASE/healthz nao respondeu 200 -- o cmd/social esta parado ou nao adotou o socket"
+	exit 1
+fi
+exige /readyz 200
+
+# 2. As rotas publicas e as gemeas Markdown de cada uma. O canal de maquina e
+#    contrato, nao cortesia: rota indexavel sem gemea quebra MCP, A2A e lote.
+for rota in /redesocial/ /redesocial/index.md \
+	/redesocial/perguntas/ /redesocial/perguntas/index.md /redesocial/perguntas/feed.xml \
+	/redesocial/consulta/ /redesocial/consulta/index.md \
+	/redesocial/confere/ /redesocial/confere/index.md \
+	/redesocial/tese/ /redesocial/tese/index.md; do
+	exige "$rota" 200
+done
+
+# 3. A folha que a pagina REALMENTE pede, extraida do HTML servido.
+inicio="$(corpo_de "$BASE/redesocial/")"
+folha="$(printf '%s' "$inicio" | grep -o '/redesocial/assets/css/[A-Za-z0-9._-]*\.css' | head -1)"
+if [ -z "$folha" ]; then
+	echo "social_http_smoke_sem_folha: /redesocial/ nao referencia nenhuma folha sob /redesocial/assets/css/"
+	falhas=$((falhas + 1))
+else
+	exige "$folha" 200
+fi
+
+# 4. Rota inexistente devolve 404 honesto, nunca 200 com pagina vazia nem
+#    redirect para a raiz. "Em breve" nao existe neste projeto.
+exige /redesocial/rota-que-nao-existe/ 404
+
+# 5. A CSP servida autoriza a folha EXATA, e nao o diretorio dela.
+#    Autorizar /redesocial/assets/css/ inteiro e 'self' reintroduzido com
+#    escopo de diretorio: daria a qualquer arquivo gravado ali o direito de ser
+#    interpretado como folha de estilo. Medido em 2026-09-05: o Go ja emitia a
+#    URL exata e o nginx sobrescrevia com o prefixo antigo, porque
+#    `more_set_headers` substitui o cabecalho do upstream e o processo ainda
+#    carregava a config anterior ao reload.
+csp="$(cabecalho_de "$BASE/redesocial/" | grep -i '^content-security-policy:')"
+if [ -z "$csp" ]; then
+	echo "social_http_smoke_sem_csp: /redesocial/ nao trouxe Content-Security-Policy"
+	falhas=$((falhas + 1))
+elif [ -n "$folha" ] && ! printf '%s' "$csp" | grep -qF "$folha"; then
+	echo "social_http_smoke_csp_nao_nomeia_a_folha: style-src nao contem $folha -- CSP servida: $(printf '%s' "$csp" | tr ';' '\n' | grep -i 'style-src' | tr -d '\r')"
+	falhas=$((falhas + 1))
+fi
+
+# 6. script-src 'none' nas duas variantes. A rede social publica texto de
+#    terceiro, e esta e a unica defesa que continua valendo quando a
+#    sanitizacao falhar -- e a sanitizacao e codigo nosso, logo pode ter bug.
+if [ -n "$csp" ] && ! printf '%s' "$csp" | grep -q "script-src 'none'"; then
+	echo "social_http_smoke_script_src_afrouxado: a CSP de /redesocial/ nao traz script-src 'none'"
+	falhas=$((falhas + 1))
+fi
+
+# 7. A CSP QUE O MUNDO RECEBE SAI DO NGINX, NAO DO GO -- e por isso as seis
+#    verificacoes acima, todas contra $BASE (:8091), NAO ALCANCAM o defeito que
+#    esta secao existe para pegar.
+#
+#    `more_set_headers` SUBSTITUI o cabecalho do upstream, e e TUDO-OU-NADA POR
+#    NIVEL: uma location que nao declare os seus herda os do server{}, que sao os
+#    do ACERVO. O Go pode emitir a CSP social perfeita e o visitante receber a do
+#    acervo mesmo assim.
+#
+#    MEDIDO EM 2026-09-06, e o gate passava verde enquanto isso:
+#    /api/v1/redesocial/lote servia `script-src <hash> googletagmanager
+#    *.clarity.ms` -- a CSP do acervo, com analytics autorizado, sobre o canal de
+#    maquina da REDE SOCIAL. A causa e que a location faz `try_files $uri
+#    @fallback`, e a resposta e gerada no contexto do named location: o `include`
+#    posto na location original nunca alcanca a resposta. A correcao anterior
+#    tinha sido escrita no .conf e o gate `social-csp`, que LE o .conf, viu o
+#    include e aprovou.
+#
+#    E POR ISSO A PROVA AQUI E SONDAGEM, E NAO LEITURA DE CONFIG. Ler o arquivo
+#    mede a intencao; sondar a porta mede o que o bot recebe.
+BORDA="${WIKI_SOCIAL_SMOKE_BORDA:-http://127.0.0.1:8088}"
+
+# Rotas publicas da rede social que atravessam o nginx. A de assets entra porque
+# a folha e servida por location propria, e a de lote porque e o canal de
+# maquina -- exatamente o que os bots de IA consomem.
+rotas_da_borda='/redesocial/ /api/v1/redesocial/lote'
+
+if [ -z "$(codigo_de "$BORDA/redesocial/" 2>/dev/null)" ] || [ "$(codigo_de "$BORDA/redesocial/")" = "000" ]; then
+	# nginx fora do ar (ambiente sem borda, ou deploy trocando o servico). Calar
+	# e' correto aqui: reprovar por ausencia de nginx confundiria "config errada"
+	# com "nao ha nginx", que mandam investigar coisas diferentes.
+	echo "social-http-smoke: borda nao sondada (nginx em $BORDA nao respondeu)"
+else
+	for rota in $rotas_da_borda; do
+		csp_borda="$(cabecalho_de "$BORDA$rota" | grep -i '^content-security-policy:' | tr -d '\r')"
+		if [ -z "$csp_borda" ]; then
+			echo "social_http_smoke_borda_sem_csp: $rota servida pelo nginx nao trouxe Content-Security-Policy"
+			falhas=$((falhas + 1))
+			continue
+		fi
+		# A assinatura da CSP DO ACERVO numa rota social: os hosts de analytics.
+		# A rede social e `script-src 'none'` por decisao registrada -- ela publica
+		# texto de terceiro, e essa e a defesa que sobrevive a um bug de
+		# sanitizacao.
+		if printf '%s' "$csp_borda" | grep -qE 'googletagmanager|clarity\.ms'; then
+			echo "social_http_smoke_borda_serve_csp_do_acervo: $rota recebeu a CSP do ACERVO pelo nginx (analytics autorizado numa rota social) -- script-src servido: $(printf '%s' "$csp_borda" | tr ';' '\n' | grep -i 'script-src' | sed 's/^ *//')"
+			falhas=$((falhas + 1))
+		elif ! printf '%s' "$csp_borda" | grep -q "script-src 'none'"; then
+			echo "social_http_smoke_borda_script_src_afrouxado: $rota nao traz script-src 'none' pelo nginx -- script-src servido: $(printf '%s' "$csp_borda" | tr ';' '\n' | grep -i 'script-src' | sed 's/^ *//')"
+			falhas=$((falhas + 1))
+		fi
+	done
+fi
+
+if [ "$falhas" -gt 0 ]; then
+	echo "social_http_smoke: $falhas verificacao(oes) reprovaram em $BASE"
+	exit 1
+fi
+echo "social-http-smoke: pass base=$BASE borda=$BORDA rotas=13 folha=$folha"

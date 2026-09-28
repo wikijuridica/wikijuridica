@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""check-lastmod-causalidade — a data so pode andar quando o conteudo andou.
+
+POR QUE ESTE GATE EXISTE, e por que ele NAO duplica check-freshness-signal-integrity
+--------------------------------------------------------------------------------
+A regra oficial do Google sobre `<lastmod>` e condicional, nao incondicional:
+
+    "Google uses the <lastmod> value if it's consistently and verifiably
+     (for example by comparing to the last modification of the page) accurate."
+    -- https://developers.google.com/search/docs/crawling-indexing/sitemaps/build-sitemap
+       (pagina atualizada em 2026-07-08)
+
+Ou seja: o buscador NAO promete usar o campo. Ele promete usar o campo enquanto
+o campo for verificavel. Um portal que carimba data nova em pagina que nao mudou
+nao ganha frescor — ele perde o direito de ter o sinal lido, e perde para todas
+as atualizacoes futuras, inclusive as verdadeiras.
+
+O gate irmao `check-freshness-signal-integrity` mede CONSISTENCIA (as camadas
+dizem a mesma data?) e, por decisao explicita e correta do autor, se recusa a
+medir DISTRIBUICAO — porque "muitas paginas na mesma data" e legitimo quando o
+acervo foi mesmo publicado num dia so. Este gate mede a terceira coisa, que
+nenhum dos dois cobria: CAUSALIDADE. Nao "a data e a mesma em todo lugar", nem
+"a data se repete", mas: **essa data andou porque o conteudo andou?**
+
+E a pergunta certa porque o repositorio ja tem a evidencia para responde-la sem
+adivinhar. `data/ops/page_content_revision.jsonl` guarda, por rota, o
+`content_sha256` — o hash do que o AUTOR escreveu, que de proposito ignora as
+datas. Se o hash nao mudou e a data andou, a data e fabricada. Nao e opiniao,
+e subtracao.
+
+O DEFEITO QUE ORIGINOU O GATE (medido em 2026-08-27, com o proprio hash do repo):
+entre `e2c291fa~1` e a worktree, 10.070 rotas avancaram `revised_on` e ZERO
+mudaram `content_sha256`. O sitemap passou a anunciar 10.070 URLs revisadas no
+MESMO SEGUNDO (2026-08-26T23:19:47Z) enquanto o rodape de cada pagina dizia
+"revisado em 27 de agosto de 2026" — as duas camadas se contradizendo, que e
+literalmente a comparacao que a doc do Google descreve para decidir se confia.
+
+A causa foi um laco de realimentacao que o gerador documenta e que voltou por
+uma porta nova: datar muda o HTML (a data e renderizada nele), o HTML mudado
+parece "conteudo novo", o conteudo novo pede data nova. O gerador ja tem defesa
+(`neutraliza_datas`, `--ressemear`); o que faltava era alguem VERIFICANDO que a
+defesa segurou. Defesa sem gate volta — foi o que aconteceu.
+
+O QUE ELE VERIFICA
+  1. CAUSALIDADE: nenhuma rota avancou `revised_on` com `content_sha256` igual.
+  2. PRECISAO HONESTA: nenhum INSTANTE ao segundo e compartilhado por LOTE_MINIMO
+     rotas ou mais. Dia compartilhado por milhares e legitimo (publicacao em
+     lote); segundo compartilhado por milhares e precisao inventada.
+     Este criterio e o mesmo que o gerador adotou; aqui ele vira invariante.
+  3. COERENCIA: o `<lastmod>` que o sitemap REALMENTE serve bate com o ledger.
+     Os shards sao lidos pelo INDICE, nunca por glob do diretorio — o disco tem
+     shards aposentados fora do indice, e ler por glob ja produziu 365
+     divergencias falsas uma vez (commit 1dc09fd2).
+  4. REVISAO AFIRMADA: `reviewed_at` de content/pages.json nao avancou em rota
+     cujo `content_sha256` ficou igual. Este campo e RENDERIZADO no rodape como
+     "Revisao: <advogado> em <data>", com numero de OAB ao lado — carimba-lo sem
+     revisao afirma ao leitor um ato profissional que nao ocorreu. E e tambem o
+     que faz os bytes de TODAS as paginas mudarem a cada republicacao, girando
+     `Last-Modified` e `ETag` (que o nginx deriva do mtime) e impedindo que
+     qualquer requisicao condicional do crawler feche em 304.
+
+Uso:
+    tools/check-lastmod-causalidade                    # worktree x HEAD
+    tools/check-lastmod-causalidade --desde e2c291fa~1 # audita uma janela
+    tools/check-lastmod-causalidade --json
+    tools/check-lastmod-causalidade --listar 20
+
+Saida:
+    0  os quatro invariantes valem.
+    1  FRAUDE DE SINAL: data fabricada, precisao inventada ou revisao afirmada
+       sem revisao. O dado afirma um fato que nao ocorreu.
+    2  PENDENTE: o ledger esta correto e o artefato publico ainda carrega o valor
+       antigo porque a republicacao nao rodou. Estado de passagem, nao acusacao.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+from typing import Dict, List, Tuple
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LEDGER = os.path.join(RAIZ, "data", "ops", "page_content_revision.jsonl")
+LEDGER_REL = "data/ops/page_content_revision.jsonl"
+PAGES = os.path.join(RAIZ, "content", "pages.json")
+PAGES_REL = "content/pages.json"
+INDICE_SITEMAP = os.path.join(RAIZ, "public", "sitemap.xml")
+DIR_SITEMAPS = os.path.join(RAIZ, "public", "sitemaps")
+
+# O mesmo limiar do gerador (tools/generate-page-content-revision, LOTE_MINIMO):
+# a partir daqui um carimbo e lote, e lote nao tem hora.
+LOTE_MINIMO = 50
+
+CARIMBO_INSTANTE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+RE_LOC = re.compile(r"<loc>([^<]+)</loc>")
+RE_URL = re.compile(r"<url>(.*?)</url>", re.S)
+RE_LASTMOD = re.compile(r"<lastmod>([^<]+)</lastmod>")
+
+
+def ler_ledger_do_git(ref: str) -> Dict[str, Tuple[str, str, str]]:
+    """Le o ledger numa revisao do git. Nunca faz checkout: `git show` e leitura."""
+    proc = subprocess.run(
+        ["git", "-C", RAIZ, "show", f"{ref}:{LEDGER_REL}"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"nao consegui ler {LEDGER_REL} em {ref}: {proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return _parse_ledger(proc.stdout)
+
+
+def ler_ledger_da_worktree() -> Dict[str, Tuple[str, str, str]]:
+    with open(LEDGER, "rb") as fh:
+        return _parse_ledger(fh.read())
+
+
+def _parse_ledger(bruto: bytes) -> Dict[str, Tuple[str, str, str]]:
+    """Le o ledger devolvendo (content_sha256, served_sha256, revised_on).
+
+    O served_sha256 ENTRA NA TUPLA, e a ausencia dele era um bug: ate 2026-08-27
+    este parser lia so o content_sha256, e o invariante 1 concluia "data
+    fabricada" para toda rota que avancasse a data sem que o TEXTO mudasse.
+
+    So que o gerador re-data por served de proposito, e documenta isso em
+    generate-page-content-revision:569-584 -- "content_sha256 responde 'o autor
+    reescreveu?'; served_sha256 responde 'o que chega ao consumidor mudou?' -- e
+    e esta que enxerga og:image, JSON-LD, credencial estruturada". Mudar o
+    JSON-LD da home (sameAs de um perfil oficial, por exemplo) muda o que chega
+    ao consumidor sem tocar em campo autoral nenhum: re-datar ali e correto, e o
+    gate acusava FRAUDE DE SINAL por ler pela chave errada.
+
+    Ler as duas chaves NAO afrouxa o gate: data que avanca sem que NENHUM dos
+    dois hashes mude continua sendo fabricada, que e o defeito real que este
+    arquivo existe para pegar.
+    """
+    registros: Dict[str, Tuple[str, str, str]] = {}
+    for linha in bruto.splitlines():
+        if not linha.strip():
+            continue
+        obj = json.loads(linha)
+        registros[obj["path"]] = (
+            obj.get("content_sha256") or "",
+            obj.get("served_sha256") or "",
+            obj.get("revised_on") or "",
+        )
+    return registros
+
+
+# A ANCORA E A INDENTACAO EXATA DE QUATRO ESPACOS, e nao `\s*`.
+#
+# `"path"` nao e chave exclusiva do registro: cada entrada de `internal_links`
+# tem a sua. Com `^\s*` o varredor casava 70.694 linhas em vez de 10.112 e
+# atribuia o `reviewed_at` do registro ao ULTIMO link interno dele — numeros
+# plausiveis, todos errados. Foi medido em 2026-08-27 e e a armadilha que
+# docs/ARQUITETURA_FIEL.md descreve: ler pela chave que se SUPOS, na posicao
+# que se supos. O registro de topo mora em quatro espacos; o aninhado, em mais.
+RE_PATH_JSON = re.compile(rb'^    "path":\s*"([^"]*)"')
+RE_REVIEWED_JSON = re.compile(rb'^    "reviewed_at":\s*"([^"]*)"')
+
+
+def ler_reviewed_at(ref: str) -> Dict[str, str]:
+    """path -> reviewed_at de content/pages.json, por varredura de linha.
+
+    POR QUE NAO `json.load`: o arquivo tem 76 MB e o gate precisa carregar DUAS
+    revisoes dele para comparar. Duas arvores Python inteiras custam ~2 GB e
+    dezenas de segundos numa maquina compartilhada, e gate lento e gate que
+    ninguem roda. O arquivo e gravado indentado, com "path" como PRIMEIRA chave
+    de cada registro e "reviewed_at" depois dela, entao emparelhar por ordem de
+    aparicao le o mesmo dado por uma fracao do custo.
+
+    A suposicao de formato nao fica implicita: se aparecer um `reviewed_at` antes
+    de qualquer `path`, ou se o arquivo nao render registro nenhum, a funcao
+    levanta em vez de devolver um dicionario silenciosamente errado — ler a
+    camada que alguem SUPOS e a armadilha catalogada deste repositorio.
+    """
+    if ref == "WORKTREE":
+        fonte = open(PAGES, "rb")
+    else:
+        proc = subprocess.run(["git", "-C", RAIZ, "show", f"{ref}:{PAGES_REL}"],
+                              capture_output=True)
+        if proc.returncode != 0:
+            raise SystemExit(f"nao consegui ler {PAGES_REL} em {ref}")
+        import io
+        fonte = io.BytesIO(proc.stdout)
+    revisoes: Dict[str, str] = {}
+    atual = None
+    vistos_path = 0
+    with fonte as fh:
+        for linha in fh:
+            m = RE_PATH_JSON.match(linha)
+            if m:
+                atual = m.group(1).decode("utf-8", "replace")
+                vistos_path += 1
+                continue
+            m = RE_REVIEWED_JSON.match(linha)
+            if m:
+                if atual is None:
+                    raise SystemExit(
+                        f"{PAGES_REL}@{ref}: 'reviewed_at' antes de qualquer 'path' — "
+                        "o formato mudou e esta leitura por linha deixou de valer")
+                revisoes[atual] = m.group(1).decode("utf-8", "replace")
+                atual = None
+    if not revisoes:
+        raise SystemExit(f"{PAGES_REL}@{ref}: nenhum registro lido — formato inesperado")
+    # A leitura por linha so vale enquanto TODO registro tiver os dois campos no
+    # nivel de topo. Se um dia um registro deixar de trazer `reviewed_at`, o
+    # emparelhamento por ordem escorrega e passa a datar a rota errada em
+    # silencio. Contar as duas ancoras e barato e transforma esse escorregao em
+    # falha ruidosa, que e o unico tipo de falha aceitavel num gate.
+    if len(revisoes) != vistos_path:
+        raise SystemExit(
+            f"{PAGES_REL}@{ref}: {vistos_path} registro(s) com 'path' de topo mas "
+            f"{len(revisoes)} com 'reviewed_at' — o emparelhamento por ordem deixou de valer")
+    return revisoes
+
+
+def carimbo_avancou(antes: str, depois: str) -> bool:
+    """O carimbo andou para a frente?
+
+    Comparacao lexicografica funciona aqui porque as DUAS formas canonicas
+    (AAAA-MM-DD e AAAA-MM-DDThh:mm:ssZ) sao ordenaveis como texto e compartilham
+    o prefixo de dia. "2026-08-26" < "2026-08-26T23:19:47Z" e verdadeiro, e e o
+    resultado desejado: ganhar precisao dentro do MESMO dia conta como avanco de
+    carimbo, porque e exatamente o movimento que fabricou o defeito de origem.
+    Perder precisao (o caminho inverso, que a ressemeadura faz de proposito) NAO
+    conta como avanco — e correcao, e correcao para tras e sempre permitida.
+    """
+    return bool(depois) and bool(antes) and depois > antes
+
+
+def ler_sitemap_servido() -> Dict[str, str]:
+    """lastmod por URL, lendo SO os shards que o indice anuncia.
+
+    Shard aposentado que ficou no disco nao existe para o buscador: ele busca o
+    que o indice lista. Medir o que o consumidor nao le e a armadilha catalogada
+    em docs/DADOS_CONFIAVEIS_E_ARMADILHAS.md.
+    """
+    if not os.path.exists(INDICE_SITEMAP):
+        return {}
+    with open(INDICE_SITEMAP, "r", encoding="utf-8") as fh:
+        indice = fh.read()
+    lastmod: Dict[str, str] = {}
+    for loc in RE_LOC.findall(indice):
+        nome = loc.rsplit("/", 1)[-1]
+        caminho = os.path.join(DIR_SITEMAPS, nome)
+        if not os.path.exists(caminho):
+            continue
+        with open(caminho, "r", encoding="utf-8") as fh:
+            corpo = fh.read()
+        for bloco in RE_URL.findall(corpo):
+            m_loc = RE_LOC.search(bloco)
+            m_lm = RE_LASTMOD.search(bloco)
+            if not m_loc:
+                continue
+            rota = re.sub(r"^https?://[^/]+", "", m_loc.group(1)) or "/"
+            lastmod[rota] = m_lm.group(1) if m_lm else ""
+    return lastmod
+
+
+def main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(description="A data so anda quando o conteudo anda.")
+    ap.add_argument("--desde", default="HEAD", help="revisao de comparacao (padrao: HEAD)")
+    ap.add_argument("--listar", type=int, default=0, help="lista ate N rotas violadoras")
+    ap.add_argument("--json", action="store_true", help="saida JSON")
+    args = ap.parse_args(argv)
+
+    atual = ler_ledger_da_worktree()
+    antigo = ler_ledger_do_git(args.desde)
+    comuns = set(atual) & set(antigo)
+
+    fabricadas: List[Tuple[str, str, str]] = []
+    revisao_real = 0
+    for rota in sorted(comuns):
+        texto_a, servido_a, data_a = antigo[rota]
+        texto_d, servido_d, data_d = atual[rota]
+        # Qualquer um dos dois hashes mudando e CAUSA LEGITIMA para a data
+        # andar. O servido cobre o que a maquina consome (JSON-LD, og:image,
+        # credencial estruturada) e nao aparece em campo autoral nenhum; exigir
+        # que o texto mude condenaria como fraude uma re-datacao que o proprio
+        # gerador faz por desenho. Ausencia de served nas DUAS pontas cai no
+        # ramo antigo sozinha ("" != "" e falso), preservando o veredito para
+        # ledger anterior ao campo.
+        if texto_a != texto_d or servido_a != servido_d:
+            revisao_real += 1
+        elif carimbo_avancou(data_a, data_d):
+            fabricadas.append((rota, data_a, data_d))
+
+    # 2. precisao honesta: instante ao segundo nao pode ser carimbo de lote.
+    instantes = collections.Counter(
+        data for *_, data in atual.values() if CARIMBO_INSTANTE.fullmatch(data)
+    )
+    precisao_falsa = {d: n for d, n in instantes.items() if n >= LOTE_MINIMO}
+
+    # 3. coerencia com o que o sitemap realmente serve.
+    servido = ler_sitemap_servido()
+    divergentes: List[Tuple[str, str, str]] = []
+    conferidas = 0
+    for rota, lm in servido.items():
+        if rota not in atual:
+            continue
+        conferidas += 1
+        # [2] e a DATA (revised_on). Era [1] ate 2026-08-28, e [1] e o
+        # served_sha256 -- um hash. O gate comparava hash com data e concluia
+        # "divergente" para TODA rota: 10.114 de 10.114, falso positivo de 100%.
+        #
+        # A regressao entrou em 2026-08-27, quando o served_sha256 foi
+        # acrescentado a tupla de `_parse_ledger` para corrigir OUTRO falso
+        # positivo (o invariante 1 acusava "data fabricada" quando so a
+        # renderizacao mudava). O indice deste ponto nao acompanhou, e o gate
+        # passou a reprovar sempre -- inclusive na onda de hoje, escondendo o
+        # defeito real que ele existe para pegar.
+        esperado = atual[rota][2]
+        if lm and esperado and lm != esperado:
+            divergentes.append((rota, esperado, lm))
+
+    # 4. REVISAO AFIRMADA X REVISAO OCORRIDA.
+    #
+    # `reviewed_at` nao e um detalhe de metadado: ele e RENDERIZADO no rodape de
+    # cada pagina como "Revisao: <advogado> em <data>", com numero de OAB ao
+    # lado. Carimba-lo com o dia da execucao afirma ao leitor que um advogado
+    # revisou aquele texto hoje. Quando o `content_sha256` prova que o texto nao
+    # mudou, a afirmacao e falsa — e a regra anti-fraude deste repositorio nao
+    # admite escrever campo de evidencia sem a acao correspondente ter ocorrido.
+    #
+    # O efeito colateral tecnico e igualmente concreto: a data entra no HTML, o
+    # HTML muda, o mtime muda, e o nginx deriva `Last-Modified` e `ETag` do
+    # mtime. O acervo inteiro passa a anunciar "mudei hoje" a cada republicacao,
+    # nenhuma requisicao condicional do crawler pode fechar em 304, e o
+    # `<lastmod>` do sitemap contradiz o que a propria pagina diz — que e
+    # exatamente a comparacao que a doc do Google descreve para decidir se o
+    # campo merece credito.
+    revisao_afirmada_sem_revisao: List[Tuple[str, str, str]] = []
+    try:
+        rev_atual = ler_reviewed_at("WORKTREE")
+        rev_antigo = ler_reviewed_at(args.desde)
+    except SystemExit:
+        raise
+    else:
+        for rota in sorted(comuns):
+            if antigo[rota][0] != atual[rota][0]:
+                continue  # o texto mudou: revisar e datar e legitimo
+            a, d = rev_antigo.get(rota, ""), rev_atual.get(rota, "")
+            if carimbo_avancou(a, d):
+                revisao_afirmada_sem_revisao.append((rota, a, d))
+
+    resultado = {
+        "comparado_com": args.desde,
+        "revisao_afirmada_sem_conteudo_mudar": len(revisao_afirmada_sem_revisao),
+        "rotas_no_ledger": len(atual),
+        "rotas_comuns": len(comuns),
+        "revisoes_reais_hash_mudou": revisao_real,
+        "datas_fabricadas_hash_igual_data_avancou": len(fabricadas),
+        "instantes_com_precisao_falsa": precisao_falsa,
+        "lote_minimo": LOTE_MINIMO,
+        "urls_conferidas_no_sitemap": conferidas,
+        "sitemap_divergente_do_ledger": len(divergentes),
+    }
+
+    # DUAS SEVERIDADES, e confundi-las seria mentir sobre o que aconteceu.
+    #
+    # Fabricar data e carimbar precisao que nao existe sao FRAUDE DE SINAL: o
+    # dado afirma um fato que nao ocorreu, e o buscador que verificar aprende a
+    # ignorar o campo. Isso reprova (exit 1).
+    #
+    # Sitemap divergente do ledger e outra coisa: o ledger foi corrigido e o
+    # artefato publico ainda carrega o valor velho porque a republicacao nao
+    # rodou. E um estado de PASSAGEM esperado — inclusive o estado que este
+    # proprio gate deixa atras de si ao consertar o ledger — e some sozinho na
+    # proxima transacao. Tratar os dois como a mesma falha faria o operador ler
+    # "fraude" onde ha so trabalho pendente, e e assim que gate perde a
+    # credibilidade. Sai 2: nao esta verde, mas nao e a mesma acusacao.
+    fraude_de_sinal = bool(fabricadas or precisao_falsa or revisao_afirmada_sem_revisao)
+    apenas_desatualizado = bool(divergentes) and not fraude_de_sinal
+
+    if args.json:
+        resultado["exemplos_fabricadas"] = [
+            {"rota": r, "antes": a, "depois": d} for r, a, d in fabricadas[: args.listar or 10]
+        ]
+        resultado["exemplos_divergentes"] = [
+            {"rota": r, "ledger": e, "sitemap": s} for r, e, s in divergentes[: args.listar or 10]
+        ]
+        print(json.dumps(resultado, ensure_ascii=False, indent=1, sort_keys=True))
+    else:
+        print("== causalidade do lastmod ==")
+        print(f"  comparado com                      {args.desde}")
+        print(f"  rotas no ledger                    {len(atual)}")
+        print(f"  rotas comuns as duas revisoes      {len(comuns)}")
+        print(f"  revisoes REAIS (algum sha mudou)   {revisao_real}")
+        print(f"  datas FABRICADAS (hash igual)      {len(fabricadas)}")
+        if precisao_falsa:
+            print(f"  instantes com precisao falsa (>= {LOTE_MINIMO} rotas no mesmo segundo):")
+            for d, n in sorted(precisao_falsa.items(), key=lambda kv: -kv[1]):
+                print(f"    {d}  {n} rota(s)")
+        else:
+            print(f"  instantes com precisao falsa       0")
+        print(f"  revisao AFIRMADA sem conteudo mudar {len(revisao_afirmada_sem_revisao)}")
+        print(f"  URLs conferidas no sitemap servido {conferidas}")
+        print(f"  sitemap divergente do ledger       {len(divergentes)}")
+        if args.listar:
+            for r, a, d in fabricadas[: args.listar]:
+                print(f"    FABRICADA {r}  {a} -> {d}")
+            for r, e, s in divergentes[: args.listar]:
+                print(f"    DIVERGENTE {r}  ledger={e} sitemap={s}")
+        print()
+        if fabricadas:
+            print("REPROVADO: a data andou sem o conteudo andar "
+                  f"({len(fabricadas)} rota(s)) — o lastmod deixa de ser verificavel.")
+        if precisao_falsa:
+            print("REPROVADO: instante ao segundo usado como carimbo de lote — "
+                  "precisao inventada.")
+        if revisao_afirmada_sem_revisao:
+            print("REPROVADO: reviewed_at avancou em "
+                  f"{len(revisao_afirmada_sem_revisao)} rota(s) sem o conteudo mudar — "
+                  "a pagina afirma revisao de advogado que nao ocorreu.")
+        if apenas_desatualizado:
+            print(f"PENDENTE: o ledger esta correto e o sitemap servido ainda nao "
+                  f"({len(divergentes)} rota(s)). Falta republicar pelo pipeline "
+                  f"sancionado; nao ha sinal fabricado.")
+        if not fraude_de_sinal and not divergentes:
+            print("OK: todo avanco de data tem mudanca de conteudo por tras, e o "
+                  "artefato servido concorda com o ledger.")
+
+    if fraude_de_sinal:
+        return 1
+    return 2 if apenas_desatualizado else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

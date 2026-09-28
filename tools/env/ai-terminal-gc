@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# ai-terminal-gc — limpa CODEX_HOME isolados orfaos criados por start-ai-terminal.sh.
+#
+# Cada terminal aberto cria ~/.codex/terminal-homes/<sessao> e nunca era limpo,
+# acumulando GBs. Este GC remove com seguranca os homes cuja sessao tmux ja morreu.
+#
+# SEGURANCA (multiplas camadas, nada e removido se qualquer uma falhar):
+#   - NUNCA remove o home de uma sessao tmux VIVA (tmux list-sessions).
+#   - NUNCA remove o CODEX_HOME de um processo `codex` VIVO (lido de /proc).
+#   - NUNCA remove um home RECEM-CRIADO (mtime < --min-age-minutes, default 60):
+#     na janela de startup o home nasce vazio ANTES de a sessao tmux/codex ser
+#     registrada, entao as camadas tmux/proc ainda nao o enxergam. Sem este piso
+#     de idade, dois terminais abrindo juntos apagavam o home um do outro (corrida
+#     corrigida 2026-07-14). Este e o piso load-bearing contra a corrida.
+#   - Homes explicitamente protegidos via --protect PATH nunca sao removidos.
+#   - Por padrao remove apenas homes VAZIOS (sem dados de sessao reais).
+#   - Homes COM historico ('sessions/' com conteudo) so sao removidos com
+#     --include-history E se mais antigos que a retencao (--days, default 14).
+#   - Dry-run por padrao: nada e apagado sem --apply.
+#
+# Uso:
+#   ai-terminal-gc                      # dry-run: mostra o que faria
+#   ai-terminal-gc --apply              # remove apenas os VAZIOS orfaos e maduros
+#   ai-terminal-gc --apply --min-age-minutes 60
+#   ai-terminal-gc --apply --protect "$CODEX_HOME"
+#   ai-terminal-gc --apply --include-history --days 14
+#   ai-terminal-gc --apply --include-history --days 0   # remove todo orfao com historico
+set -uo pipefail
+
+BASE_HOME="${CODEX_BASE_HOME:-$HOME/.codex}"
+HOMES_DIR="$BASE_HOME/terminal-homes"
+
+apply=0
+include_history=0
+retention_days=14
+# Piso de idade: home mais novo que isto e tratado como sessao em startup e
+# JAMAIS removido (protege contra a corrida de criacao). Empty home custa ~4KB,
+# entao um piso generoso nao tem downside.
+min_age_minutes=60
+protect_homes=""
+# Limiar de "vazio": home so com symlinks/estrutura ocupa poucos KB.
+# Acima disto ha dados reais (sqlite/cache/sessions) => tratado como historico.
+empty_kb=1024
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) apply=1 ;;
+    --include-history) include_history=1 ;;
+    --days) shift; retention_days="${1:-14}" ;;
+    --days=*) retention_days="${1#--days=}" ;;
+    --min-age-minutes) shift; min_age_minutes="${1:-60}" ;;
+    --min-age-minutes=*) min_age_minutes="${1#--min-age-minutes=}" ;;
+    --protect) shift; protect_homes="$protect_homes
+${1:-}" ;;
+    --protect=*) protect_homes="$protect_homes
+${1#--protect=}" ;;
+    -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "arg desconhecido: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -d "$HOMES_DIR" ] || { echo "nada a fazer: $HOMES_DIR nao existe"; exit 0; }
+
+# Sessoes tmux vivas (nomes) — protegidas.
+live_sessions=""
+if command -v tmux >/dev/null 2>&1; then
+  live_sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)"
+fi
+
+# CODEX_HOME de processos codex vivos (via /proc) — protegidos, sem depender do tmux.
+live_codex_homes=""
+for pid in $(pgrep -f 'codex' 2>/dev/null || true); do
+  # Guarda a leitura: o processo pode morrer entre o pgrep e o read (a falha de
+  # redirecionamento em /proc/$pid/environ vazaria para o stderr antes do tr).
+  [ -r "/proc/$pid/environ" ] || continue
+  ch="$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | sed -n 's/^CODEX_HOME=//p' | head -1)"
+  [ -n "$ch" ] && live_codex_homes="$live_codex_homes
+$ch"
+done
+
+now_epoch="$(date +%s)"
+cutoff=$(( retention_days * 86400 ))
+min_age_sec=$(( min_age_minutes * 60 ))
+
+removed=0 kept=0 freed_kb=0
+printf 'ai-terminal-gc  (%s)\n' "$([ "$apply" -eq 1 ] && echo APLICANDO || echo 'DRY-RUN — nada sera apagado')"
+printf 'retencao=%sd  include_history=%s  min_age=%smin\n\n' "$retention_days" "$include_history" "$min_age_minutes"
+
+for home in "$HOMES_DIR"/*/; do
+  [ -d "$home" ] || continue
+  home="${home%/}"
+  name="$(basename "$home")"
+
+  # Camada 1: sessao tmux viva com esse nome?
+  if printf '%s\n' "$live_sessions" | grep -Fxq "$name" 2>/dev/null; then
+    printf 'KEEP  [tmux vivo]      %s\n' "$name"; kept=$((kept+1)); continue
+  fi
+  # Camada 2: e o CODEX_HOME de um codex rodando?
+  if printf '%s\n' "$live_codex_homes" | grep -Fxq "$home" 2>/dev/null; then
+    printf 'KEEP  [codex rodando]  %s\n' "$name"; kept=$((kept+1)); continue
+  fi
+  # Camada 3: explicitamente protegido (ex.: CODEX_HOME do launcher que chamou)?
+  if printf '%s\n' "$protect_homes" | grep -Fxq "$home" 2>/dev/null; then
+    printf 'KEEP  [protegido]      %s\n' "$name"; kept=$((kept+1)); continue
+  fi
+
+  # Idade do home. mtime reflete a ultima escrita (symlinks na criacao, ou
+  # sessions/sqlite enquanto o codex roda) — home ativo permanece "fresco".
+  mtime_epoch="$(stat -c %Y "$home" 2>/dev/null || echo "$now_epoch")"
+  age=$(( now_epoch - mtime_epoch ))
+
+  # Camada 4 (load-bearing contra a corrida): home recem-criado NUNCA e removido.
+  # Na janela de startup o home nasce vazio antes de a sessao tmux/codex ser
+  # registrada, entao as camadas 1-2 ainda nao o enxergam. O piso de idade
+  # garante que qualquer vitima da corrida (sempre com segundos de vida) sobreviva.
+  if [ "$age" -lt "$min_age_sec" ]; then
+    printf 'KEEP  [recente %4ss]   %s\n' "$age" "$name"; kept=$((kept+1)); continue
+  fi
+
+  size_kb="$(du -sk "$home" 2>/dev/null | cut -f1)"; size_kb="${size_kb:-0}"
+  # "Tem dados" = ocupa mais que o limiar estrutural (sqlite/cache/sessions),
+  # independente de estarem ou nao em sessions/.
+  has_history=1
+  if [ "$size_kb" -le "$empty_kb" ]; then
+    has_history=0
+  fi
+
+  if [ "$has_history" -eq 0 ]; then
+    # Orfao vazio (so symlinks/estrutura) e maduro (passou o piso de idade).
+    if [ "$apply" -eq 1 ]; then rm -rf -- "$home"; fi
+    printf 'DEL   [vazio %6sKB]  %s\n' "$size_kb" "$name"
+    removed=$((removed+1)); freed_kb=$((freed_kb+size_kb)); continue
+  fi
+
+  # Tem historico: so remove com --include-history E alem da retencao.
+  if [ "$include_history" -eq 1 ] && [ "$age" -ge "$cutoff" ]; then
+    if [ "$apply" -eq 1 ]; then rm -rf -- "$home"; fi
+    printf 'DEL   [hist %6sKB %2sd] %s\n' "$size_kb" "$(( age/86400 ))" "$name"
+    removed=$((removed+1)); freed_kb=$((freed_kb+size_kb)); continue
+  fi
+
+  printf 'KEEP  [hist %6sKB %2sd] %s\n' "$size_kb" "$(( age/86400 ))" "$name"
+  kept=$((kept+1))
+done
+
+printf '\nresumo: %s removidos, %s mantidos, ~%s MB liberados%s\n' \
+  "$removed" "$kept" "$(( freed_kb/1024 ))" \
+  "$([ "$apply" -eq 1 ] && echo '' || echo ' (dry-run)')"

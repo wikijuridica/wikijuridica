@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""check-edge-vary-contract — a sonda que detecta envenenamento de cache.
+
+O QUE ESTA SONDA EXISTE PARA PEGAR, e por que nenhuma outra pega: a mesma URL
+passa a ter duas representações (HTML para a pessoa, Markdown para o agente), e
+a borda decide qual guardar. Se ela guardar UMA e servir para todos, o primeiro
+agente que pedir Markdown faz o visitante humano ler Markdown cru — e, com o
+Edge TTL de 7 dias desta zona, por uma semana. O defeito não aparece na
+requisição que o causa: ele aparece na PRÓXIMA, feita por outra pessoa.
+
+A asserção que importa é a terceira, não a segunda: depois de pedir Markdown,
+pedir HTML de novo e exigir que o corpo AINDA comece com `<!doctype html>`.
+Conferir só que o Markdown veio certo não prova nada sobre o que ficou guardado.
+
+TRÊS CAMADAS CONFERIDAS, e a falha de cada uma tem causa distinta:
+
+  1. A Cache Rule da zona declara `vary.headers.accept` com allowlist de
+     `media_types`? Sem isso a borda ignora o `Vary` da origem e guarda uma
+     representação só. (Medido em 2026-08-12: o plano Free ACEITA o parâmetro; o
+     PUT exige `vary.default` junto, e o único valor aceito é um objeto com
+     `action`.)
+  2. A origem emite `Vary: Accept` nas rotas que negociam? Medido no mesmo dia:
+     com a Cache Rule no ar mas SEM a origem emitindo o header, a borda serve a
+     MESMA entrada para `Accept: text/markdown` e para o Accept do navegador —
+     ou seja, a regra sozinha não separa nada. As duas metades são necessárias.
+  3. O HTML sobrevive a um pedido de Markdown na mesma URL?
+
+READ-ONLY por contrato: `tools/check-*` não escreve. Quem registra evidência é
+quem chama (o deploy anexa a saída em data/ops/). As requisições saem com
+User-Agent próprio e `X-Warming-Request: true`, então não contam como audiência.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloudflare_auth  # noqa: E402  (tools/ nao e pacote; o caminho entra acima)
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SITEMAPS = os.path.join(ROOT, "public", "sitemaps", "*.xml")
+
+USER_AGENT = "wikijuridica-vary-probe/1.0 (+interno; sonda de coerencia de cache; nao-indexar)"
+ACCEPT_NAVEGADOR = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+ACCEPT_MARKDOWN = "text/markdown"
+
+
+def cabecalhos(accept: str) -> dict:
+    return {
+        "User-Agent": USER_AGENT,
+        # A marca que tira estas requisições de toda contagem de audiência. Sonda
+        # que se disfarça de visitante é fraude de métrica, não conveniência.
+        "X-Warming-Request": "true",
+        "Accept": accept,
+        # Sem compressão: o corpo é lido para conferir o `<!doctype`, e
+        # descomprimir aqui só acrescentaria uma coisa a dar errado.
+        "Accept-Encoding": "identity",
+    }
+
+
+def busca(url: str, accept: str, timeout: int = 25) -> dict:
+    pedido = urllib.request.Request(url, headers=cabecalhos(accept), method="GET")
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            corpo = resposta.read(400)
+            return {
+                "status": resposta.status,
+                "content_type": (resposta.headers.get("Content-Type") or "").lower(),
+                "vary": resposta.headers.get("Vary") or "",
+                "cf_cache_status": (resposta.headers.get("CF-Cache-Status") or "-").lower(),
+                "link": resposta.headers.get("Link") or "",
+                "inicio_do_corpo": corpo[:60].decode("utf-8", "replace"),
+            }
+    except urllib.error.HTTPError as erro:
+        return {
+            "status": erro.code,
+            "content_type": (erro.headers.get("Content-Type") or "").lower() if erro.headers else "",
+            "vary": (erro.headers.get("Vary") or "") if erro.headers else "",
+            "cf_cache_status": ((erro.headers.get("CF-Cache-Status") or "-").lower() if erro.headers else "-"),
+            "link": (erro.headers.get("Link") or "") if erro.headers else "",
+            "inicio_do_corpo": "",
+        }
+    except (urllib.error.URLError, OSError, TimeoutError) as erro:
+        return {"status": 0, "erro": type(erro).__name__, "content_type": "", "vary": "",
+                "cf_cache_status": "-", "link": "", "inicio_do_corpo": ""}
+
+
+def le_env_local() -> dict:
+    """Lê .env.local sem depender de shell. Ausência não é erro: a camada da
+    borda simplesmente fica `nao_verificada`, e as camadas 2 e 3 — que são as
+    que dependem do nosso próprio código — seguem sendo conferidas. Delegado a
+    tools/cloudflare_auth.py desde 2026-09-03."""
+    return cloudflare_auth.ambiente(os.path.join(ROOT, ".env.local"))
+
+
+def confere_cache_rule(env: dict) -> dict:
+    """Delegado a tools/cloudflare_auth.py (escopo "leitura"): antes desta
+    migração, esta função exigia CLOUDFLARE_API_TOKEN presente mesmo com
+    CLOUDFLARE_ZONE_TOKEN no ambiente — abortava com "credencial ausente"
+    tendo uma credencial válida na mão."""
+    cabecalho, _ = cloudflare_auth.cabecalhos("leitura", env=env)
+    if cabecalho is None:
+        return {"verificada": False, "motivo": "credencial ausente em .env.local"}
+
+    def api(caminho: str):
+        pedido = urllib.request.Request("https://api.cloudflare.com/client/v4" + caminho, headers=cabecalho)
+        with urllib.request.urlopen(pedido, timeout=25) as resposta:
+            return json.load(resposta)
+
+    try:
+        zonas = api("/zones?name=wikijuridica.com.br")
+        if not zonas.get("success") or not zonas.get("result"):
+            return {"verificada": False, "motivo": "zona nao encontrada"}
+        zona = zonas["result"][0]["id"]
+        entrada = api("/zones/%s/rulesets/phases/http_request_cache_settings/entrypoint" % zona)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as erro:
+        return {"verificada": False, "motivo": "api indisponivel: %s" % type(erro).__name__}
+    if not entrada.get("success"):
+        return {"verificada": False, "motivo": "api recusou a leitura"}
+
+    for regra in entrada["result"].get("rules", []):
+        vary = (regra.get("action_parameters") or {}).get("vary") or {}
+        accept = (vary.get("headers") or {}).get("accept") or {}
+        if accept:
+            return {
+                "verificada": True,
+                "acao": accept.get("action"),
+                "media_types": accept.get("media_types"),
+                # Allowlist é o que garante DUAS variantes por URL: a doc é
+                # explícita — "any MIME type not in the list is removed from the
+                # normalized value". Sem ela, cada Accept distinto vira uma chave.
+                "allowlist_fecha_em_duas_variantes": accept.get("action") == "normalize"
+                and bool(accept.get("media_types")),
+                "mcp_excluido": "/mcp" in (regra.get("expression") or ""),
+            }
+    return {"verificada": True, "acao": None, "allowlist_fecha_em_duas_variantes": False,
+            "motivo": "nenhuma regra declara vary.headers.accept"}
+
+
+def url_de_prova(caminho_pedido: str | None) -> str | None:
+    if caminho_pedido:
+        return caminho_pedido
+    for arquivo in sorted(glob.glob(SITEMAPS)):
+        with open(arquivo, encoding="utf-8") as manipulador:
+            achadas = re.findall(r"<loc>([^<]+)</loc>", manipulador.read())
+        # PÁGINA DO ACERVO, e não qualquer <loc>: só as rotas de dois segmentos
+        # têm gêmea em Markdown. A home e os hubs de área estão no sitemap e não
+        # negociam nada — sondar um deles mediria sempre "markdown: não" e a
+        # sonda diria que está tudo bem justamente por não ter testado nada.
+        #
+        # E a 78ª da lista, não a 1ª: as primeiras do primeiro shard são as mais
+        # aquecidas de todas (o aquecedor começa por elas), e sondar sempre a URL
+        # quentíssima esconde o comportamento de MISS, que é onde o defeito mora.
+        do_acervo = [u for u in achadas if len(u.split("/", 3)[-1].strip("/").split("/")) == 2]
+        if len(do_acervo) > 77:
+            return do_acervo[77]
+        if do_acervo:
+            return do_acervo[-1]
+    return None
+
+
+def veredito(registro: dict) -> tuple[int, list[str]]:
+    """Decide o codigo de saida a partir do registro JA COLETADO.
+
+    Separado de main() de proposito: enquanto a decisao morava no meio das
+    chamadas de rede, nao havia como provar que ela reprova quando deve. O
+    contrato deste projeto exige que todo detector nasca com teste de falso
+    positivo sobre amostra real -- ja houve detector que acusou 46 paginas
+    sendo que as 46 eram falso positivo. `tools/check-edge-vary-falsificacao`
+    exercita esta funcao com registros sinteticos.
+
+    Devolve (codigo, linhas). Codigo 2 e "nao medi"; 1 e "medi e esta quebrado".
+    """
+    linhas = []
+    borda = registro.get("camada_1_cache_rule") or {}
+    sondas_falhas = registro.get("sondas_que_nao_completaram") or []
+    markdown_negociado = registro.get("markdown_negociado")
+    origem_declara_vary = registro.get("camada_2_origem_declara_vary_accept")
+    html_intacto = registro.get("camada_3_html_intacto_apos_pedido_markdown")
+
+    # A REDE E CONFERIDA ANTES DE QUALQUER VEREDITO. Sonda que nao completou nao
+    # produz evidencia nem a favor nem contra: exit 2 e "nao medi", que e
+    # diferente de exit 1 "medi e esta quebrado".
+    #
+    # Ate 2026-08-28 esta distincao nao existia: `busca()` devolve corpo VAZIO
+    # quando a conexao falha, corpo vazio nao comeca com "<!doctype html", e o
+    # gate imprimia "a URL deixou de devolver HTML depois de um pedido de
+    # Markdown" -- o diagnostico de ENVENENAMENTO DE CACHE. Mandava purgar a
+    # borda por causa de uma rede instavel.
+    if sondas_falhas:
+        linhas.append("NAO MEDIDO: %d sonda(s) nao completaram (%s) — erro de rede, nao veredito."
+                      % (len(sondas_falhas), ", ".join(sondas_falhas)))
+        return 2, linhas
+
+    # CAMADA 1 E VEREDITO DURO quando a negociacao esta LIGADA, e nao ser custou
+    # quatro dias de cegueira: a Cache Rule da zona foi esvaziada em
+    # 2026-08-22T13:10Z (ruleset v14, zero regras) e so voltou em
+    # 2026-08-26T15:55Z. Este gate saiu VERDE os quatro dias, porque o veredito
+    # nunca olhava `camada_1_cache_rule` -- iterava sobre a lista de regras, e
+    # lista vazia nao contradiz nada. Quem pegou foi check-edge-rule-drift.
+    #
+    # A condicao e CONJUNTA de proposito, e e o falso positivo que a redacao
+    # anterior temia: enquanto a negociacao de Markdown nao estiver ligada, a
+    # ausencia da regra e estado legitimo ("ainda nao implantado"), nao defeito.
+    # Ligada a negociacao, a mesma ausencia e a precondicao exata do
+    # envenenamento -- sem a allowlist normalizando o Accept, a borda guarda UMA
+    # representacao por URL e serve Markdown a quem pediu HTML.
+    #
+    # `verificada` False (sem credencial, API fora) NAO reprova: indisponibilidade
+    # de API nao e drift, e transformar isso em falha seria alarme por falta de
+    # medicao.
+    if markdown_negociado and borda.get("verificada") and not borda.get("allowlist_fecha_em_duas_variantes"):
+        linhas.append("FALHA: a origem negocia Markdown e a Cache Rule da borda NAO declara vary.headers.accept (%s)."
+                      % borda.get("motivo", "sem allowlist"))
+        linhas.append("       e a precondicao do envenenamento: a borda guarda UMA representacao por URL.")
+        linhas.append("       foi este exato estado que passou verde por quatro dias em 22-26/08.")
+        return 1, linhas
+
+    if not html_intacto:
+        linhas.append("FALHA: a URL deixou de devolver HTML ao navegador depois de um pedido de Markdown.")
+        return 1, linhas
+    # Coerencia entre as duas metades: negociar SEM declarar Vary e a combinacao
+    # que envenena, e ela nao se manifesta na mesma requisicao -- por isso e
+    # reprovada por construcao, e nao so quando o estrago ja apareceu.
+    if markdown_negociado and not origem_declara_vary:
+        linhas.append("FALHA: a origem negocia Markdown e NAO declara Vary: Accept — a borda guardaria uma representacao so.")
+        return 1, linhas
+    if registro.get("camada_4_qvalue_zero_nao_colide") is False:
+        linhas.append("FALHA: pedir com q=0 e depois sem q devolveu HTML — as duas chaves de variante colidiram na borda.")
+        linhas.append("       a normalizacao da Cache Rule esta descartando o parametro q; o canal de Markdown negociado")
+        linhas.append("       fica envenenado ate a proxima purga. A URL gemea /index.md nao e afetada.")
+        return 1, linhas
+    return 0, linhas
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--url", default=None, help="URL a sondar (padrão: uma página do sitemap)")
+    parser.add_argument("--json", action="store_true", help="imprime o registro completo em JSON")
+    argumentos = parser.parse_args()
+
+    alvo = url_de_prova(argumentos.url)
+    if not alvo:
+        print("nenhuma URL em public/sitemaps/ — o site foi publicado?", file=sys.stderr)
+        return 2
+
+    borda = confere_cache_rule(le_env_local())
+    antes = busca(alvo, ACCEPT_NAVEGADOR)
+    markdown = busca(alvo, ACCEPT_MARKDOWN)
+    depois = busca(alvo, ACCEPT_NAVEGADOR)
+    # A COLISÃO DE qvalue, que nenhuma das três camadas acima alcança.
+    #
+    # A chave de variante da borda é computada do header da REQUISIÇÃO, não da
+    # resposta — então ela independe de como a origem roteia. Se a normalização
+    # com `media_types` descartar o parâmetro `q` (a doc não diz o que faz com
+    # ele), `text/markdown;q=0` e `text/markdown` caem na MESMA chave. E a origem
+    # devolve corpos DIFERENTES para os dois, corretamente: q=0 é recusa
+    # explícita pela RFC 9110 §12.5.1 e recebe HTML. Resultado: quem pedisse com
+    # q=0 primeiro gravaria HTML sob a chave do Markdown, e todo agente seguinte
+    # receberia HTML por até sete dias.
+    #
+    # A ordem importa: q=0 PRIMEIRO (para ele gravar, se for gravar), markdown
+    # depois. Se o segundo voltar HTML, as duas chaves colidiram.
+    recusa = busca(alvo, ACCEPT_MARKDOWN + ";q=0")
+    markdown_depois_da_recusa = busca(alvo, ACCEPT_MARKDOWN)
+
+    # ERRO DE REDE NAO E ENVENENAMENTO, e ate 2026-08-28 esta linha nao sabia a
+    # diferenca. `busca()` devolve status 0 e corpo VAZIO quando a conexao falha
+    # (URLError, timeout, DNS), e corpo vazio nao comeca com "<!doctype html" --
+    # entao uma rede instavel imprimia "FALHA: a URL deixou de devolver HTML ao
+    # navegador depois de um pedido de Markdown", que e o diagnostico de
+    # envenenamento de cache. Diagnostico errado custa mais que ausencia de
+    # diagnostico: manda o operador purgar a borda por um problema que nao
+    # existe, e ensina a ignorar o gate quando ele acertar.
+    sondas_falhas = [nome for nome, r in (("html_antes", antes), ("markdown", markdown),
+                                          ("html_depois", depois), ("markdown_q0", recusa),
+                                          ("markdown_apos_q0", markdown_depois_da_recusa))
+                     if r.get("status") == 0]
+    html_intacto = depois["inicio_do_corpo"].lstrip().lower().startswith("<!doctype html")
+    origem_declara_vary = "accept" in [
+        parte.strip().lower() for parte in (markdown.get("vary") or "").split(",")
+    ]
+    markdown_negociado = markdown["content_type"].startswith("text/markdown")
+
+    registro = {
+        "schema_version": "edge_vary_contract_v1",
+        "url": alvo,
+        "camada_1_cache_rule": borda,
+        "camada_2_origem_declara_vary_accept": origem_declara_vary,
+        "camada_3_html_intacto_apos_pedido_markdown": html_intacto,
+        "camada_4_qvalue_zero_nao_colide": (
+            None if not markdown_negociado
+            else markdown_depois_da_recusa["content_type"].startswith("text/markdown")
+        ),
+        "markdown_negociado": markdown_negociado,
+        "respostas": {"html_antes": antes, "markdown": markdown, "html_depois": depois,
+                      "markdown_q0": recusa, "markdown_apos_q0": markdown_depois_da_recusa},
+        "user_agent": USER_AGENT,
+        "sondas_que_nao_completaram": sondas_falhas,
+        "counts_as_audience": False,
+    }
+
+    if argumentos.json:
+        print(json.dumps(registro, ensure_ascii=False, sort_keys=True))
+    else:
+        print("sonda: %s" % alvo)
+        print("  borda declara vary.accept: %s (%s)" % (
+            borda.get("allowlist_fecha_em_duas_variantes"), borda.get("media_types") or borda.get("motivo", "")))
+        print("  origem declara Vary: Accept: %s (veio %r)" % (origem_declara_vary, markdown.get("vary")))
+        print("  markdown negociado       : %s (%s)" % (markdown_negociado, markdown["content_type"]))
+        print("  HTML intacto depois      : %s (cache %s)" % (html_intacto, depois["cf_cache_status"]))
+        print("  q=0 nao colide com q=1   : %s" % (
+            registro["camada_4_qvalue_zero_nao_colide"]
+            if registro["camada_4_qvalue_zero_nao_colide"] is not None
+            else "nao aplicavel (negociacao ainda nao ligada)"))
+
+    # ENVENENAMENTO é a única falha dura. As outras duas camadas são ESTADO, não
+    # veredito: antes do deploy que liga a negociação, a origem legitimamente não
+    # emite Vary e a URL legitimamente não devolve Markdown — reprovar aí seria
+    # transformar "ainda não implantado" em "quebrado", e um verificador que
+    # grita sem motivo é um verificador que se aprende a ignorar.
+    codigo, linhas = veredito(registro)
+    for linha in linhas:
+        print(linha, file=sys.stderr)
+    if codigo != 0:
+        if codigo == 1 and not html_intacto:
+            print("       corpo recebido: %r" % depois["inicio_do_corpo"][:60], file=sys.stderr)
+        return codigo
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

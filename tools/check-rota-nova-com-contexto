@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Sonda de publicação que reprova o 200 VAZIO.
+
+★ POR QUE ESTA FERRAMENTA EXISTE (ordem do dono, 2026-09-16)
+
+    "fazer o build e deploy com código novo completo em produção + checagem da
+    saúde, se tudo está 200, e com contexto, pois sem 200 sem contexto é fraco"
+
+`curl -I` devolvendo 200 não prova nada sobre conteúdo. Uma rota pode responder
+200 e servir: um esqueleto sem corpo, a página do template sem a citação
+oficial, um H1 genérico que não nomeia o julgado, ou uma cronologia impossível
+no JSON-LD. Todas essas falhas são invisíveis ao código de status, e duas delas
+já aconteceram neste repositório -- 944 páginas com `datePublished` no futuro do
+`dateModified`, e páginas publicadas com a citação truncada em 42 palavras
+porque a corrida do transcritor parou num cabeçalho.
+
+Esta sonda reprova cada uma, por rota, com o motivo nomeado.
+
+★ O QUE ELA CONFERE, e por que cada uma é um defeito diferente
+
+  1. HTTP 200 na BORDA. É a camada que o visitante e o agente de IA veem. Sondar
+     127.0.0.1 passa verde com o túnel caído -- o precedente está na skill
+     `verificar-producao-viva`.
+  2. O H1 NOMEIA O JULGADO. O identificador do slug (`stj-resp-1514567`) tem de
+     aparecer no H1 na forma que o leitor lê (`1.514.567`). H1 que não nomeia o
+     caso é template servido no lugar de conteúdo.
+  3. A CITAÇÃO OFICIAL EXISTE E TEM CORPO. O bloco entre aspas curvas -- que é
+     como a DEC-032 manda identificar texto de fonte oficial -- precisa de pelo
+     menos `--minimo-citacao` palavras (padrão 25, que é o `minimoCitacaoOficial`
+     do gerador). Abaixo disso a página é comentário sobre uma fonte que ela não
+     mostra.
+  4. A CAMADA AUTORAL EXISTE. Texto fora das aspas, com piso próprio: página que
+     só transcreve o tribunal é espelho, e espelho o contrato proíbe.
+  5. CRONOLOGIA POSSÍVEL. `dateModified` nunca anterior a `datePublished` no
+     JSON-LD servido. É a asserção que `cmd/publish-v2-direct` declara proibida e
+     que ninguém conferia sobre o artefato SERVIDO.
+
+★ IDENTIDADE: a sonda não pode inflar a métrica que ela existe para proteger
+
+Sai com User-Agent próprio no prefixo `wikijuridica-` e `X-Warming-Request: true`
+-- os dois critérios que o relatório de tráfego usa para excluir a linha da
+contagem. Sem o cabeçalho, o portal mede o próprio eco, e o contrato trata isso
+como fraude contra o dono. É o mesmo par que `tools/social_borda_probe.py` usa, e
+o equivalente Python de `wikijuridicabot.AplicaSondaInterna`.
+
+★ AMOSTRA POR STRIDE, não pelas primeiras N
+
+Rota nova nasce em MISS na borda, e as primeiras de um shard são as de maior
+evidência -- medir só elas superestimaria o lote. O stride varre o conjunto
+inteiro em passo constante. `--amostra 0` sonda tudo.
+
+Saída: exit 0 se todas passarem; exit 1 com a lista nomeada se alguma falhar;
+exit 2 se a ferramenta não conseguiu medir (rede, arquivo ausente), porque
+"não consegui medir" nunca pode ser lido como "está tudo bem".
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# O par de identidade. O prefixo `wikijuridica-` e o cabeçalho são o que mantém
+# esta requisição FORA da medição de audiência.
+UA = "wikijuridica-sonda-contexto/1.0"
+CABECALHOS = {"User-Agent": UA, "X-Warming-Request": "true"}
+
+# Aspas curvas: é como o projeto marca citação de fonte oficial no HTML servido.
+# Aspas retas ficam de fora de propósito -- elas aparecem em atributo e em JSON
+# embutido, e casá-las mediria marcação, não citação.
+RE_CITACAO = re.compile(r"“([^”]+)”")
+RE_H1 = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
+RE_TAG = re.compile(r"<[^>]+>")
+RE_DATA_PUB = re.compile(r'"datePublished"\s*:\s*"([^"]+)"')
+RE_DATA_MOD = re.compile(r'"dateModified"\s*:\s*"([^"]+)"')
+# `stj-resp-1514567` -> `1514567`; serve para qualquer sigla da família.
+RE_SLUG_NUMERO = re.compile(r"-(\d{4,})/?$")
+
+
+def numero_legivel(digitos: str) -> str:
+    """1514567 -> 1.514.567, que é a forma como o H1 escreve."""
+    partes = []
+    resto = digitos
+    while len(resto) > 3:
+        partes.insert(0, resto[-3:])
+        resto = resto[:-3]
+    partes.insert(0, resto)
+    return ".".join(partes)
+
+
+def so_digitos(texto: str) -> str:
+    return re.sub(r"\D", "", texto)
+
+
+def palavras(texto: str) -> int:
+    return len([p for p in re.split(r"\s+", texto.strip()) if p])
+
+
+def busca(url: str, tempo_limite: float) -> tuple[int, str]:
+    pedido = urllib.request.Request(url, headers=CABECALHOS)
+    try:
+        with urllib.request.urlopen(pedido, timeout=tempo_limite) as resposta:
+            corpo = resposta.read().decode("utf-8", errors="replace")
+            return resposta.status, corpo
+    except urllib.error.HTTPError as erro:
+        try:
+            corpo = erro.read().decode("utf-8", errors="replace")
+        except Exception:
+            corpo = ""
+        return erro.code, corpo
+
+
+def confere(rota: str, status: int, html: str, minimo_citacao: int,
+            minimo_autoral: int) -> list[str]:
+    """Devolve a lista de defeitos NOMEADOS. Lista vazia = rota íntegra."""
+    defeitos: list[str] = []
+
+    if status != 200:
+        # Sem 200 as outras conferências mediriam a página de erro.
+        return [f"http_{status}"]
+
+    # 2. O H1 nomeia o julgado.
+    achado_h1 = RE_H1.search(html)
+    if not achado_h1:
+        defeitos.append("sem_h1")
+    else:
+        texto_h1 = RE_TAG.sub(" ", achado_h1.group(1))
+        achado_slug = RE_SLUG_NUMERO.search(rota)
+        if achado_slug:
+            esperado = achado_slug.group(1)
+            # Compara só dígitos: o H1 escreve 1.514.567 e o slug 1514567.
+            if esperado not in so_digitos(texto_h1):
+                defeitos.append("h1_nao_nomeia_o_julgado")
+
+    # 3. e 4. As duas camadas que a DEC-032 obriga.
+    citacoes = RE_CITACAO.findall(html)
+    maior = max((palavras(c) for c in citacoes), default=0)
+    if maior < minimo_citacao:
+        defeitos.append(f"citacao_oficial_com_{maior}_palavras")
+
+    sem_citacao = RE_CITACAO.sub(" ", html)
+    # Corpo aproximado: fora de tag e fora das aspas. É piso, não medida fina --
+    # serve para pegar "página que só transcreve", não para calibrar o gate.
+    corpo_autoral = RE_TAG.sub(" ", sem_citacao)
+    if palavras(corpo_autoral) < minimo_autoral:
+        defeitos.append("camada_autoral_ausente")
+
+    # 5. Cronologia possível.
+    pub = RE_DATA_PUB.search(html)
+    mod = RE_DATA_MOD.search(html)
+    if not pub:
+        defeitos.append("sem_datePublished")
+    elif mod and mod.group(1) < pub.group(1):
+        defeitos.append(f"cronologia_impossivel_{mod.group(1)}_antes_de_{pub.group(1)}")
+
+    return defeitos
+
+
+def rotas_por_intent(caminho_manifesto: str) -> dict[str, str]:
+    """`unique_intent_id` -> `path`, lido do published_manifest.
+
+    O MANIFESTO E A AUTORIDADE DA ROTA, e o shard nao a tem: ele guarda
+    `intent_id`, `h1`, `sections` -- conteudo, nao endereco. Derivar a rota do
+    `intent_id` por regra de prefixo (`jur-` -> `/jurisprudencia/`) funcionaria
+    hoje e quebraria no dia em que uma familia mudar de area, produzindo uma
+    sonda que mede rota inexistente e reprova pagina boa. Falso vermelho de
+    sonda e pior que sonda ausente: ele treina quem le a ignorar.
+    """
+    mapa: dict[str, str] = {}
+    with open(caminho_manifesto, encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            intent = registro.get("unique_intent_id") or ""
+            rota = registro.get("path") or registro.get("canonical_url") or ""
+            if not intent or not rota:
+                continue
+            if rota.startswith("http"):
+                rota = "/" + rota.split("/", 3)[-1] if rota.count("/") > 2 else "/"
+            if not rota.startswith("/"):
+                rota = "/" + rota
+            if not rota.endswith("/"):
+                rota += "/"
+            mapa[intent] = rota
+    return mapa
+
+
+def rotas_do_shard(caminho: str, por_intent: dict[str, str]) -> tuple[list[str], list[str]]:
+    """Devolve (rotas resolvidas, intents SEM rota no manifesto).
+
+    O segundo valor nao e' descarte silencioso: intent do shard que nao esta no
+    manifesto significa pagina que nao foi publicada, e isso e' exatamente o que
+    a sonda tem de gritar depois de um deploy.
+    """
+    rotas: list[str] = []
+    orfaos: list[str] = []
+    with open(caminho, encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if not linha:
+                continue
+            registro = json.loads(linha)
+            intent = registro.get("intent_id") or registro.get("unique_intent_id") or ""
+            if not intent:
+                continue
+            rota = por_intent.get(intent)
+            if rota:
+                rotas.append(rota)
+            else:
+                orfaos.append(intent)
+    return rotas, orfaos
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--shard", action="append", default=[],
+                    help="JSONL de v2_pages de onde tirar as rotas (repetível)")
+    ap.add_argument("--rota", action="append", default=[],
+                    help="rota avulsa a sondar (repetível)")
+    ap.add_argument("--manifesto", default="data/editorial/published_manifest.jsonl",
+                    help="published_manifest de onde sai a rota canônica de cada intent")
+    ap.add_argument("--base", default="",
+                    help="origem a sondar (padrão: base_url de content/site.json)")
+    ap.add_argument("--amostra", type=int, default=30,
+                    help="quantas rotas sondar, por stride; 0 sonda todas")
+    ap.add_argument("--minimo-citacao", type=int, default=25,
+                    help="piso de palavras do bloco entre aspas curvas")
+    ap.add_argument("--minimo-autoral", type=int, default=120,
+                    help="piso de palavras fora das aspas")
+    ap.add_argument("--pausa", type=float, default=0.15,
+                    help="espera entre requisições, em segundos")
+    ap.add_argument("--tempo-limite", type=float, default=20.0)
+    args = ap.parse_args()
+
+    base = args.base
+    if not base:
+        try:
+            with open(os.path.join(RAIZ, "content", "site.json"), encoding="utf-8") as f:
+                base = json.load(f)["base_url"]
+        except Exception as erro:
+            print(f"check-rota-nova-com-contexto: nao consegui ler base_url: {erro}",
+                  file=sys.stderr)
+            return 2
+    base = base.rstrip("/")
+
+    rotas: list[str] = list(args.rota)
+    orfaos: list[str] = []
+    if args.shard:
+        caminho_manifesto = (args.manifesto if os.path.isabs(args.manifesto)
+                             else os.path.join(RAIZ, args.manifesto))
+        try:
+            por_intent = rotas_por_intent(caminho_manifesto)
+        except Exception as erro:
+            print(f"check-rota-nova-com-contexto: manifesto ilegivel: {erro}",
+                  file=sys.stderr)
+            return 2
+        for shard in args.shard:
+            caminho = shard if os.path.isabs(shard) else os.path.join(RAIZ, shard)
+            try:
+                achadas, sem_rota = rotas_do_shard(caminho, por_intent)
+            except Exception as erro:
+                print(f"check-rota-nova-com-contexto: shard ilegivel {shard}: {erro}",
+                      file=sys.stderr)
+                return 2
+            rotas.extend(achadas)
+            orfaos.extend(sem_rota)
+
+    # Remove repetida preservando a ordem, que é a do shard (evidência primeiro).
+    vistas: set[str] = set()
+    unicas = [r for r in rotas if not (r in vistas or vistas.add(r))]
+    if not unicas:
+        print("check-rota-nova-com-contexto: nenhuma rota informada", file=sys.stderr)
+        return 2
+
+    if args.amostra and args.amostra < len(unicas):
+        # Stride: varre o conjunto inteiro em passo constante. Pegar as primeiras
+        # N mediria só a fatia de maior evidência e superestimaria o lote.
+        passo = len(unicas) / float(args.amostra)
+        alvo = [unicas[int(i * passo)] for i in range(args.amostra)]
+    else:
+        alvo = unicas
+
+    falhas: list[tuple[str, list[str]]] = []
+    ok = 0
+    for indice, rota in enumerate(alvo):
+        url = base + rota
+        try:
+            status, html = busca(url, args.tempo_limite)
+        except Exception as erro:
+            print(f"check-rota-nova-com-contexto: {rota}: falha de rede: {erro}",
+                  file=sys.stderr)
+            return 2
+        defeitos = confere(rota, status, html, args.minimo_citacao, args.minimo_autoral)
+        if defeitos:
+            falhas.append((rota, defeitos))
+        else:
+            ok += 1
+        if args.pausa and indice + 1 < len(alvo):
+            time.sleep(args.pausa)
+
+    print(f"sondadas {len(alvo)} de {len(unicas)} rota(s) em {base}")
+    if orfaos:
+        print(f"  ATENCAO: {len(orfaos)} intent(s) do shard SEM rota no manifesto "
+              f"-- pagina que nao foi publicada. Amostra: {', '.join(orfaos[:5])}")
+    print(f"  200 COM CONTEXTO : {ok}")
+    print(f"  reprovadas       : {len(falhas)}")
+    if falhas:
+        motivos: dict[str, int] = {}
+        for _, defeitos in falhas:
+            for defeito in defeitos:
+                chave = re.sub(r"\d+", "N", defeito)
+                motivos[chave] = motivos.get(chave, 0) + 1
+        print("  motivos, cada um nomeado:")
+        for motivo, quantas in sorted(motivos.items(), key=lambda p: -p[1]):
+            print(f"    {motivo:<52} {quantas}")
+        print("  amostra das reprovadas:")
+        for rota, defeitos in falhas[:10]:
+            print(f"    {rota} -> {', '.join(defeitos)}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

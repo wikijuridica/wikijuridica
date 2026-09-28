@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""warm-origin-cache — enche o cache de ORIGEM do nginx, que é o que serve o
+canal de máquina quando o processo Go cai ou reinicia.
+
+READ-ONLY para o conteúdo: só faz GET em 127.0.0.1:8088 com o Host do portal,
+User-Agent próprio e `X-Warming-Request: true` — nunca sai para a internet, não
+passa pela borda e não entra em nenhuma contagem de audiência (o ledger do Go
+marca `warming=true`, e o log do nginx marca `warm=true`).
+
+────────────────────────────────────────────────────────────────────────────
+POR QUE ESTA FERRAMENTA EXISTE
+
+Em 2026-09-02 o servidor Go ficou 17 h em `failed` e TODA rota dinâmica —
+gêmea Markdown, /mcp, /a2a, /api/v1, /.well-known — devolveu 503 a todo bot.
+A resposta de engenharia foi a zona `proxy_cache wj_dyn` com
+`proxy_cache_use_stale error timeout http_500 http_502 http_503 http_504` em
+`@markdown` e `@fallback`: com o objeto no cache, a queda do upstream vira
+resposta velha em vez de erro.
+
+Mas `use_stale` só serve o que ESTÁ no cache, e o cache só tem o que alguém
+pediu antes. O aquecimento de BORDA (`warm-edge-cache`) não enche este cache:
+quando a Cloudflare responde HIT, a requisição nem chega à origem. Sem esta
+ferramenta, a proteção existe só para as poucas rotas que um bot pediu desde o
+último deploy — e o deploy apaga o cache justamente quando republica.
+
+Por isso ela roda no fim do deploy (passo 5) e num timer próprio.
+
+────────────────────────────────────────────────────────────────────────────
+O QUE ELA MEDE, E POR QUE PELO LOG
+
+O estado do cache de origem não aparece no corpo nem em cabeçalho público: a
+resposta de um HIT é byte a byte igual à de um MISS. Ele aparece em
+`$upstream_cache_status`, que o `log_format wj_main` grava como `ocs=` desde
+2026-09-03. Esta ferramenta marca a posição do access.log ANTES da passada e lê
+só o trecho novo — é medição do que o servidor registrou, não do que o cliente
+supôs. `ocs=-` significa "não passou por proxy_cache" (acervo HTML estático, por
+exemplo) e é contado à parte de MISS, que é "passou e não estava lá".
+
+E mede POR VARIANTE de `Accept-Encoding` (`ae=` no mesmo log), porque o nginx
+guarda um objeto por variante quando o upstream manda `Vary: Accept-Encoding` —
+que é o caso da gêmea. Um total que soma variantes já escondeu o defeito uma
+vez; ver `VARIANTES_ACCEPT_ENCODING`, logo abaixo, com a medição.
+
+Uso:
+    tools/warm-origin-cache                 # descritores + todas as gêmeas
+    tools/warm-origin-cache --so-descritores
+    tools/warm-origin-cache --limite 200 --json
+    tools/warm-origin-cache --variantes 'gzip, br'   # uma variante só
+"""
+
+import argparse
+import concurrent.futures
+import datetime
+import glob
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from importlib.machinery import SourceFileLoader
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ORIGEM = os.environ.get("WIKI_ORIGEM_NGINX", "http://127.0.0.1:8088")
+HOST = "wikijuridica.com.br"
+USER_AGENT = "wikijuridica-origin-warm/1.0 (+interno; aquecimento do cache de origem; nao-indexar)"
+LOG_NGINX = os.environ.get("WIKI_NGINX_ACCESS_LOG", "/var/log/nginx/wikijuridica/access.log")
+LEDGER = os.path.join(RAIZ, "data/ops/origin_cache_warm.jsonl")
+CACHE_DIR = os.environ.get("WIKI_NGINX_CACHE_DIR", os.path.join(RAIZ, "var/nginx/cache"))
+
+# AS VARIANTES QUE O BOT REALMENTE PEDE (medido em 2026-09-05, e é o defeito que
+# esta constante conserta).
+#
+# O Go responde a gêmea com `Vary: Accept-Encoding`. O nginx honra o Vary: o
+# objeto no `proxy_cache` é guardado POR VALOR do `Accept-Encoding` do pedido,
+# ainda que a `proxy_cache_key` não o mencione. Até hoje esta ferramenta pedia
+# tudo com `Accept-Encoding: identity` — uma variante que NENHUM cliente externo
+# usa. Resultado medido no access.log, só gêmeas, sem as sondas internas:
+#
+#     ae="gzip, br"  ocs=MISS   60      (bingbot, OAI-SearchBot, …)
+#     ae="-"         ocs=MISS    3
+#     ae="identity"  ocs=HIT     1      (a própria sonda)
+#
+# 60 de 60 pedidos de bot batiam em MISS enquanto o ledger desta ferramenta
+# anunciava HIT 10.213 — o instrumento estava medindo a si mesmo. Com o upstream
+# fora do ar, `proxy_cache_use_stale` não teria objeto NENHUM para a variante do
+# bot: a proteção existia e era decorativa exatamente para quem ela protege.
+#
+# Prova das quatro requisições sobre uma gêmea fria (2026-09-05, mesmo log):
+#     ae="gzip, br" ocs=MISS  →  ae="gzip, br" ocs=HIT
+#     ae="-"        ocs=MISS      (variante própria, estava vazia)
+#     ae="identity" ocs=HIT       (a única que estava cheia)
+#
+# A string é literal: `gzip, br` com vírgula-espaço, como os 60 pedidos chegaram.
+# `gzip,br` seria outra variante. A segunda entrada é o cliente que não manda o
+# cabeçalho; o urllib não deixa omiti-lo, e VALOR VAZIO cai na mesma variante que
+# a AUSÊNCIA — medido: pedido sem o header gravou `ae="-"` e MISS, e o pedido
+# seguinte com valor vazio gravou `ae=""` e HIT sobre o mesmo objeto.
+VARIANTES_ACCEPT_ENCODING = ("gzip, br", "")
+
+_universo = SourceFileLoader("wikiuniverso", os.path.join(RAIZ, "tools/wikiuniverso.py")).load_module()
+
+# DESCRITORES DINÂMICOS: as rotas que o processo Go renderiza e que morrem com
+# ele. A lista é a mesma que `internal/agentsurface` declara mais as que o
+# `/llms.txt` anuncia ao agente — cada uma custa uma requisição local e é a
+# diferença entre um agente ler o catálogo durante uma queda e receber 503.
+# /mcp e /a2a/v1 ficam de fora: são POST e conversação, não recurso cacheável.
+DESCRITORES = (
+    "/.well-known/agent-card.json",
+    "/.well-known/ai-catalog.json",
+    "/.well-known/mcp/server-card.json",
+    "/.well-known/api-catalog",
+    "/.well-known/agent-skills/index.json",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-authorization-server",
+    "/openapi.json",
+    "/api.md",
+    "/auth.md",
+    "/api/politica-de-uso.json",
+    "/llms.txt",
+)
+
+
+def rotas_de_lote():
+    """Uma chamada de lote por área, com o limite que o /llms.txt anuncia.
+
+    O lote entra no cache pela URI inteira (query incluída), então só a forma
+    anunciada é aquecida: aquecer combinações que ninguém pede encheria o cache
+    com objeto morto.
+    """
+    # DERIVA DE pages.json, e nao de areas_publicadas(): sao conjuntos
+    # diferentes por medicao, nao por descuido. `/api/v1/lote?area=contato` e
+    # `?area=fontes` respondem 200 (conferido em 2026-09-03 contra 127.0.0.1:8089),
+    # porque o lote pagina por prefixo de rota e nao exige hub de area — ao
+    # contrario de `/{area}/llms-full.txt`, que resolve por IndiceEstruturalPara.
+    # Estreitar este para 32 deixaria duas rotas validas fora do aquecimento.
+    return ["/api/v1/lote?area=%s&limite=50" % a for a in areas_de_pages_json()]
+
+
+def areas_de_pages_json():
+    caminho = os.path.join(RAIZ, "content/pages.json")
+    areas = set()
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            dados = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    paginas = dados if isinstance(dados, list) else dados.get("pages", [])
+    for pagina in paginas:
+        rota = (pagina.get("path") or "") if isinstance(pagina, dict) else ""
+        partes = [p for p in rota.split("/") if p]
+        if len(partes) == 2:
+            areas.add(partes[0])
+    return sorted(areas)
+
+
+def rotas_de_texto_integral():
+    """`/{area}/llms-full.txt` — o corpo das paginas de cada area.
+
+    Rota DINAMICA do Go (internal/httpserver/llmsfull.go): morre com o processo,
+    como todo o resto desta lista. Entra no aquecimento pelo mesmo motivo dos
+    descritores, e com um peso proprio: sao 3,5 MB no caso maior, e um agente
+    que peca o texto integral durante uma queda receberia 503 depois de esperar
+    o suficiente para desistir. Com o objeto no proxy_cache, `use_stale` o serve
+    da origem sem o Go de pe.
+
+    Deriva as areas da MESMA leitura que rotas_de_lote faz, e nao de uma lista
+    escrita a mao, para que area nova entre nas duas de uma vez.
+    """
+    return ["/%s/llms-full.txt" % a for a in areas_publicadas()]
+
+
+def areas_publicadas():
+    """As areas de PRATICA, derivadas de quem tem `public/{area}/llms.txt`.
+
+    NAO se deriva de `content/pages.json` contando rotas de dois segmentos, que
+    era a forma obvia e estava errada: ela devolve 34 nomes, e dois deles —
+    `contato` e `fontes` — sao rotas institucionais, nao areas do acervo. O Go
+    resolve `/{area}/llms-full.txt` por `IndiceEstruturalPara`, que exige hub
+    de area; pedir as duas institucionais devolveria 404 e sujaria o ledger do
+    aquecedor com falha que nao e falha.
+
+    O conjunto certo e o mesmo que o `/llms.txt` raiz anuncia, e ele ja esta
+    materializado em disco: um `llms.txt` por area, escrito pelo publicador a
+    partir de `hubSet.SitemapPages`. Ler o disco amarra o aquecedor a MESMA
+    fonte que o servidor usa, em vez de a uma reconstrucao paralela que pode
+    divergir dela sem ninguem notar. Medido em 2026-09-03: 32 areas.
+    """
+    padrao = os.path.join(RAIZ, "public", "*", "llms.txt")
+    return sorted(
+        os.path.basename(os.path.dirname(caminho))
+        for caminho in glob.glob(padrao)
+    )
+
+
+def gemeas():
+    """`/x/index.md` de cada URL pública — o canal que os bots de IA consomem."""
+    saida = []
+    for url in _universo.urls_publicas(RAIZ):
+        caminho = url.split(HOST, 1)[-1] if HOST in url else url
+        if not caminho.startswith("/"):
+            continue
+        saida.append(caminho.rstrip("/") + "/index.md" if caminho != "/" else "/index.md")
+    return saida
+
+
+# 2026-09-22: era 30 s fixos, e isso falhava por construção numa rota grande.
+# Medido: /jurisprudencia/llms-full.txt tem 63.183.623 bytes e responde em 0,7 s
+# sozinha, mas sob a rajada de `--rps 80 --concorrencia 8` ela disputa banda com
+# as outras 37.785 requisições e estoura os 30 s. O aquecimento do deploy de
+# 2026-09-22 registrou exatamente uma falha, e era essa.
+TIMEOUT_PADRAO = 180
+
+
+def pedir(caminho, timeout=None, accept_encoding=VARIANTES_ACCEPT_ENCODING[0]):
+    """Um GET local. `accept_encoding` ESCOLHE A VARIANTE que vai para o cache.
+
+    Devolve `(codigo, tamanho, motivo)`. `motivo` é "" no caminho feliz e traz o
+    erro quando o código é 0 — antes esta função devolvia `0, 0` para qualquer
+    exceção, e o operador via "status 0" sem saber se foi timeout, conexão
+    recusada ou DNS. Diagnóstico engolido é o mesmo que diagnóstico ausente.
+
+    O corpo volta comprimido e não é decodificado: o tamanho só alimenta a
+    contagem de falhas, e decodificar 10 mil respostas gastaria CPU para produzir
+    um número que ninguém usa.
+    """
+    if timeout is None:
+        timeout = TIMEOUT_PADRAO
+    pedido = urllib.request.Request(
+        ORIGEM + caminho,
+        headers={"User-Agent": USER_AGENT, "X-Warming-Request": "true", "Host": HOST,
+                 "Accept-Encoding": accept_encoding})
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+            corpo = resposta.read()
+            return resposta.status, len(corpo), ""
+    except urllib.error.HTTPError as erro:
+        try:
+            corpo = erro.read()
+        except Exception:
+            corpo = b""
+        return erro.code, len(corpo), ""
+    except Exception as erro:
+        return 0, 0, "%s: %s" % (type(erro).__name__, erro)
+
+
+def posicao_do_log():
+    try:
+        return os.path.getsize(LOG_NGINX)
+    except OSError:
+        return None
+
+
+def estados_do_log(desde):
+    """Conta `ocs=` POR VARIANTE `ae=` no trecho do log escrito depois de `desde`.
+
+    Devolve (contagem, linhas_lidas) ou (None, 0) quando o log não é legível — o
+    que vira ressalva na saída, nunca número inventado.
+
+    A abertura por `ae=` não é enfeite: até 2026-09-05 esta função somava todas
+    as variantes num número só, e foi ele que escondeu o defeito. O ledger
+    anunciava `HIT 10.213` porque o aquecedor batia na variante que ele mesmo
+    tinha enchido, enquanto os 60 pedidos de bot do mesmo dia batiam em MISS. Um
+    total que mistura variantes mede o instrumento, não a proteção.
+    """
+    if desde is None:
+        return None, 0
+    contagem = {}
+    linhas = 0
+    try:
+        with open(LOG_NGINX, "rb") as fh:
+            fh.seek(desde)
+            for bruto in fh:
+                linha = bruto.decode("utf-8", "replace")
+                if USER_AGENT.split("/")[0] not in linha or "ocs=" not in linha:
+                    continue
+                estado = linha.split("ocs=", 1)[1].split(None, 1)[0].strip()
+                variante = linha.split('ae="', 1)[1].split('"', 1)[0] if 'ae="' in linha else "?"
+                contagem.setdefault(variante, {})
+                contagem[variante][estado] = contagem[variante].get(estado, 0) + 1
+                linhas += 1
+    except OSError:
+        return None, 0
+    return contagem, linhas
+
+
+def objetos_em_cache():
+    total = 0
+    for _raiz, _dirs, arquivos in os.walk(CACHE_DIR):
+        total += len(arquivos)
+    return total
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--limite", type=int, default=0, help="aquece no máximo N gêmeas (0 = todas)")
+    ap.add_argument("--rps", type=float, default=60.0, help="requisições por segundo (local, padrão 60)")
+    ap.add_argument("--concorrencia", type=int, default=6)
+    ap.add_argument("--timeout", type=float, default=TIMEOUT_PADRAO,
+                    help="segundos por requisição (padrão %(default)s; rota grande sob "
+                         "rajada precisa de folga — llms-full.txt tem 63 MB)")
+    ap.add_argument("--so-descritores", action="store_true",
+                    help="só as rotas de descoberta (rápido, para o fim do deploy)")
+    ap.add_argument("--variantes", default="",
+                    help="variantes de Accept-Encoding separadas por `|` (padrão: as medidas no "
+                         "tráfego real). Vazio entre barras = cliente que não manda o cabeçalho.")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--listar-rotas", action="store_true",
+                    help="não aquece: imprime o conjunto dinâmico (descritores, lote, texto integral, "
+                         "gêmeas — inclusive /index.md e /{área}/index.md), uma rota por linha. É a "
+                         "lista que o deploy purga na borda quando só o binário do servidor mudou "
+                         "(2026-09-09): o HTML estático de public/ não muda por binário e fica quente.")
+    args = ap.parse_args()
+
+    if args.listar_rotas:
+        rotas = list(DESCRITORES) + rotas_de_lote() + rotas_de_texto_integral() + gemeas()
+        vistas = set()
+        for rota in rotas:
+            if rota in vistas:
+                continue
+            vistas.add(rota)
+            print(rota)
+        return 0 if vistas else 2
+
+    # A origem precisa estar de pé: aquecer contra um Go morto encheria o cache
+    # de nada e ainda gastaria 10 mil requisições provando o que /readyz diz numa.
+    pronto, _, _ = pedir("/readyz", timeout=10)
+    if pronto != 200:
+        print("warm-origin-cache: origem não está pronta (/readyz = %s); nada a aquecer" % pronto,
+              file=sys.stderr)
+        return 2
+
+    rotas = list(DESCRITORES) + rotas_de_lote() + rotas_de_texto_integral()
+    if not args.so_descritores:
+        gs = gemeas()
+        if args.limite:
+            gs = gs[:args.limite]
+        rotas += gs
+    if not rotas:
+        print("warm-origin-cache: nenhuma rota a aquecer (sitemap vazio?)", file=sys.stderr)
+        return 2
+
+    antes_log = posicao_do_log()
+    antes_objetos = objetos_em_cache()
+    inicio = time.monotonic()
+    status = {}
+    falhas = []
+    intervalo = 1.0 / args.rps if args.rps > 0 else 0.0
+    proximo = time.monotonic()
+
+    # Uma requisição por (rota, variante): o nginx guarda um objeto por variante
+    # de `Accept-Encoding`, então aquecer uma só deixa a outra vazia.
+    variantes = list(dict.fromkeys(args.variantes.split("|"))) if args.variantes \
+        else list(VARIANTES_ACCEPT_ENCODING)
+    pedidos = [(caminho, ae) for caminho in rotas for ae in variantes]
+
+    def tarefa(caminho, accept_encoding):
+        codigo, tamanho, motivo = pedir(caminho, accept_encoding=accept_encoding,
+                                        timeout=args.timeout)
+        return caminho, accept_encoding, codigo, tamanho, motivo
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concorrencia) as executor:
+        pendentes = []
+        for caminho, accept_encoding in pedidos:
+            agora = time.monotonic()
+            if agora < proximo:
+                time.sleep(proximo - agora)
+            proximo = max(proximo, agora) + intervalo
+            pendentes.append(executor.submit(tarefa, caminho, accept_encoding))
+        for futuro in concurrent.futures.as_completed(pendentes):
+            caminho, accept_encoding, codigo, _tamanho, motivo = futuro.result()
+            status[codigo] = status.get(codigo, 0) + 1
+            if codigo != 200 and len(falhas) < 8:
+                rotulo = accept_encoding or "(sem cabecalho)"
+                if motivo:
+                    rotulo += " [%s]" % motivo
+                falhas.append((caminho, codigo, rotulo))
+
+    duracao = time.monotonic() - inicio
+    estados, linhas_lidas = estados_do_log(antes_log)
+    depois_objetos = objetos_em_cache()
+
+    registro = {
+        # v2 (2026-09-05): `cache_status_origem` deixou de ser um total e passou a
+        # ser {variante de Accept-Encoding: {estado: n}}. O total do v1 somava a
+        # variante `identity`, que só as sondas internas pedem, com as que o bot
+        # pede — e por isso anunciava HIT 10.213 num dia em que o bot levou 60
+        # MISS de 60. Quem ler a série tem de ver a mudança de forma, não
+        # descobri-la comparando números que não são comparáveis.
+        "schema_version": "origin_cache_warm_v2",
+        "medido_em": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "alvo": ORIGEM,
+        "user_agent": USER_AGENT,
+        "warming_header": True,
+        "counts_as_audience": False,
+        "rotas": len(rotas),
+        "variantes_accept_encoding": variantes,
+        "requisicoes": len(pedidos),
+        "descritores": len(DESCRITORES) + len(rotas_de_lote()) + len(rotas_de_texto_integral()),
+        "gemeas": 0 if args.so_descritores else len(rotas) - len(DESCRITORES) - len(rotas_de_lote()) - len(rotas_de_texto_integral()),
+        "duracao_s": round(duracao, 1),
+        "status": {str(k): v for k, v in sorted(status.items())},
+        "cache_status_origem": estados,
+        "cache_status_fonte": "ocs=$upstream_cache_status x ae=$http_accept_encoding no access.log do nginx"
+                              if estados is not None
+                              else "log do nginx ilegível: sem medição de HIT/MISS nesta passada",
+        "linhas_de_log_lidas": linhas_lidas,
+        "objetos_em_cache_antes": antes_objetos,
+        "objetos_em_cache_depois": depois_objetos,
+        "falhas_amostra": falhas,
+    }
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if args.json:
+        print(json.dumps(registro, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("warm-origin-cache: %d rota(s) x %d variante(s) = %d requisicao(oes) em %.1fs (%.1f r/s)"
+              % (len(rotas), len(variantes), len(pedidos), duracao,
+                 len(pedidos) / duracao if duracao else 0))
+        print("  status         : %s" % registro["status"])
+        if estados is None:
+            print("  cache de origem: não medido (log ilegível)")
+        else:
+            for variante in sorted(estados):
+                print("  cache de origem: ae=%-12s %s"
+                      % ('"%s"' % variante, estados[variante]))
+        print("  objetos        : %d -> %d" % (antes_objetos, depois_objetos))
+        for caminho, codigo, accept_encoding in falhas:
+            print("  falha %s %s (Accept-Encoding: %s)" % (codigo, caminho, accept_encoding))
+
+    erros_servidor = sum(v for k, v in status.items() if k >= 500 or k == 0)
+    if erros_servidor:
+        print("warm-origin-cache: %d resposta(s) 5xx/sem-conexão — o cache guardou menos do que devia"
+              % erros_servidor, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

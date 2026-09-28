@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""verify-official-sources — reconfere, de verdade, se cada fonte oficial responde.
+
+POR QUE EXISTE: `internal/v2writingsemantic/material.go:16` fixa
+`maxOfficialSourceAgeDays = 30`, e o hook de integridade recusa QUALQUER commit
+de `data/editorial/v2_pages/` quando alguma fonte do estoque passou disso. Em
+2026-08-12 mediu-se **12.287 fontes vencidas (52%) em 4.413 páginas** — e o
+número cresce todo dia, porque o prazo corre sozinho. Ninguém violou o gate: ele
+venceu. Sem re-verificação real, o estoque inteiro trava para escrita.
+
+A SAÍDA CORRETA É ESTA, e não subir o número. O gate existe para garantir que a
+citação aponta para endereço vivo e conferido; trocar o prazo por conveniência é
+o afrouxamento que o contrato proíbe. Então se confere de novo.
+
+O QUE TORNA ISSO VIÁVEL: dedupe. São 12.287 ocorrências, mas apenas **4.646 URLs
+distintas** em 121 hosts — a mesma lei é citada por dezenas de páginas. Verifica-se
+a URL uma vez e o resultado serve a todas.
+
+RESPEITO A ÓRGÃO PÚBLICO, que aqui não é detalhe: o throttle é POR HOST (padrão
+1 req/s), com hosts em paralelo. O maior deles concentra 2.789 URLs, então ele é
+quem dita o tempo. User-Agent identificado, com contato. HEAD primeiro, GET só
+quando o servidor não aceita HEAD — muitos portais de governo recusam o método.
+O `CLAUDE.md` já registra WAF em gov.br; passar por cima disso com rajada seria
+tanto grosseiro quanto contraproducente.
+
+NÃO ESCREVE NO ESTOQUE. Este script só coleta e grava evidência em
+`data/ops/official_source_verification.jsonl`. Quem aplica `verified_at` e
+`http_status` nos JSONL é o gerador datado, com lease e CAS — separar a coleta
+(lenta, de rede) da escrita (rápida, transacional) é o que permite reexecutar
+uma sem repetir a outra.
+
+Uso:
+    tools/verify-official-sources --dry-run          # só lista o que faria
+    tools/verify-official-sources                    # verifica as vencidas
+    tools/verify-official-sources --todas            # reverifica tudo
+    tools/verify-official-sources --rps-por-host 0.5 # mais devagar
+"""
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import queue
+import re
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ESTOQUE = os.path.join(ROOT, "data", "editorial", "v2_pages", "*.jsonl")
+SAIDA = os.path.join(ROOT, "data", "ops", "official_source_verification.jsonl")
+
+# Mesmo teto do gate Go (material.go:16). Duplicar a constante seria criar duas
+# verdades; ela fica aqui com o ponteiro para a origem, e o check de coerência
+# abaixo reprova se divergirem.
+MAX_IDADE_DIAS = 30
+FONTE_DA_CONSTANTE = "internal/v2writingsemantic/material.go:16"
+
+# Os status que o gate aceita (material.go:190).
+STATUS_ACEITOS = {200, 203, 206}
+
+# O PREFIXO "Mozilla/5.0 (compatible; ...)" NÃO É DISFARCE, e sem ele esta
+# ferramenta não mede nada.
+#
+# Medido em 2026-08-12, contra https://www.planalto.gov.br/ccivil_03/leis/l8078.htm:
+#   wikijuridica-source-verifier/1.0 (…)                    -> Connection reset by peer
+#   Mozilla/5.0 (compatible; wikijuridica-source-audit/1.0; …) -> HTTP 200 em 0,34 s
+#
+# O WAF do Planalto derruba a conexão de User-Agent que não segue a convenção
+# `Mozilla/5.0 (compatible; <nome>; +<url>)`, que é justamente a forma como
+# crawler legítimo se identifica há décadas. E o Planalto responde por 15.085 das
+# 21.039 ocorrências de fonte do acervo — 72%. Rodar a varredura com o UA nu
+# marcaria a MAIORIA das fontes do portal como morta, e gravaria essa mentira na
+# evidência com cara de medição, que é a classe de defeito que este projeto trata
+# como adjacente a fraude.
+#
+# A identificação continua honesta e completa: o nome do agente, a URL do
+# projeto, o propósito e o contato seguem no UA. O que muda é só o envelope que
+# o WAF exige para não cortar a conexão antes de ler qualquer coisa.
+# Identidade canonica (CLAUDE.md secao 11, internal/wikijuridicabot). Medido em
+# 2026-09-05 com este UA: www.planalto.gov.br 200/230.913 B, www.bcb.gov.br
+# 200/2.871 B, www.normattiva.it 200/91.138 B -- os tres hosts que este arquivo
+# alcanca hoje continuam respondendo ao envelope canonico.
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+    "+https://wikijuridica.com.br/bot/; reconferencia de fonte oficial citada, "
+    "contato https://wikijuridica.com.br/contato/advogado/)"
+)
+
+
+def teto_do_gate_confere():
+    """Reprova se a constante Go mudar e esta ferramenta não acompanhar."""
+    caminho = os.path.join(ROOT, "internal", "v2writingsemantic", "material.go")
+    try:
+        with open(caminho, encoding="utf-8") as arquivo:
+            texto = arquivo.read()
+    except OSError:
+        return True, "material.go ilegível — seguindo com o teto local"
+    # A constante foi renomeada de `maxOfficialSourceAgeDays` para
+    # `OfficialSourceStaleAfterDays` (material.go:48) e esta conferência passou a
+    # devolver "constante não encontrada" — isto é, deixou de conferir coisa
+    # alguma enquanto imprimia um aviso que ninguém lia. Aceita os dois nomes.
+    achado = re.search(r"(?:maxOfficialSourceAgeDays|OfficialSourceStaleAfterDays)\s*=\s*(\d+)", texto)
+    if not achado:
+        return True, "constante não encontrada — seguindo com o teto local"
+    valor = int(achado.group(1))
+    if valor != MAX_IDADE_DIAS:
+        return False, (
+            "o gate Go usa %d dias e esta ferramenta usa %d (%s) — ajuste MAX_IDADE_DIAS"
+            % (valor, MAX_IDADE_DIAS, FONTE_DA_CONSTANTE))
+    return True, ""
+
+
+def coletar(somente_vencidas=True):
+    """Devolve {url: {'ocorrencias': n, 'mais_antiga': 'AAAA-MM-DD'}}."""
+    hoje = datetime.date.today()
+    limite = hoje - datetime.timedelta(days=MAX_IDADE_DIAS)
+    urls = {}
+    for caminho in sorted(glob.glob(ESTOQUE)):
+        with open(caminho, encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                try:
+                    registro = json.loads(linha)
+                except ValueError:
+                    continue
+                for fonte in registro.get("official_sources") or []:
+                    url = fonte.get("url")
+                    verificada = fonte.get("verified_at")
+                    if not url:
+                        continue
+                    if somente_vencidas:
+                        if not verificada:
+                            continue
+                        try:
+                            data = datetime.date.fromisoformat(verificada)
+                        except ValueError:
+                            continue
+                        if data >= limite:
+                            continue
+                    entrada = urls.setdefault(url, {"ocorrencias": 0, "mais_antiga": verificada or ""})
+                    entrada["ocorrencias"] += 1
+                    if verificada and (not entrada["mais_antiga"] or verificada < entrada["mais_antiga"]):
+                        entrada["mais_antiga"] = verificada
+    return urls
+
+
+def host_de(url):
+    achado = re.match(r"https?://([^/]+)", url)
+    return achado.group(1).lower() if achado else ""
+
+
+# ---------------------------------------------------------------------------
+# EVIDÊNCIA DE CONTEÚDO — por que HEAD e status não bastam
+#
+# Medido ao vivo em 2026-08-12, com este mesmo User-Agent:
+#
+#   https://www.bcb.gov.br/estabilidadefinanceira/exibenormativo?numero=4949&tipo=RESOLUÇÃO
+#       -> HTTP 200, 2.871 bytes, texto visível INTEIRO: "Banco Central do Brasil"
+#
+# O articulado é montado por JavaScript e nunca chega ao primeiro response. A
+# versão anterior desta ferramenta concluía "viva, aceita pelo gate" a partir do
+# status 200 e carimbava `verified_at` — campo de evidência escrito sem a
+# evidência correspondente. São 126 URLs distintas do bcb.gov.br assim no acervo,
+# 179 no total, medidas por
+# `tools/measure-official-source-content-evidence-20260812`.
+#
+# HEAD continua servindo à liveness barata, mas HEAD NÃO TEM CORPO: quem decide
+# `verificado` é o GET. E a decisão é fail-closed em três direções, porque o erro
+# inverso (marcar fonte viva como morta) custa tão caro quanto:
+#
+#   PDF                     -> verificado por identidade de bytes (%PDF-). PDF não
+#                              tem âncora nem marcação HTML; exigi-la reprovaria
+#                              357 PDFs oficiais do acervo.
+#   texto com articulado    -> verificado.
+#   texto sem articulado    -> verificado como FONTE (a página de serviço do
+#                              gov.br é oficial e tem conteúdo real), com a faixa
+#                              gravada para quem quiser exigir mais.
+#   texto abaixo do piso    -> INDETERMINADO. Não recebe `verified_at`.
+#
+# Os limiares e a expressão de marca normativa moram na ferramenta de medição;
+# duplicá-los aqui em silêncio criaria duas verdades. `criterio_confere()`
+# aborta se divergirem.
+FERRAMENTA_DE_MEDICAO = os.path.join(ROOT, "tools",
+                                     "measure-official-source-content-evidence-20260812")
+PISO_TEXTO = 500
+MINIMO_MARCAS = 3
+
+SEM_TEXTO = re.compile(rb"(?is)<(script|style|noscript|template)\b.*?</\1>")
+TAG = re.compile(rb"(?s)<[^>]*>")
+ENTIDADE = re.compile(r"&[a-zA-Z]+;|&#\d+;")
+ESPACO = re.compile(r"\s+")
+MARCA_NORMATIVA = re.compile(
+    r"(?i)\bart(?:\.|igos?|icolos?|ículos?|icles?)?\s*\.?\s*\d"
+    r"|§\s*\d"
+    r"|\bparágrafo único\b"
+    r"|\bincis[oa]\b"
+    r"|\bcaput\b"
+    r"|\bcomma\s+\d"
+    r"|\bapartado\s+\d"
+    r"|\babsatz\s+\d")
+
+
+def criterio_confere():
+    """Reprova se os limiares desta ferramenta divergirem da de medição."""
+    try:
+        with open(FERRAMENTA_DE_MEDICAO, encoding="utf-8") as arquivo:
+            texto = arquivo.read()
+    except OSError:
+        return True, "ferramenta de medição ausente — seguindo com os limiares locais"
+    for nome, valor in (("PISO_TEXTO", PISO_TEXTO), ("MINIMO_MARCAS", MINIMO_MARCAS)):
+        achado = re.search(r"^%s\s*=\s*(\d+)" % nome, texto, re.M)
+        if achado and int(achado.group(1)) != valor:
+            return False, ("%s vale %s na ferramenta de medição e %d aqui — ajuste"
+                           % (nome, achado.group(1), valor))
+    return True, ""
+
+
+def texto_visivel(bruto):
+    limpo = TAG.sub(b" ", SEM_TEXTO.sub(b" ", bruto))
+    try:
+        texto = limpo.decode("utf-8")
+    except UnicodeDecodeError:
+        texto = limpo.decode("latin-1", "replace")
+    return ESPACO.sub(" ", ENTIDADE.sub(" ", texto)).strip()
+
+
+def evidencia_de_conteudo(bruto):
+    """(faixa, verificado, chars, marcas) — o veredito de conteúdo."""
+    if not bruto:
+        return "corpo_ausente", False, 0, 0
+    if bruto[:5] == b"%PDF-":
+        return "documento_pdf", True, -1, -1
+    texto = texto_visivel(bruto)
+    marcas = len(MARCA_NORMATIVA.findall(texto))
+    if marcas >= MINIMO_MARCAS:
+        return "articulado_no_texto", True, len(texto), marcas
+    if len(texto) >= PISO_TEXTO:
+        return "conteudo_sem_articulado", True, len(texto), marcas
+    return "casca_sem_conteudo", False, len(texto), marcas
+
+
+def autoteste():
+    """Prova, sobre corpos reais, que o critério não inventa nenhuma das duas falhas.
+
+    Cada caso é um corpo de verdade: os três primeiros são sintéticos mínimos com
+    a assinatura exata do caso real (a casca do bcb tem 23 caracteres visíveis), e
+    os demais saem do cache de documentos oficiais, quando houver.
+    """
+    casos = [
+        ("pdf oficial (sem âncora HTML — NÃO pode reprovar)",
+         b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n", "documento_pdf", True),
+        ("casca JS do bcb.gov.br (200 sem conteúdo)",
+         b"<html><head><title>Banco Central do Brasil</title>"
+         b"<script>carrega()</script></head><body><div id=\"app\"></div></body></html>",
+         "casca_sem_conteudo", False),
+        ("lei com articulado no texto",
+         ("<html><body><p>Art. 1&ordm; Esta Lei estabelece normas.</p>"
+          "<p>Art. 2&ordm; Aplica-se o disposto no caput.</p>"
+          "<p>&sect; 1&ordm; O inciso II fica revogado.</p></body></html>").encode("utf-8"),
+         "articulado_no_texto", True),
+        ("página de serviço oficial sem articulado (NÃO pode reprovar)",
+         ("<html><body><p>" + ("orientacoes ao cidadao sobre o atendimento " * 20)
+          + "</p></body></html>").encode("utf-8"),
+         "conteudo_sem_articulado", True),
+        ("script pesado com texto curto NÃO vira conteúdo",
+         b"<html><body><script>" + b"var x=1;" * 500 + b"</script><p>Portal</p></body></html>",
+         "casca_sem_conteudo", False),
+    ]
+    falhas = 0
+    for descricao, corpo, faixa_esperada, verificado_esperado in casos:
+        faixa, verificado, chars, marcas = evidencia_de_conteudo(corpo)
+        ok = faixa == faixa_esperada and verificado is verificado_esperado
+        falhas += 0 if ok else 1
+        print("  [%s] %-52s -> %s (chars=%d marcas=%d)"
+              % ("ok" if ok else "FALHA", descricao, faixa, chars, marcas))
+    cache = os.environ.get("PLANALTO_CACHE", "/tmp/wiki-planalto-cache-20260812")
+    reais = [
+        ("https://www.planalto.gov.br/ccivil_03/leis/l8078.htm", "articulado_no_texto", True),
+        ("https://www.bcb.gov.br/estabilidadefinanceira/pix", "casca_sem_conteudo", False),
+        ("https://www.normattiva.it/uri-res/N2Ls?urn:nir:stato:legge:1992-02-05;91",
+         "conteudo_sem_articulado", True),
+    ]
+    import hashlib
+    for url, faixa_esperada, verificado_esperado in reais:
+        caminho = os.path.join(cache, hashlib.sha256(url.encode()).hexdigest()[:24] + ".htm")
+        if not os.path.isfile(caminho):
+            print("  [--] corpo real ausente do cache: %s" % url[:70])
+            continue
+        with open(caminho, "rb") as arquivo:
+            faixa, verificado, chars, marcas = evidencia_de_conteudo(arquivo.read())
+        ok = faixa == faixa_esperada and verificado is verificado_esperado
+        falhas += 0 if ok else 1
+        print("  [%s] corpo real %-40s -> %s (chars=%d marcas=%d)"
+              % ("ok" if ok else "FALHA", url[-40:], faixa, chars, marcas))
+    print("autoteste: %s" % ("todos os casos passaram" if not falhas else "%d FALHA(S)" % falhas))
+    return 0 if not falhas else 1
+
+
+def consultar(url, timeout=20):
+    """HEAD para liveness barata, GET para o corpo — o veredito exige o corpo.
+
+    Portal de governo frequentemente devolve 403/405 a HEAD e 200 a GET; tratar
+    HEAD como veredito final marcaria fonte viva como morta. E status sozinho não
+    prova conteúdo: quem decide é `evidencia_de_conteudo` sobre o corpo do GET.
+
+    Devolve (status, método, erro, faixa, verificado, chars, marcas).
+    """
+    contexto = ssl.create_default_context()
+    cabecalhos = {"User-Agent": USER_AGENT, "Accept": "text/html,application/pdf,*/*"}
+    status_head = 0
+    try:
+        pedido = urllib.request.Request(url, method="HEAD", headers=cabecalhos)
+        with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+            status_head = resposta.status
+    except urllib.error.HTTPError as erro:
+        status_head = erro.code
+        if erro.code not in (403, 405, 501) and erro.code not in STATUS_ACEITOS:
+            return erro.code, "HEAD", "", "http_recusado", False, 0, 0
+    except Exception:
+        status_head = 0
+    try:
+        pedido = urllib.request.Request(url, method="GET", headers=cabecalhos)
+        with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+            bruto, status = resposta.read(), resposta.status
+    except urllib.error.HTTPError as erro:
+        return erro.code, "GET", "", "http_recusado", False, 0, 0
+    except Exception as erro:
+        # `URLError` sozinho não discrimina DNS de TLS de timeout, e a diferença
+        # decide o veredito editorial. Medido em 2026-08-12:
+        # portal.stf.jus.br resolve DNS, mas serve a folha DUAS vezes e nenhuma
+        # intermediária ("Verify return code: 21"), o que reprova a verificação
+        # de cadeia em qualquer cliente (curl e Python reproduzem). São ~130 URLs
+        # do acervo. Registrar isso como fonte morta seria mentira: a fonte está
+        # de pé, quem está quebrado é a cadeia TLS do órgão.
+        motivo = getattr(erro, "reason", erro)
+        detalhe = "%s: %s" % (type(erro).__name__, motivo)
+        faixa = ("tls_cadeia_incompleta"
+                 if "CERTIFICATE_VERIFY_FAILED" in str(motivo) else "corpo_ausente")
+        return 0, "GET", detalhe[:200], faixa, False, 0, 0
+    metodo = "HEAD+GET" if status_head else "GET"
+    if status not in STATUS_ACEITOS:
+        return status, metodo, "", "http_recusado", False, 0, 0
+    faixa, verificado, chars, marcas = evidencia_de_conteudo(bruto)
+    return status, metodo, "", faixa, verificado, chars, marcas
+
+
+def _consultar_legado(url, timeout=20):
+    """Mantido só como referência do que NÃO decide verificação: status puro."""
+    contexto = ssl.create_default_context()
+    cabecalhos = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    for metodo in ("HEAD", "GET"):
+        pedido = urllib.request.Request(url, method=metodo, headers=cabecalhos)
+        try:
+            with urllib.request.urlopen(pedido, timeout=timeout, context=contexto) as resposta:
+                return resposta.status, metodo, ""
+        except urllib.error.HTTPError as erro:
+            if metodo == "HEAD" and erro.code in (403, 405, 501):
+                continue  # servidor não aceita HEAD; tenta GET
+            return erro.code, metodo, ""
+        except Exception as erro:  # rede, TLS, timeout
+            if metodo == "HEAD":
+                continue
+            return 0, metodo, type(erro).__name__
+    return 0, "GET", "sem resposta"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--todas", action="store_true", help="reverifica tudo, não só as vencidas")
+    parser.add_argument("--rps-por-host", type=float, default=1.0)
+    parser.add_argument("--hosts-paralelos", type=int, default=8)
+    parser.add_argument("--limite", type=int, default=0, help="para em N URLs (teste)")
+    parser.add_argument("--autoteste", action="store_true",
+                        help="prova o critério de conteúdo sobre corpos reais e sai")
+    args = parser.parse_args()
+
+    if args.autoteste:
+        return autoteste()
+
+    coerente, aviso = criterio_confere()
+    if not coerente:
+        print("ABORTA: " + aviso, file=sys.stderr)
+        return 2
+    if aviso:
+        print("aviso: " + aviso, file=sys.stderr)
+
+    coerente, aviso = teto_do_gate_confere()
+    if not coerente:
+        print("ABORTA: " + aviso, file=sys.stderr)
+        return 2
+    if aviso:
+        print("aviso: " + aviso, file=sys.stderr)
+
+    urls = coletar(somente_vencidas=not args.todas)
+    if args.limite:
+        urls = dict(list(urls.items())[: args.limite])
+    por_host = collections.defaultdict(list)
+    for url in urls:
+        por_host[host_de(url)].append(url)
+
+    maior = max((len(v) for v in por_host.values()), default=0)
+    print("URLs distintas a verificar: %d em %d hosts" % (len(urls), len(por_host)))
+    print("  maior host: %d URLs -> ~%d min a %.1f req/s" % (maior, maior / max(args.rps_por_host, 0.01) / 60 + 1, args.rps_por_host))
+    if args.dry_run:
+        for host, lista in sorted(por_host.items(), key=lambda kv: -len(kv[1]))[:10]:
+            print("   %5d  %s" % (len(lista), host))
+        print("\n--dry-run: nada foi consultado.")
+        return 0
+
+    resultados = {}
+    trava = threading.Lock()
+    fila = queue.Queue()
+    for host in por_host:
+        fila.put(host)
+    intervalo = 1.0 / max(args.rps_por_host, 0.01)
+    inicio = time.time()
+    feitos = [0]
+
+    def trabalhar():
+        while True:
+            try:
+                host = fila.get_nowait()
+            except queue.Empty:
+                return
+            proximo = time.monotonic()
+            for url in por_host[host]:
+                agora = time.monotonic()
+                if agora < proximo:
+                    time.sleep(proximo - agora)
+                proximo = max(proximo, agora) + intervalo
+                status, metodo, erro, faixa, verificado, chars, marcas = consultar(url)
+                with trava:
+                    resultados[url] = {"http_status": status, "metodo": metodo, "erro": erro,
+                                       "faixa": faixa, "verificado": verificado,
+                                       "texto_visivel_chars": chars, "marcas_normativas": marcas}
+                    feitos[0] += 1
+                    if feitos[0] % 200 == 0:
+                        decorrido = time.time() - inicio
+                        print("  %d/%d em %.0fs" % (feitos[0], len(urls), decorrido), flush=True)
+            fila.task_done()
+
+    threads = [threading.Thread(target=trabalhar, daemon=True) for _ in range(min(args.hosts_paralelos, len(por_host)))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    hoje = datetime.date.today().isoformat()
+    verificadas = sum(1 for r in resultados.values() if r["verificado"])
+    indeterminadas = sum(1 for r in resultados.values()
+                         if not r["verificado"] and r["http_status"] in STATUS_ACEITOS)
+    recusadas = len(resultados) - verificadas - indeterminadas
+    faixas = collections.Counter(r["faixa"] for r in resultados.values())
+    os.makedirs(os.path.dirname(SAIDA), exist_ok=True)
+    # Evidência coletada custou rede e tempo: uma execução curta (--limite) NÃO
+    # pode apagar a varredura completa da véspera. Guarda a anterior ao lado,
+    # datada, antes de reescrever.
+    if os.path.isfile(SAIDA) and os.path.getsize(SAIDA) > 0:
+        anterior = "%s.anterior-%s" % (SAIDA, time.strftime("%Y%m%dT%H%M%S"))
+        with open(SAIDA, "rb") as origem, open(anterior, "wb") as destino:
+            destino.write(origem.read())
+        print("evidência anterior preservada em %s" % os.path.relpath(anterior, ROOT))
+    with open(SAIDA, "w", encoding="utf-8") as arquivo:
+        for url in sorted(resultados):
+            registro = resultados[url]
+            if registro["verificado"]:
+                veredito = "verificado"
+            elif registro["http_status"] in STATUS_ACEITOS:
+                veredito = "indeterminado"
+            else:
+                veredito = "recusado"
+            saida = {
+                "schema_version": "official_source_verification_v2",
+                "url": url,
+                "http_status": registro["http_status"],
+                "method": registro["metodo"],
+                "error": registro["erro"],
+                "verdict": veredito,
+                "content_evidence_band": registro["faixa"],
+                "visible_text_chars": registro["texto_visivel_chars"],
+                "normative_marks": registro["marcas_normativas"],
+                # FAIL-CLOSED: `accepted_by_gate` deixou de ser "status 200". Sem
+                # evidência de conteúdo, o campo é falso e `verified_at` NEM
+                # EXISTE na linha — quem aplicar o carimbo não tem de onde tirá-lo.
+                "accepted_by_gate": veredito == "verificado",
+                "occurrences_in_stock": urls[url]["ocorrencias"],
+                "previous_verified_at": urls[url]["mais_antiga"],
+            }
+            if veredito == "verificado":
+                saida["verified_at"] = hoje
+            arquivo.write(json.dumps(saida, ensure_ascii=False, sort_keys=True) + "\n")
+
+    print("\nconsultadas: %d em %.0f min" % (len(resultados), (time.time() - inicio) / 60))
+    print("  verificadas (com evidência de conteúdo): %d" % verificadas)
+    print("  INDETERMINADAS (200 sem conteúdo):       %d" % indeterminadas)
+    print("  recusadas (status/rede):                 %d" % recusadas)
+    for faixa, quantas in faixas.most_common():
+        print("     %-24s %d" % (faixa, quantas))
+    if indeterminadas:
+        amostra = [(u, r["texto_visivel_chars"]) for u, r in resultados.items()
+                   if not r["verificado"] and r["http_status"] in STATUS_ACEITOS][:5]
+        for url, chars in amostra:
+            print("     200 com %d caracteres visíveis: %s" % (chars, url[:75]))
+    print("  evidência: %s" % os.path.relpath(SAIDA, ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,795 @@
+#!/usr/bin/env python3
+"""warm-edge-cache — coloca o acervo na borda antes que um crawler precise dele.
+
+POR QUE EXISTE: o teste de resiliência de 2026-08-11 mediu que, com o túnel
+parado, uma URL **cacheada** responde 200 e uma URL **fora do cache** responde
+530. Com a Cache Rule de Edge TTL 12h, aquecer uma vez cobre o acervo inteiro
+por doze horas — ou seja, transforma "o site cai quando o túnel cai" em "o site
+continua no ar e só perde as rotas dinâmicas".
+
+O ganho secundário é de custo de crawl: um crawler que pede URL já aquecida é
+atendido pelo edge dele, sem atravessar o backbone até GIG (Rio), onde estão as
+quatro conexões do túnel.
+
+ANTI-FRAUDE, e isto não é detalhe: toda requisição sai com User-Agent PRÓPRIO
+(`wikijuridica-cache-warm/1.0`) e `X-Warming-Request: true`. O access log marca
+`warming=true` (internal/httpserver/access_log.go:73) e os relatórios de tráfego
+excluem essas linhas; `tools/botagents.py` ignora o prefixo `wikijuridica-`.
+Aquecimento que se disfarça de visitante — ou pior, de crawler — é fraude de
+métrica, e a política do projeto proíbe em qualquer circunstância. Este script
+NUNCA usa User-Agent de bot real.
+
+Nada aqui é conteúdo novo: só pede ao edge páginas que já são públicas.
+
+Uso:
+    tools/warm-edge-cache                    # aquece tudo o que está no sitemap
+    tools/warm-edge-cache --limite 500       # amostra
+    tools/warm-edge-cache --rps 8            # throttle (o padrão é 25/s)
+    tools/warm-edge-cache --so-frios         # HEAD antes do GET: pula o que já está HIT
+    tools/warm-edge-cache --degraus          # mede o teto real em degraus de rps
+"""
+import argparse
+import concurrent.futures
+import datetime
+import fcntl
+import glob
+import http.client
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wikiuniverso  # noqa: E402
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SITEMAPS = os.path.join(ROOT, "public", "sitemaps", "*.xml")
+HISTORICO = os.path.join(ROOT, "data", "ops", "edge_cache_warm.jsonl")
+
+# Trava de exclusao mutua entre aquecimentos. Fica em /tmp de proposito: o que
+# ela protege e a JANELA de execucao, nao um dado — sobreviver a reboot seria
+# defeito, porque deixaria uma trava orfa impedindo o proximo aquecimento.
+LOCK_AQUECIMENTO = "/tmp/opt-wiki-warm-edge-cache.lock"
+
+USER_AGENT = "wikijuridica-cache-warm/1.0 (+interno; aquecimento de borda; nao-indexar)"
+
+# ★ O `Accept` NÃO É DECORAÇÃO — ELE É PARTE DA CHAVE DE CACHE (2026-08-29, BUG-059)
+#
+# A Cache Rule da borda declara `vary.headers.accept` em modo `normalize` com
+# allowlist `["text/markdown"]`, e `check-edge-vary-contract` confirma que ela
+# está no ar. O efeito é que a borda guarda representações separadas por valor
+# NORMALIZADO do `Accept` — e "cabeçalho ausente" é um valor distinto de
+# "cabeçalho presente sem text/markdown".
+#
+# Até esta linha existir, a varredura de HTML chamava `varre(..., accept=None)`,
+# isto é, sem mandar `Accept` nenhum. O aquecedor aquecia uma terceira variante,
+# que NENHUM cliente real pede: todo navegador manda
+# `text/html,...,*/*;q=0.8` e todo bot manda pelo menos `*/*`.
+#
+# MEDIDO, mesma URL, mesmo instante, mesmo User-Agent (9 rotas sorteadas do
+# índice, 3 por variante):
+#
+#   Accept ausente          -> HIT, age ~26.000 s
+#   Accept: */*             -> MISS
+#   Accept de navegador     -> MISS
+#
+# (a tabela acima está no BUGLOG; o experimento é reproduzível com HEAD.)
+#
+# Isso é o BUG-059 inteiro. O acervo aparecia "100% frio" para o gate de
+# cobertura — que sonda com `curl -I`, e o curl manda `Accept: */*` — enquanto
+# uma amostra aleatória de 150 URLs sondada SEM `Accept` dava 150/150 HIT. Os
+# dois números estavam certos: mediam variantes diferentes. O aquecedor gastava
+# 872 s por rodada esquentando a variante que ninguém consome, e o portal ficava
+# exposto a devolver 530 no acervo inteiro se o túnel piscasse.
+#
+# O valor abaixo é o `Accept` que um navegador manda, porque é o que a maioria
+# do tráfego humano e a maior parte do tráfego de bot produzem depois da
+# normalização: nenhum deles cita `text/markdown`, então todos colapsam na MESMA
+# variante — que passa a ser a aquecida. A variante `text/markdown` continua
+# tendo sua própria passada (`--markdown`), como já tinha.
+ACCEPT_NAVEGADOR = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8")
+
+CABECALHOS = {
+    "User-Agent": USER_AGENT,
+    "X-Warming-Request": "true",
+    "Accept-Encoding": "gzip, br",
+}
+
+
+# Artefatos que o crawler lê ANTES de qualquer página, e que por isso não podem
+# faltar no cache. Eles não aparecem entre as <loc> do sitemap — o sitemap lista
+# páginas, não a si mesmo —, e essa omissão foi medida: no teste de resiliência
+# de 2026-08-12, com o túnel parado, 25 de 25 páginas responderam 200 e
+# `/sitemaps/pages-0001.xml` respondeu **530**. Um shard de sitemap fora do ar é
+# pior que uma página fora do ar: é a lista de tudo que existe.
+ARTEFATOS_DE_CRAWL = (
+    "/robots.txt",
+    "/sitemap.xml",
+    "/feed.xml",
+    "/llms.txt",
+    "/.well-known/security.txt",
+    # A SUPERFÍCIE DE AGENTE entrou em 2026-08-12, e a omissão custou uma falha
+    # medida: durante a janela do deploy, a borda serviu 502 de corpo vazio para
+    # o SKILL.md anunciado no índice, enquanto a origem respondia 200. Cliente que
+    # confere o digest do índice contra o byte servido recebe falha DURA — o
+    # digest não bate com um corpo vazio —, e o índice de habilidades passa a
+    # parecer mentiroso.
+    #
+    # Esta tupla é fonte ÚNICA: tools/deploy-publico a lê por
+    # --listar-artefatos para montar a purga. Acrescentar aqui aquece E purga,
+    # que é o par que impede artefato de descoberta velho de ficar quente.
+    "/openapi.json",
+    "/.well-known/api-catalog",
+    "/.well-known/mcp-registry-auth",
+)
+
+
+def rotas_de_habilidades():
+    """Caminhos da superfície de habilidades, derivados do acervo em disco.
+
+    Até 2026-08-20 os SKILL.md ficavam nomeados À MÃO na tupla acima, e eram
+    dois. Habilidade nova ficaria fora do aquecimento e da purga sem que nada
+    acusasse — e o preço disso já foi medido: durante uma janela de deploy a
+    borda serviu 502 de corpo vazio para um SKILL.md anunciado no índice, e
+    cliente que confere o digest recebe falha dura, porque hash de corpo vazio
+    não bate com nada.
+
+    A fonte é `cmd/agent-skills rotas`, o mesmo código que monta o índice — não
+    há segunda lista a manter em sincronia. Se ele falhar, devolve-se apenas o
+    índice: aquecer de menos é degradação, listar caminho errado é defeito.
+    """
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        saida = subprocess.run(
+            ["./tools/go-modern", "run", "./cmd/agent-skills", "rotas"],
+            cwd=raiz, capture_output=True, text=True, timeout=180, check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError) as erro:
+        print(f"warm-edge-cache: nao consegui derivar as rotas de habilidades ({erro});"
+              f" seguindo so com o indice", file=sys.stderr)
+        return ("/.well-known/agent-skills/index.json",)
+    return tuple(linha.strip() for linha in saida.splitlines() if linha.strip().startswith("/"))
+
+
+def artefatos_de_crawl():
+    """A tupla estável mais as rotas de habilidades derivadas do acervo."""
+    return ARTEFATOS_DE_CRAWL + rotas_de_habilidades()
+
+
+def urls_de_arquivo(caminho):
+    """Rotas de um arquivo (uma por linha, caminho absoluto: `/x/`, `/x/index.md`,
+    `/api/v1/pages/x/`), viradas em URLs públicas com a MESMA base do sitemap.
+    É o aquecimento DIRIGIDO pós-purga (2026-09-09): o deploy reaquece exatamente
+    o que purgou, em vez de deixar ~800 páginas frias até a próxima varredura —
+    e a varredura pôde cair de seis para duas por dia por causa disso."""
+    encontradas = wikiuniverso.urls_publicas(ROOT)
+    if not encontradas:
+        return []
+    partes = encontradas[0].split("/")
+    base = partes[0] + "//" + partes[2]
+    urls = []
+    with open(caminho, encoding="utf-8") as arquivo:
+        for linha in arquivo:
+            rota = linha.strip()
+            if not rota or rota.startswith("#"):
+                continue
+            if rota.startswith("http://") or rota.startswith("https://"):
+                urls.append(rota)
+            elif rota.startswith("/"):
+                urls.append(base + rota)
+    return list(dict.fromkeys(urls))
+
+
+def urls_do_sitemap():
+    """Páginas do sitemap **mais** os artefatos de descoberta, incluindo os
+    próprios shards, que são descobertos lendo o índice."""
+    base = ""
+    shards = []
+    # PÁGINAS: vêm do ÍNDICE, não do disco (FAMÍLIA-A, 2026-08-29). O disco
+    # guarda também os shards em carência, que listam as MESMAS URLs — a
+    # deduplicação abaixo já corrigia o sintoma, mas derivar do índice corrige a
+    # origem: o universo passa a ser, por construção, o que o portal anuncia.
+    encontradas = wikiuniverso.urls_publicas(ROOT)
+    if encontradas:
+        # Deriva o host das próprias URLs em vez de repetir a constante: se o
+        # domínio mudar, isto acompanha sozinho.
+        partes = encontradas[0].split("/")
+        base = partes[0] + "//" + partes[2]
+        # SHARDS: aqui o disco É a fonte certa, e de propósito. Os 28 shards
+        # em carência não estão no índice, mas SERVEM 200 por 192 h justamente
+        # para atender o crawler que ainda tem o índice anterior — deixá-los
+        # frios na borda entregaria a eles a latência de origem, ou um 530 se o
+        # túnel piscar. Aquecer o que se serve, anunciar o que se indexa: são
+        # decisões diferentes e é correto que tenham fontes diferentes.
+        for caminho in sorted(glob.glob(SITEMAPS)):
+            shards.append(base + "/sitemaps/" + os.path.basename(caminho))
+        for artefato in artefatos_de_crawl():
+            shards.append(base + artefato)
+    # Os artefatos vêm PRIMEIRO: se o aquecimento for interrompido no meio, o
+    # que sobrevive é a camada de descoberta, não uma amostra de páginas.
+    #
+    # DEDUPLICAÇÃO, e ela não é higiene: é 44% do orçamento. O glob varre TODOS
+    # os shards do disco, e o disco guarda também os aposentados em carência —
+    # que servem 200 fora do índice por 192 h de propósito, listando as MESMAS
+    # URLs dos shards vivos. Medido em 2026-08-29: 18.777 entradas para 10.341
+    # URLs distintas, ou seja, cada página era aquecida ~1,8 vez, com o
+    # orçamento de 2.503 s dimensionado sobre o número inflado.
+    #
+    # `dict.fromkeys` e não `set` porque a ORDEM é contrato aqui: os artefatos de
+    # descoberta precisam continuar vindo antes das páginas, e `set` os
+    # embaralharia.
+    return list(dict.fromkeys(shards + encontradas))
+
+
+# Uma conexão por thread, reaproveitada entre requisições. `threading.local`
+# porque `http.client.HTTPSConnection` não é seguro para uso concorrente: duas
+# threads no mesmo socket embaralham as respostas.
+_local = threading.local()
+
+
+def _conexao_da_thread(url, timeout):
+    partes = urllib.parse.urlsplit(url)
+    chave = (partes.scheme, partes.netloc)
+    atual = getattr(_local, "conexao", None)
+    if atual is not None and getattr(_local, "chave", None) == chave:
+        return atual
+    if atual is not None:
+        try:
+            atual.close()
+        except OSError:
+            pass
+    if partes.scheme == "https":
+        nova = http.client.HTTPSConnection(partes.netloc, timeout=timeout)
+    else:
+        nova = http.client.HTTPConnection(partes.netloc, timeout=timeout)
+    _local.conexao = nova
+    _local.chave = chave
+    return nova
+
+
+def _descartar_conexao_da_thread():
+    atual = getattr(_local, "conexao", None)
+    if atual is not None:
+        try:
+            atual.close()
+        except OSError:
+            pass
+    _local.conexao = None
+    _local.chave = None
+
+
+def pedir(url, metodo, timeout=25, accept=None):
+    """Uma requisição de aquecimento. `accept` existe para a VARIANTE.
+
+    A regra de cache da borda declara `vary.headers.accept` com
+    `media_types: ["text/markdown"]`: HTML e Markdown da mesma URL são objetos
+    de cache SEPARADOS. Até 2026-08-26 este aquecedor só pedia HTML, então a
+    variante Markdown ficava fria por construção — e ela é o canal que responde
+    por 86,5% do tráfego de bot de IA deste portal (16.539 de 19.113
+    requisições medidas em 6 dias de log).
+    """
+    cabecalhos = dict(CABECALHOS)
+    if accept:
+        cabecalhos["Accept"] = accept
+
+    # CONEXÃO REUSADA, E NÃO uma nova por requisição.
+    #
+    # Até 2026-08-27 esta função usava `urllib.request.urlopen`, que abre uma
+    # conexão, faz o handshake TLS inteiro e fecha — para CADA URL. Com 10.390
+    # URLs em duas varreduras (HTML e Markdown), são ~20.780 handshakes por
+    # execução, e o handshake é justamente a parte cara em CPU.
+    #
+    # Medido enquanto o serviço rodava: 53 minutos de CPU em 29 de relógio
+    # (~180%), num processo cujas threads estavam todas em `do_sys_poll` — ou
+    # seja, não era busy-wait, era criptografia. O dono viu a carga e mandou
+    # investigar antes de matar; o processo estava correto e progredindo, só
+    # pagava handshake que não precisava pagar.
+    #
+    # O pool por thread é o que permite `Connection: keep-alive` valer alguma
+    # coisa: `http.client` reaproveita o socket enquanto a resposta anterior for
+    # drenada, e a borda mantém a conexão viva entre requisições.
+    conexao = _conexao_da_thread(url, timeout)
+    caminho = urllib.parse.urlsplit(url)
+    alvo = caminho.path + (("?" + caminho.query) if caminho.query else "")
+    try:
+        conexao.request(metodo, alvo, headers=cabecalhos)
+        resposta = conexao.getresponse()
+        estado = resposta.headers.get("CF-Cache-Status") or "-"
+        status = resposta.status
+        # Drenar é obrigatório para o socket poder ser reutilizado: resposta não
+        # lida deixa a conexão suja e a próxima requisição falha.
+        resposta.read()
+        return status, estado
+    except (OSError, TimeoutError, http.client.HTTPException) as erro:
+        # Conexão morta (a borda fecha depois de N requisições, ou houve timeout)
+        # não é falha da URL: descarta o socket e tenta uma vez com conexão nova.
+        _descartar_conexao_da_thread()
+        try:
+            conexao = _conexao_da_thread(url, timeout)
+            conexao.request(metodo, alvo, headers=cabecalhos)
+            resposta = conexao.getresponse()
+            estado = resposta.headers.get("CF-Cache-Status") or "-"
+            status = resposta.status
+            resposta.read()
+            return status, estado
+        except (OSError, TimeoutError, http.client.HTTPException) as segundo:
+            _descartar_conexao_da_thread()
+            return 0, type(segundo).__name__
+
+
+# Estados em que a borda já tem a resposta e serví-la NÃO custa nada à origem.
+# `revalidated` entra porque a borda reconferiu com a origem e ficou com a cópia
+# dela — pedir de novo seria repetir a conferência que acabou de acontecer.
+JA_QUENTE = ("hit", "revalidated")
+
+
+def origem_atende_markdown(timeout=8):
+    """(True, "") se a origem esta pronta para a variante Markdown; senao (False, motivo).
+
+    Sonda /readyz pelo nginx local (127.0.0.1:8088, Host do portal): e a mesma
+    rota que a borda usa, e ela so devolve 200 com o processo Go atendendo.
+    Depois confere UMA gemea real (a do primeiro hub do sitemap), porque um
+    readyz verde com a gemea em 5xx ja aconteceria numa reconfiguracao do nginx.
+    """
+    base = "http://127.0.0.1:8088"
+    cabecalhos = {"User-Agent": USER_AGENT, "X-Warming-Request": "true", "Host": "wikijuridica.com.br"}
+    for caminho in ("/readyz", "/familia/index.md"):
+        pedido = urllib.request.Request(base + caminho, headers=cabecalhos)
+        try:
+            with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+                if resposta.status != 200:
+                    return False, "origem %s respondeu %d" % (caminho, resposta.status)
+        except urllib.error.HTTPError as erro:
+            return False, "origem %s respondeu %d" % (caminho, erro.code)
+        except Exception as erro:
+            return False, "origem %s inalcancavel: %s" % (caminho, str(erro)[:80])
+    return True, ""
+
+
+def aquecer(url, so_frios=False, timeout=25, accept=None):
+    """Aquece uma URL na borda. Devolve (status, estado_de_cache, pediu_corpo).
+
+    Com `so_frios`, um HEAD decide antes: se a borda já responde HIT, o GET não
+    sai. É o que a flag sempre prometeu no --help e nunca fez — ela era declarada
+    em `add_argument` e NUNCA lida no corpo do programa, então quem a usava
+    acreditava estar pulando o que já estava quente e varria o acervo inteiro do
+    mesmo jeito. O HEAD custa uma requisição de borda sem corpo (a página do
+    acervo tem ~22 KB), e num acervo majoritariamente quente isso troca 9.835
+    downloads por 9.835 cabeçalhos.
+
+    Sem a flag, o comportamento é o de sempre: GET direto em tudo.
+
+    Devolve (status, estado_de_cache_do_GET, pediu_corpo, estado_de_cache_do_HEAD).
+    O quarto campo (2026-09-02) e o CF-Cache-Status visto ANTES de este processo
+    tocar a borda — a unica cobertura que o aquecedor pode afirmar sem se medir a
+    si mesmo; None sem `so_frios`.
+    """
+    if so_frios:
+        codigo, cache = pedir(url, "HEAD", timeout, accept)
+        if codigo == 200 and (cache or "").lower() in JA_QUENTE:
+            return codigo, cache, False, cache
+        codigo_get, cache_get = pedir(url, "GET", timeout, accept)
+        return codigo_get, cache_get, True, cache
+    codigo, cache = pedir(url, "GET", timeout, accept)
+    return codigo, cache, True, None
+
+
+def varre(urls, rps, concorrencia, so_frios, accept=None):
+    """Aquece uma lista de URLs no ritmo pedido e devolve o que foi medido.
+
+    Extraída do `main` para que `--degraus` possa repetir exatamente a mesma
+    varredura em ritmos diferentes. Medir com um caminho de código e produzir
+    com outro é como se descobre, tarde, que o teto medido não era o teto real.
+    """
+    inicio = datetime.datetime.now(datetime.timezone.utc)
+    partida = time.monotonic()
+    intervalo = 1.0 / rps if rps > 0 else 0.0
+    contagem = {"hit": 0, "miss": 0, "expired": 0, "revalidated": 0, "dynamic": 0, "none": 0, "outro": 0}
+    status = {}
+    falhas = []
+    pulados = 0
+    proximo = time.monotonic()
+
+    # ESTADO PRE-AQUECIMENTO (2026-09-02). `contagem` registra o CF-Cache-Status
+    # do GET — que, quando o HEAD acabou de dizer MISS/EXPIRED, e o estado DEPOIS
+    # de este processo preencher a borda. Foi assim que o ledger disse hit=10.193
+    # na mesma hora em que a sonda de cobertura media 0 %. `pre_head` conta o que
+    # o HEAD viu ANTES do GET: a unica cobertura que este aquecedor pode afirmar
+    # sem se medir a si mesmo (so existe com --so-frios; sem a flag, `sem_head`).
+    pre_head = {"hit": 0, "miss": 0, "expired": 0, "revalidated": 0, "dynamic": 0, "none": 0, "outro": 0, "sem_head": 0}
+
+    def tarefa(url):
+        codigo, cache, pediu_corpo, cache_head = aquecer(url, so_frios=so_frios, accept=accept)
+        return url, codigo, (cache or "-").lower(), pediu_corpo, cache_head
+
+    def anota(futuro):
+        nonlocal pulados
+        _url, codigo, cache, pediu_corpo, cache_head = futuro.result()
+        status[codigo] = status.get(codigo, 0) + 1
+        contagem[cache if cache in contagem else "outro"] += 1
+        if cache_head is None:
+            pre_head["sem_head"] += 1
+        else:
+            chave = (cache_head or "-").lower()
+            pre_head[chave if chave in pre_head else "outro"] += 1
+        if not pediu_corpo:
+            pulados += 1
+        if codigo != 200:
+            falhas.append((_url, codigo))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concorrencia) as executor:
+        pendentes = set()
+        for url in urls:
+            # Throttle simples: o relógio manda, não o número de threads.
+            agora = time.monotonic()
+            if agora < proximo:
+                time.sleep(proximo - agora)
+            proximo = max(proximo, agora) + intervalo
+            pendentes.add(executor.submit(tarefa, url))
+            if len(pendentes) >= concorrencia * 4:
+                concluidas, pendentes = concurrent.futures.wait(
+                    pendentes, return_when=concurrent.futures.FIRST_COMPLETED)
+                for futuro in concluidas:
+                    anota(futuro)
+        for futuro in concurrent.futures.as_completed(pendentes):
+            anota(futuro)
+
+    fim = datetime.datetime.now(datetime.timezone.utc)
+    duracao = max(time.monotonic() - partida, 1e-9)
+    return {
+        "cobertura_pre_head": pre_head,
+        "started_at": inicio.isoformat(),
+        "finished_at": fim.isoformat(),
+        "urls": len(urls),
+        "duration_s": round(duracao, 1),
+        "throughput_rps": round(len(urls) / duracao, 2),
+        "status": status,
+        "cache_status": {k: v for k, v in contagem.items() if v},
+        "skipped_already_hot": pulados,
+        "failures_sample": falhas[:10],
+        "failures": len(falhas),
+    }
+
+
+# Degraus padrão da medição de teto. Começam ACIMA do antigo padrão de 8 r/s
+# porque 8 já é sabidamente seguro, e param em 32 porque o objetivo é achar o
+# ritmo de trabalho — não descobrir onde a própria proteção do site quebra.
+DEGRAUS_PADRAO = (12, 18, 25, 32)
+
+
+def mede_degraus(urls, args):
+    """Mede o teto real de ritmo, em degraus, contra URLs de verdade.
+
+    CONDIÇÃO DE VALIDADE, e ela é dura: requisição que a borda serve em HIT não
+    chega à origem, logo não testa rate limit nenhum. Uma medição feita com o
+    acervo quente devolve "nenhum 429 a 32 r/s" sem ter provado coisa alguma. Por
+    isso a saída reporta a fração de MISS de cada degrau e recusa a conclusão
+    quando ela é baixa — é preferível não concluir a concluir errado.
+
+    PARADA: sobe enquanto o degrau tiver zero 429, zero status diferente de 200 e
+    vazão de pelo menos 95% do ritmo pedido (abaixo disso o gargalo já não é o
+    pacer, é a travessia). Vale o último degrau que passou, não o que quebrou.
+    """
+    bloco = max(args.degraus_bloco, 1)
+    resultados = []
+    aprovado = None
+    for indice, rps in enumerate(args.degraus_rps or DEGRAUS_PADRAO):
+        fatia = urls[indice * bloco:(indice + 1) * bloco]
+        if not fatia:
+            print("acabaram as URLs antes de acabarem os degraus", file=sys.stderr)
+            break
+        medida = varre(fatia, rps, args.concorrencia, so_frios=False,
+                      accept=ACCEPT_NAVEGADOR)
+        medida["rps_pedido"] = rps
+        total = sum(medida["cache_status"].values()) or 1
+        quentes = medida["cache_status"].get("hit", 0) + medida["cache_status"].get("revalidated", 0)
+        medida["fracao_ja_quente"] = round(quentes / total, 3)
+        medida["respostas_429"] = medida["status"].get(429, 0)
+        medida["vazao_relativa"] = round(medida["throughput_rps"] / rps, 3) if rps else 0.0
+        # A vazão relativa só é critério com bloco grande. Num bloco pequeno o
+        # tempo de subida do pacer domina a média e a razão cai abaixo de 0,95
+        # sem que nada tenha ficado lento — medido: 20 URLs a 12 r/s deram 90%
+        # com zero 429 e zero falha. Reprovar aí pararia a medição no primeiro
+        # degrau e esconderia o teto real, que é justamente o que se quer achar.
+        vazao_conta = bloco >= 100
+        passou = (
+            medida["respostas_429"] == 0
+            and medida["failures"] == 0
+            and (not vazao_conta or medida["vazao_relativa"] >= 0.95)
+        )
+        medida["vazao_foi_criterio"] = vazao_conta
+        medida["passou"] = passou
+        # UM DEGRAU SÓ VALE SE ELE MESMO TOCOU A ORIGEM. Requisição que a borda
+        # serve em HIT não chega à origem e portanto não testa limite nenhum: um
+        # degrau majoritariamente quente pode "passar" sem ter medido nada.
+        medida["tocou_origem"] = medida["fracao_ja_quente"] < 0.5
+        resultados.append(medida)
+        print("degrau %2d r/s: vazao %.2f r/s (%.0f%%), 429=%d, falhas=%d, ja_quente=%.0f%% -> %s" % (
+            rps, medida["throughput_rps"], 100 * medida["vazao_relativa"],
+            medida["respostas_429"], medida["failures"], 100 * medida["fracao_ja_quente"],
+            "passou" if passou else "QUEBROU"))
+        if not passou:
+            break
+        # O ritmo aprovado é o maior degrau que passou E mediu de verdade. Aprovar
+        # por um degrau quente seria carimbar como seguro um ritmo que nunca
+        # atravessou até a origem.
+        if medida["tocou_origem"]:
+            aprovado = rps
+
+    # A CONCLUSÃO VALE POR DEGRAU, NÃO POR CONJUNTO — e a versão anterior errava
+    # exatamente aqui: `any(...)` bastava um degrau frio, lá no começo, para
+    # carimbar como válida a aprovação de um degrau alto que rodou quente e não
+    # mediu nada. O `aprovado` acima já só avança em degrau que tocou a origem;
+    # esta linha passa a refletir o mesmo fato.
+    tocou_origem = any(m["tocou_origem"] for m in resultados)
+    degraus_quentes = [m["rps_pedido"] for m in resultados if not m["tocou_origem"]]
+    registro = {
+        "schema_version": "edge_cache_warm_degrees_v1",
+        "measured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "degraus": resultados,
+        "rps_aprovado": aprovado,
+        "mediu_origem": tocou_origem,
+        "degraus_que_nao_mediram": degraus_quentes,
+        "conclusao_valida": bool(aprovado),
+        "nota": (
+            "cada degrau usou URLs distintas; requisicao servida em HIT nao chega a origem "
+            "e por isso nao testa o rate limit da origem"
+        ),
+        "user_agent": USER_AGENT,
+        "counts_as_audience": False,
+    }
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+    if not tocou_origem:
+        print("MEDICAO INCONCLUSIVA: o acervo ja estava quente, nenhum degrau atravessou ate a origem.")
+        print("  rode logo depois de uma purga, quando o cache esta frio.")
+        return 3
+    if aprovado is None:
+        print("nenhum degrau passou COM medicao real — o que passou rodou quente e nao testou a origem.")
+        if degraus_quentes:
+            print("  degraus descartados por cache quente: %s" % degraus_quentes)
+        return 1
+    if degraus_quentes:
+        print("  ATENCAO: os degraus %s rodaram quentes e NAO contaram; o aprovado saiu dos que mediram."
+              % degraus_quentes)
+    print("ritmo aprovado: %d r/s (registro em %s)" % (aprovado, HISTORICO))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--limite", type=int, default=0, help="aquece no máximo N URLs (0 = todas)")
+    # O TETO É 50 r/s, NÃO 10 — e o comentário anterior, escrito HOJE, afirmava
+    # o contrário. Vale registrar como o engano se formou, porque ele é do tipo
+    # que se repete: a medição que baixou o padrão para 8 r/s é REAL (1.294 de
+    # 9.835 requisições do aquecedor voltaram 429), mas aconteceu em
+    # **11/Aug 22:17–22:28**, sob a zona antiga de 600 r/m. O commit 18a8503b
+    # subiu a zona para `rate=3000r/m` às 12/Aug 06:44 e o nginx só passou a
+    # servir com ela às 14:43, quando reiniciou. Reconferido no log vivo:
+    # DEPOIS das 14:43, ZERO respostas 429 — de qualquer origem, do aquecedor
+    # inclusive. O número estava certo; a data é que o tornou obsoleto.
+    #
+    # O custo do engano é medível: a 8 r/s o acervo leva ~20,5 min para aquecer;
+    # a 25 r/s, ~6,6 min. Depois de uma purga total, essa diferença é o tempo em
+    # que o acervo inteiro fica exposto a 530 se o túnel oscilar.
+    #
+    # 25 e não 50: metade do teto deixa a outra metade para o tráfego real, para
+    # a sonda e para o smoke, que saem do MESMO IP e caem na MESMA zona. A
+    # concorrência sai de rps × latência (25 × 0,333 s ≈ 8,3), com 12 dando 1,44×
+    # de folga. `--degraus` mede isso de novo quando o cache está frio — é a
+    # única condição em que a medição vale, porque requisição que a borda serve
+    # em HIT não chega à origem e portanto não testa limite nenhum.
+    parser.add_argument("--rps", type=float, default=25.0, help="requisições por segundo (padrão 25, metade do teto de 50/s da zona wj_generic)")
+    parser.add_argument("--concorrencia", type=int, default=12, help="requisições simultâneas")
+    parser.add_argument("--markdown", action="store_true",
+                        help="aquece TAMBEM a variante Accept: text/markdown, que e outro "
+                             "objeto de cache por causa do vary.accept da regra de borda")
+    parser.add_argument("--so-frios", action="store_true", help="HEAD antes do GET: pula o que a borda já serve em HIT")
+    parser.add_argument("--de-arquivo", default="",
+                        help="aquece SÓ as rotas do arquivo (uma por linha, caminho absoluto; .md e /api/v1 "
+                             "entram como estão) — o dirigido pós-purga do deploy, em vez do sitemap inteiro")
+    # --listar-artefatos existe para que a lista de artefatos de descoberta tenha
+    # UMA fonte só. Até 2026-08-12 tools/deploy-publico mantinha uma cópia
+    # literal dela para montar a purga, e o comentário de lá já afirmava
+    # "espelha ARTEFATOS de tools/warm-edge-cache" — mas não espelhava:
+    # /.well-known/security.txt estava só aqui. Resultado: a borda mantinha
+    # QUENTE, indefinidamente, a cópia velha do único artefato que muda em toda
+    # publicação (o Expires do security.txt é recomputado a cada transação).
+    # Duas listas paralelas divergem; esta flag elimina a segunda.
+    parser.add_argument(
+        "--listar-artefatos",
+        action="store_true",
+        help="imprime os artefatos de descoberta, um por linha, e sai (fonte única para a purga do deploy)",
+    )
+    parser.add_argument(
+        "--degraus",
+        action="store_true",
+        help="mede o teto de ritmo em degraus de rps, contra URLs frias, e sai",
+    )
+    parser.add_argument(
+        "--degraus-rps",
+        type=int,
+        nargs="+",
+        default=None,
+        help="ritmos a medir, em ordem crescente (padrão: %s)" % " ".join(str(d) for d in DEGRAUS_PADRAO),
+    )
+    parser.add_argument(
+        "--degraus-bloco",
+        type=int,
+        default=500,
+        help="quantas URLs por degrau (padrão 500; cada degrau usa URLs distintas)",
+    )
+    args = parser.parse_args()
+
+    if args.listar_artefatos:
+        for artefato in artefatos_de_crawl():
+            print(artefato)
+        return 0
+
+    # EXCLUSAO MUTUA — o defeito medido em 2026-08-12 17:28.
+    #
+    # O passo 6/7 de tools/deploy-publico aquece o acervo inteiro depois da purga
+    # total. As 17:24:30 esse aquecimento comecou; as 17:28:51 o timer
+    # wikijuridica-edge-warm.timer disparou POR CIMA dele. Os dois processos
+    # varreram as MESMAS 9.841 URLs ao mesmo tempo: 512% + 87% de CPU, load 20,6,
+    # e o dobro de requisicoes na borda para o mesmo resultado. Nada aqui tinha
+    # lock — duas instancias sempre puderam correr juntas.
+    #
+    # Dobrar requisicao de aquecimento nao e so desperdicio de CPU: o aquecimento
+    # ja responde pela maior parte do trafego de borda, e inflar essa conta
+    # atrapalha justamente a medicao de quanto crawler REAL nos visita.
+    #
+    # O salto e o comportamento CORRETO quando outro aquecimento esta em voo, e
+    # por isso sai com 0: para um timer periodico, pular a rodada nao e falha.
+    # Mas ele NAO e silencioso — vai para o mesmo historico das varreduras, com
+    # `skipped_concurrent: true`, porque salto que ninguem ve e a origem da
+    # proxima medicao enganosa.
+    trava = open(LOCK_AQUECIMENTO, "a+")
+    try:
+        if args.de_arquivo:
+            # O dirigido pos-purga NAO pula: a lista purgada ficaria fria ate a
+            # proxima passada do timer (12 h desde 2026-09-09). Espera a varredura
+            # em voo terminar (teto de 20 min: uma passada leva ~15).
+            limite = time.monotonic() + 1200
+            while True:
+                try:
+                    fcntl.flock(trava.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() > limite:
+                        raise
+                    time.sleep(5)
+        else:
+            fcntl.flock(trava.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        agora = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+        with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+            arquivo.write(json.dumps({
+                "schema_version": "edge_cache_warm_v1",
+                "observed_at": agora,
+                "skipped_concurrent": True,
+                "lock_path": LOCK_AQUECIMENTO,
+                "pid": os.getpid(),
+                "reason": "outro aquecimento ja detem a trava; varredura duplicada nao acrescenta HIT",
+                "warming_header": True,
+                "counts_as_audience": False,
+            }, ensure_ascii=False, sort_keys=True) + "\n")
+        print("outro aquecimento ja esta em voo (%s) — pulando esta rodada." % LOCK_AQUECIMENTO)
+        print("  registrado em %s com skipped_concurrent=true" % HISTORICO)
+        return 0
+
+    if args.de_arquivo:
+        urls = urls_de_arquivo(args.de_arquivo)
+        if not urls:
+            print("nenhuma rota em %s — nada a aquecer" % args.de_arquivo, file=sys.stderr)
+            return 2
+        # A lista já traz as gêmeas (.md) e os itens da API por caminho: a
+        # segunda passada por Accept seria aquecer o que ninguém purgou.
+        args.markdown = False
+    else:
+        urls = urls_do_sitemap()
+    if not urls:
+        print("nenhuma URL encontrada em public/sitemaps/ — o site foi publicado?", file=sys.stderr)
+        return 2
+    if args.limite:
+        urls = urls[: args.limite]
+
+    if args.degraus:
+        return mede_degraus(urls, args)
+
+    # accept=ACCEPT_NAVEGADOR e o que faz esta varredura aquecer a variante que
+    # o mundo consome. Ver o bloco de ACCEPT_NAVEGADOR: sem ele, aquecia-se uma
+    # terceira variante (cabecalho ausente) que nenhum cliente real pede.
+    medida = varre(urls, args.rps, args.concorrencia, args.so_frios,
+                   accept=ACCEPT_NAVEGADOR)
+
+    # SEGUNDA PASSADA: a variante Markdown, que e outro objeto de cache.
+    #
+    # A regra de borda declara `vary.headers.accept` com media_types
+    # ["text/markdown"], entao HTML e Markdown da MESMA URL sao entradas
+    # separadas. Sem esta passada, o canal que responde por 86,5% do trafego de
+    # bot de IA fica frio por construcao, e cada requisicao dele atravessa o
+    # tunel -- foi assim que o `meta-externalagent` baixou o acervo inteiro DUAS
+    # vezes direto da origem.
+    #
+    # Custo controlado por DUAS decisoes: (a) `--so-frios` faz um HEAD antes,
+    # entao numa segunda execucao quase nada e baixado; (b) a passada e OPCIONAL
+    # e desligada por padrao, porque dobrar o trafego proprio de 62 mil
+    # requisicoes/dia para aquecer um canal com ~1.100 requisicoes externas/dia
+    # so se justifica com o cache funcionando -- que passou a ser o caso em
+    # 2026-08-26, e nao era antes.
+    # GUARDA DA ORIGEM (2026-09-02). A variante Markdown so existe atravessando o
+    # Go; com o Go fora, cada GET desta passada recebe 503 — e, como a Cache Rule
+    # guardava 5xx como no-cache (TTL 0) e HTML e Markdown partilham a chave por
+    # `Vary: Accept`, o 503 da variante DERRUBAVA o HTML fresco de 7 dias da mesma
+    # URL (medido: HIT age 1500 -> 503 STALE -> EXPIRED, 2x). Seis passadas por dia
+    # com o Go caido zeraram a cobertura da borda (40/40 HIT -> 40/40 EXPIRED). A
+    # regra passou a -1 (no-store), mas aquecer 10 mil 503 continua sendo 10 mil
+    # requisicoes que so provam que a origem esta fora: a passada e PULADA quando
+    # /readyz do nginx (que so responde 200 com o Go atras) nao responde 200, e o
+    # ledger diz por que.
+    origem_pronta, motivo_origem = origem_atende_markdown()
+    if args.markdown and not origem_pronta:
+        print("\n--- variante text/markdown: PULADA (%s) ---" % motivo_origem)
+        medida["variante_markdown"] = {"markdown_skipped_origin_down": True, "motivo": motivo_origem}
+    if args.markdown and origem_pronta:
+        medida_md = varre(urls, args.rps, args.concorrencia,
+                          args.so_frios, accept="text/markdown")
+        print("\n--- variante text/markdown ---")
+        print("  urls           : %d" % len(urls))
+        print("  cache          : %s" % medida_md["cache_status"])
+        print("  status         : %s" % medida_md["status"])
+        print("  pulados (ja quente): %d" % medida_md.get("pulados", 0))
+        medida["variante_markdown"] = {
+            "cache_status": medida_md["cache_status"],
+            "status": medida_md["status"],
+            "pulados": medida_md.get("pulados", 0),
+            "duration_s": medida_md.get("duration_s"),
+        }
+    falhas = medida["failures_sample"]
+    registro = dict(medida)
+    registro.update({
+        "schema_version": "edge_cache_warm_v1",
+        "user_agent": USER_AGENT,
+        "warming_header": True,
+        "counts_as_audience": False,
+        "rps_pedido": args.rps,
+        "so_frios": bool(args.so_frios),
+        "de_arquivo": bool(args.de_arquivo),
+    })
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(registro, ensure_ascii=False, sort_keys=True) + "\n")
+
+    print("aquecidas: %d em %.0fs (%.2f r/s)" % (
+        registro["urls"], registro["duration_s"], registro["throughput_rps"]))
+    print("  status: %s" % registro["status"])
+    print("  cache : %s" % registro["cache_status"])
+    if args.so_frios:
+        print("  puladas por ja estarem quentes: %d" % registro["skipped_already_hot"])
+    if registro["failures"]:
+        print("  falhas: %d (amostra: %s)" % (registro["failures"], falhas[:3]))
+    return 0 if not registro["failures"] else 1
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

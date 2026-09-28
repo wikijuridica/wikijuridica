@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""generate-source-hint-duplicate-merge-20260829 — funde chave duplicada do catálogo na chave canônica.
+
+O DEFEITO, medido em 2026-08-29. Três chaves do
+`data/editorial/v2_source_hint_catalog.json` são duplicatas de chaves que já
+existiam, com URL oficial BYTE-IDÊNTICA à do original:
+
+    susep              -> susep-seguros            (gov.br/susep .../institucional)
+    codigo-civil       -> codigo-civil-10406-2002  (planalto .../l10406.htm)
+    jurisprudencia-stj -> stj-jurisprudencia       (processo.stj.jus.br/SCON/)
+
+As três entraram DEPOIS da proibição que as nomeia
+(`forbiddenHints`, internal/contract/source/source_hint_catalog_test.go:461,
+nascida em 0204bb14, 2026-07-21): `susep` em 80f632c1 (2026-07-22),
+`codigo-civil` e `jurisprudencia-stj` em c604082f (2026-07-30), ambos commits
+de fábrica em massa que não justificam derrubar a proibição. A asserção não
+envelheceu — ela disparou, e o defeito é de DADO.
+
+POR QUE FUNDIR E NÃO SÓ APAGAR. 52 registros de `portfolio_v2` apontam para as
+três chaves (susep 34, jurisprudencia-stj 14, codigo-civil 4). Apagar a entrada
+sem repontuar deixaria hint pendurado, e hint sem resolução exata força a
+intenção inteira para strict com override ZERADO — o beco que o docstring de
+`tools/generate-catalog-url-repair` descreve. Por isso a fusão é uma operação
+só: remover a chave e repontuar a referência, com verificação de que sobrou
+zero ocorrência.
+
+POR QUE ESTE ALVO E NÃO OUTRO. A URL da chave canônica é idêntica à da
+duplicata, então a fusão é semanticamente nula: nenhuma página passa a citar
+fonte diferente da que citava. O gerador RECUSA fundir chaves com URL
+diferente — trocar a URL de uma fonte é decisão editorial, não normalização,
+e não cabe aqui.
+
+CONTRATO DE ESCRITA: lease de época canônica, lock exclusivo, escrita atômica
+com fsync, catálogo regravado no formato canônico (indent=1, sort_keys), linha
+de portfólio não modificada preservada BYTE A BYTE, preflight fail-closed e
+verificação posterior de zero referência pendurada. NÃO commita.
+
+Uso:
+    tools/generate-source-hint-duplicate-merge-20260829 --dry-run
+    tools/generate-source-hint-duplicate-merge-20260829
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+CATALOGO = ROOT / "data/editorial/v2_source_hint_catalog.json"
+PORTFOLIO = ROOT / "data/editorial/portfolio_v2"
+LOCK = ROOT / "data/editorial/.source-hint-duplicate-merge.lock"
+EVIDENCIA = ROOT / "data/source-audit/source_hint_duplicate_merge.jsonl"
+
+# duplicata -> canônica. A canônica tem de existir e ter a MESMA URL.
+FUSOES = {
+    "susep": "susep-seguros",
+    "codigo-civil": "codigo-civil-10406-2002",
+    "jurisprudencia-stj": "stj-jurisprudencia",
+}
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def preflight(hints: dict) -> list:
+    problemas = []
+    for duplicata, canonica in sorted(FUSOES.items()):
+        if duplicata not in hints:
+            continue  # já fundida: idempotente
+        if canonica not in hints:
+            problemas.append(f"{canonica!r}: chave canonica ausente do catalogo")
+            continue
+        if canonica in FUSOES:
+            problemas.append(f"{canonica!r}: alvo de fusao e ele mesmo duplicata")
+        url_duplicata = hints[duplicata].get("url")
+        url_canonica = hints[canonica].get("url")
+        if url_duplicata != url_canonica:
+            problemas.append(
+                f"{duplicata!r} -> {canonica!r}: URL diverge "
+                f"({url_duplicata!r} != {url_canonica!r}); fusao recusada")
+    return problemas
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    catalogo = json.loads(CATALOGO.read_text(encoding="utf-8"))
+    hints = catalogo["source_hints"]
+    problemas = preflight(hints)
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        return 1
+
+    remover = [chave for chave in FUSOES if chave in hints]
+    print(f"duplicatas presentes no catalogo: {len(remover)} "
+          f"de {len(FUSOES)} ({', '.join(sorted(remover)) or 'nenhuma'})")
+
+    arquivos = sorted(glob.glob(os.fspath(PORTFOLIO / "*.jsonl")))
+    planejado = []
+    saidas = {}
+    for caminho in arquivos:
+        bruto = Path(caminho).read_bytes().decode("utf-8")
+        linhas = bruto.split("\n")
+        termina_com_quebra = bool(linhas) and linhas[-1] == ""
+        if termina_com_quebra:
+            linhas = linhas[:-1]
+        saida = []
+        mudou = False
+        for numero, linha in enumerate(linhas, 1):
+            if not linha.strip():
+                saida.append(linha)
+                continue
+            registro = json.loads(linha)
+            atuais = registro.get("source_hints") or []
+            if not any(hint in FUSOES for hint in atuais):
+                saida.append(linha)
+                continue
+            novos = []
+            trocados = []
+            for hint in atuais:
+                destino = FUSOES.get(hint, hint)
+                if hint in FUSOES:
+                    trocados.append(f"{hint}->{destino}")
+                if destino not in novos:
+                    novos.append(destino)
+            registro["source_hints"] = novos
+            # A linha viva do portfólio é `json.dumps(obj, ensure_ascii=False)`
+            # com a ordem de inserção preservada (conferido byte a byte em
+            # 2026-08-29). Regravar com sort_keys reordenaria o registro
+            # inteiro e produziria diff que esta operação não pediu.
+            saida.append(json.dumps(registro, ensure_ascii=False))
+            planejado.append({
+                "file": os.path.relpath(caminho, ROOT), "line": numero,
+                "intent_id": registro.get("intent_id"), "trocas": trocados,
+                "source_hints_depois": novos,
+            })
+            mudou = True
+        if mudou:
+            saidas[caminho] = ("\n".join(saida) +
+                               ("\n" if termina_com_quebra else "")).encode("utf-8")
+
+    print(f"referencias a repontuar: {len(planejado)} em {len(saidas)} arquivo(s)")
+    for registro in planejado[:6]:
+        print(f"  {registro['file']}:{registro['line']} "
+              f"{registro['intent_id']}: {', '.join(registro['trocas'])}")
+    if len(planejado) > 6:
+        print(f"  ... mais {len(planejado) - 6}")
+
+    if not remover and not planejado:
+        print("nada a fundir.")
+        return 0
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+        return 0
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                for chave in remover:
+                    del hints[chave]
+                catalogo["source_hints"] = dict(sorted(hints.items()))
+                atomic_write(CATALOGO, (json.dumps(
+                    catalogo, ensure_ascii=False, indent=1,
+                    sort_keys=True) + "\n").encode("utf-8"))
+                for caminho, payload in saidas.items():
+                    atomic_write(Path(caminho), payload)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+    except StockEpochBusy as erro:
+        print(f"estoque canonico ocupado por outra frente: {erro}",
+              file=sys.stderr)
+        return 75
+
+    # Verificação posterior: nenhuma referência pendurada pode sobreviver.
+    catalogo_final = json.loads(CATALOGO.read_text(encoding="utf-8"))
+    pendentes = [chave for chave in FUSOES
+                 if chave in catalogo_final["source_hints"]]
+    penduradas = []
+    for caminho in arquivos:
+        for numero, linha in enumerate(
+                Path(caminho).read_text(encoding="utf-8").split("\n"), 1):
+            if not linha.strip():
+                continue
+            registro = json.loads(linha)
+            for hint in registro.get("source_hints") or []:
+                if hint in FUSOES:
+                    penduradas.append(
+                        f"{os.path.relpath(caminho, ROOT)}:{numero}:{hint}")
+    if pendentes or penduradas:
+        print(f"VERIFICACAO FALHOU: catalogo={pendentes} "
+              f"portfolio={penduradas[:8]}", file=sys.stderr)
+        return 1
+
+    anterior = EVIDENCIA.read_bytes() if EVIDENCIA.exists() else b""
+    if anterior and not anterior.endswith(b"\n"):
+        anterior += b"\n"
+    linhas_evidencia = [{"chave_removida": chave, "chave_canonica": FUSOES[chave],
+                         "url": catalogo_final["source_hints"][FUSOES[chave]]["url"]}
+                        for chave in sorted(remover)] + planejado
+    atomic_write(EVIDENCIA, anterior + ("\n".join(
+        json.dumps(r, ensure_ascii=False) for r in linhas_evidencia
+    ) + "\n").encode("utf-8"))
+    print(f"\nFundidas {len(remover)} chave(s); {len(planejado)} referencia(s) "
+          f"repontuada(s); zero pendurada. Evidencia: "
+          f"{os.path.relpath(EVIDENCIA, ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

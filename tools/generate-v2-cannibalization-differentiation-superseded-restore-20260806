@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""generate-v2-cannibalization-differentiation-superseded-restore-20260806 — devolve o rótulo das páginas protegidas.
+
+O QUE ACONTECEU. `generate-v2-cannibalization-differentiation-20260806` trocou
+title e h1 de 34 páginas para desfazer 17 disputas pela mesma consulta. Dessas
+34, **17 estão sob supersessão** — e eram justamente as 17 "suprimidas" de cada
+par, o que era óbvio em retrospecto: é o arquivo de supersessão que o medidor de
+canibalização lê para montar os pares.
+
+Editar uma página preservada em arquivo de supersessão dispara
+`active_source_changed_without_provenance` e o pre-commit ABORTA:
+
+  check-v2-supersession-integrity: authenticate writing-semantic successor
+  provenance: semantic resolution does not authenticate exact unique page:
+  gloss-dissolucao-parcial
+  fatal: ref updates aborted by hook
+
+O gate está certo. A página preservada tem um payload autenticado, e mudá-la sem
+proveniência durável quebraria a cadeia que prova o que foi arquivado.
+
+A SOLUÇÃO É MAIS SIMPLES DO QUE PARECIA: para desfazer a canibalização basta que
+UM lado do par mude de rótulo. Os 17 lados canônicos — que não estão sob
+supersessão — mantêm os títulos novos; os 17 protegidos voltam ao que eram. O par
+continua diferenciado e a cadeia de supersessão continua íntegra.
+
+Este gerador restaura title e h1 exatos de antes, por edição para frente: nada de
+`git checkout`, `restore` ou `reset`, que descartariam trabalho concorrente.
+
+CONTRATO DE ESCRITA: lease de época, lock exclusivo, CAS pelo sha256 da LINHA
+viva, CAS pelo valor atual de title e h1, demais campos preservados byte a byte,
+word_count recalculado pela fórmula do ingest, escrita atômica com fsync,
+idempotente. NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-cannibalization-differentiation-superseded-restore-20260806 --dry-run
+    tools/generate-v2-cannibalization-differentiation-superseded-restore-20260806
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import unicodedata
+from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.cannibalization-differentiation-restore-20260806.lock"
+
+TITLE_MIN, TITLE_MAX = 20, 65
+
+# intent_id -> (shard, title atual, title novo, h1 atual, h1 novo)
+REPAROS: dict[str, tuple[str, str, str, str, str]] = {
+    'banc-alienacao-fiduciaria-imovel-o-que-e': (
+        'data/editorial/v2_pages/bancario-14.jsonl',
+        'Alienação fiduciária: quitar e dar baixa', 'Alienação fiduciária de imóvel: o que é e como funciona',
+        'Alienação fiduciária no financiamento: encargos, quitação e baixa', 'Como a alienação fiduciária organiza propriedade, posse e quitação'),
+    'banc-previdencia-sem-beneficiario-indicado': (
+        'data/editorial/v2_pages/bancario-17.jsonl',
+        'PGBL e VGBL sem beneficiário: como se habilitar', 'Previdência privada sem beneficiário indicado',
+        'PGBL ou VGBL sem beneficiário: habilitação e documentos', 'Quem recebe PGBL ou VGBL quando não há beneficiário cadastrado'),
+    'cid-averbacao-divorcio-certidao': (
+        'data/editorial/v2_pages/cidadania-02.jsonl',
+        'Certidão ainda diz casado: escritura ou mandado?', 'Averbar o divórcio: como atualizar a certidão de casamento',
+        'Averbação do divórcio: escritura, mandado e volta do nome', 'Me divorciei, mas a certidão ainda diz que sou casado: como resolver'),
+    'gloss-arrolamento-sumario': (
+        'data/editorial/v2_pages/glossario-01.jsonl',
+        'Arrolamento sumário ou inventário extrajudicial?', 'Arrolamento sumário: o inventário judicial rápido',
+        'Arrolamento sumário: requisitos e diferença do extrajudicial', 'Arrolamento sumário: a via judicial simplificada de partilha'),
+    'gloss-assedio-moral-trabalho': (
+        'data/editorial/v2_pages/glossario-08.jsonl',
+        'Assédio moral: como provar e o que pedir', 'Assédio moral no trabalho: o que caracteriza e como provar',
+        'Assédio moral no trabalho: provas e pedidos possíveis', 'Assédio moral no trabalho: caracterização e consequências'),
+    'gloss-codicilo': (
+        'data/editorial/v2_pages/glossario-01.jsonl',
+        'Codicilo no inventário: o que ele não substitui', 'Codicilo: última vontade sem as formas do testamento',
+        'Codicilo: o conceito e o que ele nunca substitui', 'Codicilo: um escrito simples para instruções de pequena monta'),
+    'gloss-dados-de-criancas': (
+        'data/editorial/v2_pages/glossario2-15.jsonl',
+        'Dado de criança na LGPD: o que o termo significa', 'Dados de crianças e adolescentes na LGPD',
+        'Dados de crianças e adolescentes: o conceito na LGPD', 'Como a LGPD protege os dados de crianças e adolescentes'),
+    'gloss-dissolucao-parcial': (
+        'data/editorial/v2_pages/glossario-14.jsonl',
+        'Sair da sociedade: prazos e responsabilidade', 'Dissolução parcial: a sociedade continua após a saída',
+        'Dissolução parcial: prazos de saída e responsabilidade do sócio', 'Dissolução parcial de sociedade: o que muda e o que permanece'),
+    'gloss-junta-medica': (
+        'data/editorial/v2_pages/glossario2-16.jsonl',
+        'Junta médica: o que é e quando acionar a ANS', 'Junta médica no plano de saúde: quando é acionada',
+        'Junta médica: o conceito e o caminho da reclamação à ANS', 'Junta médica: o desempate técnico entre os profissionais'),
+    'gloss-justificacao-administrativa': (
+        'data/editorial/v2_pages/glossario-11.jsonl',
+        'Justificação administrativa negada: o que fazer', 'Justificação administrativa: provar tempo sem documento',
+        'Justificação administrativa: início de prova e recurso da negativa', 'Justificação administrativa: quando testemunhas suprem a falta de documento no INSS'),
+    'gloss-rmc-reserva-margem-cartao': (
+        'data/editorial/v2_pages/glossario2-08.jsonl',
+        'RMC não reconhecida: como contestar e cancelar', 'RMC: o que é a reserva de margem do cartão consignado',
+        'RMC: o que é e como cancelar o cartão consignado', 'RMC: a reserva de margem para cartão de crédito consignado'),
+    'gloss-rmi': (
+        'data/editorial/v2_pages/glossario-10.jsonl',
+        'RMI: o que é a renda mensal inicial do INSS', 'RMI no INSS: como se calcula a renda mensal inicial',
+        'RMI: o significado da renda mensal inicial do benefício', 'RMI: como o INSS calcula a renda mensal inicial do benefício'),
+    'gloss-testamento-vital': (
+        'data/editorial/v2_pages/glossario-01.jsonl',
+        'Testamento vital ou testamento comum: a diferença', 'Testamento vital: as diretivas antecipadas de vontade',
+        'Testamento vital: o conceito e a diferença para o testamento', 'Testamento vital: registrar hoje decisões médicas para o futuro'),
+    'gloss-usucapiao-especial-urbana': (
+        'data/editorial/v2_pages/glossario-12.jsonl',
+        'Usucapião especial urbana: o conceito do art. 183', 'Usucapião especial urbana: 250 m² e cinco anos de moradia',
+        'Usucapião especial urbana: a definição constitucional', 'Usucapião especial urbana de imóvel de até 250 m²'),
+    'proc-aneel-reclamar': (
+        'data/editorial/v2_pages/procedimentos-13.jsonl',
+        'Corte indevido, dano elétrico e fatura fora do padrão', 'Como reclamar da distribuidora de energia na ANEEL',
+        'ANEEL: corte indevido, dano elétrico e conta fora do padrão', 'Reclamação contra distribuidora de energia na ANEEL'),
+    'proc-detran-crlv-digital': (
+        'data/editorial/v2_pages/procedimentos-09.jsonl',
+        'Emitir o CRLV digital: licenciamento e download', 'CRLV digital: como emitir e conferir o documento',
+        'Como emitir o CRLV digital passo a passo no Detran', 'Como emitir e usar o CRLV digital do veículo'),
+    'proc-inpi-registrar-software': (
+        'data/editorial/v2_pages/procedimentos-13.jsonl',
+        'e-Software: passo a passo do pedido no INPI', 'Como registrar programa de computador no e-Software',
+        'Como preencher o e-Software: do resumo hash à GRU 730', 'Registro de programa de computador no INPI'),
+}
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _words(value: str | None) -> int:
+    if not value:
+        return 0
+    folded = unicodedata.normalize("NFKD", (value or "").lower())
+    folded = "".join(char for char in folded if not unicodedata.combining(char))
+    return len(re.findall(r"[^\W_]+", folded, re.UNICODE))
+
+
+def word_count(record: dict) -> int:
+    """bodyWordCount, internal/v2ingest/validate.go:984.
+
+    title e h1 NÃO entram nessa conta, então o valor não deveria mudar. É
+    recalculado mesmo assim: se o declarado estivesse defasado por outro motivo,
+    gravar a linha sem revisar o número congelaria o defeito.
+    """
+    total = _words(record.get("opening"))
+    for section in record.get("sections") or []:
+        total += _words(section.get("heading"))
+        total += _words(section.get("text"))
+    for item in record.get("faq") or []:
+        total += _words(item.get("q"))
+        total += _words(item.get("a"))
+    return total
+
+
+def preflight() -> None:
+    """Valida ANTES de abrir o estoque: comprimento, unicidade e diferenciação."""
+    problemas: list[str] = []
+
+    titulos_novos: dict[str, str] = {}
+    h1_novos: dict[str, str] = {}
+    for intent, (_shard, title_atual, title_novo, h1_atual, h1_novo) in sorted(REPAROS.items()):
+        tamanho = len(title_novo)
+        if not TITLE_MIN <= tamanho <= TITLE_MAX:
+            problemas.append(f"{intent}: title tem {tamanho} caracteres, fora de {TITLE_MIN}-{TITLE_MAX}")
+        if title_novo == title_atual and h1_novo == h1_atual:
+            problemas.append(f"{intent}: nada muda")
+        chave_titulo = title_novo.strip().lower()
+        if chave_titulo in titulos_novos:
+            problemas.append(f"{intent}: title igual ao de {titulos_novos[chave_titulo]}")
+        titulos_novos[chave_titulo] = intent
+        chave_h1 = h1_novo.strip().lower()
+        if chave_h1 in h1_novos:
+            problemas.append(f"{intent}: h1 igual ao de {h1_novos[chave_h1]}")
+        h1_novos[chave_h1] = intent
+
+    # Unicidade contra TODO o acervo, não só entre os pares tratados.
+    for caminho in sorted((ROOT / "data/editorial/v2_pages").glob("*.jsonl")):
+        with open(caminho, encoding="utf-8") as handle:
+            for linha in handle:
+                if not linha.strip():
+                    continue
+                registro = json.loads(linha)
+                intent = registro.get("intent_id")
+                if not intent or intent in REPAROS:
+                    continue
+                titulo = (registro.get("title") or "").strip().lower()
+                if titulo in titulos_novos:
+                    problemas.append(
+                        f"{titulos_novos[titulo]}: title novo colide com {intent}")
+                h1 = (registro.get("h1") or "").strip().lower()
+                if h1 in h1_novos:
+                    problemas.append(f"{h1_novos[h1]}: h1 novo colide com {intent}")
+
+    if problemas:
+        for problema in problemas:
+            print(f"PREFLIGHT FALHOU: {problema}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"preflight ok: {len(REPAROS)} páginas sob supersessão, títulos restaurados "
+          f"e dentro de {TITLE_MIN}-{TITLE_MAX} caracteres")
+
+
+def aplicar(shard_rel: str, alvos: dict, dry_run: bool) -> tuple[int, int]:
+    path = ROOT / shard_rel
+    linhas = path.read_bytes().decode("utf-8").split("\n")
+    fim_com_newline = bool(linhas) and linhas[-1] == ""
+    if fim_com_newline:
+        linhas = linhas[:-1]
+
+    saida: list[str] = []
+    alterados = 0
+    ja_feitos = 0
+    for numero, raw in enumerate(linhas, 1):
+        if not raw.strip():
+            raise SystemExit(f"{shard_rel}: linha em branco {numero}")
+        registro = json.loads(raw)
+        intent = registro.get("intent_id")
+        if intent not in alvos:
+            saida.append(raw)
+            continue
+
+        title_atual, title_novo, h1_atual, h1_novo = alvos[intent]
+        if registro.get("title") == title_novo and registro.get("h1") == h1_novo:
+            ja_feitos += 1
+            saida.append(raw)
+            continue
+        if registro.get("title") != title_atual or registro.get("h1") != h1_atual:
+            raise SystemExit(
+                f"CAS FALHOU em {shard_rel}:{numero} ({intent}): o title/h1 vivo não é "
+                f"o esperado.\n  title vivo    : {registro.get('title')!r}\n"
+                f"  title esperado: {title_atual!r}\n"
+                f"  h1 vivo       : {registro.get('h1')!r}\n"
+                f"  h1 esperado   : {h1_atual!r}\n"
+                f"Reler o conteúdo vivo antes de reaplicar.")
+
+        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+        registro["title"] = title_novo
+        registro["h1"] = h1_novo
+        registro["word_count"] = word_count(registro)
+        nova = json.dumps(registro, ensure_ascii=False, sort_keys=True)
+        atual = hashlib.sha256(
+            path.read_bytes().decode("utf-8").split("\n")[numero - 1].strip().encode("utf-8")
+        ).hexdigest()
+        if atual != digest_antes:
+            raise SystemExit(
+                f"CAS DE LINHA FALHOU em {shard_rel}:{numero} ({intent}): "
+                f"outra frente tocou este registro durante a execução.")
+        saida.append(nova)
+        alterados += 1
+        print(f"  {intent}\n      title: {title_novo}\n      h1   : {h1_novo}")
+
+    if alterados and not dry_run:
+        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+        atomic_write(path, payload.encode("utf-8"))
+    return alterados, ja_feitos
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    preflight()
+
+    por_shard: dict[str, dict] = {}
+    for intent, (shard, title_atual, title_novo, h1_atual, h1_novo) in REPAROS.items():
+        por_shard.setdefault(shard, {})[intent] = (title_atual, title_novo, h1_atual, h1_novo)
+
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with exclusive_lock(LOCK):
+                total_alterados = 0
+                total_ja = 0
+                for shard in sorted(por_shard):
+                    alterados, ja = aplicar(shard, por_shard[shard], args.dry_run)
+                    total_alterados += alterados
+                    total_ja += ja
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    if args.dry_run:
+        print(f"\n--dry-run: {total_alterados} aplicável(is), {total_ja} já feita(s). Nada escrito.")
+        return 0
+    print(f"\n{total_alterados} restaurada(s), {total_ja} já estava(m) restaurada(s).")
+    if total_alterados:
+        print("Reingerir o estoque e republicar para o espelho refletir a mudança.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,4023 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+	echo "usage: run-go-cmd-cached ./cmd/name [args...]" >&2
+	exit 2
+fi
+
+ROOT="$(
+	unset CDPATH
+	cd -- "$(dirname -- "$0")/.." && pwd
+)"
+PATH="$ROOT/tools:$PATH"
+export PATH
+# Cache persistente (ULTRAPLAN E2): /tmp evapora a cada boot e forcava cold-start
+# recorrente de compilacao; o default do Go (~/.cache/go-build) e compartilhado
+# com go-modern/pre-commit, entao todos os caminhos reusam o mesmo cache.
+export GOCACHE="${GOCACHE:-$HOME/.cache/go-build}"
+
+PKG="$1"
+shift
+
+case "$PKG" in
+./cmd/*) ;;
+*)
+	echo "run-go-cmd-cached: package must be under ./cmd, got $PKG" >&2
+	exit 2
+	;;
+esac
+
+NAME="${PKG#./cmd/}"
+case "$NAME" in
+*[!A-Za-z0-9_-]* | "")
+	echo "run-go-cmd-cached: invalid command name $NAME" >&2
+	exit 2
+	;;
+esac
+
+MAX_WRAPPER_TIMEOUT_SECONDS=1800
+MAX_BUILD_BUDGET_MS=300000
+MAX_LOCK_WAIT_SECONDS=300
+
+BUILD_SOURCE_ROOT_EXPLICIT=0
+if [[ -n "${WIKI_GO_CMD_BUILD_SOURCE_ROOT:-}" ]]; then
+	BUILD_SOURCE_ROOT_EXPLICIT=1
+	BUILD_SOURCE_ROOT="$WIKI_GO_CMD_BUILD_SOURCE_ROOT"
+else
+	BUILD_SOURCE_ROOT="$ROOT"
+fi
+case "$BUILD_SOURCE_ROOT" in
+/*) ;;
+*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_SOURCE_ROOT must be a canonical absolute path" >&2
+	exit 2
+	;;
+esac
+resolved_build_source_root="$(realpath -e -- "$BUILD_SOURCE_ROOT" 2>/dev/null || true)"
+if [[ -z "$resolved_build_source_root" || "$resolved_build_source_root" != "$BUILD_SOURCE_ROOT" || ! -d "$BUILD_SOURCE_ROOT" || -L "$BUILD_SOURCE_ROOT" ]]; then
+	echo "run-go-cmd-cached: build source root must exist canonically without symlinks: $BUILD_SOURCE_ROOT" >&2
+	exit 2
+fi
+if [[ ! -f "$BUILD_SOURCE_ROOT/go.mod" || -L "$BUILD_SOURCE_ROOT/go.mod" || ! -d "$BUILD_SOURCE_ROOT/cmd" || -L "$BUILD_SOURCE_ROOT/cmd" || ! -d "$BUILD_SOURCE_ROOT/internal" || -L "$BUILD_SOURCE_ROOT/internal" ]]; then
+	echo "run-go-cmd-cached: build source root requires regular go.mod and non-symlink cmd/internal trees: $BUILD_SOURCE_ROOT" >&2
+	exit 2
+fi
+if [[ -e "$BUILD_SOURCE_ROOT/go.sum" && (! -f "$BUILD_SOURCE_ROOT/go.sum" || -L "$BUILD_SOURCE_ROOT/go.sum") ]]; then
+	echo "run-go-cmd-cached: build source root go.sum must be a regular non-symlink file" >&2
+	exit 2
+fi
+
+positive_integer() {
+	case "$1" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[[ "$1" -gt 0 ]]
+}
+
+bounded_wrapper_milliseconds() {
+	local value="$1"
+	[[ "$value" =~ ^[0-9]+$ && "${#value}" -le 9 && "$value" -gt 0 && "$value" -le $((MAX_WRAPPER_TIMEOUT_SECONDS * 1000)) ]]
+}
+
+positive_duration() {
+	case "$1" in
+	'' | 0 | 0ms | 0s | 0m | 0h) return 1 ;;
+	*[!0-9msh]*) return 1 ;;
+	*ms | *s | *m | *h) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+heavy_throughput_expected_is_numeric() {
+	local contract="${WIKI_HEAVY_THROUGHPUT_EXPECTED:-}" numeric
+	if [[ ! "$contract" =~ ^(records_per_second|pages_per_second|urls_per_second|items_per_second|records/s|pages/s|throughput)=([0-9]+([.][0-9]+)?)$ ]]; then
+		return 1
+	fi
+	numeric="${BASH_REMATCH[2]}"
+	awk -v value="$numeric" 'BEGIN { exit !(value + 0 > 0) }'
+}
+
+cached_generate_has_budget_arg() {
+	local expect_budget_value=0
+	for arg in "$@"; do
+		if [[ "$expect_budget_value" == "1" ]]; then
+			positive_integer "$arg"
+			return $?
+		fi
+		case "$arg" in
+		--budget-ms=*)
+			positive_integer "${arg#--budget-ms=}"
+			return $?
+			;;
+		--budget-ms)
+			expect_budget_value=1
+			;;
+		esac
+	done
+	return 1
+}
+
+cached_generate_has_timings_arg() {
+	local arg
+	for arg in "$@"; do
+		if [[ "$arg" == "--timings" ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+heavy_supervisor_ancestry_is_verified() {
+	[[ "${WIKI_RUN_GO_CMD_CACHED_UNDER_HEAVY:-}" == "1" ]] || return 1
+	command -v python3 >/dev/null 2>&1 || return 1
+	python3 - "$ROOT" "$(realpath -e -- "$0" 2>/dev/null || true)" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+runner = pathlib.Path(sys.argv[2])
+heavy = root / "tools" / "run-heavy-throttled"
+supervisor = root / "tools" / "supervise-process-tree"
+expected_uid = os.geteuid()
+
+if not runner.is_absolute() or not heavy.is_file() or not supervisor.is_file():
+    raise SystemExit(1)
+
+def canonical_argument(argument: bytes, cwd: pathlib.Path, path_value: str) -> pathlib.Path | None:
+    try:
+        text = os.fsdecode(argument)
+        candidate = pathlib.Path(text)
+        if not candidate.is_absolute() and "/" not in text:
+            for entry in path_value.split(os.pathsep):
+                base = pathlib.Path(entry) if entry else cwd
+                if not base.is_absolute():
+                    base = cwd / base
+                resolved_candidate = base / candidate
+                try:
+                    if resolved_candidate.is_file() and os.access(resolved_candidate, os.X_OK):
+                        return resolved_candidate.resolve(strict=True)
+                except OSError:
+                    continue
+            return None
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        return candidate.resolve(strict=True)
+    except (OSError, RuntimeError, UnicodeError):
+        return None
+
+def read_process(pid: int) -> tuple[int, list[bytes], pathlib.Path, str, pathlib.Path]:
+    proc = pathlib.Path("/proc") / str(pid)
+    status = (proc / "status").read_text(encoding="ascii", errors="strict")
+    parent = None
+    owner = None
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            parent = int(line.split()[1])
+        elif line.startswith("Uid:"):
+            owner = int(line.split()[1])
+    if parent is None or owner != expected_uid:
+        raise OSError("untrusted process owner or parent")
+    with (proc / "cmdline").open("rb") as command_file:
+        payload = command_file.read(256 * 1024 + 1)
+    if not payload or len(payload) > 256 * 1024:
+        raise OSError("missing or oversized process command line")
+    arguments = [part for part in payload.split(b"\0") if part]
+    cwd = (proc / "cwd").resolve(strict=True)
+    with (proc / "environ").open("rb") as environment_file:
+        environment_payload = environment_file.read(256 * 1024 + 1)
+    if len(environment_payload) > 256 * 1024:
+        raise OSError("oversized process environment")
+    path_value = ""
+    for item in environment_payload.split(b"\0"):
+        if item.startswith(b"PATH="):
+            path_value = os.fsdecode(item.removeprefix(b"PATH="))
+            break
+    executable = (proc / "exe").resolve(strict=True)
+    executable_info = executable.stat()
+    if (
+        not stat.S_ISREG(executable_info.st_mode)
+        or executable_info.st_uid not in (0, expected_uid)
+        or executable_info.st_mode & 0o022
+    ):
+        raise OSError("untrusted process executable")
+    return parent, arguments, cwd, path_value, executable
+
+def trusted_interpreters(target: pathlib.Path, cwd: pathlib.Path, path_value: str) -> set[pathlib.Path]:
+    try:
+        with target.open("rb") as target_file:
+            first_line = target_file.readline(4097)
+    except OSError:
+        return set()
+    if len(first_line) > 4096 or not first_line.startswith(b"#!"):
+        return set()
+    try:
+        words = os.fsdecode(first_line[2:].strip()).split()
+    except UnicodeError:
+        return set()
+    if not words:
+        return set()
+    interpreter = canonical_argument(os.fsencode(words[0]), cwd, path_value)
+    trusted = {interpreter} if interpreter is not None else set()
+    # /usr/bin/env replaces itself with the selected interpreter, so the live
+    # process executable is the command after `env`, not env itself.
+    if interpreter is not None and interpreter.name == "env" and len(words) >= 2:
+        selected = canonical_argument(os.fsencode(words[-1]), cwd, path_value)
+        if selected is not None:
+            trusted.add(selected)
+    return trusted
+
+def invokes_script(
+    arguments: list[bytes], cwd: pathlib.Path, path_value: str,
+    executable: pathlib.Path, target: pathlib.Path,
+) -> bool:
+    # A real shebang-backed script is argv[1] of its live interpreter. Merely
+    # assigning the script path to a forged argv[0] must not authenticate an
+    # unrelated shell/process as run-heavy or supervise-process-tree.
+    if len(arguments) < 2 or canonical_argument(arguments[1], cwd, path_value) != target:
+        return False
+    return executable in trusted_interpreters(target, cwd, path_value)
+
+def contains_runner(arguments: list[bytes], cwd: pathlib.Path, path_value: str) -> bool:
+    return any(canonical_argument(argument, cwd, path_value) == runner for argument in arguments)
+
+pid = os.getppid()
+seen: set[int] = set()
+supervisor_seen = False
+for _ in range(64):
+    if pid <= 1 or pid in seen:
+        break
+    seen.add(pid)
+    try:
+        parent, arguments, cwd, path_value, executable = read_process(pid)
+    except (OSError, ValueError, UnicodeError):
+        raise SystemExit(1)
+    if invokes_script(arguments, cwd, path_value, executable, supervisor) and contains_runner(arguments, cwd, path_value):
+        supervisor_seen = True
+    elif supervisor_seen and invokes_script(arguments, cwd, path_value, executable, heavy) and contains_runner(arguments, cwd, path_value):
+        raise SystemExit(0)
+    pid = parent
+raise SystemExit(1)
+PY
+}
+
+validate_cached_generate_command_contract() {
+	# ./cmd/generate is the multiplexed launcher (subcommand form). It must be
+	# held to the SAME supervised P0 contract as the standalone ./cmd/generate-*
+	# tools. This is additive: the ./cmd/generate-* branch is unchanged, so the
+	# non-migrated tools behave exactly as before.
+	case "$PKG" in
+	./cmd/generate | ./cmd/generate-*) ;;
+	*) return 0 ;;
+	esac
+
+	missing=""
+	local heavy_supervision_verified=0
+	if heavy_supervisor_ancestry_is_verified; then
+		heavy_supervision_verified=1
+	else
+		missing="${missing} run-heavy-throttled"
+	fi
+	if [[ -z "${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-}" || -z "${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-}" || -z "${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-}" ]]; then
+		missing="${missing} artifact_claim"
+	fi
+	if ! positive_integer "${WIKI_HEAVY_BUDGET_MS:-}" && ! cached_generate_has_budget_arg "$@"; then
+		missing="${missing} budget_ms"
+	fi
+	if [[ -n "${WIKI_HEAVY_BUDGET_MS:-}" ]] && ! bounded_wrapper_milliseconds "$WIKI_HEAVY_BUDGET_MS"; then
+		missing="${missing} budget_ms_exceeds_${MAX_WRAPPER_TIMEOUT_SECONDS}s_or_invalid"
+	fi
+	if ! positive_integer "${WIKI_HEAVY_EXPECTED_DURATION_MS:-}"; then
+		missing="${missing} expected_duration_ms"
+	fi
+	if [[ -n "${WIKI_HEAVY_EXPECTED_DURATION_MS:-}" ]] && ! bounded_wrapper_milliseconds "$WIKI_HEAVY_EXPECTED_DURATION_MS"; then
+		missing="${missing} expected_duration_ms_exceeds_${MAX_WRAPPER_TIMEOUT_SECONDS}s_or_invalid"
+	fi
+	if [[ -z "${WIKI_HEAVY_STOP_CONDITION:-}" ]]; then
+		missing="${missing} stop_condition"
+	fi
+	if ! heavy_throughput_expected_is_numeric; then
+		missing="${missing} throughput_expected"
+	fi
+	case "${WIKI_HEAVY_TIMING_MODE:-}" in
+	'')
+		if ! cached_generate_has_timings_arg "$@"; then
+			missing="${missing} timing_evidence(--timings or supervisor_wall_clock_v1)"
+		fi
+		;;
+	child_flag_v1)
+		if ! cached_generate_has_timings_arg "$@"; then
+			missing="${missing} --timings(child_flag_v1 capability)"
+		fi
+		;;
+	supervisor_wall_clock_v1)
+		if [[ "$heavy_supervision_verified" != "1" ]]; then
+			missing="${missing} supervisor_wall_clock_without_verified_run-heavy-process-tree"
+		fi
+		;;
+	*) missing="${missing} invalid_WIKI_HEAVY_TIMING_MODE" ;;
+	esac
+	if [[ -n "$missing" ]]; then
+		echo "run-go-cmd-cached: ./cmd/generate-* requires run-heavy-throttled supervision with explicit artifact_claim, numeric budget/expected duration, stop_condition, numeric throughput_expected and real child or supervisor timing evidence; missing:$missing command=$PKG $*" >&2
+		exit 2
+	fi
+}
+
+validate_cached_generate_command_contract "$@"
+
+# Binarios cacheados persistem no repo (.cache/ e gitignored) em vez de /tmp,
+# que evapora a cada boot e forcava recompilar todos os geradores (ULTRAPLAN E2).
+CACHE_ROOT="${WIKI_GO_CMD_BIN_CACHE:-$ROOT/.cache/go-cmd-bin}"
+case "$CACHE_ROOT" in
+/*) ;;
+*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BIN_CACHE must be a canonical absolute path" >&2
+	exit 2
+	;;
+esac
+CACHE_DIR="$CACHE_ROOT/$NAME"
+BIN="$CACHE_DIR/$NAME"
+DEPS_LIST="$CACHE_DIR/deps.list"
+DEPS_BUILD_ROOT="$CACHE_DIR/deps.build-root"
+LOCK_DIR="$CACHE_DIR/build.lock"
+LOCK_META="$LOCK_DIR/meta"
+LOCK_METADATA_TMP=""
+BUILD_LOCK_OWNED=0
+BUILD_METADATA="$CACHE_DIR/bootstrap-build-metadata.json"
+BUILD_METADATA_SHA256="$CACHE_DIR/bootstrap-build-metadata.sha256"
+BUILD_METADATA_STORE="$CACHE_DIR/bootstrap-build-metadata.d"
+BUILD_IDENTITY="$CACHE_DIR/build-identity.json"
+BUILD_BINARY_SHA256="$CACHE_DIR/build-binary.sha256"
+ENV_WRAPPER="${WIKI_GO_CMD_ENV_WRAPPER:-}"
+LOCK_WAIT_SECONDS="${WIKI_GO_CMD_BUILD_LOCK_WAIT_SECONDS:-300}"
+LOCK_STALE_SECONDS="${WIKI_GO_CMD_BUILD_LOCK_STALE_SECONDS:-900}"
+LOCK_META_INIT_GRACE_MS="${WIKI_GO_CMD_BUILD_LOCK_META_INIT_GRACE_MS:-500}"
+# 2026-07-31 (bug medido ao vivo, sandbox Cowork/virtiofs): liberar OU reciclar
+# o lock de build dependia exclusivamente de rmdir/unlink. Em mount que nega
+# DELETE (EPERM), (a) o dono nunca conseguia soltar o proprio lock e (b) o
+# candidato nunca conseguia despejar o lock de uma sessao morta -- as duas
+# metades de reclaim_stale_build_lock terminam em "rm -f || return 1". Caso
+# real: .cache/go-cmd-bin/finalize-v2-semantic-recut/build.lock ficou orfao de
+# 2026-07-30 22:49 (pid 81, boot_id de outro boot) e travou o wrapper para
+# sempre, invocacao apos invocacao. Correcao: heartbeat renovado DENTRO do
+# lock-dir como prova de vida do detentor + despejo por RENAME atomico do
+# lock-dir (que o mount permite), com rmdir/unlink apenas como limpeza
+# best-effort. A exclusao mutua no caso sao fica intacta: heartbeat fresco
+# nunca e despejado, e o vencedor continua sendo decidido pelo mkdir atomico.
+LOCK_HEARTBEAT="$LOCK_DIR/heartbeat"
+LOCK_EVICTED_ROOT="$CACHE_DIR/.build.lock.evicted"
+LOCK_HEARTBEAT_INTERVAL_SECONDS="${WIKI_GO_CMD_BUILD_LOCK_HEARTBEAT_INTERVAL_SECONDS:-5}"
+LOCK_HEARTBEAT_STALE_SECONDS="${WIKI_GO_CMD_BUILD_LOCK_HEARTBEAT_STALE_SECONDS:-120}"
+LOCK_HEARTBEAT_RENEWER_PID=""
+BUILD_LOCK_OWNED_IDENTITY=""
+WRAPPER_PID="$$"
+BUILD_BUDGET_MS="${WIKI_GO_CMD_BUILD_BUDGET_MS:-180000}"
+BUILD_IDENTITY_TIMEOUT_SECONDS="${WIKI_GO_CMD_BUILD_IDENTITY_TIMEOUT_SECONDS:-10}"
+DEPENDENCY_LIST_TIMEOUT_SECONDS="${WIKI_GO_CMD_DEPENDENCY_LIST_TIMEOUT_SECONDS:-15}"
+METADATA_TIMEOUT_SECONDS="${WIKI_GO_CMD_METADATA_TIMEOUT_SECONDS:-15}"
+RUN_TIMEOUT_GRACE_SECONDS="${WIKI_GO_CMD_TIMEOUT_GRACE_SECONDS:-5}"
+BOOTSTRAP_SOURCE_CONTRACT="${WIKI_BOOTSTRAP_SOURCE_CONTRACT_SHA256:-}"
+BOOTSTRAP_CACHE_MODE=0
+BOOTSTRAP_CONTEXT_FILE=""
+BOOTSTRAP_CLOSURE_FILE=""
+BOOTSTRAP_GO_ENV_FILE=""
+BOOTSTRAP_CONTEXT_SHA256=""
+CURRENT_METADATA_SHA256=""
+CURRENT_BINARY_SHA256=""
+CURRENT_CLOSURE_SHA256=""
+CURRENT_BUILD_SOURCE_SHA256=""
+GENERAL_CONTEXT_FILE=""
+GENERAL_GO_ENV_FILE=""
+GENERAL_CONTEXT_SHA256=""
+if [[ -n "$BOOTSTRAP_SOURCE_CONTRACT" ]]; then
+	if [[ "$BOOTSTRAP_SOURCE_CONTRACT" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		BOOTSTRAP_CACHE_MODE=1
+		if ! command -v base64 >/dev/null 2>&1; then
+			echo "run-go-cmd-cached: base64 is required for machine-readable bootstrap metadata paths" >&2
+			exit 75
+		fi
+	else
+		echo "run-go-cmd-cached: WIKI_BOOTSTRAP_SOURCE_CONTRACT_SHA256 must be a canonical sha256 token" >&2
+		exit 2
+	fi
+fi
+REPO_AWARENESS_TIMEOUT="${WIKI_REPO_AWARENESS_TIMEOUT:-}"
+REPO_AWARENESS_TIMEOUT_EXPLICIT=0
+# ULTRAPLAN E2/DEC-016: a "repo awareness" completa custa 7 comandos git por
+# invocacao (~5s de CPU em repo grande) e e burocracia de processo (DEC-002).
+# Default agora e o modo rapido; a coleta completa exige WIKI_REPO_AWARENESS_FULL=1.
+if [[ "${WIKI_REPO_AWARENESS_FULL:-0}" == "1" ]]; then
+	REPO_AWARENESS_FAST_MODE=0
+else
+	REPO_AWARENESS_FAST_MODE=1
+fi
+if [[ -n "${WIKI_REPO_AWARENESS_TIMEOUT+x}" ]]; then
+	REPO_AWARENESS_TIMEOUT_EXPLICIT=1
+fi
+if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
+	echo "run-go-cmd-cached: cannot create command cache directory: $CACHE_DIR" >&2
+	exit 75
+fi
+resolved_cache_dir="$(realpath -e -- "$CACHE_DIR" 2>/dev/null || true)"
+if [[ -z "$resolved_cache_dir" || "$resolved_cache_dir" != "$CACHE_DIR" ]]; then
+	echo "run-go-cmd-cached: command cache path must be canonical and must not cross symlinks: path=$CACHE_DIR resolved=${resolved_cache_dir:-missing}" >&2
+	exit 75
+fi
+cache_owner_uid="$(stat -c %u "$CACHE_DIR" 2>/dev/null || printf 'unknown')"
+cache_mode="$(stat -c %a "$CACHE_DIR" 2>/dev/null || printf 'unknown')"
+cache_mode_is_safe=0
+if [[ "$cache_mode" =~ ^[0-7]+$ ]] && (((8#$cache_mode & 8#022) == 0)); then
+	cache_mode_is_safe=1
+fi
+if [[ ! -d "$CACHE_DIR" || -L "$CACHE_DIR" || ! -w "$CACHE_DIR" || "$cache_owner_uid" != "$(id -u)" || "$cache_mode_is_safe" != "1" ]]; then
+	echo "run-go-cmd-cached: command cache directory must be writable, non-symlink, current-user-owned and not group/world-writable: owner_uid=$cache_owner_uid mode=$cache_mode expected_uid=$(id -u) path=$CACHE_DIR" >&2
+	exit 75
+fi
+
+# A safe leaf is not sufficient when another user can rename one of its
+# ancestors and replace the whole cache between validation and exec. Sticky
+# roots such as /tmp are safe only when owned by root/current user; every other
+# group/world-writable ancestor is rejected.
+cache_ancestor="$CACHE_ROOT"
+while :; do
+	cache_ancestor_owner="$(stat -c %u "$cache_ancestor" 2>/dev/null || printf 'unknown')"
+	cache_ancestor_mode="$(stat -c %a "$cache_ancestor" 2>/dev/null || printf 'unknown')"
+	if [[ ! "$cache_ancestor_owner" =~ ^[0-9]+$ || ! "$cache_ancestor_mode" =~ ^[0-7]+$ ]]; then
+		echo "run-go-cmd-cached: cannot authenticate cache ancestor: path=$cache_ancestor owner_uid=$cache_ancestor_owner mode=$cache_ancestor_mode" >&2
+		exit 75
+	fi
+	if (((8#$cache_ancestor_mode & 8#022) != 0)); then
+		if (((8#$cache_ancestor_mode & 8#1000) == 0)) || [[ "$cache_ancestor_owner" != "0" && "$cache_ancestor_owner" != "$EUID" ]]; then
+			echo "run-go-cmd-cached: cache ancestor is replaceable by another user: path=$cache_ancestor owner_uid=$cache_ancestor_owner mode=$cache_ancestor_mode" >&2
+			exit 75
+		fi
+	fi
+	[[ "$cache_ancestor" == "/" ]] && break
+	cache_ancestor="${cache_ancestor%/*}"
+	[[ -n "$cache_ancestor" ]] || cache_ancestor="/"
+done
+
+if [[ -n "$ENV_WRAPPER" ]]; then
+	resolved_env_wrapper="$(realpath -e -- "$ENV_WRAPPER" 2>/dev/null || true)"
+	env_wrapper_owner="$(stat -c %u "$resolved_env_wrapper" 2>/dev/null || printf 'unknown')"
+	env_wrapper_mode="$(stat -c %a "$resolved_env_wrapper" 2>/dev/null || printf 'unknown')"
+	env_wrapper_mode_is_safe=0
+	if [[ "$env_wrapper_mode" =~ ^[0-7]+$ ]] && (((8#$env_wrapper_mode & 8#022) == 0)); then
+		env_wrapper_mode_is_safe=1
+	fi
+	if [[ -z "$resolved_env_wrapper" || ! -f "$resolved_env_wrapper" || ! -x "$resolved_env_wrapper" ||
+		! "$env_wrapper_owner" =~ ^[0-9]+$ || ("$env_wrapper_owner" != "0" && "$env_wrapper_owner" != "$EUID") ||
+		"$env_wrapper_mode_is_safe" != "1" ]]; then
+		echo "run-go-cmd-cached: WIKI_GO_CMD_ENV_WRAPPER must resolve to a safe root/current-user-owned executable wrapper, got $ENV_WRAPPER owner_uid=$env_wrapper_owner mode=$env_wrapper_mode" >&2
+		exit 2
+	fi
+	ENV_WRAPPER="$resolved_env_wrapper"
+fi
+
+case "$LOCK_WAIT_SECONDS" in
+'' | *[!0-9]*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_WAIT_SECONDS must be numeric seconds" >&2
+	exit 2
+	;;
+esac
+if [[ "$LOCK_WAIT_SECONDS" -gt "$MAX_LOCK_WAIT_SECONDS" ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_WAIT_SECONDS must not exceed ${MAX_LOCK_WAIT_SECONDS}s; reorient/shard instead of extending a passive wait" >&2
+	exit 2
+fi
+case "$LOCK_STALE_SECONDS" in
+'' | *[!0-9]* | 0)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_STALE_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+case "$LOCK_META_INIT_GRACE_MS" in
+'' | *[!0-9]*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_META_INIT_GRACE_MS must be numeric milliseconds" >&2
+	exit 2
+	;;
+esac
+if [[ "$LOCK_META_INIT_GRACE_MS" -gt 5000 ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_META_INIT_GRACE_MS must not exceed 5000 milliseconds" >&2
+	exit 2
+fi
+# `0*` alem de `0`: o padrao antigo recusava `0` e ACEITAVA `00`, `000` e `007`.
+# Nao e teoria — medido em 2026-09-05 sob refutacao adversarial: com `00`,
+# `sleep 00` volta em 2 ms e o renovador reescreve o heartbeat 105+ vezes em 2 s,
+# queimando CPU durante todo o build. `007` e pior ainda, porque parece 7 e nao
+# e: em `[[ ... -gt 60 ]]` o bash le base 8. Recusar todo prefixo zero mata as
+# duas armadilhas de uma vez, e a mensagem ja diz "positive integer".
+case "$LOCK_HEARTBEAT_INTERVAL_SECONDS" in
+'' | *[!0-9]* | 0*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_HEARTBEAT_INTERVAL_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+if [[ "$LOCK_HEARTBEAT_INTERVAL_SECONDS" -gt 60 ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_HEARTBEAT_INTERVAL_SECONDS must not exceed 60 seconds" >&2
+	exit 2
+fi
+case "$LOCK_HEARTBEAT_STALE_SECONDS" in
+'' | *[!0-9]* | 0)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_HEARTBEAT_STALE_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+# Orfandade so pode ser declarada depois de MUITAS renovacoes perdidas; menos do
+# que isso transformaria pico de carga do detentor vivo em despejo de lock sao.
+if [[ "$LOCK_HEARTBEAT_STALE_SECONDS" -lt $((LOCK_HEARTBEAT_INTERVAL_SECONDS * 6)) ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_LOCK_HEARTBEAT_STALE_SECONDS must cover at least six heartbeat intervals ($((LOCK_HEARTBEAT_INTERVAL_SECONDS * 6))s)" >&2
+	exit 2
+fi
+# O orcamento por heartbeat nunca pode ser mais permissivo que o orcamento
+# conservador por mtime: ele acelera o despejo de orfao provado, nao o afrouxa.
+if [[ "$LOCK_HEARTBEAT_STALE_SECONDS" -gt "$LOCK_STALE_SECONDS" ]]; then
+	LOCK_HEARTBEAT_STALE_SECONDS="$LOCK_STALE_SECONDS"
+fi
+for timeout_setting in \
+	"BUILD_IDENTITY_TIMEOUT_SECONDS:$BUILD_IDENTITY_TIMEOUT_SECONDS" \
+	"DEPENDENCY_LIST_TIMEOUT_SECONDS:$DEPENDENCY_LIST_TIMEOUT_SECONDS" \
+	"METADATA_TIMEOUT_SECONDS:$METADATA_TIMEOUT_SECONDS"; do
+	timeout_name="${timeout_setting%%:*}"
+	timeout_value="${timeout_setting#*:}"
+	case "$timeout_value" in
+	'' | *[!0-9]* | 0)
+		echo "run-go-cmd-cached: $timeout_name must be a positive integer seconds" >&2
+		exit 2
+		;;
+	esac
+	if [[ "$timeout_value" -gt 60 ]]; then
+		echo "run-go-cmd-cached: $timeout_name must not exceed 60 seconds" >&2
+		exit 2
+	fi
+done
+case "$BUILD_BUDGET_MS" in
+'' | *[!0-9]*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_BUDGET_MS must be a positive integer milliseconds" >&2
+	exit 2
+	;;
+esac
+if [[ "$BUILD_BUDGET_MS" -le 0 ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_BUDGET_MS must be a positive integer milliseconds" >&2
+	exit 2
+fi
+if [[ "$BUILD_BUDGET_MS" -gt "$MAX_BUILD_BUDGET_MS" ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_BUILD_BUDGET_MS must not exceed $MAX_BUILD_BUDGET_MS; optimize/cache/shard the build instead of extending its budget" >&2
+	exit 2
+fi
+case "$RUN_TIMEOUT_GRACE_SECONDS" in
+'' | *[!0-9]*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_GRACE_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+if [[ "$RUN_TIMEOUT_GRACE_SECONDS" -le 0 ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_GRACE_SECONDS must be a positive integer seconds" >&2
+	exit 2
+fi
+if [[ "$RUN_TIMEOUT_GRACE_SECONDS" -gt 30 ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_GRACE_SECONDS must not exceed 30 seconds" >&2
+	exit 2
+fi
+TIMEOUT_KILL_AFTER_SPEC="${RUN_TIMEOUT_GRACE_SECONDS}s"
+if [[ -n "${WIKI_GO_CMD_TIMEOUT_SECONDS+x}" ]]; then
+	case "$WIKI_GO_CMD_TIMEOUT_SECONDS" in
+	'' | *[!0-9]*)
+		echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+		exit 2
+		;;
+	esac
+	if [[ "$WIKI_GO_CMD_TIMEOUT_SECONDS" -le 0 ]]; then
+		echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+		exit 2
+	fi
+	if [[ "$WIKI_GO_CMD_TIMEOUT_SECONDS" -gt "$MAX_WRAPPER_TIMEOUT_SECONDS" ]]; then
+		echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_SECONDS must not exceed ${MAX_WRAPPER_TIMEOUT_SECONDS}s; shard/cache/optimize instead of increasing the timeout" >&2
+		exit 2
+	fi
+fi
+if [[ -n "${WIKI_HEAVY_TIMEOUT_SECONDS:-}" ]]; then
+	case "$WIKI_HEAVY_TIMEOUT_SECONDS" in
+	'' | *[!0-9]* | 0)
+		echo "run-go-cmd-cached: WIKI_HEAVY_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+		exit 2
+		;;
+	esac
+	if [[ "$WIKI_HEAVY_TIMEOUT_SECONDS" -gt "$MAX_WRAPPER_TIMEOUT_SECONDS" ]]; then
+		echo "run-go-cmd-cached: WIKI_HEAVY_TIMEOUT_SECONDS must not exceed ${MAX_WRAPPER_TIMEOUT_SECONDS}s; shard/cache/optimize instead of increasing the timeout" >&2
+		exit 2
+	fi
+fi
+if [[ "${WIKI_RUN_GO_CMD_CACHED_UNDER_HEAVY:-}" == "1" && "${WIKI_HEAVY_TIMEOUT_SECONDS:-}" =~ ^[0-9]+$ && "$WIKI_HEAVY_TIMEOUT_SECONDS" -gt "$RUN_TIMEOUT_GRACE_SECONDS" ]]; then
+	heavy_build_cap_ms=$(((WIKI_HEAVY_TIMEOUT_SECONDS - RUN_TIMEOUT_GRACE_SECONDS) * 1000))
+	if [[ "$heavy_build_cap_ms" -lt 1000 ]]; then
+		heavy_build_cap_ms=1000
+	fi
+	if [[ "$BUILD_BUDGET_MS" -gt "$heavy_build_cap_ms" ]]; then
+		BUILD_BUDGET_MS="$heavy_build_cap_ms"
+	fi
+fi
+
+parse_duration_milliseconds() {
+	local duration="$1"
+	local total_ms=0
+	local value unit rest
+	if [[ -z "$duration" ]]; then
+		return 1
+	fi
+	while [[ -n "$duration" ]]; do
+		if [[ "$duration" =~ ^([0-9]+)(ms|s|m|h)(.*)$ ]]; then
+			value="${BASH_REMATCH[1]}"
+			unit="${BASH_REMATCH[2]}"
+			rest="${BASH_REMATCH[3]}"
+			if [[ "${#value}" -gt 9 ]]; then
+				return 1
+			fi
+			value=$((10#$value))
+			case "$unit" in
+			ms) total_ms=$((total_ms + value)) ;;
+			s) total_ms=$((total_ms + value * 1000)) ;;
+			m) total_ms=$((total_ms + value * 60 * 1000)) ;;
+			h) total_ms=$((total_ms + value * 60 * 60 * 1000)) ;;
+			esac
+			if [[ "$total_ms" -gt $((MAX_WRAPPER_TIMEOUT_SECONDS * 1000)) ]]; then
+				return 1
+			fi
+			duration="$rest"
+			continue
+		fi
+		return 1
+	done
+	if [[ "$total_ms" -lt 1 ]]; then
+		return 1
+	fi
+	printf '%s' "$total_ms"
+}
+
+parse_duration_seconds() {
+	local total_ms
+	total_ms="$(parse_duration_milliseconds "$1")" || return 1
+	local seconds=$(((total_ms + 999) / 1000))
+	if [[ "$seconds" -lt 1 ]]; then
+		seconds=1
+	fi
+	printf '%s' "$seconds"
+}
+
+timeout_ms_from_max_duration() {
+	local parsed
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--max-duration)
+			shift
+			if [[ $# -eq 0 ]]; then
+				printf '0'
+				return 0
+			fi
+			parsed="$(parse_duration_milliseconds "$1" 2>/dev/null || true)"
+			printf '%s' "${parsed:-0}"
+			return 0
+			;;
+		--max-duration=*)
+			parsed="$(parse_duration_milliseconds "${1#--max-duration=}" 2>/dev/null || true)"
+			printf '%s' "${parsed:-0}"
+			return 0
+			;;
+		esac
+		shift
+	done
+	printf '0'
+}
+
+timeout_seconds_from_max_duration() {
+	local parsed_ms
+	parsed_ms="$(timeout_ms_from_max_duration "$@")"
+	if [[ "$parsed_ms" =~ ^[0-9]+$ && "$parsed_ms" -gt 0 ]]; then
+		printf '%s' "$(((parsed_ms + 999) / 1000))"
+		return 0
+	fi
+	printf '0'
+}
+
+timeout_ms_from_budget_ms() {
+	local value
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--budget-ms)
+			shift
+			if [[ $# -eq 0 ]]; then
+				printf '0'
+				return 0
+			fi
+			value="$1"
+			;;
+		--budget-ms=*)
+			value="${1#--budget-ms=}"
+			;;
+		*)
+			shift
+			continue
+			;;
+		esac
+		if [[ "$value" =~ ^[0-9]+$ && "${#value}" -le 9 && "$value" -gt 0 && "$value" -le $((MAX_WRAPPER_TIMEOUT_SECONDS * 1000)) ]]; then
+			printf '%s' "$value"
+			return 0
+		fi
+		printf '0'
+		return 0
+	done
+	printf '0'
+}
+
+timeout_seconds_from_budget_ms() {
+	local parsed_ms
+	parsed_ms="$(timeout_ms_from_budget_ms "$@")"
+	if [[ "$parsed_ms" =~ ^[0-9]+$ && "$parsed_ms" -gt 0 ]]; then
+		printf '%s' "$(((parsed_ms + 999) / 1000))"
+		return 0
+	fi
+	printf '0'
+}
+
+format_timeout_spec_from_ms() {
+	local value="$1"
+	local whole fractional
+	if [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+		whole=$((value / 1000))
+		fractional=$((value % 1000))
+		if [[ "$fractional" -eq 0 ]]; then
+			printf '%ss' "$whole"
+		else
+			printf '%s.%03ds' "$whole" "$fractional"
+		fi
+		return 0
+	fi
+	return 1
+}
+
+timeout_spec_from_budget_ms() {
+	local value
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--budget-ms)
+			shift
+			if [[ $# -eq 0 ]]; then
+				return 1
+			fi
+			value="$1"
+			;;
+		--budget-ms=*)
+			value="${1#--budget-ms=}"
+			;;
+		*)
+			shift
+			continue
+			;;
+		esac
+		if [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+			format_timeout_spec_from_ms "$value"
+			return 0
+		fi
+		return 1
+	done
+	return 1
+}
+
+validate_command_timeout_arguments() {
+	local value parsed
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--max-duration)
+			shift
+			if [[ $# -eq 0 ]]; then
+				echo "run-go-cmd-cached: --max-duration requires a positive duration no greater than ${MAX_WRAPPER_TIMEOUT_SECONDS}s" >&2
+				exit 2
+			fi
+			value="$1"
+			if ! parsed="$(parse_duration_milliseconds "$value" 2>/dev/null)"; then
+				echo "run-go-cmd-cached: --max-duration must be positive and no greater than ${MAX_WRAPPER_TIMEOUT_SECONDS}s; shard/cache/optimize instead of extending it" >&2
+				exit 2
+			fi
+			;;
+		--max-duration=*)
+			value="${1#--max-duration=}"
+			if ! parsed="$(parse_duration_milliseconds "$value" 2>/dev/null)"; then
+				echo "run-go-cmd-cached: --max-duration must be positive and no greater than ${MAX_WRAPPER_TIMEOUT_SECONDS}s; shard/cache/optimize instead of extending it" >&2
+				exit 2
+			fi
+			;;
+		--budget-ms)
+			shift
+			if [[ $# -eq 0 ]] || ! bounded_wrapper_milliseconds "$1"; then
+				echo "run-go-cmd-cached: --budget-ms must be positive and no greater than $((MAX_WRAPPER_TIMEOUT_SECONDS * 1000)); shard/cache/optimize instead of extending it" >&2
+				exit 2
+			fi
+			;;
+		--budget-ms=*)
+			value="${1#--budget-ms=}"
+			if ! bounded_wrapper_milliseconds "$value"; then
+				echo "run-go-cmd-cached: --budget-ms must be positive and no greater than $((MAX_WRAPPER_TIMEOUT_SECONDS * 1000)); shard/cache/optimize instead of extending it" >&2
+				exit 2
+			fi
+			;;
+		esac
+		shift
+	done
+}
+
+min_positive_timeout_seconds() {
+	local left="$1"
+	local right="$2"
+	if [[ "$left" =~ ^[0-9]+$ && "$left" -gt 0 && "$right" =~ ^[0-9]+$ && "$right" -gt 0 ]]; then
+		if [[ "$left" -lt "$right" ]]; then
+			printf '%s' "$left"
+		else
+			printf '%s' "$right"
+		fi
+		return 0
+	fi
+	if [[ "$left" =~ ^[0-9]+$ && "$left" -gt 0 ]]; then
+		printf '%s' "$left"
+		return 0
+	fi
+	if [[ "$right" =~ ^[0-9]+$ && "$right" -gt 0 ]]; then
+		printf '%s' "$right"
+		return 0
+	fi
+	printf '0'
+}
+
+derive_run_timeout_seconds() {
+	local env_seconds max_duration_seconds budget_seconds selected_seconds
+	env_seconds="${WIKI_GO_CMD_TIMEOUT_SECONDS:-0}"
+	max_duration_seconds="$(timeout_seconds_from_max_duration "$@")"
+	budget_seconds="$(timeout_seconds_from_budget_ms "$@")"
+	if [[ "$max_duration_seconds" =~ ^[0-9]+$ && "$max_duration_seconds" -gt 0 ]]; then
+		max_duration_seconds=$((max_duration_seconds + RUN_TIMEOUT_GRACE_SECONDS))
+	fi
+	selected_seconds="$(min_positive_timeout_seconds "$env_seconds" "$max_duration_seconds")"
+	selected_seconds="$(min_positive_timeout_seconds "$selected_seconds" "$budget_seconds")"
+	if [[ "$selected_seconds" =~ ^[0-9]+$ && "$selected_seconds" -gt 0 ]]; then
+		printf '%s' "$selected_seconds"
+		return 0
+	fi
+	printf '300'
+}
+
+derive_run_timeout_spec() {
+	local env_ms=0 max_duration_ms budget_ms max_with_grace_ms selected_ms=0
+	if [[ -n "${WIKI_GO_CMD_TIMEOUT_SECONDS:-}" && "$WIKI_GO_CMD_TIMEOUT_SECONDS" =~ ^[0-9]+$ && "$WIKI_GO_CMD_TIMEOUT_SECONDS" -gt 0 ]]; then
+		env_ms=$((WIKI_GO_CMD_TIMEOUT_SECONDS * 1000))
+	fi
+	max_duration_ms="$(timeout_ms_from_max_duration "$@")"
+	budget_ms="$(timeout_ms_from_budget_ms "$@")"
+	if [[ "$max_duration_ms" =~ ^[0-9]+$ && "$max_duration_ms" -gt 0 ]]; then
+		max_with_grace_ms=$((max_duration_ms + RUN_TIMEOUT_GRACE_SECONDS * 1000))
+	else
+		max_with_grace_ms=0
+	fi
+	for candidate_ms in "$env_ms" "$max_with_grace_ms" "$budget_ms"; do
+		if [[ "$candidate_ms" =~ ^[0-9]+$ && "$candidate_ms" -gt 0 ]]; then
+			if [[ "$selected_ms" -eq 0 || "$candidate_ms" -lt "$selected_ms" ]]; then
+				selected_ms="$candidate_ms"
+			fi
+		fi
+	done
+	if [[ "$selected_ms" -gt 0 ]]; then
+		format_timeout_spec_from_ms "$selected_ms"
+		return 0
+	fi
+	printf '%ss' "$(derive_run_timeout_seconds "$@")"
+}
+
+derive_wrapper_timeout_spec() {
+	local run_seconds build_seconds total_seconds
+	run_seconds="$(derive_run_timeout_seconds "$@")"
+	build_seconds=$(((BUILD_BUDGET_MS + 999) / 1000))
+	total_seconds=$((run_seconds + build_seconds + 1))
+	if [[ "$BOOTSTRAP_CACHE_MODE" == "1" ]]; then
+		# Two bounded context snapshots (before/after a build) plus bounded
+		# metadata validation/install. This is a hard outer cap, not a retry budget.
+		total_seconds=$((total_seconds + 2 * (2 * BUILD_IDENTITY_TIMEOUT_SECONDS + DEPENDENCY_LIST_TIMEOUT_SECONDS + 2 * METADATA_TIMEOUT_SECONDS) + 4 * METADATA_TIMEOUT_SECONDS))
+	else
+		# Fast-cache identity is collected once on a hit and again after a build:
+		# each snapshot has two Go probes and two metadata/source-tree probes.
+		# Reserve three more metadata windows for binary hash/install/revalidation.
+		total_seconds=$((total_seconds + 2 * (2 * BUILD_IDENTITY_TIMEOUT_SECONDS + 2 * METADATA_TIMEOUT_SECONDS) + 3 * METADATA_TIMEOUT_SECONDS))
+	fi
+	# The kill-after interval is part of the same hard wall-clock ceiling. Signal
+	# early enough that even a SIGTERM-ignoring tree is killed by the ceiling
+	# second (MAX_WRAPPER_TIMEOUT_SECONDS).
+	local outer_signal_seconds=$((MAX_WRAPPER_TIMEOUT_SECONDS - RUN_TIMEOUT_GRACE_SECONDS))
+	if [[ "$total_seconds" -gt "$outer_signal_seconds" ]]; then
+		total_seconds="$outer_signal_seconds"
+	fi
+	printf '%ss' "$total_seconds"
+}
+
+derive_repo_awareness_timeout() {
+	if [[ -n "${WIKI_REPO_AWARENESS_TIMEOUT:-}" ]]; then
+		printf '%s' "$WIKI_REPO_AWARENESS_TIMEOUT"
+		return 0
+	fi
+	local max_duration_ms budget_ms selected_ms=0
+	max_duration_ms="$(timeout_ms_from_max_duration "$@")"
+	budget_ms="$(timeout_ms_from_budget_ms "$@")"
+	if [[ "$max_duration_ms" =~ ^[0-9]+$ && "$max_duration_ms" -gt 0 ]]; then
+		selected_ms="$max_duration_ms"
+	fi
+	if [[ "$budget_ms" =~ ^[0-9]+$ && "$budget_ms" -gt 0 ]]; then
+		if [[ "$selected_ms" -eq 0 || "$budget_ms" -lt "$selected_ms" ]]; then
+			selected_ms="$budget_ms"
+		fi
+	fi
+	if [[ "$selected_ms" -gt 0 && "$selected_ms" -le 2000 ]]; then
+		printf '0.05s'
+		return 0
+	fi
+	printf '2s'
+}
+
+repo_awareness_fast_mode_from_args() {
+	local max_duration_ms budget_ms selected_ms=0
+	max_duration_ms="$(timeout_ms_from_max_duration "$@")"
+	budget_ms="$(timeout_ms_from_budget_ms "$@")"
+	if [[ "$max_duration_ms" =~ ^[0-9]+$ && "$max_duration_ms" -gt 0 ]]; then
+		selected_ms="$max_duration_ms"
+	fi
+	if [[ "$budget_ms" =~ ^[0-9]+$ && "$budget_ms" -gt 0 ]]; then
+		if [[ "$selected_ms" -eq 0 || "$budget_ms" -lt "$selected_ms" ]]; then
+			selected_ms="$budget_ms"
+		fi
+	fi
+	[[ "$selected_ms" -gt 0 && "$selected_ms" -le 2000 ]]
+}
+
+validate_command_timeout_arguments "$@"
+RUN_TIMEOUT_SECONDS="$(derive_run_timeout_seconds "$@")"
+RUN_TIMEOUT_SPEC="$(derive_run_timeout_spec "$@")"
+WRAPPER_TIMEOUT_SPEC="$(derive_wrapper_timeout_spec "$@")"
+BUILD_TIMEOUT_SPEC="$(format_timeout_spec_from_ms "$BUILD_BUDGET_MS")"
+REPO_AWARENESS_TIMEOUT="$(derive_repo_awareness_timeout "$@")"
+if [[ "$REPO_AWARENESS_TIMEOUT_EXPLICIT" != "1" ]] && repo_awareness_fast_mode_from_args "$@"; then
+	REPO_AWARENESS_FAST_MODE=1
+fi
+if [[ "$REPO_AWARENESS_TIMEOUT_EXPLICIT" != "1" && -d "$LOCK_DIR" ]]; then
+	REPO_AWARENESS_TIMEOUT="0.05s"
+fi
+case "$RUN_TIMEOUT_SECONDS" in
+'' | *[!0-9]*)
+	echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+	exit 2
+	;;
+esac
+if [[ "$RUN_TIMEOUT_SECONDS" -le 0 ]]; then
+	echo "run-go-cmd-cached: WIKI_GO_CMD_TIMEOUT_SECONDS must be a positive integer seconds" >&2
+	exit 2
+fi
+if [[ -z "$RUN_TIMEOUT_SPEC" ]]; then
+	echo "run-go-cmd-cached: timeout specification must not be empty" >&2
+	exit 2
+fi
+if [[ -z "$WRAPPER_TIMEOUT_SPEC" || -z "$BUILD_TIMEOUT_SPEC" ]]; then
+	echo "run-go-cmd-cached: timeout specification must not be empty" >&2
+	exit 2
+fi
+
+inline_token() {
+	tr '\n' ' ' <<<"$1" | sed 's/[[:space:]][[:space:]]*/_/g'
+}
+
+run_go_cmd_notice() {
+	echo "run-go-cmd-cached: $*" >&2
+}
+
+sha256_token() {
+	case "$1" in
+	sha256:????????????????????????????????????????????????????????????????)
+		printf '%s' "$1"
+		return 0
+		;;
+	esac
+	printf '%s' "$1" | sha256sum | awk '{print "sha256:" $1}'
+}
+
+base64_token() {
+	printf '%s' "$1" | base64 -w0
+}
+
+repo_metric_for() {
+	local metric tmp
+	tmp="$(mktemp "${TMPDIR:-/tmp}/wiki-repo-awareness.XXXXXX" 2>/dev/null || true)"
+	if [[ -z "$tmp" ]]; then
+		printf 'unavailable'
+		return 0
+	fi
+	if command -v timeout >/dev/null 2>&1; then
+		if timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "$REPO_AWARENESS_TIMEOUT" "$@" >"$tmp" 2>/dev/null; then
+			metric="$(cksum "$tmp" 2>/dev/null | awk '{print "cksum:" $1 ":bytes:" $2}')"
+		else
+			if [[ "$REPO_AWARENESS_TIMEOUT_EXPLICIT" == "1" ]]; then
+				metric="unavailable"
+			else
+				metric="$(
+					printf 'timed_out:%s\n' "$*" |
+						cksum 2>/dev/null | awk '{print "timed_out:cksum:" $1 ":bytes:" $2}'
+				)"
+			fi
+		fi
+	else
+		if "$@" >"$tmp" 2>/dev/null; then
+			metric="$(cksum "$tmp" 2>/dev/null | awk '{print "cksum:" $1 ":bytes:" $2}')"
+		else
+			metric="unavailable"
+		fi
+	fi
+	rm -f "$tmp"
+	if [[ -z "$metric" ]]; then
+		metric="unavailable"
+	fi
+	printf '%s' "$metric"
+}
+
+repo_head_show_metric() {
+	repo_metric_for git -c core.pager=cat -c diff.renames=false --no-pager show --no-ext-diff --stat=80,60,200 --oneline --summary HEAD
+}
+
+emit_repo_awareness_and_artifact_claim() {
+	local repo_root worktree_filesystem status_short unstaged_diff staged_diff untracked_files committed_history head_show repo_fingerprint
+	repo_root="unavailable"
+	worktree_filesystem="unavailable"
+	status_short="unavailable"
+	unstaged_diff="unavailable"
+	staged_diff="unavailable"
+	untracked_files="unavailable"
+	committed_history="unavailable"
+	head_show="unavailable"
+	repo_fingerprint="unavailable"
+	local inside_git=false
+	if [[ "$REPO_AWARENESS_TIMEOUT_EXPLICIT" != "1" && -d "$LOCK_DIR" ]]; then
+		repo_root="active_build_lock_preflight"
+		worktree_filesystem="skipped_for_active_build_lock"
+		status_short="skipped_for_active_build_lock"
+		unstaged_diff="skipped_for_active_build_lock"
+		staged_diff="skipped_for_active_build_lock"
+		untracked_files="skipped_for_active_build_lock"
+		committed_history="skipped_for_active_build_lock"
+		head_show="skipped_for_active_build_lock"
+	elif [[ "$REPO_AWARENESS_TIMEOUT_EXPLICIT" != "1" && "$REPO_AWARENESS_FAST_MODE" == "1" ]]; then
+		repo_root="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$ROOT")"
+		worktree_filesystem="skipped_for_subsecond_budget"
+		status_short="skipped_for_subsecond_budget"
+		unstaged_diff="skipped_for_subsecond_budget"
+		staged_diff="skipped_for_subsecond_budget"
+		untracked_files="skipped_for_subsecond_budget"
+		committed_history="skipped_for_subsecond_budget"
+		head_show="skipped_for_subsecond_budget"
+	elif command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		inside_git=true
+		repo_root="$(git rev-parse --show-toplevel 2>/dev/null || printf 'unknown')"
+		worktree_filesystem="$(repo_metric_for git status --porcelain=v1 -z -uall)"
+		status_short="$(repo_metric_for git status --short)"
+		unstaged_diff="$(repo_metric_for git diff --name-status)"
+		staged_diff="$(repo_metric_for git diff --cached --name-status)"
+		untracked_files="$(repo_metric_for git ls-files --others --exclude-standard)"
+		committed_history="$(repo_metric_for git log --oneline -5)"
+		head_show="$(repo_head_show_metric)"
+	else
+		repo_root="unavailable"
+		worktree_filesystem="unavailable"
+		status_short="unavailable"
+		unstaged_diff="unavailable"
+		staged_diff="unavailable"
+		untracked_files="unavailable"
+		committed_history="unavailable"
+		head_show="unavailable"
+	fi
+	if [[ "$inside_git" == "true" ]]; then
+		for required_metric in "$worktree_filesystem" "$status_short" "$unstaged_diff" "$staged_diff" "$untracked_files" "$committed_history" "$head_show"; do
+			if [[ "$required_metric" == "unavailable" ]]; then
+				echo "run-go-cmd-cached: repo_awareness_unavailable required_git_metric_failed timeout=$REPO_AWARENESS_TIMEOUT" >&2
+				exit 75
+			fi
+		done
+	fi
+	repo_fingerprint="$(
+		sha256_token "$(
+			printf '%s\n' \
+				"$worktree_filesystem" "$status_short" "$unstaged_diff" "$staged_diff" \
+				"$untracked_files" "$committed_history" "$head_show"
+		)"
+	)"
+	if [[ -z "$repo_fingerprint" ]]; then
+		repo_fingerprint="unavailable"
+	fi
+
+	local claim_path claim_producer claim_output claim_output_fingerprint claim_budget_ms claim_stop_condition requested_budget_ms
+	claim_path="$BIN"
+	claim_producer="tools/run-go-cmd-cached"
+	claim_output="cached_binary_or_command_status"
+	claim_output_fingerprint="sha256:uncomputed"
+	claim_budget_ms="$((RUN_TIMEOUT_SECONDS * 1000))"
+	claim_stop_condition="command_exits_or_build_lock_timeout_or_run_timeout"
+	requested_budget_ms="$claim_budget_ms"
+	requested_budget_ms="$(timeout_ms_from_budget_ms "$@")"
+	if ! [[ "$requested_budget_ms" =~ ^[0-9]+$ && "$requested_budget_ms" -gt 0 ]]; then
+		requested_budget_ms="$((RUN_TIMEOUT_SECONDS * 1000))"
+	fi
+	claim_path="${WIKI_GO_CMD_ARTIFACT_CLAIM_PATH:-$BIN}"
+	claim_producer="${WIKI_GO_CMD_ARTIFACT_CLAIM_PRODUCER:-tools/run-go-cmd-cached}"
+	claim_output="${WIKI_GO_CMD_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-cached_binary_or_command_status}"
+	claim_budget_ms="${WIKI_GO_CMD_BUDGET_MS:-$requested_budget_ms}"
+	claim_stop_condition="${WIKI_GO_CMD_STOP_CONDITION:-command_exits_or_build_lock_timeout_or_run_timeout}"
+	if [[ ("$PKG" == ./cmd/generate || "$PKG" == ./cmd/generate-*) && "${WIKI_RUN_GO_CMD_CACHED_UNDER_HEAVY:-}" == "1" ]]; then
+		claim_path="${WIKI_GO_CMD_ARTIFACT_CLAIM_PATH:-${WIKI_HEAVY_ARTIFACT_CLAIM_PATH:-$BIN}}"
+		claim_producer="${WIKI_GO_CMD_ARTIFACT_CLAIM_PRODUCER:-${WIKI_HEAVY_ARTIFACT_CLAIM_PRODUCER:-tools/run-go-cmd-cached}}"
+		claim_output="${WIKI_GO_CMD_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-${WIKI_HEAVY_ARTIFACT_OUTPUT_FINGERPRINT_EXPECTED:-cached_binary_or_command_status}}"
+		claim_budget_ms="${WIKI_GO_CMD_BUDGET_MS:-${WIKI_HEAVY_BUDGET_MS:-$requested_budget_ms}}"
+		claim_stop_condition="${WIKI_GO_CMD_STOP_CONDITION:-${WIKI_HEAVY_STOP_CONDITION:-command_exits_or_build_lock_timeout_or_run_timeout}}"
+	fi
+	claim_output_fingerprint="$(sha256_token "$claim_output")"
+
+	echo "run-go-cmd-cached: repo_awareness data_read_paths=worktree_filesystem;git status --short;git diff;git diff --cached;git ls-files --others --exclude-standard;git log;git show --stat HEAD;committed_history;staged;unstaged;untracked repo_root=$(inline_token "${repo_root:-unavailable}") worktree_filesystem=${worktree_filesystem:-unavailable} status=${status_short:-unavailable} diff=${unstaged_diff:-unavailable} diff_cached=${staged_diff:-unavailable} untracked=${untracked_files:-unavailable} committed_history=${committed_history:-unavailable} log=${committed_history:-unavailable} show=${head_show:-unavailable} timeout=$(inline_token "$REPO_AWARENESS_TIMEOUT") timeout_explicit=$REPO_AWARENESS_TIMEOUT_EXPLICIT input_fingerprint=${repo_fingerprint:-unavailable}" >&2
+	echo "run-go-cmd-cached: artifact_claim path=$(inline_token "${claim_path:-$BIN}") producer=$(inline_token "${claim_producer:-tools/run-go-cmd-cached}") input_fingerprint=${repo_fingerprint:-unavailable} output_fingerprint_expected=${claim_output_fingerprint:-sha256:uncomputed} output_fingerprint_description=$(inline_token "${claim_output:-cached_binary_or_command_status}") lock_scope=build:$PKG budget_ms=$(inline_token "${claim_budget_ms:-$((RUN_TIMEOUT_SECONDS * 1000))}") stop_condition=$(inline_token "${claim_stop_condition:-command_exits_or_build_lock_timeout_or_run_timeout}")" >&2
+}
+
+timeout_supervision_is_verified() {
+	local marker="${WIKI_RUN_GO_CMD_CACHED_UNDER_TIMEOUT:-}"
+	[[ "$marker" == v1:* ]] || return 1
+	python3 - "$marker" "$PPID" "$(realpath -e -- "$0" 2>/dev/null || true)" "$WRAPPER_TIMEOUT_SPEC" "$TIMEOUT_KILL_AFTER_SPEC" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+marker, shell_parent_text, runner_name, wrapper_spec, kill_after_spec = sys.argv[1:]
+parts = marker.split(":")
+if len(parts) != 4 or parts[0] != "v1":
+    raise SystemExit(1)
+boot_id, pid_text, ticks_text = parts[1:]
+if not pid_text.isdigit() or not ticks_text.isdigit():
+    raise SystemExit(1)
+if not shell_parent_text.isdigit():
+    raise SystemExit(1)
+pid = int(pid_text)
+if pid != int(shell_parent_text) or pid <= 1:
+    raise SystemExit(1)
+try:
+    if pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip() != boot_id:
+        raise SystemExit(1)
+    proc = pathlib.Path("/proc") / str(pid)
+    status = (proc / "status").read_text(encoding="ascii", errors="strict")
+    uid = None
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            uid = int(line.split()[1])
+            break
+    if uid != os.geteuid():
+        raise SystemExit(1)
+    stat_text = (proc / "stat").read_text(encoding="ascii", errors="strict")
+    remainder = stat_text[stat_text.rfind(") ") + 2 :].split()
+    if len(remainder) < 20 or remainder[19] != ticks_text:
+        raise SystemExit(1)
+    executable = (proc / "exe").resolve(strict=True)
+    executable_info = executable.stat()
+    executable_owner_trusted = executable_info.st_uid in (0, os.geteuid())
+    if (
+        not executable_owner_trusted
+        and executable_info.st_uid == 65534
+        and not os.access(executable, os.W_OK)
+    ):
+        try:
+            with open("/proc/self/uid_map", "rb") as uid_map_handle:
+                uid_map_payload = uid_map_handle.read(4096)
+        except OSError:
+            uid_map_payload = b""
+        # Sob user namespace com root NAO mapeado (ex.: sandbox Cowork), todo
+        # arquivo do host-root (ex.: /usr/bin/timeout) aparece como uid de
+        # overflow 65534 e e imutavel para o usuario do namespace; mesma
+        # correcao do trust-check do pre-commit (2026-07-29, .githooks/pre-commit)
+        # e de tools/v2_stock_epoch.py:_host_root_owner_uids (2026-07-30) para o
+        # mesmo falso-positivo, aqui na verificacao de ancestry do timeout que
+        # supervisiona run-go-cmd-cached. Em host sem userns, 65534 continua
+        # reprovado como sempre.
+        executable_owner_trusted = uid_map_payload != b"" and not any(
+            line.split() and line.split()[0] == "0"
+            for line in uid_map_payload.decode("ascii", errors="replace").splitlines()
+        )
+    if (
+        executable.name != "timeout"
+        or not stat.S_ISREG(executable_info.st_mode)
+        or not executable_owner_trusted
+        or executable_info.st_mode & 0o022
+    ):
+        raise SystemExit(1)
+    with (proc / "cmdline").open("rb") as command_file:
+        payload = command_file.read(256 * 1024 + 1)
+    if not payload or len(payload) > 256 * 1024:
+        raise SystemExit(1)
+    arguments = [os.fsdecode(part) for part in payload.split(b"\0") if part]
+    cwd = (proc / "cwd").resolve(strict=True)
+    runner = pathlib.Path(runner_name)
+    def canonical(value: str) -> pathlib.Path | None:
+        try:
+            candidate = pathlib.Path(value)
+            if not candidate.is_absolute():
+                candidate = cwd / candidate
+            return candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+    if not any(canonical(argument) == runner for argument in arguments):
+        raise SystemExit(1)
+    required = {
+        f"--kill-after={kill_after_spec}",
+        wrapper_spec,
+        f"WIKI_RUN_GO_CMD_CACHED_UNDER_TIMEOUT={marker}",
+    }
+    if not required.issubset(set(arguments)):
+        raise SystemExit(1)
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+current_wrapper_process_identity() {
+	local boot_id stat_line remainder
+	local -a fields
+	boot_id="$(sed -n '1p' /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+	IFS= read -r stat_line <"/proc/$$/stat" 2>/dev/null || return 1
+	[[ -n "$boot_id" && "$stat_line" == *') '* ]] || return 1
+	remainder="${stat_line##*) }"
+	read -r -a fields <<<"$remainder"
+	[[ "${#fields[@]}" -ge 20 && "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+	printf 'v1:%s:%s:%s' "$boot_id" "$$" "${fields[19]}"
+}
+
+run_command_with_timeout() {
+	if ! command -v timeout >/dev/null 2>&1; then
+		echo "run-go-cmd-cached: timeout command is required for supervised P0 command execution" >&2
+		exit 75
+	fi
+	if ! timeout_supervision_is_verified; then
+		if [[ "${WIKI_RUN_GO_CMD_CACHED_UNDER_TIMEOUT:-}" == v1:* ]]; then
+			echo "run-go-cmd-cached: invalid authenticated outer-timeout marker; refusing recursive supervision" >&2
+			exit 75
+		fi
+		local supervision_marker
+		supervision_marker="$(current_wrapper_process_identity)" || {
+			echo "run-go-cmd-cached: could not authenticate outer timeout process identity" >&2
+			exit 75
+		}
+		exec timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "$WRAPPER_TIMEOUT_SPEC" env WIKI_RUN_GO_CMD_CACHED_UNDER_TIMEOUT="$supervision_marker" "$0" "$PKG" "$@"
+	fi
+}
+
+run_command_with_timeout "$@"
+emit_repo_awareness_and_artifact_claim "$@"
+
+run_go_tool_bounded() {
+	local timeout_seconds="$1"
+	shift
+	if [[ -n "$ENV_WRAPPER" ]]; then
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${timeout_seconds}s" "$ENV_WRAPPER" go-modern "$@"
+		return $?
+	fi
+	timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${timeout_seconds}s" go-modern "$@"
+}
+
+cleanup_bootstrap_context() {
+	local context_path
+	for context_path in "$BOOTSTRAP_CONTEXT_FILE" "$BOOTSTRAP_CLOSURE_FILE" "$BOOTSTRAP_GO_ENV_FILE"; do
+		if [[ -n "$context_path" ]]; then
+			rm -f -- "$context_path" 2>/dev/null || true
+		fi
+	done
+	BOOTSTRAP_CONTEXT_FILE=""
+	BOOTSTRAP_CLOSURE_FILE=""
+	BOOTSTRAP_GO_ENV_FILE=""
+}
+
+cleanup_general_build_context() {
+	local context_path
+	for context_path in "$GENERAL_CONTEXT_FILE" "$GENERAL_GO_ENV_FILE"; do
+		if [[ -n "$context_path" ]]; then
+			rm -f -- "$context_path" 2>/dev/null || true
+		fi
+	done
+	GENERAL_CONTEXT_FILE=""
+	GENERAL_GO_ENV_FILE=""
+}
+
+cleanup_build_contexts() {
+	cleanup_bootstrap_context
+	cleanup_general_build_context
+}
+
+collect_general_build_context() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "0" ]] || return 0
+	local go_version go_root go_tool_binary go_tool_binary_sha256 go_modern_sha256 cache_runner_sha256 env_wrapper_sha256
+	GENERAL_CONTEXT_FILE="$(mktemp "${TMPDIR:-/tmp}/wiki-go-fast-build-context.XXXXXX")" || {
+		echo "run-go-cmd-cached: could not allocate fast build context" >&2
+		exit 75
+	}
+	GENERAL_GO_ENV_FILE="$(mktemp "${TMPDIR:-/tmp}/wiki-go-fast-build-env.XXXXXX")" || {
+		cleanup_general_build_context
+		echo "run-go-cmd-cached: could not allocate fast Go environment" >&2
+		exit 75
+	}
+	if ! go_version="$(cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$BUILD_IDENTITY_TIMEOUT_SECONDS" version)" || [[ -z "$go_version" || "$go_version" == *$'\n'* ]]; then
+		echo "run-go-cmd-cached: could not authenticate bounded Go version for fast cache" >&2
+		exit 75
+	fi
+	if ! (
+		cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$BUILD_IDENTITY_TIMEOUT_SECONDS" env -json \
+			GOVERSION GOTOOLCHAIN GOOS GOARCH GO386 GOAMD64 GOARM GOARM64 GOMIPS GOMIPS64 \
+			GOPPC64 GORISCV64 GOWASM GOFIPS140 GO_EXTLINK_ENABLED CGO_ENABLED GOEXPERIMENT GOFLAGS \
+			GOROOT GOMOD GOWORK GOMODCACHE GOENV CC CXX AR PKG_CONFIG \
+			CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS \
+			CGO_CFLAGS_ALLOW CGO_CFLAGS_DISALLOW CGO_CPPFLAGS_ALLOW CGO_CPPFLAGS_DISALLOW \
+			CGO_CXXFLAGS_ALLOW CGO_CXXFLAGS_DISALLOW CGO_FFLAGS_ALLOW CGO_FFLAGS_DISALLOW \
+			CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW
+	) >"$GENERAL_GO_ENV_FILE"; then
+		echo "run-go-cmd-cached: could not authenticate bounded Go environment for fast cache" >&2
+		exit 75
+	fi
+	if ! go_root="$(
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - "$GENERAL_GO_ENV_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict"))
+root = value.get("GOROOT") if isinstance(value, dict) else None
+if not isinstance(root, str) or not root:
+    raise SystemExit("missing GOROOT")
+print(root)
+PY
+	)"; then
+		echo "run-go-cmd-cached: could not resolve effective Go toolchain for fast cache" >&2
+		exit 75
+	fi
+	go_tool_binary="$go_root/bin/go"
+	go_tool_binary_sha256="$(sha256sum "$go_tool_binary" 2>/dev/null | awk '{print "sha256:" $1}')"
+	go_modern_sha256="$(sha256sum "$ROOT/tools/go-modern" 2>/dev/null | awk '{print "sha256:" $1}')"
+	cache_runner_sha256="$(sha256sum "$ROOT/tools/run-go-cmd-cached" 2>/dev/null | awk '{print "sha256:" $1}')"
+	if [[ ! -x "$go_tool_binary" || ! "$go_tool_binary_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not authenticate effective Go binary for fast cache" >&2
+		exit 75
+	fi
+	if [[ ! "$go_modern_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not authenticate tools/go-modern for fast cache" >&2
+		exit 75
+	fi
+	if [[ ! "$cache_runner_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not authenticate tools/run-go-cmd-cached for fast cache" >&2
+		exit 75
+	fi
+	env_wrapper_sha256=""
+	if [[ -n "$ENV_WRAPPER" ]]; then
+		env_wrapper_sha256="$(sha256sum "$ENV_WRAPPER" 2>/dev/null | awk '{print "sha256:" $1}')"
+		if [[ ! "$env_wrapper_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+			echo "run-go-cmd-cached: could not authenticate WIKI_GO_CMD_ENV_WRAPPER for fast cache" >&2
+			exit 75
+		fi
+	fi
+	if ! timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - \
+		"$GENERAL_CONTEXT_FILE" "$GENERAL_GO_ENV_FILE" "$PKG" "$BUILD_SOURCE_ROOT" "$go_version" \
+		"$go_tool_binary" "$go_tool_binary_sha256" "$ROOT/tools/go-modern" "$go_modern_sha256" \
+		"$ROOT/tools/run-go-cmd-cached" "$cache_runner_sha256" "$ENV_WRAPPER" "$env_wrapper_sha256" <<'PY'; then
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import stat
+import sys
+
+(
+    context_name, go_env_name, package, build_source_root, go_version,
+    go_tool_binary_path, go_tool_binary_sha256, go_modern_path, go_modern_sha256,
+    cache_runner_path, cache_runner_sha256, env_wrapper_path, env_wrapper_sha256,
+) = sys.argv[1:]
+sha256 = re.compile(r"sha256:[0-9a-f]{64}")
+if any(sha256.fullmatch(value) is None for value in (go_tool_binary_sha256, go_modern_sha256, cache_runner_sha256)):
+    raise SystemExit("noncanonical tool fingerprint")
+if env_wrapper_path and sha256.fullmatch(env_wrapper_sha256) is None:
+    raise SystemExit("noncanonical environment-wrapper fingerprint")
+go_env = json.loads(pathlib.Path(go_env_name).read_text(encoding="utf-8", errors="strict"))
+if not isinstance(go_env, dict) or not go_env:
+    raise SystemExit("Go environment is not a nonempty object")
+if any(not isinstance(key, str) or not isinstance(value, str) for key, value in go_env.items()):
+    raise SystemExit("Go environment contains non-string entries")
+root = pathlib.Path(build_source_root)
+if not root.is_absolute() or root.resolve(strict=True) != root or root.is_symlink():
+    raise SystemExit("build source root is not canonical")
+if go_env.get("GOMOD") != os.fspath(root / "go.mod"):
+    raise SystemExit("effective Go module is outside the canonical build source root")
+workspace_name = go_env.get("GOWORK", "")
+workspace_files = []
+if workspace_name and workspace_name != "off":
+    # A workspace can inject arbitrary local modules outside cmd/internal. The
+    # normal fast cache deliberately avoids a costly `go list -deps`; refuse the
+    # ambiguous topology instead of accepting a stale binary. Bootstrap mode has
+    # a real package closure and remains the supported workspace path.
+    raise SystemExit("Go workspaces require authenticated bootstrap cache mode")
+
+go_mod_text = (root / "go.mod").read_text(encoding="utf-8", errors="strict")
+for replacement in re.finditer(r'=>\s*(?:"([^"]+)"|`([^`]+)`|([^\s]+))', go_mod_text):
+    replacement_target = next(value for value in replacement.groups() if value is not None)
+    if replacement_target.startswith((".", "/")):
+        raise SystemExit("local go.mod replace requires authenticated bootstrap cache mode")
+
+# Content-bearing GOFLAGS outside the canonical source tree cannot be reduced
+# to a path string. Refuse that ambiguous cache identity instead of reusing a
+# binary after an overlay/profile/tool file changes in place.
+flag_tokens = go_env.get("GOFLAGS", "").split()
+unsafe_path_flags = ("-overlay", "-modfile", "-pgo", "-pkgdir", "-toolexec", "-exec")
+for token in flag_tokens:
+    if any(token == flag or token.startswith(flag + "=") for flag in unsafe_path_flags):
+        raise SystemExit(f"content-bearing GOFLAGS option is unsupported by authenticated fast cache: {token}")
+
+source_paths = {root / "go.mod"}
+go_sum = root / "go.sum"
+if go_sum.exists():
+    source_paths.add(go_sum)
+source_paths.update(workspace_files)
+source_roots = []
+for relative_root in ("cmd", "internal", "assets", "third_party", "vendor"):
+    candidate_root = root / relative_root
+    if not candidate_root.exists():
+        continue
+    if not candidate_root.is_dir() or candidate_root.is_symlink() or candidate_root.resolve(strict=True) != candidate_root:
+        raise SystemExit(f"unsafe build source tree: {relative_root}")
+    source_roots.append(relative_root)
+    for candidate in candidate_root.rglob("*"):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            # Arquivo transitório de outra sessão (temp de escrita atômica,
+            # ex.: internal/render/render.go.tmp.<pid>.<token>) listado pelo
+            # readdir e removido antes do lstat. Um inventário é o conjunto do
+            # que EXISTE: a entrada sumida não integra o snapshot. Mutação real
+            # de fonte autenticada continua reprovando nas comparações de
+            # identidade e de conjunto abaixo — isto só remove o crash TOCTOU
+            # (traceback FileNotFoundError, incidente 2026-08-04 durante o
+            # repin do ingest-v2-stock).
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"build source tree crosses a symlink: {candidate}")
+        if stat.S_ISREG(info.st_mode):
+            relative = candidate.relative_to(root)
+            if "__pycache__" in relative.parts or candidate.suffix == ".pyc":
+                continue
+            source_paths.add(candidate)
+if not source_paths:
+    raise SystemExit("build source tree is empty")
+
+def file_identity(info):
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+source_digest = hashlib.sha256(b"run-go-cmd-cached-fast-source-tree/v1\0")
+source_total = 0
+source_count = 0
+source_identities = {}
+for source_path in sorted(source_paths, key=lambda value: value.relative_to(root).as_posix()):
+    try:
+        before = source_path.lstat()
+    except FileNotFoundError:
+        # Presente na enumeração, ausente na leitura autenticada: a árvore
+        # mudou no meio do snapshot. Recusa limpa e retryável (exit 75 via
+        # caller), nunca traceback — mesma semântica fail-closed da
+        # comparação de inventário pós-leitura.
+        raise SystemExit(f"build source inventory changed during authenticated read: {source_path}")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_mode & 0o022
+        or before.st_size < 0
+        or before.st_size > 256 * 1024 * 1024
+    ):
+        raise SystemExit(f"unsafe fast-cache build source file: {source_path}")
+    source_total += before.st_size
+    source_count += 1
+    if source_total > 2 * 1024 * 1024 * 1024 or source_count > 1_000_000:
+        raise SystemExit("fast-cache build source tree exceeds bounded size")
+    # O_NOFOLLOW closes the symlink race; O_NONBLOCK makes a concurrent
+    # regular-file -> FIFO replacement fail at fstat instead of hanging before
+    # the descriptor can be authenticated.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(source_path, flags)
+    file_digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if file_identity(opened) != file_identity(before):
+            raise SystemExit(f"build source changed before authenticated read: {source_path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"short build source read: {source_path}")
+            file_digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"build source grew during authenticated read: {source_path}")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if file_identity(after) != file_identity(opened):
+        raise SystemExit(f"build source changed during authenticated read: {source_path}")
+    source_identities[source_path] = file_identity(after)
+    relative = source_path.relative_to(root).as_posix()
+    source_digest.update(relative.encode("utf-8") + b"\0")
+    source_digest.update(f"{stat.S_IMODE(before.st_mode):o}\0{before.st_size}\0".encode("ascii"))
+    source_digest.update(file_digest.digest())
+
+# Close the enumeration/read race: an addition, removal, replacement or edit
+# anywhere in the authenticated roots invalidates this snapshot before it can
+# become a cache identity.
+source_paths_after = {root / "go.mod"}
+if go_sum.exists():
+    source_paths_after.add(go_sum)
+source_paths_after.update(workspace_files)
+source_roots_after = []
+for relative_root in ("cmd", "internal", "assets", "third_party", "vendor"):
+    candidate_root = root / relative_root
+    if not candidate_root.exists():
+        continue
+    if not candidate_root.is_dir() or candidate_root.is_symlink() or candidate_root.resolve(strict=True) != candidate_root:
+        raise SystemExit(f"unsafe build source tree after read: {relative_root}")
+    source_roots_after.append(relative_root)
+    for candidate in candidate_root.rglob("*"):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            # Mesmo caso TOCTOU da primeira varredura: entrada transitória que
+            # sumiu entre readdir e lstat não existe e não integra o inventário
+            # pós-leitura. Se um arquivo AUTENTICADO sumiu, a desigualdade de
+            # conjuntos logo abaixo reprova exatamente como antes.
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"build source tree gained a symlink during read: {candidate}")
+        if stat.S_ISREG(info.st_mode):
+            relative = candidate.relative_to(root)
+            if "__pycache__" in relative.parts or candidate.suffix == ".pyc":
+                continue
+            source_paths_after.add(candidate)
+if source_roots_after != source_roots or source_paths_after != source_paths:
+    raise SystemExit("build source inventory changed during authenticated read")
+for source_path, expected_identity in source_identities.items():
+    try:
+        current_identity = file_identity(source_path.lstat())
+    except FileNotFoundError:
+        raise SystemExit(f"build source changed after authenticated read: {source_path}")
+    if current_identity != expected_identity:
+        raise SystemExit(f"build source changed after authenticated read: {source_path}")
+wrapper = None
+if env_wrapper_path:
+    wrapper = {"path": env_wrapper_path, "sha256": env_wrapper_sha256}
+
+def cgo_tool_identity(environment_name):
+    command = go_env.get(environment_name, "")
+    try:
+        words = shlex.split(command)
+    except ValueError as error:
+        raise SystemExit(f"invalid {environment_name} command: {error}")
+    if not words:
+        return {"environment": environment_name, "command": command, "path": None, "sha256": None}
+    selected = shutil.which(words[0], path=os.environ.get("PATH", ""))
+    if selected is None:
+        return {"environment": environment_name, "command": command, "path": None, "sha256": None}
+    selected_path = pathlib.Path(selected).resolve(strict=True)
+    info = selected_path.stat()
+    cgo_tool_owner_trusted = info.st_uid in (0, os.geteuid())
+    if not cgo_tool_owner_trusted and info.st_uid == 65534 and not os.access(selected_path, os.W_OK):
+        try:
+            with open("/proc/self/uid_map", "rb") as uid_map_handle:
+                uid_map_payload = uid_map_handle.read(4096)
+        except OSError:
+            uid_map_payload = b""
+        # Sob user namespace com root NAO mapeado (sandbox Cowork), ferramentas
+        # de build do host-root (ex.: gcc) aparecem como uid de overflow 65534;
+        # mesma correcao do trust-check do pre-commit (2026-07-29) e de
+        # tools/v2_stock_epoch.py:_host_root_owner_uids para o mesmo
+        # falso-positivo. Em host sem userns, 65534 continua reprovado.
+        cgo_tool_owner_trusted = uid_map_payload != b"" and not any(
+            line.split() and line.split()[0] == "0"
+            for line in uid_map_payload.decode("ascii", errors="replace").splitlines()
+        )
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or not cgo_tool_owner_trusted
+        or info.st_mode & 0o022
+        or info.st_size < 0
+        or info.st_size > 512 * 1024 * 1024
+    ):
+        raise SystemExit(f"unsafe CGO build tool: {selected_path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(selected_path, flags)
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if file_identity(opened) != file_identity(info):
+            raise SystemExit(f"CGO build tool changed before read: {selected_path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"short CGO build tool read: {selected_path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if file_identity(after) != file_identity(opened):
+        raise SystemExit(f"CGO build tool changed during read: {selected_path}")
+    return {
+        "environment": environment_name,
+        "command": command,
+        "path": os.fspath(selected_path),
+        "sha256": "sha256:" + digest.hexdigest(),
+    }
+
+cgo_tools = []
+if go_env.get("CGO_ENABLED") == "1":
+    cgo_tools = [cgo_tool_identity(name) for name in ("CC", "CXX", "AR", "PKG_CONFIG")]
+context = {
+    "schema": "run-go-cmd-cached-fast-build-context/v1",
+    "package": package,
+    "build_source_root": build_source_root,
+    "build_flags": ["-tags", "devcmds", "-buildvcs=false"],
+    "go_version": go_version,
+    "go_toolchain": go_env,
+    "cgo_build_tools": cgo_tools,
+    "go_toolchain_binary": {"path": go_tool_binary_path, "sha256": go_tool_binary_sha256},
+    "go_modern": {"path": go_modern_path, "sha256": go_modern_sha256},
+    "cache_runner": {"path": cache_runner_path, "sha256": cache_runner_sha256},
+    "environment_wrapper": wrapper,
+    "source_tree": {
+        "roots": source_roots,
+        "sha256": "sha256:" + source_digest.hexdigest(),
+        "file_count": source_count,
+        "size_bytes": source_total,
+    },
+}
+payload = (json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+pathlib.Path(context_name).write_bytes(payload)
+PY
+		echo "run-go-cmd-cached: could not canonicalize fast build context" >&2
+		exit 75
+	fi
+	rm -f -- "$GENERAL_GO_ENV_FILE"
+	GENERAL_GO_ENV_FILE=""
+	GENERAL_CONTEXT_SHA256="$(sha256sum "$GENERAL_CONTEXT_FILE" 2>/dev/null | awk '{print "sha256:" $1}')"
+	if [[ ! "$GENERAL_CONTEXT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not fingerprint fast build context" >&2
+		exit 75
+	fi
+}
+
+general_build_identity_matches() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "0" ]] || return 1
+	local observed
+	# Authenticate every cache component through the descriptor used to read it.
+	# A pathname precheck followed by cmp/sed/sha256sum leaves a regular->FIFO
+	# race that can block before the file type is known. O_NONBLOCK + O_NOFOLLOW
+	# makes every non-regular replacement fail closed without a passive wait.
+	if ! observed="$(
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - \
+			"$GENERAL_CONTEXT_FILE" "$BUILD_IDENTITY" "$BUILD_BINARY_SHA256" "$BIN" <<'PY'
+import os
+import re
+import stat
+import struct
+import sys
+
+context_name, identity_name, digest_name, binary_name = sys.argv[1:]
+# v2: identity is (Go build id, dev, ino, size, mtime_ns), not a full-content
+# sha256. A full sha256 of a ~240MB cmd binary cost ~1.2-1.5s CPU and this
+# check runs multiple times per invocation (cache-hit decision + pre-exec
+# revalidation) — several seconds of CPU spent re-hashing bytes that did not
+# change. The Go build id is a content-derived fingerprint the toolchain
+# already embeds in a small ELF note near the head of the file (ULTRAPLAN
+# invocation-ceremony fix); reading it plus the inode/size/mtime tuple is
+# O(1) in the binary's size and still fails closed on truncation, corruption,
+# stale artifacts or a rebuild. This is NOT the wall-clock/mtime-only
+# heuristic rejected below for `cached_binary_fast_path_valid` — that ordering
+# heuristic trusts "newer" timestamps, which restored caches routinely fake.
+# Here mtime/inode/size are combined with a build-id equality check, i.e.
+# authenticated identity, not ordering. The cache directory and every
+# ancestor are already authenticated as current-user-owned and
+# non-group/world-writable (see the cache_ancestor walk above), so the only
+# actor able to swap this binary could equally rewrite the recorded digest;
+# a full content hash buys nothing extra against that actor and only costs
+# CPU against the legitimate case (unchanged binary).
+binary_identity_token = re.compile(rb"binary-identity-v1:[0-9a-f]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+\n")
+
+def descriptor_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+def open_regular(name: str, maximum: int, *, executable: bool = False) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o022
+        or info.st_size <= 0
+        or info.st_size > maximum
+        or (executable and info.st_mode & 0o111 == 0)
+    ):
+        os.close(descriptor)
+        raise OSError(f"unsafe authenticated cache file: {name}")
+    return descriptor, info
+
+def read_regular(name: str, maximum: int) -> bytes:
+    descriptor, opened = open_regular(name, maximum)
+    try:
+        remaining = opened.st_size
+        chunks = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError(f"short authenticated cache read: {name}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError(f"authenticated cache file grew during read: {name}")
+        after = os.fstat(descriptor)
+        if descriptor_identity(after) != descriptor_identity(opened):
+            raise OSError(f"authenticated cache file changed during read: {name}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+def go_build_id(descriptor: int) -> bytes:
+    header = os.pread(descriptor, 64, 0)
+    if len(header) != 64 or header[:4] != b"\x7fELF" or header[4] != 2:
+        raise OSError("unsupported binary format for fast identity")
+    endian = "<" if header[5] == 1 else ">"
+    e_shoff, = struct.unpack_from(endian + "Q", header, 0x28)
+    e_shentsize, = struct.unpack_from(endian + "H", header, 0x3A)
+    e_shnum, = struct.unpack_from(endian + "H", header, 0x3C)
+    e_shstrndx, = struct.unpack_from(endian + "H", header, 0x3E)
+    if e_shentsize <= 0 or e_shnum <= 0 or e_shnum > 4096 or e_shstrndx >= e_shnum:
+        raise OSError("unsafe ELF section header table")
+    shtab_size = e_shentsize * e_shnum
+    if shtab_size > 1024 * 1024:
+        raise OSError("oversized ELF section header table")
+    shtab = os.pread(descriptor, shtab_size, e_shoff)
+    if len(shtab) != shtab_size:
+        raise OSError("short ELF section header table read")
+
+    def section(index: int) -> tuple[int, int, int]:
+        base = index * e_shentsize
+        name_off, = struct.unpack_from(endian + "I", shtab, base)
+        sh_offset, = struct.unpack_from(endian + "Q", shtab, base + 0x18)
+        sh_size, = struct.unpack_from(endian + "Q", shtab, base + 0x20)
+        return name_off, sh_offset, sh_size
+
+    _, strtab_off, strtab_size = section(e_shstrndx)
+    if strtab_size <= 0 or strtab_size > 1024 * 1024:
+        raise OSError("unsafe ELF section name table")
+    strtab = os.pread(descriptor, strtab_size, strtab_off)
+    if len(strtab) != strtab_size:
+        raise OSError("short ELF section name table read")
+    note_offset = note_size = None
+    for index in range(e_shnum):
+        name_off, sh_offset, sh_size = section(index)
+        end = strtab.find(b"\0", name_off)
+        if end < 0:
+            continue
+        if strtab[name_off:end] == b".note.go.buildid":
+            note_offset, note_size = sh_offset, sh_size
+            break
+    if note_offset is None or note_size is None or note_size <= 0 or note_size > 65536:
+        raise OSError("missing authenticated Go build id note")
+    note = os.pread(descriptor, note_size, note_offset)
+    if len(note) != note_size or len(note) < 12:
+        raise OSError("short Go build id note read")
+    namesz, descsz, _note_type = struct.unpack_from(endian + "III", note, 0)
+    name_pad = (namesz + 3) & ~3
+    desc_start = 12 + name_pad
+    if descsz <= 0 or descsz > 4096 or desc_start + descsz > len(note):
+        raise OSError("malformed Go build id note")
+    build_id = note[desc_start:desc_start + descsz]
+    if not build_id:
+        raise OSError("empty Go build id")
+    return build_id
+
+def binary_identity(name: str, maximum: int) -> str:
+    descriptor, opened = open_regular(name, maximum, executable=True)
+    try:
+        build_id = go_build_id(descriptor)
+        after = os.fstat(descriptor)
+        if descriptor_identity(after) != descriptor_identity(opened):
+            raise OSError(f"authenticated binary changed during identity read: {name}")
+    finally:
+        os.close(descriptor)
+    return (
+        "binary-identity-v1:" + build_id.hex()
+        + ":" + str(after.st_dev) + ":" + str(after.st_ino)
+        + ":" + str(after.st_size) + ":" + str(after.st_mtime_ns)
+    )
+
+try:
+    if read_regular(context_name, 1024 * 1024) != read_regular(identity_name, 1024 * 1024):
+        raise OSError("fast-cache build identity mismatch")
+    recorded_payload = read_regular(digest_name, 512)
+    if binary_identity_token.fullmatch(recorded_payload) is None:
+        raise OSError("invalid fast-cache binary identity")
+    recorded = recorded_payload[:-1].decode("ascii", errors="strict")
+    observed = binary_identity(binary_name, 2 * 1024 * 1024 * 1024)
+    if observed != recorded:
+        raise OSError("fast-cache binary identity mismatch")
+except (OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+print(observed)
+PY
+	)"; then
+		return 1
+	fi
+	[[ "$observed" =~ ^binary-identity-v1:[0-9a-f]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] || return 1
+	CURRENT_BINARY_SHA256="$observed"
+	return 0
+}
+
+verify_general_build_context_stable_after_build() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "0" ]] || return 0
+	local before_context_sha256="$GENERAL_CONTEXT_SHA256"
+	cleanup_general_build_context
+	collect_general_build_context
+	if [[ "$GENERAL_CONTEXT_SHA256" != "$before_context_sha256" ]]; then
+		echo "run-go-cmd-cached: toolchain/build flags/wrapper context changed during build; refusing stale binary before=$before_context_sha256 after=$GENERAL_CONTEXT_SHA256" >&2
+		return 75
+	fi
+}
+
+write_general_build_identity() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "0" ]] || return 0
+	local temporary_identity temporary_binary_identity binary_identity_token
+	temporary_identity="$(mktemp "$CACHE_DIR/.build-identity.XXXXXX")" || return 75
+	temporary_binary_identity="$(mktemp "$CACHE_DIR/.build-binary-sha256.XXXXXX")" || {
+		rm -f -- "$temporary_identity"
+		return 75
+	}
+	# v2: binary-identity-v1 token (Go build id + dev/ino/size/mtime), not a
+	# full-content sha256 — see general_build_identity_matches for the
+	# rationale. Bounded ELF-note read instead of streaming ~240MB through
+	# sha256sum on every build.
+	if ! binary_identity_token="$(
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - "$BIN" <<'PY'
+import os
+import stat
+import struct
+import sys
+
+def open_regular(name, maximum, *, executable=False):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o022
+        or info.st_size <= 0
+        or info.st_size > maximum
+        or (executable and info.st_mode & 0o111 == 0)
+    ):
+        os.close(descriptor)
+        raise OSError(f"unsafe authenticated cache file: {name}")
+    return descriptor, info
+
+def descriptor_identity(info):
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+def go_build_id(descriptor):
+    header = os.pread(descriptor, 64, 0)
+    if len(header) != 64 or header[:4] != b"\x7fELF" or header[4] != 2:
+        raise OSError("unsupported binary format for fast identity")
+    endian = "<" if header[5] == 1 else ">"
+    e_shoff, = struct.unpack_from(endian + "Q", header, 0x28)
+    e_shentsize, = struct.unpack_from(endian + "H", header, 0x3A)
+    e_shnum, = struct.unpack_from(endian + "H", header, 0x3C)
+    e_shstrndx, = struct.unpack_from(endian + "H", header, 0x3E)
+    if e_shentsize <= 0 or e_shnum <= 0 or e_shnum > 4096 or e_shstrndx >= e_shnum:
+        raise OSError("unsafe ELF section header table")
+    shtab_size = e_shentsize * e_shnum
+    if shtab_size > 1024 * 1024:
+        raise OSError("oversized ELF section header table")
+    shtab = os.pread(descriptor, shtab_size, e_shoff)
+    if len(shtab) != shtab_size:
+        raise OSError("short ELF section header table read")
+
+    def section(index):
+        base = index * e_shentsize
+        name_off, = struct.unpack_from(endian + "I", shtab, base)
+        sh_offset, = struct.unpack_from(endian + "Q", shtab, base + 0x18)
+        sh_size, = struct.unpack_from(endian + "Q", shtab, base + 0x20)
+        return name_off, sh_offset, sh_size
+
+    _, strtab_off, strtab_size = section(e_shstrndx)
+    if strtab_size <= 0 or strtab_size > 1024 * 1024:
+        raise OSError("unsafe ELF section name table")
+    strtab = os.pread(descriptor, strtab_size, strtab_off)
+    if len(strtab) != strtab_size:
+        raise OSError("short ELF section name table read")
+    note_offset = note_size = None
+    for index in range(e_shnum):
+        name_off, sh_offset, sh_size = section(index)
+        end = strtab.find(b"\0", name_off)
+        if end < 0:
+            continue
+        if strtab[name_off:end] == b".note.go.buildid":
+            note_offset, note_size = sh_offset, sh_size
+            break
+    if note_offset is None or note_size is None or note_size <= 0 or note_size > 65536:
+        raise OSError("missing authenticated Go build id note")
+    note = os.pread(descriptor, note_size, note_offset)
+    if len(note) != note_size or len(note) < 12:
+        raise OSError("short Go build id note read")
+    namesz, descsz, _note_type = struct.unpack_from(endian + "III", note, 0)
+    name_pad = (namesz + 3) & ~3
+    desc_start = 12 + name_pad
+    if descsz <= 0 or descsz > 4096 or desc_start + descsz > len(note):
+        raise OSError("malformed Go build id note")
+    build_id = note[desc_start:desc_start + descsz]
+    if not build_id:
+        raise OSError("empty Go build id")
+    return build_id
+
+name = sys.argv[1]
+try:
+    descriptor, opened = open_regular(name, 2 * 1024 * 1024 * 1024, executable=True)
+    try:
+        build_id = go_build_id(descriptor)
+        after = os.fstat(descriptor)
+        if descriptor_identity(after) != descriptor_identity(opened):
+            raise OSError(f"authenticated binary changed during identity read: {name}")
+    finally:
+        os.close(descriptor)
+    print(
+        "binary-identity-v1:" + build_id.hex()
+        + ":" + str(after.st_dev) + ":" + str(after.st_ino)
+        + ":" + str(after.st_size) + ":" + str(after.st_mtime_ns)
+    )
+except (OSError, ValueError) as error:
+    print(f"run-go-cmd-cached: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+	)"; then
+		rm -f -- "$temporary_identity" "$temporary_binary_identity"
+		echo "run-go-cmd-cached: could not authenticate fast-cache binary identity before identity install" >&2
+		return 75
+	fi
+	if [[ ! "$binary_identity_token" =~ ^binary-identity-v1:[0-9a-f]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]]; then
+		rm -f -- "$temporary_identity" "$temporary_binary_identity"
+		echo "run-go-cmd-cached: invalid fast-cache binary identity token" >&2
+		return 75
+	fi
+	cp -- "$GENERAL_CONTEXT_FILE" "$temporary_identity"
+	printf '%s\n' "$binary_identity_token" >"$temporary_binary_identity"
+	chmod 0600 "$temporary_identity" "$temporary_binary_identity"
+	mv -fT -- "$temporary_identity" "$BUILD_IDENTITY"
+	mv -fT -- "$temporary_binary_identity" "$BUILD_BINARY_SHA256"
+}
+
+collect_bootstrap_build_context() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "1" ]] || return 0
+	local go_version go_root go_tool_binary go_tool_binary_sha256 go_modern_sha256 cache_runner_sha256 env_wrapper_sha256
+	BOOTSTRAP_CONTEXT_FILE="$(mktemp "${TMPDIR:-/tmp}/wiki-go-build-context.XXXXXX")" || {
+		echo "run-go-cmd-cached: could not allocate bootstrap build context" >&2
+		exit 75
+	}
+	BOOTSTRAP_CLOSURE_FILE="$(mktemp "${TMPDIR:-/tmp}/wiki-go-build-closure.XXXXXX")" || {
+		cleanup_bootstrap_context
+		echo "run-go-cmd-cached: could not allocate bootstrap dependency closure" >&2
+		exit 75
+	}
+	BOOTSTRAP_GO_ENV_FILE="$(mktemp "${TMPDIR:-/tmp}/wiki-go-build-env.XXXXXX")" || {
+		cleanup_bootstrap_context
+		echo "run-go-cmd-cached: could not allocate bootstrap Go environment" >&2
+		exit 75
+	}
+	if ! go_version="$(cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$BUILD_IDENTITY_TIMEOUT_SECONDS" version)" || [[ -z "$go_version" || "$go_version" == *$'\n'* ]]; then
+		echo "run-go-cmd-cached: could not authenticate bounded Go version for bootstrap cache" >&2
+		exit 75
+	fi
+	if ! (
+		cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$BUILD_IDENTITY_TIMEOUT_SECONDS" env -json \
+			GOVERSION GOTOOLCHAIN GOOS GOARCH GO386 GOAMD64 GOARM GOARM64 GOMIPS GOMIPS64 \
+			GOPPC64 GORISCV64 GOWASM GOFIPS140 GO_EXTLINK_ENABLED CGO_ENABLED GOEXPERIMENT GOFLAGS \
+			GOROOT GOMOD GOWORK GOMODCACHE GOENV CC CXX AR PKG_CONFIG \
+			CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS \
+			CGO_CFLAGS_ALLOW CGO_CFLAGS_DISALLOW CGO_CPPFLAGS_ALLOW CGO_CPPFLAGS_DISALLOW \
+			CGO_CXXFLAGS_ALLOW CGO_CXXFLAGS_DISALLOW CGO_FFLAGS_ALLOW CGO_FFLAGS_DISALLOW \
+			CGO_LDFLAGS_ALLOW CGO_LDFLAGS_DISALLOW
+	) >"$BOOTSTRAP_GO_ENV_FILE"; then
+		echo "run-go-cmd-cached: could not authenticate bounded Go toolchain environment for bootstrap cache" >&2
+		exit 75
+	fi
+	if ! go_root="$(
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - "$BOOTSTRAP_GO_ENV_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="strict"))
+root = value.get("GOROOT") if isinstance(value, dict) else None
+if not isinstance(root, str) or not root:
+    raise SystemExit("missing GOROOT")
+print(root)
+PY
+	)"; then
+		echo "run-go-cmd-cached: could not resolve effective Go toolchain binary" >&2
+		exit 75
+	fi
+	go_tool_binary="$go_root/bin/go"
+	go_tool_binary_sha256="$(sha256sum "$go_tool_binary" 2>/dev/null | awk '{print "sha256:" $1}')"
+	if [[ ! -x "$go_tool_binary" || ! "$go_tool_binary_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not authenticate effective Go toolchain binary path=$(inline_token "$go_tool_binary")" >&2
+		exit 75
+	fi
+	if ! (cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$DEPENDENCY_LIST_TIMEOUT_SECONDS" \
+		list -deps -tags devcmds -json "$PKG") >"$BOOTSTRAP_CLOSURE_FILE"; then
+		echo "run-go-cmd-cached: could not authenticate bounded dependency closure for bootstrap cache" >&2
+		exit 75
+	fi
+	if [[ ! -s "$BOOTSTRAP_CLOSURE_FILE" ]]; then
+		echo "run-go-cmd-cached: dependency closure is empty for bootstrap cache package=$PKG" >&2
+		exit 75
+	fi
+	go_modern_sha256="$(sha256sum "$ROOT/tools/go-modern" 2>/dev/null | awk '{print "sha256:" $1}')"
+	if [[ ! "$go_modern_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not authenticate tools/go-modern for bootstrap cache" >&2
+		exit 75
+	fi
+	cache_runner_sha256="$(sha256sum "$ROOT/tools/run-go-cmd-cached" 2>/dev/null | awk '{print "sha256:" $1}')"
+	if [[ ! "$cache_runner_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not authenticate tools/run-go-cmd-cached for bootstrap cache" >&2
+		exit 75
+	fi
+	env_wrapper_sha256=""
+	if [[ -n "$ENV_WRAPPER" ]]; then
+		env_wrapper_sha256="$(sha256sum "$ENV_WRAPPER" 2>/dev/null | awk '{print "sha256:" $1}')"
+		if [[ ! "$env_wrapper_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+			echo "run-go-cmd-cached: could not authenticate WIKI_GO_CMD_ENV_WRAPPER for bootstrap cache" >&2
+			exit 75
+		fi
+	fi
+
+	if ! timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - \
+		"$BOOTSTRAP_CONTEXT_FILE" "$BOOTSTRAP_GO_ENV_FILE" "$BOOTSTRAP_CLOSURE_FILE" \
+		"$PKG" "$BOOTSTRAP_SOURCE_CONTRACT" "$BUILD_SOURCE_ROOT" "$go_version" \
+		"$go_tool_binary" "$go_tool_binary_sha256" \
+		"$ROOT/tools/go-modern" "$go_modern_sha256" \
+		"$ROOT/tools/run-go-cmd-cached" "$cache_runner_sha256" "$ENV_WRAPPER" "$env_wrapper_sha256" <<'PY'; then
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import stat
+import sys
+
+(
+    context_name, go_env_name, closure_name, package, source_contract,
+    build_source_root, go_version, go_tool_binary_path, go_tool_binary_sha256,
+    go_modern_path, go_modern_sha256, cache_runner_path, cache_runner_sha256,
+    env_wrapper_path, env_wrapper_sha256,
+) = sys.argv[1:]
+sha256 = re.compile(r"sha256:[0-9a-f]{64}")
+if sha256.fullmatch(source_contract) is None:
+    raise SystemExit("noncanonical source contract")
+if sha256.fullmatch(go_modern_sha256) is None:
+    raise SystemExit("noncanonical go-modern fingerprint")
+if sha256.fullmatch(go_tool_binary_sha256) is None:
+    raise SystemExit("noncanonical Go toolchain binary fingerprint")
+if sha256.fullmatch(cache_runner_sha256) is None:
+    raise SystemExit("noncanonical cache-runner fingerprint")
+if env_wrapper_path and sha256.fullmatch(env_wrapper_sha256) is None:
+    raise SystemExit("noncanonical environment-wrapper fingerprint")
+
+go_env_bytes = pathlib.Path(go_env_name).read_bytes()
+closure_bytes = pathlib.Path(closure_name).read_bytes()
+if not go_env_bytes or len(go_env_bytes) > 1024 * 1024:
+    raise SystemExit("Go environment metadata is empty or oversized")
+if not closure_bytes or len(closure_bytes) > 16 * 1024 * 1024:
+    raise SystemExit("dependency closure is empty or oversized")
+try:
+    go_env = json.loads(go_env_bytes.decode("utf-8", errors="strict"))
+    closure_text = closure_bytes.decode("utf-8", errors="strict")
+except (UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid build context encoding: {error}")
+if not isinstance(go_env, dict) or not go_env:
+    raise SystemExit("Go environment is not a nonempty object")
+if any(not isinstance(key, str) or not isinstance(value, str) for key, value in go_env.items()):
+    raise SystemExit("Go environment contains non-string entries")
+
+decoder = json.JSONDecoder()
+position = 0
+packages = []
+while position < len(closure_text):
+    while position < len(closure_text) and closure_text[position].isspace():
+        position += 1
+    if position >= len(closure_text):
+        break
+    value, position = decoder.raw_decode(closure_text, position)
+    if not isinstance(value, dict):
+        raise SystemExit("dependency closure contains a non-object")
+    packages.append(value)
+if not packages:
+    raise SystemExit("dependency closure contains no packages")
+
+def module_identity(value):
+    if not isinstance(value, dict):
+        return None
+    replacement = value.get("Replace")
+    return {
+        "path": value.get("Path", ""),
+        "version": value.get("Version", ""),
+        "sum": value.get("Sum", ""),
+        "go_mod": value.get("GoMod", ""),
+        "go_mod_sum": value.get("GoModSum", ""),
+        "main": bool(value.get("Main", False)),
+        "replace": module_identity(replacement) if isinstance(replacement, dict) else None,
+    }
+
+closure = []
+for dependency in packages:
+    import_path = dependency.get("ImportPath")
+    directory = dependency.get("Dir")
+    if not isinstance(import_path, str) or not import_path or not isinstance(directory, str) or not directory:
+        raise SystemExit("dependency closure lacks ImportPath or Dir")
+    closure.append({
+        "import_path": import_path,
+        "directory": directory,
+        "standard": bool(dependency.get("Standard", False)),
+        "module": module_identity(dependency.get("Module")),
+    })
+closure.sort(key=lambda value: (value["import_path"], value["directory"]))
+if len({(value["import_path"], value["directory"]) for value in closure}) != len(closure):
+    raise SystemExit("dependency closure contains duplicate packages")
+closure_payload = (json.dumps(closure, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+root = pathlib.Path(build_source_root)
+if not root.is_absolute() or root.resolve(strict=True) != root or root.is_symlink():
+    raise SystemExit("build source root is not canonical")
+if go_env.get("GOMOD") != os.fspath(root / "go.mod"):
+    raise SystemExit("effective Go module is outside the canonical build source root")
+for dependency in packages:
+    module = dependency.get("Module")
+    replacement = module.get("Replace") if isinstance(module, dict) else None
+    if not isinstance(replacement, dict) or replacement.get("Version"):
+        continue
+    replacement_directory = replacement.get("Dir")
+    if not isinstance(replacement_directory, str) or not replacement_directory:
+        continue
+    try:
+        pathlib.Path(replacement_directory).resolve(strict=True).relative_to(root)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"local module replacement escapes authenticated build root: {error}")
+source_files = set()
+for fixed_name in ("go.mod", "go.sum"):
+    fixed = root / fixed_name
+    if fixed.exists():
+        source_files.add(fixed)
+workspace_name = go_env.get("GOWORK", "")
+if workspace_name and workspace_name != "off":
+    workspace = pathlib.Path(workspace_name)
+    try:
+        if workspace.resolve(strict=True) != workspace:
+            raise ValueError("workspace crosses a symlink")
+        workspace.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"effective Go workspace is outside canonical build source root: {error}")
+    source_files.add(workspace)
+    workspace_sum = workspace.with_name(workspace.name + ".sum")
+    if workspace_sum.exists():
+        source_files.add(workspace_sum)
+source_fields = (
+    "GoFiles", "CgoFiles", "CFiles", "CXXFiles", "MFiles", "HFiles",
+    "FFiles", "SFiles", "SwigFiles", "SwigCXXFiles", "SysoFiles", "EmbedFiles",
+)
+for dependency in packages:
+    directory_value = dependency.get("Dir")
+    if not isinstance(directory_value, str):
+        continue
+    directory = pathlib.Path(directory_value)
+    try:
+        directory.relative_to(root)
+    except ValueError:
+        continue
+    for field in source_fields:
+        names = dependency.get(field, [])
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
+            raise SystemExit(f"dependency field {field} is malformed")
+        for name in names:
+            candidate = pathlib.Path(name)
+            if not candidate.is_absolute():
+                candidate = directory / candidate
+            absolute = pathlib.Path(os.path.abspath(candidate))
+            try:
+                resolved = absolute.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError) as error:
+                raise SystemExit(f"build source file escapes canonical root: {candidate}: {error}")
+            if resolved != absolute:
+                raise SystemExit(f"build source file crosses a symlink: {candidate}")
+            source_files.add(absolute)
+if not source_files:
+    raise SystemExit("build source closure has no files")
+
+source_digest = hashlib.sha256(b"run-go-cmd-cached-build-source/v1\0")
+source_total = 0
+source_records = []
+for source_path in sorted(source_files, key=lambda value: value.relative_to(root).as_posix()):
+    info = source_path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o022
+        or info.st_size < 0
+        or info.st_size > 256 * 1024 * 1024
+    ):
+        raise SystemExit(f"unsafe build source file: {source_path}")
+    source_total += info.st_size
+    if source_total > 2 * 1024 * 1024 * 1024:
+        raise SystemExit("build source closure exceeds bounded size")
+    relative = source_path.relative_to(root).as_posix()
+    source_digest.update(relative.encode("utf-8") + b"\0")
+    source_digest.update(f"{stat.S_IMODE(info.st_mode):o}\0{info.st_size}\0".encode("ascii"))
+    file_digest = hashlib.sha256()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(source_path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        if identity(opened) != identity(info):
+            raise SystemExit(f"build source changed before authenticated read: {source_path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"short build source read: {source_path}")
+            source_digest.update(chunk)
+            file_digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"build source grew during authenticated read: {source_path}")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if identity(after) != identity(opened):
+        raise SystemExit(f"build source changed during authenticated read: {source_path}")
+    source_records.append({
+        "path": relative,
+        "mode": f"{stat.S_IMODE(info.st_mode):o}",
+        "size_bytes": info.st_size,
+        "sha256": "sha256:" + file_digest.hexdigest(),
+    })
+wrapper = None
+if env_wrapper_path:
+    wrapper = {"path": env_wrapper_path, "sha256": env_wrapper_sha256}
+
+def cgo_tool_identity(environment_name):
+    command = go_env.get(environment_name, "")
+    try:
+        words = shlex.split(command)
+    except ValueError as error:
+        raise SystemExit(f"invalid {environment_name} command: {error}")
+    if not words:
+        return {"environment": environment_name, "command": command, "path": None, "sha256": None}
+    selected = shutil.which(words[0], path=os.environ.get("PATH", ""))
+    if selected is None:
+        return {"environment": environment_name, "command": command, "path": None, "sha256": None}
+    selected_path = pathlib.Path(selected).resolve(strict=True)
+    before = selected_path.stat()
+    cgo_tool_owner_trusted = before.st_uid in (0, os.geteuid())
+    if not cgo_tool_owner_trusted and before.st_uid == 65534 and not os.access(selected_path, os.W_OK):
+        try:
+            with open("/proc/self/uid_map", "rb") as uid_map_handle:
+                uid_map_payload = uid_map_handle.read(4096)
+        except OSError:
+            uid_map_payload = b""
+        # Sob user namespace com root NAO mapeado (sandbox Cowork), ferramentas
+        # de build do host-root (ex.: gcc) aparecem como uid de overflow 65534;
+        # mesma correcao do trust-check do pre-commit (2026-07-29) e de
+        # tools/v2_stock_epoch.py:_host_root_owner_uids para o mesmo
+        # falso-positivo. Em host sem userns, 65534 continua reprovado.
+        cgo_tool_owner_trusted = uid_map_payload != b"" and not any(
+            line.split() and line.split()[0] == "0"
+            for line in uid_map_payload.decode("ascii", errors="replace").splitlines()
+        )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not cgo_tool_owner_trusted
+        or before.st_mode & 0o022
+        or before.st_size < 0
+        or before.st_size > 512 * 1024 * 1024
+    ):
+        raise SystemExit(f"unsafe CGO build tool: {selected_path}")
+    identity = lambda info: (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(selected_path, flags)
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if identity(opened) != identity(before):
+            raise SystemExit(f"CGO build tool changed before read: {selected_path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"short CGO build tool read: {selected_path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if identity(after) != identity(opened):
+        raise SystemExit(f"CGO build tool changed during read: {selected_path}")
+    return {
+        "environment": environment_name,
+        "command": command,
+        "path": os.fspath(selected_path),
+        "sha256": "sha256:" + digest.hexdigest(),
+    }
+
+cgo_tools = []
+if go_env.get("CGO_ENABLED") == "1":
+    cgo_tools = [cgo_tool_identity(name) for name in ("CC", "CXX", "AR", "PKG_CONFIG")]
+context = {
+    "schema": "run-go-cmd-cached-build-context/v1",
+    "package": package,
+    "source_contract_sha256": source_contract,
+    "build_source": {
+        "root": build_source_root,
+        "sha256": "sha256:" + source_digest.hexdigest(),
+        "file_count": len(source_files),
+        "size_bytes": source_total,
+        "files": source_records,
+    },
+    "build_flags": ["-tags", "devcmds", "-buildvcs=false"],
+    "go_version": go_version,
+    "go_toolchain": go_env,
+    "cgo_build_tools": cgo_tools,
+    "go_toolchain_binary": {"path": go_tool_binary_path, "sha256": go_tool_binary_sha256},
+    "go_modern": {"path": go_modern_path, "sha256": go_modern_sha256},
+    "cache_runner": {"path": cache_runner_path, "sha256": cache_runner_sha256},
+    "environment_wrapper": wrapper,
+    "dependency_closure": {
+        "sha256": "sha256:" + hashlib.sha256(closure_payload).hexdigest(),
+        "entries": closure,
+    },
+}
+payload = (json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+pathlib.Path(context_name).write_bytes(payload)
+PY
+		echo "run-go-cmd-cached: could not canonicalize bootstrap build context" >&2
+		exit 75
+	fi
+	rm -f -- "$BOOTSTRAP_CLOSURE_FILE" "$BOOTSTRAP_GO_ENV_FILE"
+	BOOTSTRAP_CLOSURE_FILE=""
+	BOOTSTRAP_GO_ENV_FILE=""
+	BOOTSTRAP_CONTEXT_SHA256="$(sha256sum "$BOOTSTRAP_CONTEXT_FILE" 2>/dev/null | awk '{print "sha256:" $1}')"
+	if [[ ! "$BOOTSTRAP_CONTEXT_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "run-go-cmd-cached: could not fingerprint canonical bootstrap build context" >&2
+		exit 75
+	fi
+}
+
+verify_bootstrap_build_context_stable_after_build() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "1" ]] || return 0
+	local before_context_sha256="$BOOTSTRAP_CONTEXT_SHA256"
+	cleanup_bootstrap_context
+	collect_bootstrap_build_context
+	if [[ "$BOOTSTRAP_CONTEXT_SHA256" != "$before_context_sha256" ]]; then
+		echo "run-go-cmd-cached: build source/toolchain/dependency context changed during build; refusing unauthenticated binary before=$before_context_sha256 after=$BOOTSTRAP_CONTEXT_SHA256" >&2
+		return 75
+	fi
+}
+
+validate_bootstrap_build_metadata() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "1" ]] || return 1
+	local validation
+	if ! validation="$(
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - \
+			"$BIN" "$BUILD_METADATA" "$BUILD_METADATA_SHA256" "$BUILD_METADATA_STORE" \
+			"$BOOTSTRAP_CONTEXT_FILE" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+binary_name, metadata_name, digest_name, store_name, context_name = sys.argv[1:]
+sha256_token = re.compile(r"sha256:[0-9a-f]{64}")
+
+def read_regular(name: str, maximum: int, *, executable: bool = False) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or info.st_size < 0
+            or info.st_size > maximum
+            or (executable and info.st_mode & 0o111 == 0)
+        ):
+            raise OSError(f"unsafe regular file: {name}")
+        chunks = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError(f"short read: {name}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError(f"file grew during read: {name}")
+        return b"".join(chunks), info
+    finally:
+        os.close(descriptor)
+
+def hash_regular(name: str, maximum: int, *, executable: bool = False) -> tuple[str, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or info.st_size < 0
+            or info.st_size > maximum
+            or (executable and info.st_mode & 0o111 == 0)
+        ):
+            raise OSError(f"unsafe regular file: {name}")
+        digest = hashlib.sha256()
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError(f"short read: {name}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError(f"file grew during read: {name}")
+        return "sha256:" + digest.hexdigest(), info
+    finally:
+        os.close(descriptor)
+
+try:
+    context_payload, _ = read_regular(context_name, 16 * 1024 * 1024)
+    metadata_payload, _ = read_regular(metadata_name, 32 * 1024 * 1024)
+    digest_payload, _ = read_regular(digest_name, 256)
+    context = json.loads(context_payload.decode("utf-8", errors="strict"))
+    metadata = json.loads(metadata_payload.decode("utf-8", errors="strict"))
+    canonical_context = (json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    canonical_metadata = (json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if context_payload != canonical_context or metadata_payload != canonical_metadata:
+        raise OSError("noncanonical context or metadata")
+    if set(metadata) != {"schema", "build_context", "binary"}:
+        raise OSError("metadata shape mismatch")
+    if metadata.get("schema") != "run-go-cmd-cached-build-metadata/v1":
+        raise OSError("metadata schema mismatch")
+    if metadata.get("build_context") != context:
+        raise OSError("build context mismatch")
+    binary_sha256, binary_info = hash_regular(binary_name, 2 * 1024 * 1024 * 1024, executable=True)
+    expected_binary = {
+        "path": os.path.abspath(binary_name),
+        "sha256": binary_sha256,
+        "size_bytes": binary_info.st_size,
+    }
+    if metadata.get("binary") != expected_binary:
+        raise OSError("binary fingerprint mismatch")
+    metadata_sha256 = "sha256:" + hashlib.sha256(metadata_payload).hexdigest()
+    try:
+        recorded_digest = digest_payload.decode("ascii", errors="strict").removesuffix("\n")
+    except UnicodeError as error:
+        raise OSError(f"invalid metadata fingerprint encoding: {error}") from error
+    if recorded_digest != metadata_sha256 or sha256_token.fullmatch(recorded_digest) is None:
+        raise OSError("metadata fingerprint mismatch")
+    store_info = os.lstat(store_name)
+    if not stat.S_ISDIR(store_info.st_mode) or stat.S_ISLNK(store_info.st_mode) or store_info.st_uid != os.geteuid() or store_info.st_mode & 0o022:
+        raise OSError("unsafe content-addressed metadata directory")
+    record_name = os.path.join(store_name, metadata_sha256.removeprefix("sha256:") + ".json")
+    record_payload, _ = read_regular(record_name, 32 * 1024 * 1024)
+    if record_payload != metadata_payload:
+        raise OSError("content-addressed metadata record mismatch")
+    closure_sha256 = context.get("dependency_closure", {}).get("sha256", "")
+    if sha256_token.fullmatch(closure_sha256) is None:
+        raise OSError("dependency closure fingerprint mismatch")
+    build_source_sha256 = context.get("build_source", {}).get("sha256", "")
+    if sha256_token.fullmatch(build_source_sha256) is None:
+        raise OSError("build source fingerprint mismatch")
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+    print(f"run-go-cmd-cached: bootstrap cache invalid: {error}", file=sys.stderr)
+    raise SystemExit(1)
+print("\t".join((metadata_sha256, binary_sha256, closure_sha256, build_source_sha256)))
+PY
+	)"; then
+		return 1
+	fi
+	IFS=$'\t' read -r CURRENT_METADATA_SHA256 CURRENT_BINARY_SHA256 CURRENT_CLOSURE_SHA256 CURRENT_BUILD_SOURCE_SHA256 <<<"$validation"
+	[[ "$CURRENT_METADATA_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+	[[ "$CURRENT_BINARY_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+	[[ "$CURRENT_CLOSURE_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+	[[ "$CURRENT_BUILD_SOURCE_SHA256" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+	return 0
+}
+
+write_bootstrap_build_metadata() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "1" ]] || return 0
+	local installed
+	if ! installed="$(
+		timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "${METADATA_TIMEOUT_SECONDS}s" python3 - \
+			"$BIN" "$BUILD_METADATA" "$BUILD_METADATA_SHA256" "$BUILD_METADATA_STORE" \
+			"$BOOTSTRAP_CONTEXT_FILE" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+
+binary_name, metadata_name, digest_name, store_name, context_name = sys.argv[1:]
+
+def read_bounded(name: str, maximum: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or info.st_size < 0
+            or info.st_size > maximum
+        ):
+            raise OSError(f"unsafe metadata input: {name}")
+        chunks = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError(f"short metadata read: {name}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError(f"metadata input grew during read: {name}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+def hash_regular(name: str, maximum: int, *, executable: bool = False) -> tuple[str, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or info.st_size < 0
+            or info.st_size > maximum
+            or (executable and info.st_mode & 0o111 == 0)
+        ):
+            raise OSError(f"unsafe authenticated file: {name}")
+        digest = hashlib.sha256()
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError("short cached binary read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError("cached binary grew during read")
+        return "sha256:" + digest.hexdigest(), info
+    finally:
+        os.close(descriptor)
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    written = 0
+    while written < len(payload):
+        count = os.write(descriptor, payload[written:])
+        if count <= 0:
+            raise OSError("short metadata write")
+        written += count
+
+def fsync_directory(directory: str) -> None:
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    descriptor = os.open(directory, directory_flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+def atomic_replace(name: str, payload: bytes) -> None:
+    directory = os.path.dirname(name)
+    descriptor, temporary = tempfile.mkstemp(prefix=".bootstrap-metadata.", dir=directory)
+    try:
+        os.fchmod(descriptor, 0o600)
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, name)
+        fsync_directory(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+context_payload = read_bounded(context_name, 16 * 1024 * 1024)
+context = json.loads(context_payload.decode("utf-8", errors="strict"))
+if context_payload != (json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"):
+    raise OSError("noncanonical build context")
+build_source = context.get("build_source")
+if not isinstance(build_source, dict) or set(build_source) != {"root", "sha256", "file_count", "size_bytes", "files"}:
+    raise OSError("invalid build source identity")
+source_root = pathlib.Path(build_source["root"])
+if not source_root.is_absolute() or source_root.resolve(strict=True) != source_root or source_root.is_symlink():
+    raise OSError("build source root changed or crosses a symlink")
+source_records = build_source["files"]
+if not isinstance(source_records, list) or not source_records or len(source_records) != build_source["file_count"]:
+    raise OSError("invalid build source file inventory")
+observed_source_bytes = 0
+previous_source_path = ""
+for source_record in source_records:
+    if not isinstance(source_record, dict) or set(source_record) != {"path", "mode", "size_bytes", "sha256"}:
+        raise OSError("invalid build source file record")
+    relative = source_record["path"]
+    pure = pathlib.PurePosixPath(relative)
+    if not isinstance(relative, str) or not relative or pure.is_absolute() or pure.as_posix() != relative or ".." in pure.parts or relative <= previous_source_path:
+        raise OSError("noncanonical build source file path")
+    previous_source_path = relative
+    source_path = source_root / pure
+    if pathlib.Path(os.path.abspath(source_path)).resolve(strict=True) != source_path:
+        raise OSError("build source file changed or crosses a symlink")
+    observed_sha256, source_info = hash_regular(os.fspath(source_path), 256 * 1024 * 1024)
+    if (
+        observed_sha256 != source_record["sha256"]
+        or f"{stat.S_IMODE(source_info.st_mode):o}" != source_record["mode"]
+        or source_info.st_size != source_record["size_bytes"]
+    ):
+        raise OSError(f"build source file changed during build: {relative}")
+    observed_source_bytes += source_info.st_size
+if observed_source_bytes != build_source["size_bytes"]:
+    raise OSError("build source size changed during build")
+for identity_name in ("go_toolchain_binary", "go_modern", "cache_runner"):
+    identity = context.get(identity_name)
+    if not isinstance(identity, dict) or set(identity) != {"path", "sha256"}:
+        raise OSError(f"missing {identity_name} identity")
+    observed, _ = hash_regular(identity["path"], 512 * 1024 * 1024, executable=True)
+    if observed != identity["sha256"]:
+        raise OSError(f"{identity_name} changed during build")
+environment_wrapper = context.get("environment_wrapper")
+if environment_wrapper is not None:
+    if not isinstance(environment_wrapper, dict) or set(environment_wrapper) != {"path", "sha256"}:
+        raise OSError("invalid environment wrapper identity")
+    observed, _ = hash_regular(environment_wrapper["path"], 64 * 1024 * 1024, executable=True)
+    if observed != environment_wrapper["sha256"]:
+        raise OSError("environment wrapper changed during build")
+binary_sha256, binary_info = hash_regular(binary_name, 2 * 1024 * 1024 * 1024, executable=True)
+metadata = {
+    "schema": "run-go-cmd-cached-build-metadata/v1",
+    "build_context": context,
+    "binary": {
+        "path": os.path.abspath(binary_name),
+        "sha256": binary_sha256,
+        "size_bytes": binary_info.st_size,
+    },
+}
+payload = (json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+metadata_sha256 = "sha256:" + hashlib.sha256(payload).hexdigest()
+os.makedirs(store_name, mode=0o700, exist_ok=True)
+store_info = os.lstat(store_name)
+if not stat.S_ISDIR(store_info.st_mode) or stat.S_ISLNK(store_info.st_mode) or store_info.st_uid != os.geteuid() or store_info.st_mode & 0o022:
+    raise OSError("unsafe content-addressed metadata directory")
+record_name = os.path.join(store_name, metadata_sha256.removeprefix("sha256:") + ".json")
+descriptor, temporary_record = tempfile.mkstemp(prefix=".content-addressed-metadata.", dir=store_name)
+try:
+    os.fchmod(descriptor, 0o600)
+    write_all(descriptor, payload)
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = -1
+    try:
+        os.link(temporary_record, record_name, follow_symlinks=False)
+    except FileExistsError:
+        if read_bounded(record_name, 32 * 1024 * 1024) != payload:
+            raise OSError("content-addressed metadata collision")
+    else:
+        fsync_directory(store_name)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary_record)
+    except FileNotFoundError:
+        pass
+atomic_replace(metadata_name, payload)
+atomic_replace(digest_name, (metadata_sha256 + "\n").encode("ascii"))
+closure_sha256 = context["dependency_closure"]["sha256"]
+build_source_sha256 = context["build_source"]["sha256"]
+print("\t".join((metadata_sha256, binary_sha256, closure_sha256, build_source_sha256)))
+PY
+	)"; then
+		echo "run-go-cmd-cached: failed to install authenticated bootstrap binary metadata" >&2
+		return 75
+	fi
+	IFS=$'\t' read -r CURRENT_METADATA_SHA256 CURRENT_BINARY_SHA256 CURRENT_CLOSURE_SHA256 CURRENT_BUILD_SOURCE_SHA256 <<<"$installed"
+	return 0
+}
+
+fast_cache_artifacts_present() {
+	# Existencia e TIPO dos tres artefatos que a identidade autenticada compara.
+	# Deliberadamente NAO ha comparacao de mtime/ctime aqui: a heuristica de
+	# ordenacao continua proibida (ver o comentario de `needs_build` e o de
+	# general_build_identity_matches). Presenca nao aprova cache nenhum — quem
+	# aprova e general_build_identity_matches; isto so responde "existe algo a
+	# autenticar?", pergunta que custa tres stat(2) em vez do snapshot completo
+	# da arvore de fontes.
+	[[ "$BOOTSTRAP_CACHE_MODE" == "0" ]] || return 1
+	[[ -f "$BIN" && ! -L "$BIN" && -x "$BIN" && -s "$BIN" ]] || return 1
+	[[ -f "$BUILD_IDENTITY" && ! -L "$BUILD_IDENTITY" && -s "$BUILD_IDENTITY" ]] || return 1
+	[[ -f "$BUILD_BINARY_SHA256" && ! -L "$BUILD_BINARY_SHA256" && -s "$BUILD_BINARY_SHA256" ]] || return 1
+	return 0
+}
+
+ensure_general_build_context() {
+	[[ "$BOOTSTRAP_CACHE_MODE" == "0" ]] || return 0
+	[[ -z "$GENERAL_CONTEXT_FILE" ]] || return 0
+	collect_general_build_context
+}
+
+trap cleanup_build_contexts EXIT
+collect_bootstrap_build_context
+# 2026-08-29: o snapshot autenticado da arvore de fontes so e coletado quando ha
+# binario+identidade+token de binario para autenticar. Ate dad121a3 (2026-07-21)
+# a decisao de `needs_build` era barata (heuristica de mtime) e a coleta era
+# irrelevante para o caminho frio; aquele commit trocou a heuristica pela
+# identidade autenticada e deixou a coleta INCONDICIONAL, entao toda invocacao
+# com cache vazio pagava ~1,15 s de hash de cmd/+internal/+assets/ para chegar a
+# uma conclusao que tres stat(2) ja davam: nao ha o que autenticar, tem de
+# buildar. O preco aparecia no guard de build.lock, que e fail-fast por contrato
+# e mediu 1,60/1,61/1,62 s contra 0,15 s do irmao tools/run-check no MESMO
+# cenario. No caminho frio a coleta passa a acontecer imediatamente antes do
+# build (ver ensure_general_build_context la embaixo), o que tambem restringe
+# verify_general_build_context_stable_after_build ao intervalo do build em vez
+# de incluir toda a espera pelo lock.
+if fast_cache_artifacts_present; then
+	collect_general_build_context
+fi
+
+dependency_source_newer_than_bin() {
+	local pkg="$1"
+	local bin="$2"
+	local deps dir package_dir deps_tmp
+	if ! deps_build_root_matches; then
+		return 0
+	fi
+	package_dir="${BUILD_SOURCE_ROOT}/${pkg#./}"
+	if find "$package_dir" -maxdepth 0 \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+		return 0
+	fi
+	if find "$package_dir" -maxdepth 1 -type f ! -name '*_test.go' \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+		return 0
+	fi
+	if [[ -s "$DEPS_LIST" ]]; then
+		deps="$(cat "$DEPS_LIST" 2>/dev/null || true)"
+	else
+		if deps="$(cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$DEPENDENCY_LIST_TIMEOUT_SECONDS" list -deps -tags devcmds -f '{{.Dir}}' "$pkg" 2>/dev/null)"; then
+			deps_tmp="$DEPS_LIST.$$"
+			printf '%s\n' "$deps" >"$deps_tmp"
+			mv -fT -- "$deps_tmp" "$DEPS_LIST"
+		else
+			run_go_cmd_notice "dependency list timed out or failed for pkg=$pkg; using conservative cmd/internal source freshness fallback"
+			if find "$BUILD_SOURCE_ROOT/cmd" "$BUILD_SOURCE_ROOT/internal" -type f ! -name '*_test.go' \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+				return 0
+			fi
+			return 1
+		fi
+	fi
+	deps_list_source_newer_than_bin "$deps" "$bin"
+}
+
+deps_build_root_matches() {
+	local recorded_root
+	if [[ -s "$DEPS_BUILD_ROOT" ]]; then
+		recorded_root="$(sed -n '1p' "$DEPS_BUILD_ROOT" 2>/dev/null || true)"
+		[[ "$recorded_root" == "$BUILD_SOURCE_ROOT" ]]
+		return $?
+	fi
+	[[ "$BUILD_SOURCE_ROOT_EXPLICIT" == "0" ]]
+}
+
+deps_list_source_newer_than_bin() {
+	local deps="$1"
+	local bin="$2"
+	local dir
+	while IFS= read -r dir; do
+		[[ -n "$dir" ]] || continue
+		case "$dir" in
+		"$BUILD_SOURCE_ROOT/.toolchains" | "$BUILD_SOURCE_ROOT/.toolchains"/*) continue ;;
+		"$BUILD_SOURCE_ROOT" | "$BUILD_SOURCE_ROOT"/*) ;;
+		*) continue ;;
+		esac
+		if find "$dir" -maxdepth 0 \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+			return 0
+		fi
+		if find "$dir" -maxdepth 1 -type f ! -name '*_test.go' \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+			return 0
+		fi
+	done <<<"$deps"
+	return 1
+}
+
+cached_binary_fast_path_valid() {
+	local pkg="$1"
+	local bin="$2"
+	local deps package_dir
+	[[ "$REPO_AWARENESS_FAST_MODE" == "1" ]] || return 1
+	[[ -f "$bin" && ! -L "$bin" && -x "$bin" && -s "$DEPS_LIST" ]] || return 1
+	general_build_identity_matches || return 1
+	deps_build_root_matches || return 1
+	if find "$BUILD_SOURCE_ROOT/go.mod" -maxdepth 0 \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+		return 1
+	fi
+	if [[ -f "$BUILD_SOURCE_ROOT/go.sum" ]] && find "$BUILD_SOURCE_ROOT/go.sum" -maxdepth 0 \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+		return 1
+	fi
+	package_dir="${BUILD_SOURCE_ROOT}/${pkg#./}"
+	if find "$package_dir" -maxdepth 0 \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+		return 1
+	fi
+	if find "$package_dir" -maxdepth 1 -type f ! -name '*_test.go' \( -newer "$bin" -o -cnewer "$bin" \) -print -quit 2>/dev/null | grep -q .; then
+		return 1
+	fi
+	deps="$(cat "$DEPS_LIST" 2>/dev/null || true)"
+	[[ -n "$deps" ]] || return 1
+	if deps_list_source_newer_than_bin "$deps" "$bin"; then
+		return 1
+	fi
+	return 0
+}
+
+refresh_dependency_list_after_build() {
+	local pkg="$1"
+	local deps deps_tmp root_tmp
+	if deps="$(cd "$BUILD_SOURCE_ROOT" && run_go_tool_bounded "$DEPENDENCY_LIST_TIMEOUT_SECONDS" list -deps -tags devcmds -f '{{.Dir}}' "$pkg" 2>/dev/null)"; then
+		deps_tmp="$(mktemp "$CACHE_DIR/.deps-list.XXXXXX")" || return 75
+		printf '%s\n' "$deps" >"$deps_tmp"
+		chmod 0600 "$deps_tmp"
+		mv -fT -- "$deps_tmp" "$DEPS_LIST"
+		root_tmp="$(mktemp "$CACHE_DIR/.deps-build-root.XXXXXX")" || return 75
+		printf '%s\n' "$BUILD_SOURCE_ROOT" >"$root_tmp"
+		chmod 0600 "$root_tmp"
+		mv -fT -- "$root_tmp" "$DEPS_BUILD_ROOT"
+	else
+		rm -f -- "$DEPS_LIST" "$DEPS_BUILD_ROOT"
+		run_go_cmd_notice "dependency list refresh failed after build for pkg=$pkg; next cached run will use conservative freshness fallback"
+	fi
+}
+
+needs_build=0
+if [[ "$BOOTSTRAP_CACHE_MODE" == "1" ]]; then
+	# The bootstrap source contract is content-addressed. mtime is deliberately
+	# not evidence here: source bytes can change while timestamps are preserved.
+	if ! validate_bootstrap_build_metadata; then
+		needs_build=1
+	fi
+else
+	# The fast identity authenticates source bytes, build/toolchain semantics and
+	# the cached binary itself. Wall-clock ordering is neither necessary nor
+	# sufficient (restored caches routinely have newer timestamps), so do not
+	# reintroduce the legacy mtime/ctime heuristic here.
+	# Cache frio (sem binario/identidade/token) nao tem identidade a comparar: a
+	# resposta e "buildar", e o snapshot da arvore nao foi coletado la em cima.
+	# Chamar general_build_identity_matches aqui devolveria o mesmo 1 depois de
+	# pagar a coleta — por isso a presenca vem primeiro.
+	if ! fast_cache_artifacts_present || ! general_build_identity_matches; then
+		needs_build=1
+	fi
+fi
+
+lock_dir_mtime_epoch() {
+	stat -c %Y "$LOCK_DIR" 2>/dev/null || printf '0'
+}
+
+process_exists() {
+	local pid="$1"
+	case "$pid" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[[ "$pid" -gt 0 ]] || return 1
+	[[ -r "/proc/$pid/stat" ]] && process_start_ticks "$pid" >/dev/null 2>&1
+}
+
+process_boot_id() {
+	local boot_id
+	boot_id="$(sed -n '1p' /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+	case "$boot_id" in
+	'' | *[!0-9a-f-]*) return 1 ;;
+	esac
+	printf '%s' "$boot_id"
+}
+
+process_start_ticks() {
+	local pid="$1" stat_line fields_after_comm
+	local -a proc_fields
+	case "$pid" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	IFS= read -r stat_line <"/proc/$pid/stat" 2>/dev/null || return 1
+	case "$stat_line" in
+	*') '*) ;;
+	*) return 1 ;;
+	esac
+	# The comm field is parenthesized and may contain spaces. Strip through its
+	# final `) `; field 20 of the remainder is procfs starttime (field 22).
+	fields_after_comm="${stat_line##*) }"
+	read -r -a proc_fields <<<"$fields_after_comm"
+	[[ "${#proc_fields[@]}" -ge 20 && "${proc_fields[19]}" =~ ^[0-9]+$ ]] || return 1
+	printf '%s' "${proc_fields[19]}"
+}
+
+build_lock_scope() {
+	printf 'build:%s' "$PKG"
+}
+
+build_lock_wait_budget_ms() {
+	case "$LOCK_WAIT_SECONDS" in
+	'' | *[!0-9]*) printf 'missing' ;;
+	*) printf '%s' "$((LOCK_WAIT_SECONDS * 1000))" ;;
+	esac
+}
+
+lock_meta_first() {
+	local lock_meta_key="$1" lock_meta_snapshot
+	lock_meta_snapshot="$(read_lock_metadata_snapshot 2>/dev/null)" || return 0
+	awk -v prefix="${lock_meta_key}:" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }' \
+		<<<"$lock_meta_snapshot"
+}
+
+lock_metadata_entry_exists() {
+	[[ -e "$LOCK_META" || -L "$LOCK_META" ]]
+}
+
+read_lock_metadata_snapshot() {
+	# 2026-07-31: o leitor seguro passa a atender tambem o heartbeat, que usa o
+	# mesmo formato key:value e as mesmas exigencias de dono/modo/tamanho.
+	python3 - "${1:-$LOCK_META}" <<'PY'
+import os
+import stat
+import sys
+
+name = sys.argv[1]
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+
+try:
+    descriptor = os.open(name, flags)
+    try:
+        opened = os.fstat(descriptor)
+        identity = lambda info: (
+            info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o022
+            or opened.st_size <= 0
+            or opened.st_size > 16384
+        ):
+            raise OSError("unsafe build-lock metadata")
+        remaining = opened.st_size
+        chunks = []
+        while remaining:
+            chunk = os.read(descriptor, min(16384, remaining))
+            if not chunk:
+                raise OSError("short build-lock metadata read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError("build-lock metadata grew during read")
+        after = os.fstat(descriptor)
+        if identity(after) != identity(opened):
+            raise OSError("build-lock metadata changed during read")
+        payload = b"".join(chunks)
+        if b"\0" in payload:
+            raise OSError("build-lock metadata contains NUL")
+    finally:
+        os.close(descriptor)
+except OSError:
+    raise SystemExit(1)
+
+written = 0
+while written < len(payload):
+    count = os.write(1, payload[written:])
+    if count <= 0:
+        raise SystemExit(1)
+    written += count
+PY
+}
+
+lock_metadata_is_safe() {
+	read_lock_metadata_snapshot >/dev/null 2>&1
+}
+
+build_lock_holder_active_analysis() {
+	local waiter_budget_ms holder_pid holder_started holder_command holder_timeout_seconds holder_budget_ms holder_stop_condition
+	local owner_budget_ms now_epoch elapsed_ms cpu_percent
+	waiter_budget_ms="$(build_lock_wait_budget_ms)"
+	if ! lock_metadata_entry_exists; then
+		echo "run-go-cmd-cached: analise_comando_ativo pid=unknown command=unknown artifact=$(inline_token "$BIN") lock_scope=$(inline_token "$(build_lock_scope)") elapsed_ms=0 cpu_percent=unknown throughput=absent owner_budget_ms=missing waiter_budget_ms=$waiter_budget_ms stop_condition=lock_wait_timeout_or_build_lock_released hypothesis=lock_metadata_missing next_action=reorient_to_independent_p0_or_wait_only_if_critical_dependency" >&2
+		return 0
+	fi
+	if ! lock_metadata_is_safe; then
+		echo "run-go-cmd-cached: analise_comando_ativo pid=unknown command=unknown artifact=$(inline_token "$BIN") lock_scope=$(inline_token "$(build_lock_scope)") elapsed_ms=0 cpu_percent=unknown throughput=absent owner_budget_ms=missing waiter_budget_ms=$waiter_budget_ms stop_condition=lock_wait_timeout_or_build_lock_released hypothesis=lock_metadata_unsafe_or_oversized next_action=reorient_to_independent_p0_or_wait_only_if_critical_dependency" >&2
+		return 0
+	fi
+	holder_pid="$(lock_meta_first pid)"
+	holder_started="$(lock_meta_first started_epoch)"
+	holder_command="$(lock_meta_first command)"
+	holder_timeout_seconds="$(lock_meta_first timeout_seconds)"
+	holder_budget_ms="$(lock_meta_first budget_ms)"
+	holder_stop_condition="$(lock_meta_first stop_condition)"
+	case "$holder_pid" in
+	'' | *[!0-9]*) holder_pid=unknown ;;
+	esac
+	case "$holder_started" in
+	'' | *[!0-9]*) holder_started=0 ;;
+	esac
+	if [[ -z "$holder_command" ]]; then
+		holder_command=unknown
+	fi
+	if [[ -z "$holder_timeout_seconds" ]]; then
+		holder_timeout_seconds=missing
+	fi
+	case "$holder_budget_ms" in
+	'' | *[!0-9]*) owner_budget_ms=missing ;;
+	*) owner_budget_ms="$holder_budget_ms" ;;
+	esac
+	if [[ -z "$holder_stop_condition" ]]; then
+		holder_stop_condition=missing
+	fi
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	elapsed_ms=0
+	if [[ "$holder_started" -gt 0 && "$now_epoch" -gt 0 && "$now_epoch" -ge "$holder_started" ]]; then
+		elapsed_ms=$(((now_epoch - holder_started) * 1000))
+	fi
+	cpu_percent=unknown
+	if [[ "$holder_pid" != "unknown" ]] && command -v ps >/dev/null 2>&1; then
+		cpu_percent="$(ps -p "$holder_pid" -o pcpu= 2>/dev/null | awk 'NF {print $1; exit}')"
+		if [[ -z "$cpu_percent" ]]; then
+			cpu_percent=unknown
+		fi
+	fi
+	echo "run-go-cmd-cached: analise_comando_ativo pid=$holder_pid command=$(inline_token "$holder_command") artifact=$(inline_token "$BIN") lock_scope=$(inline_token "$(build_lock_scope)") elapsed_ms=$elapsed_ms cpu_percent=$cpu_percent throughput=absent owner_budget_ms=$owner_budget_ms owner_timeout_seconds=$(inline_token "$holder_timeout_seconds") waiter_budget_ms=$waiter_budget_ms stop_condition=$(inline_token "$holder_stop_condition") hypothesis=active_build_command_or_stale_lock next_action=reorient_to_independent_p0_or_wait_only_if_critical_dependency" >&2
+}
+
+validate_build_lock_wait_classification_or_exit() {
+	local classification missing observed_owner_pid
+	classification="${WIKI_GO_CMD_BUILD_LOCK_WAIT_CLASSIFICATION:-}"
+	case "$classification" in
+	non_critical_wait)
+		echo "run-go-cmd-cached: non_critical_wait forbids passive build lock sleep; reorient to independent P0 front lock_scope=$(inline_token "$(build_lock_scope)") command=$(inline_token "run-go-cmd-cached $PKG $*")" >&2
+		exit 75
+		;;
+	critical_dependency)
+		missing=""
+		case "${WIKI_GO_CMD_BUILD_LOCK_DEPENDENCY_ID:-}" in '' | *placeholder* | *later* | *todo*) missing="${missing} dependency_id" ;; esac
+		case "${WIKI_GO_CMD_BUILD_LOCK_OWNER_PID:-}" in '' | *[!0-9]*) missing="${missing} owner_pid" ;; esac
+		observed_owner_pid="$(lock_meta_first pid)"
+		if [[ "${WIKI_GO_CMD_BUILD_LOCK_OWNER_PID:-}" =~ ^[0-9]+$ && "$observed_owner_pid" != "$WIKI_GO_CMD_BUILD_LOCK_OWNER_PID" ]]; then
+			missing="${missing} owner_pid_mismatch(observed=${observed_owner_pid:-missing})"
+		fi
+		case "${WIKI_GO_CMD_BUILD_LOCK_WAIT_TIMEOUT_MS:-}" in '' | *[!0-9]* | 0) missing="${missing} timeout_ms" ;; esac
+		case "${WIKI_GO_CMD_BUILD_LOCK_LAST_EVIDENCE:-}" in '' | *placeholder* | *later* | *todo*) missing="${missing} ultima_evidencia" ;; esac
+		case "${WIKI_GO_CMD_BUILD_LOCK_REORIENTATION_COMMAND:-}" in '' | *placeholder* | *later* | *todo*) missing="${missing} comando_reorientacao" ;; esac
+		if [[ -n "$missing" ]]; then
+			echo "run-go-cmd-cached: critical_dependency build lock wait missing structured fields:$missing lock_scope=$(inline_token "$(build_lock_scope)") command=$(inline_token "run-go-cmd-cached $PKG $*")" >&2
+			exit 75
+		fi
+		;;
+	*)
+		echo "run-go-cmd-cached: active build lock requires WIKI_GO_CMD_BUILD_LOCK_WAIT_CLASSIFICATION=critical_dependency with dependency_id/owner_pid/timeout_ms/ultima_evidencia/comando_reorientacao or non_critical_wait reorientation; refusing passive sleep lock_scope=$(inline_token "$(build_lock_scope)") command=$(inline_token "run-go-cmd-cached $PKG $*")" >&2
+		exit 75
+		;;
+	esac
+}
+
+critical_build_lock_wait_timeout_ms() {
+	if [[ "${WIKI_GO_CMD_BUILD_LOCK_WAIT_CLASSIFICATION:-}" == "critical_dependency" ]]; then
+		case "${WIKI_GO_CMD_BUILD_LOCK_WAIT_TIMEOUT_MS:-}" in
+		'' | *[!0-9]*) printf '0' ;;
+		*) printf '%s' "$WIKI_GO_CMD_BUILD_LOCK_WAIT_TIMEOUT_MS" ;;
+		esac
+		return 0
+	fi
+	printf '0'
+}
+
+# ── 2026-07-31: staleness sem depender de DELETE ─────────────────────────────
+# Todo o reclaim antigo terminava em "rm -f meta || return 1" + "rmdir || return
+# 1". Em mount que nega unlink/rmdir (EPERM), isso reprovava SEMPRE: lock de
+# sessao morta virava permanente e nenhuma invocacao futura conseguia buildar.
+# As primitivas abaixo trocam o mecanismo (rename atomico) sem afrouxar o
+# criterio (identidade de encarnacao do processo + heartbeat renovado).
+build_lock_dir_identity() {
+	stat -c '%d:%i' "$LOCK_DIR" 2>/dev/null || printf 'missing'
+}
+
+snapshot_field() {
+	local key="$1" payload="$2"
+	awk -v prefix="${key}:" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }' <<<"$payload"
+}
+
+# Despeja o lock-dir liberando o caminho para o proximo mkdir atomico. Quando
+# expected_identity e informado, o despejo so acontece se o dev:ino observado
+# ainda for aquele -- e a garantia de que nao estamos despejando um lock NOVO
+# que nasceu entre a analise e a acao. Imprime o dev:ino despejado.
+evict_build_lock_directory() {
+	local expected_identity="${1:-}" keep_evidence="${2:-1}" evicted_name
+	[[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || return 1
+	evicted_name="$(date +%s 2>/dev/null || printf '0')-${WRAPPER_PID}-${RANDOM}"
+	python3 - "$LOCK_DIR" "$LOCK_EVICTED_ROOT" "$evicted_name" "$expected_identity" "$keep_evidence" <<'PY'
+import os
+import shutil
+import stat
+import sys
+
+lock_dir, evicted_root, evicted_name, expected_identity, keep_evidence = sys.argv[1:6]
+
+try:
+    info = os.lstat(lock_dir)
+except OSError:
+    raise SystemExit(1)
+
+# Nunca despejar algo que nao seja o diretorio de lock do proprio usuario.
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+    raise SystemExit(1)
+
+identity = f"{info.st_dev}:{info.st_ino}"
+if expected_identity and expected_identity != "missing" and expected_identity != identity:
+    raise SystemExit(1)
+
+try:
+    os.makedirs(evicted_root, mode=0o700, exist_ok=True)
+except OSError:
+    raise SystemExit(1)
+
+target = os.path.join(evicted_root, evicted_name)
+try:
+    # rename(2) e all-or-nothing e a janela entre o lstat acima e ele e de
+    # microssegundos no mesmo processo. Ou o caminho do lock fica livre, ou
+    # nada muda -- nunca o meio-termo "meta apagado, diretorio de pe" que o
+    # par unlink+rmdir produzia quando o segundo passo falhava.
+    os.rename(lock_dir, target)
+except OSError:
+    # Sem rename utilizavel, cai para o caminho legado (ainda funciona onde
+    # DELETE e permitido). Se tambem falhar, nada foi tocado.
+    try:
+        for entry in os.listdir(lock_dir):
+            os.unlink(os.path.join(lock_dir, entry))
+        os.rmdir(lock_dir)
+    except OSError:
+        raise SystemExit(1)
+    print(identity)
+    raise SystemExit(0)
+
+if keep_evidence != "1":
+    # Liberacao pelo proprio dono nao vira evidencia forense; onde DELETE e
+    # permitido isso evita acumular lixo, e onde e negado o ignore_errors
+    # apenas deixa o diretorio despejado parado, inofensivo.
+    shutil.rmtree(target, ignore_errors=True)
+print(identity)
+PY
+}
+
+# Prova de vida de uma encarnacao especifica. Sem dados de encarnacao, o pid
+# vivo e a unica evidencia disponivel e vale como VIVO (conservador: na duvida,
+# respeita o lock).
+build_lock_process_incarnation_is_live() {
+	local pid="$1" recorded_boot_id="${2:-}" recorded_start_ticks="${3:-}" live_boot_id live_start_ticks
+	case "$pid" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	process_exists "$pid" || return 1
+	if [[ -z "$recorded_boot_id" || "$recorded_boot_id" == "unknown" || ! "$recorded_start_ticks" =~ ^[0-9]+$ ]]; then
+		return 0
+	fi
+	live_boot_id="$(process_boot_id 2>/dev/null || true)"
+	live_start_ticks="$(process_start_ticks "$pid" 2>/dev/null || true)"
+	if [[ -z "$live_boot_id" || ! "$live_start_ticks" =~ ^[0-9]+$ ]]; then
+		return 0
+	fi
+	[[ "$recorded_boot_id" == "$live_boot_id" && "$recorded_start_ticks" == "$live_start_ticks" ]]
+}
+
+# Imprime "<veredito> <pid> <idade_s>", com veredito em:
+#   absent       -- sem heartbeat legivel/atribuivel: decidem as regras antigas
+#   fresh        -- alguem esta renovando: respeitar mesmo alem do orcamento
+#   stale_live   -- parou de renovar, mas o processo dono existe: respeitar
+#   stale_orphan -- parou de renovar E o processo dono nao existe: orfao
+build_lock_heartbeat_verdict() {
+	local snapshot epoch now age hb_pid hb_boot_id hb_start_ticks
+	if [[ ! -e "$LOCK_HEARTBEAT" && ! -L "$LOCK_HEARTBEAT" ]]; then
+		printf 'absent 0 0'
+		return 0
+	fi
+	if ! snapshot="$(read_lock_metadata_snapshot "$LOCK_HEARTBEAT" 2>/dev/null)"; then
+		printf 'absent 0 0'
+		return 0
+	fi
+	hb_pid="$(snapshot_field pid "$snapshot")"
+	hb_boot_id="$(snapshot_field boot_id "$snapshot")"
+	hb_start_ticks="$(snapshot_field start_ticks "$snapshot")"
+	epoch="$(snapshot_field epoch "$snapshot")"
+	case "$epoch" in
+	'' | *[!0-9]*) epoch="$(stat -c %Y "$LOCK_HEARTBEAT" 2>/dev/null || printf '0')" ;;
+	esac
+	now="$(date +%s 2>/dev/null || printf '0')"
+	if [[ ! "$epoch" =~ ^[0-9]+$ || ! "$now" =~ ^[0-9]+$ || "$epoch" -le 0 || "$now" -le 0 ]]; then
+		printf 'absent 0 0'
+		return 0
+	fi
+	age=0
+	if [[ "$now" -gt "$epoch" ]]; then
+		age=$((now - epoch))
+	fi
+	case "$hb_pid" in
+	'' | *[!0-9]*) hb_pid=0 ;;
+	esac
+	if [[ "$age" -lt "$LOCK_HEARTBEAT_STALE_SECONDS" ]]; then
+		printf 'fresh %s %s' "$hb_pid" "$age"
+		return 0
+	fi
+	if [[ "$hb_pid" -le 0 ]]; then
+		# Sem pid nao da para avaliar o "E nenhum processo vivo": orfandade nao
+		# esta provada, entao decidem as regras conservadoras antigas.
+		printf 'absent 0 %s' "$age"
+		return 0
+	fi
+	if build_lock_process_incarnation_is_live "$hb_pid" "$hb_boot_id" "$hb_start_ticks"; then
+		printf 'stale_live %s %s' "$hb_pid" "$age"
+		return 0
+	fi
+	printf 'stale_orphan %s %s' "$hb_pid" "$age"
+}
+
+write_build_lock_heartbeat() {
+	local heartbeat_tmp now_epoch owner_boot_id owner_start_ticks
+	[[ "$BUILD_LOCK_OWNED" == "1" ]] || return 1
+	[[ -n "$BUILD_LOCK_OWNED_IDENTITY" && "$BUILD_LOCK_OWNED_IDENTITY" == "$(build_lock_dir_identity)" ]] || return 1
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	[[ "$now_epoch" -gt 0 ]] || return 1
+	owner_boot_id="$(process_boot_id 2>/dev/null || true)"
+	owner_start_ticks="$(process_start_ticks "$WRAPPER_PID" 2>/dev/null || true)"
+	heartbeat_tmp="$(mktemp "$CACHE_DIR/.build-lock-heartbeat.XXXXXX" 2>/dev/null || true)"
+	[[ -n "$heartbeat_tmp" ]] || return 1
+	if {
+		printf 'pid:%s\n' "$WRAPPER_PID"
+		printf 'boot_id:%s\n' "${owner_boot_id:-unknown}"
+		printf 'start_ticks:%s\n' "${owner_start_ticks:-unknown}"
+		printf 'epoch:%s\n' "$now_epoch"
+	} >"$heartbeat_tmp" 2>/dev/null && mv -fT -- "$heartbeat_tmp" "$LOCK_HEARTBEAT" 2>/dev/null; then
+		return 0
+	fi
+	rm -f -- "$heartbeat_tmp" 2>/dev/null || true
+	return 1
+}
+
+# O build e uma unica chamada bloqueante de varios minutos: sem um renovador em
+# segundo plano o heartbeat nao teria como provar vida durante ele. O renovador
+# morre sozinho quando o wrapper morre (kill -0) ou quando o lock deixa de ser
+# nosso (dev:ino), entao um wrapper SIGKILLado nao consegue manter vivo para
+# sempre um lock que ninguem mais detem.
+start_build_lock_heartbeat_renewer() {
+	[[ "$BUILD_LOCK_OWNED" == "1" ]] || return 0
+	[[ -z "$LOCK_HEARTBEAT_RENEWER_PID" ]] || return 0
+	write_build_lock_heartbeat || return 0
+	(
+		trap - EXIT
+		# O `kill` de stop_build_lock_heartbeat_renewer alcanca ESTA subshell,
+		# nunca o `sleep` que ela executasse em primeiro plano: o sono e um
+		# processo separado, sobrevive ao TERM da mae e e adotado pelo
+		# subreaper que envelopa o wrapper. Sob
+		# `supervise-process-tree --fail-on-descendant-cleanup` isso e lido
+		# como descendente abandonado e devolve 125 — e o intervalo de 5 s
+		# passa longe do grace de 1,5 s do supervisor, entao a corrida nunca
+		# se resolve sozinha. Dormir em SEGUNDO plano e esperar por `wait`
+		# (builtin interrompivel) faz o TERM chegar ao trap, que encerra o
+		# sono junto com a subshell.
+		# E `jobs -p` no trap, nao o pid guardado numa variavel. A primeira
+		# versao desta correcao fazia `sleep ... & sono_pid=$!` e matava
+		# `$sono_pid`: sao dois comandos DISTINTOS, e o bash executa trap
+		# pendente ENTRE eles. TERM nessa fresta encontrava a variavel com o
+		# valor velho (vazia na primeira volta), o trap saia sem matar nada e o
+		# sono ficava orfao por um intervalo inteiro — o mesmo 125, agora
+		# intermitente, que e a pior especie. Confirmado por refutacao
+		# adversarial em 2026-09-05, com repro sob o supervisor real.
+		# `jobs -p` lista os filhos DESTA subshell no instante do disparo:
+		# vazio antes do primeiro sono, sempre atual depois, e fecha de quebra
+		# a janela espelho entre o retorno do `wait` e a limpeza da variavel.
+		trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' TERM
+		while :; do
+			sleep "$LOCK_HEARTBEAT_INTERVAL_SECONDS" &
+			wait "$!" || exit 0
+			kill -0 "$WRAPPER_PID" 2>/dev/null || exit 0
+			[[ "$BUILD_LOCK_OWNED_IDENTITY" == "$(build_lock_dir_identity)" ]] || exit 0
+			write_build_lock_heartbeat || exit 0
+		done
+	) >/dev/null 2>&1 &
+	LOCK_HEARTBEAT_RENEWER_PID="$!"
+}
+
+stop_build_lock_heartbeat_renewer() {
+	[[ -n "$LOCK_HEARTBEAT_RENEWER_PID" ]] || return 0
+	kill "$LOCK_HEARTBEAT_RENEWER_PID" 2>/dev/null || true
+	# ESPERA COM TETO, e nao `wait` nu (2026-09-05, achado sob refutacao).
+	#
+	# Se quem invocou este wrapper entrou com `trap "" TERM`, o bash instala
+	# SIG_IGN no filho assincrono e o trap da subshell NUNCA dispara: o `kill`
+	# acima e inocuo e um `wait` sem teto pendura o wrapper inteiro ate o
+	# relogio externo — medido rc=124, identico na versao anterior a esta
+	# correcao. O renovador passa a ser dono do relogio de quem o criou.
+	#
+	# 40 voltas de 50 ms dao 2 s, folga larga para a saida normal (medida em
+	# 0,28 s no pior caso do fixture). Esgotado o teto, SIGKILL: este processo
+	# nasceu NESTE wrapper e e a unica coisa que ele pode matar sem duvida.
+	local tentativas=0
+	while kill -0 "$LOCK_HEARTBEAT_RENEWER_PID" 2>/dev/null && [[ "$tentativas" -lt 40 ]]; do
+		sleep 0.05
+		tentativas=$((tentativas + 1))
+	done
+	kill -KILL "$LOCK_HEARTBEAT_RENEWER_PID" 2>/dev/null || true
+	wait "$LOCK_HEARTBEAT_RENEWER_PID" 2>/dev/null || true
+	LOCK_HEARTBEAT_RENEWER_PID=""
+}
+
+release_build_lock() {
+	local identity_now
+	identity_now="$(build_lock_dir_identity)"
+	if [[ "$identity_now" == "missing" ]]; then
+		return 0
+	fi
+	if [[ -n "$BUILD_LOCK_OWNED_IDENTITY" && "$BUILD_LOCK_OWNED_IDENTITY" != "missing" && "$BUILD_LOCK_OWNED_IDENTITY" != "$identity_now" ]]; then
+		# Este lock ja nao e o nosso: outra sessao despejou o nosso e criou o
+		# dela no mesmo caminho. Liberar agora destruiria o lock DELA.
+		echo "run-go-cmd-cached: build lock path now holds another session's lock; leaving it untouched command=$NAME owned=$BUILD_LOCK_OWNED_IDENTITY observed=$identity_now" >&2
+		return 0
+	fi
+	if evict_build_lock_directory "$BUILD_LOCK_OWNED_IDENTITY" 0 >/dev/null 2>&1; then
+		return 0
+	fi
+	echo "run-go-cmd-cached: failed to release build lock; next session will reclaim it by heartbeat command=$NAME path=$LOCK_DIR" >&2
+	return 1
+}
+
+reclaim_missing_meta_lock() {
+	[[ -d "$LOCK_DIR" ]] || return 1
+	lock_metadata_entry_exists && return 1
+	local now_epoch mtime_epoch age identity
+	identity="$(build_lock_dir_identity)"
+	now_epoch="$(date +%s 2>/dev/null || printf '0')"
+	mtime_epoch="$(lock_dir_mtime_epoch)"
+	[[ "$now_epoch" -gt 0 && "$mtime_epoch" -gt 0 ]] || return 1
+	age=$((now_epoch - mtime_epoch))
+	[[ "$age" -ge "$LOCK_STALE_SECONDS" ]] || return 1
+	evict_build_lock_directory "$identity" 1 >/dev/null 2>&1 || return 1
+	echo "run-go-cmd-cached: reclaimed stale build lock with missing metadata command=$NAME age=${age}s" >&2
+	return 0
+}
+
+# mkdir(2) grants lock ownership atomically, while the owner publishes the
+# diagnostic metadata immediately afterwards. A waiter gets only this bounded
+# initialization handshake; waiting for the build still requires the explicit
+# critical-dependency classification below.
+await_build_lock_metadata_initialization() {
+	[[ -d "$LOCK_DIR" ]] || return 0
+	lock_metadata_entry_exists && return 0
+	local waited_ms=0
+	while [[ -d "$LOCK_DIR" && "$waited_ms" -lt "$LOCK_META_INIT_GRACE_MS" ]] && ! lock_metadata_entry_exists; do
+		sleep 0.01
+		waited_ms=$((waited_ms + 10))
+	done
+}
+
+reclaim_stale_build_lock() {
+	[[ -d "$LOCK_DIR" ]] || return 1
+	# 2026-07-31: o heartbeat decide ANTES das regras antigas porque e a unica
+	# evidencia que separa "detentor vivo trabalhando" de "sessao morta" sem
+	# depender de relogio de parede. Ele so amplia a seguranca: prova de vida
+	# BLOQUEIA reciclagem que o orcamento por mtime autorizaria, e orfandade
+	# provada (parou de renovar E o processo nao existe) dispensa esperar o
+	# orcamento inteiro.
+	local lock_identity heartbeat_verdict heartbeat_pid heartbeat_age
+	lock_identity="$(build_lock_dir_identity)"
+	read -r heartbeat_verdict heartbeat_pid heartbeat_age <<<"$(build_lock_heartbeat_verdict)"
+	case "$heartbeat_verdict" in
+	fresh | stale_live)
+		return 1
+		;;
+	stale_orphan)
+		if evict_build_lock_directory "$lock_identity" 1 >/dev/null 2>&1; then
+			echo "run-go-cmd-cached: reclaimed orphaned build lock by stalled heartbeat command=$NAME pid=$heartbeat_pid heartbeat_age=${heartbeat_age}s stale_budget=${LOCK_HEARTBEAT_STALE_SECONDS}s identity=$lock_identity" >&2
+			return 0
+		fi
+		;;
+	esac
+	if ! lock_metadata_entry_exists; then
+		reclaim_missing_meta_lock
+		return $?
+	fi
+	local meta_pid meta_boot_id meta_start_ticks live_boot_id live_start_ticks now_epoch mtime_epoch age
+	if ! lock_metadata_is_safe; then
+		now_epoch="$(date +%s 2>/dev/null || printf '0')"
+		mtime_epoch="$(lock_dir_mtime_epoch)"
+		[[ "$now_epoch" -gt 0 && "$mtime_epoch" -gt 0 ]] || return 1
+		age=$((now_epoch - mtime_epoch))
+		[[ "$age" -ge "$LOCK_STALE_SECONDS" ]] || return 1
+		evict_build_lock_directory "$lock_identity" 1 >/dev/null 2>&1 || return 1
+		echo "run-go-cmd-cached: reclaimed stale build lock with unsafe metadata command=$NAME age=${age}s" >&2
+		return 0
+	fi
+	meta_pid="$(lock_meta_first pid)"
+	case "$meta_pid" in
+	'' | *[!0-9]*)
+		# Malformed/partial metadata does not prove owner death. An older wrapper
+		# may still be publishing it, so reclaim only after the stale budget.
+		now_epoch="$(date +%s 2>/dev/null || printf '0')"
+		mtime_epoch="$(lock_dir_mtime_epoch)"
+		[[ "$now_epoch" -gt 0 && "$mtime_epoch" -gt 0 ]] || return 1
+		age=$((now_epoch - mtime_epoch))
+		[[ "$age" -ge "$LOCK_STALE_SECONDS" ]] || return 1
+		evict_build_lock_directory "$lock_identity" 1 >/dev/null 2>&1 || return 1
+		echo "run-go-cmd-cached: reclaimed stale build lock with malformed metadata command=$NAME age=${age}s" >&2
+		return 0
+		;;
+	esac
+	if process_exists "$meta_pid"; then
+		meta_boot_id="$(lock_meta_first owner_boot_id)"
+		meta_start_ticks="$(lock_meta_first owner_start_ticks)"
+		live_boot_id="$(process_boot_id 2>/dev/null || true)"
+		live_start_ticks="$(process_start_ticks "$meta_pid" 2>/dev/null || true)"
+		if [[ -n "$meta_boot_id" && "$meta_start_ticks" =~ ^[0-9]+$ && -n "$live_boot_id" && "$live_start_ticks" =~ ^[0-9]+$ ]]; then
+			if [[ "$meta_boot_id" == "$live_boot_id" && "$meta_start_ticks" == "$live_start_ticks" ]]; then
+				return 1
+			fi
+			evict_build_lock_directory "$lock_identity" 1 >/dev/null 2>&1 || return 1
+			echo "run-go-cmd-cached: reclaimed reused-pid build lock command=$NAME pid=$meta_pid recorded_boot_id=$meta_boot_id recorded_start_ticks=$meta_start_ticks live_boot_id=$live_boot_id live_start_ticks=$live_start_ticks" >&2
+			return 0
+		fi
+		# Legacy metadata without a process incarnation is not trusted forever.
+		# It remains protected during the stale budget, then may be reclaimed
+		# without signalling or killing the unrelated live process.
+		now_epoch="$(date +%s 2>/dev/null || printf '0')"
+		mtime_epoch="$(lock_dir_mtime_epoch)"
+		[[ "$now_epoch" -gt 0 && "$mtime_epoch" -gt 0 ]] || return 1
+		age=$((now_epoch - mtime_epoch))
+		[[ "$age" -ge "$LOCK_STALE_SECONDS" ]] || return 1
+		evict_build_lock_directory "$lock_identity" 1 >/dev/null 2>&1 || return 1
+		echo "run-go-cmd-cached: reclaimed stale legacy build lock without process identity command=$NAME pid=$meta_pid age=${age}s" >&2
+		return 0
+	fi
+	evict_build_lock_directory "$lock_identity" 1 >/dev/null 2>&1 || return 1
+	echo "run-go-cmd-cached: reclaimed dead build lock command=$NAME pid=$meta_pid" >&2
+	return 0
+}
+
+build_lock_identity() {
+	stat -c '%d:%i:%Y:%s' "$LOCK_META" 2>/dev/null || stat -c 'missing:%d:%i:%Y' "$LOCK_DIR" 2>/dev/null || printf 'missing'
+}
+
+write_build_lock_metadata() {
+	local started_epoch="$1" owner_boot_id owner_start_ticks command_description lock_budget_description stop_description
+	shift || true
+	owner_boot_id="$(process_boot_id 2>/dev/null || true)"
+	owner_start_ticks="$(process_start_ticks "$$" 2>/dev/null || true)"
+	if [[ -z "$owner_boot_id" || ! "$owner_start_ticks" =~ ^[0-9]+$ ]]; then
+		echo "run-go-cmd-cached: failed to authenticate build lock owner process identity command=$NAME pid=$$" >&2
+		exit 75
+	fi
+	LOCK_METADATA_TMP="$(mktemp "$CACHE_DIR/.build-lock-meta.XXXXXX" 2>/dev/null || true)"
+	if [[ -z "$LOCK_METADATA_TMP" ]]; then
+		echo "run-go-cmd-cached: failed to allocate build lock metadata temporary command=$NAME" >&2
+		exit 75
+	fi
+	command_description="$(inline_token "run-go-cmd-cached $PKG $*")"
+	command_description="${command_description:0:4096}"
+	lock_budget_description="${WIKI_GO_CMD_BUDGET_MS:-$((RUN_TIMEOUT_SECONDS * 1000))}"
+	if [[ ! "$lock_budget_description" =~ ^[0-9]+$ || "${#lock_budget_description}" -gt 9 ]]; then
+		lock_budget_description=invalid
+	fi
+	stop_description="$(inline_token "${WIKI_GO_CMD_STOP_CONDITION:-command_exits_or_build_lock_timeout_or_run_timeout}")"
+	stop_description="${stop_description:0:4096}"
+	if ! {
+		printf 'pid:%s\n' "$$"
+		printf 'owner_boot_id:%s\n' "$owner_boot_id"
+		printf 'owner_start_ticks:%s\n' "$owner_start_ticks"
+		printf 'started_epoch:%s\n' "$started_epoch"
+		printf 'command:%s\n' "$command_description"
+		printf 'timeout_seconds:%s\n' "$RUN_TIMEOUT_SECONDS"
+		printf 'budget_ms:%s\n' "$lock_budget_description"
+		printf 'stop_condition:%s\n' "$stop_description"
+		printf 'lock_scope:%s\n' "$(build_lock_scope)"
+	} >"$LOCK_METADATA_TMP" || ! mv -fT -- "$LOCK_METADATA_TMP" "$LOCK_META"; then
+		echo "run-go-cmd-cached: failed to write build lock metadata command=$NAME" >&2
+		exit 75
+	fi
+	LOCK_METADATA_TMP=""
+}
+
+acquire_build_lock() {
+	local lock_owner_uid lock_mode
+	if (
+		umask 077
+		mkdir "$LOCK_DIR"
+	) 2>/dev/null; then
+		BUILD_LOCK_OWNED=1
+		# 2026-07-31: a identidade (dev:ino) do lock que ganhamos e o que
+		# autoriza renovar heartbeat e liberar depois. Sem ela, um dono antigo
+		# poderia derrubar o lock de quem o sucedeu no mesmo caminho.
+		BUILD_LOCK_OWNED_IDENTITY="$(build_lock_dir_identity)"
+		return 0
+	fi
+	if [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]]; then
+		lock_owner_uid="$(stat -c %u "$LOCK_DIR" 2>/dev/null || printf 'unknown')"
+		lock_mode="$(stat -c %a "$LOCK_DIR" 2>/dev/null || printf 'unknown')"
+		if [[ "$lock_owner_uid" == "$EUID" && "$lock_mode" =~ ^[0-7]+$ ]] && (((8#$lock_mode & 8#022) == 0)); then
+			return 1
+		fi
+		echo "run-go-cmd-cached: build lock directory is unsafe: expected_uid=$EUID owner_uid=$lock_owner_uid mode=$lock_mode path=$LOCK_DIR" >&2
+		exit 75
+	fi
+	# The owner may have removed the lock immediately after mkdir reported
+	# EEXIST. One bounded retry distinguishes that normal race from a real
+	# filesystem failure without creating an unbounded retry loop.
+	if [[ ! -e "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] && (
+		umask 077
+		mkdir "$LOCK_DIR"
+	) 2>/dev/null; then
+		BUILD_LOCK_OWNED=1
+		BUILD_LOCK_OWNED_IDENTITY="$(build_lock_dir_identity)"
+		return 0
+	fi
+	if [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]]; then
+		lock_owner_uid="$(stat -c %u "$LOCK_DIR" 2>/dev/null || printf 'unknown')"
+		lock_mode="$(stat -c %a "$LOCK_DIR" 2>/dev/null || printf 'unknown')"
+		if [[ "$lock_owner_uid" == "$EUID" && "$lock_mode" =~ ^[0-7]+$ ]] && (((8#$lock_mode & 8#022) == 0)); then
+			return 1
+		fi
+	fi
+	echo "run-go-cmd-cached: cannot acquire build lock because mkdir failed without a valid same-user lock directory: $LOCK_DIR" >&2
+	exit 75
+}
+
+current_milliseconds() {
+	date +%s%3N 2>/dev/null || printf '%s000' "$(date +%s 2>/dev/null || printf '0')"
+}
+
+elapsed_milliseconds_since() {
+	local started="$1" now
+	now="$(current_milliseconds)"
+	case "$started" in
+	'' | *[!0-9]*) printf '0' ;;
+	*) printf '%s' "$((now - started))" ;;
+	esac
+}
+
+run_build_with_timeout() {
+	local tmp_bin="$1"
+	local started_ms duration_ms status
+	started_ms="$(current_milliseconds)"
+	echo "run-go-cmd-cached: build_start command=$PKG bin=$(inline_token "$tmp_bin") build_budget_ms=$BUILD_BUDGET_MS run_timeout_spec=$(inline_token "$RUN_TIMEOUT_SPEC") build_timeout_spec=$(inline_token "$BUILD_TIMEOUT_SPEC")" >&2
+	# Dev-mains em cmd/ carregam //go:build devcmds (tirados do `go build ./...`
+	# quente). Este runner sempre builda UM pacote main exato, então a tag é
+	# necessária para os dev-mains e inócua para mains de produção sem constraint.
+	if [[ -n "$ENV_WRAPPER" ]]; then
+		if timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "$BUILD_TIMEOUT_SPEC" "$ENV_WRAPPER" go-modern build -tags devcmds -o "$tmp_bin" -buildvcs=false "$PKG"; then
+			status=0
+		else
+			status=$?
+		fi
+	else
+		if timeout --kill-after="$TIMEOUT_KILL_AFTER_SPEC" "$BUILD_TIMEOUT_SPEC" go-modern build -tags devcmds -o "$tmp_bin" -buildvcs=false "$PKG"; then
+			status=0
+		else
+			status=$?
+		fi
+	fi
+	duration_ms="$(elapsed_milliseconds_since "$started_ms")"
+	if [[ "$status" -ne 0 ]]; then
+		echo "run-go-cmd-cached: build_finish command=$PKG status=fail exit_code=$status duration_ms=$duration_ms build_budget_ms=$BUILD_BUDGET_MS stop_condition=build_exited_or_build_budget_timeout" >&2
+		return "$status"
+	fi
+	echo "run-go-cmd-cached: build_finish command=$PKG status=pass duration_ms=$duration_ms build_budget_ms=$BUILD_BUDGET_MS stop_condition=build_exited_or_build_budget_timeout" >&2
+	return 0
+}
+
+exec_cached_binary_with_timeout() {
+	if ! command -v timeout >/dev/null 2>&1; then
+		echo "run-go-cmd-cached: timeout command is required for supervised P0 command execution" >&2
+		exit 75
+	fi
+	if [[ "$BOOTSTRAP_CACHE_MODE" == "1" ]]; then
+		# Recollect the live source/toolchain closure immediately before exec. The
+		# first snapshot selected the cache entry, but a concurrent edit may have
+		# landed after that decision. A mismatch fails closed instead of executing
+		# the old binary once or starting an unbounded rebuild loop.
+		cleanup_bootstrap_context
+		collect_bootstrap_build_context
+		if ! validate_bootstrap_build_metadata; then
+			echo "run-go-cmd-cached: authenticated bootstrap binary changed before exec; refusing stale or tampered binary" >&2
+			exit 75
+		fi
+		export WIKI_GO_CMD_BINARY_METADATA_PATH="$BUILD_METADATA"
+		export WIKI_GO_CMD_BINARY_METADATA_SHA256="$CURRENT_METADATA_SHA256"
+		export WIKI_GO_CMD_BINARY_SHA256="$CURRENT_BINARY_SHA256"
+		export WIKI_GO_CMD_DEPENDENCY_CLOSURE_SHA256="$CURRENT_CLOSURE_SHA256"
+		export WIKI_GO_CMD_BUILD_SOURCE_SHA256="$CURRENT_BUILD_SOURCE_SHA256"
+		echo "run-go-cmd-cached: bootstrap_binary_metadata schema=run-go-cmd-cached-build-metadata/v1 package=$PKG source_contract_sha256=$BOOTSTRAP_SOURCE_CONTRACT build_source_root_base64=$(base64_token "$BUILD_SOURCE_ROOT") build_source_sha256=$CURRENT_BUILD_SOURCE_SHA256 metadata_path_base64=$(base64_token "$BUILD_METADATA") metadata_sha256=$CURRENT_METADATA_SHA256 binary_sha256=$CURRENT_BINARY_SHA256 dependency_closure_sha256=$CURRENT_CLOSURE_SHA256" >&2
+		cleanup_build_contexts
+	fi
+	if [[ "$BOOTSTRAP_CACHE_MODE" == "0" ]]; then
+		cleanup_general_build_context
+		collect_general_build_context
+		if ! general_build_identity_matches; then
+			echo "run-go-cmd-cached: fast-cache source/toolchain/binary identity changed before exec; refusing stale or tampered binary" >&2
+			exit 75
+		fi
+		cleanup_general_build_context
+	fi
+	# Open with O_NOFOLLOW|O_NONBLOCK and authenticate the exact descriptor that
+	# timeout will execute. Bash's `< "$BIN"` can hang if the validated regular
+	# file is swapped for a FIFO just before open(2); descriptor-first Python can
+	# reject FIFO/directory/symlink replacements before any blocking read.
+	trap - EXIT
+	exec python3 - "$BIN" "$CURRENT_BINARY_SHA256" "$RUN_TIMEOUT_SPEC" "$TIMEOUT_KILL_AFTER_SPEC" "$ENV_WRAPPER" "$@" <<'PY'
+import hashlib
+import os
+import shutil
+import stat
+import struct
+import sys
+
+binary_name, expected_identity, timeout_spec, kill_after_spec, environment_wrapper, *command_arguments = sys.argv[1:]
+descriptor = -1
+try:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(binary_name, flags)
+    opened = os.fstat(descriptor)
+    identity = lambda info: (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.geteuid()
+        or opened.st_mode & 0o022
+        or opened.st_mode & 0o111 == 0
+        or opened.st_size <= 0
+        or opened.st_size > 2 * 1024 * 1024 * 1024
+    ):
+        raise OSError("unsafe cached binary descriptor")
+
+    def go_build_id(fd):
+        header = os.pread(fd, 64, 0)
+        if len(header) != 64 or header[:4] != b"\x7fELF" or header[4] != 2:
+            raise OSError("unsupported binary format for fast identity pin")
+        endian = "<" if header[5] == 1 else ">"
+        e_shoff, = struct.unpack_from(endian + "Q", header, 0x28)
+        e_shentsize, = struct.unpack_from(endian + "H", header, 0x3A)
+        e_shnum, = struct.unpack_from(endian + "H", header, 0x3C)
+        e_shstrndx, = struct.unpack_from(endian + "H", header, 0x3E)
+        if e_shentsize <= 0 or e_shnum <= 0 or e_shnum > 4096 or e_shstrndx >= e_shnum:
+            raise OSError("unsafe ELF section header table before descriptor pin")
+        shtab_size = e_shentsize * e_shnum
+        if shtab_size > 1024 * 1024:
+            raise OSError("oversized ELF section header table before descriptor pin")
+        shtab = os.pread(fd, shtab_size, e_shoff)
+        if len(shtab) != shtab_size:
+            raise OSError("short ELF section header table read before descriptor pin")
+
+        def section(index):
+            base = index * e_shentsize
+            name_off, = struct.unpack_from(endian + "I", shtab, base)
+            sh_offset, = struct.unpack_from(endian + "Q", shtab, base + 0x18)
+            sh_size, = struct.unpack_from(endian + "Q", shtab, base + 0x20)
+            return name_off, sh_offset, sh_size
+
+        _, strtab_off, strtab_size = section(e_shstrndx)
+        if strtab_size <= 0 or strtab_size > 1024 * 1024:
+            raise OSError("unsafe ELF section name table before descriptor pin")
+        strtab = os.pread(fd, strtab_size, strtab_off)
+        if len(strtab) != strtab_size:
+            raise OSError("short ELF section name table read before descriptor pin")
+        note_offset = note_size = None
+        for index in range(e_shnum):
+            name_off, sh_offset, sh_size = section(index)
+            end = strtab.find(b"\0", name_off)
+            if end < 0:
+                continue
+            if strtab[name_off:end] == b".note.go.buildid":
+                note_offset, note_size = sh_offset, sh_size
+                break
+        if note_offset is None or note_size is None or note_size <= 0 or note_size > 65536:
+            raise OSError("missing authenticated Go build id note before descriptor pin")
+        note = os.pread(fd, note_size, note_offset)
+        if len(note) != note_size or len(note) < 12:
+            raise OSError("short Go build id note read before descriptor pin")
+        namesz, descsz, _note_type = struct.unpack_from(endian + "III", note, 0)
+        name_pad = (namesz + 3) & ~3
+        desc_start = 12 + name_pad
+        if descsz <= 0 or descsz > 4096 or desc_start + descsz > len(note):
+            raise OSError("malformed Go build id note before descriptor pin")
+        build_id = note[desc_start:desc_start + descsz]
+        if not build_id:
+            raise OSError("empty Go build id before descriptor pin")
+        return build_id
+
+    # v2: two identity schemes share this pre-exec pin. Bootstrap mode (content-
+    # addressed, workspace builds) still gets a full sha256 of the descriptor,
+    # unchanged. Fast/default mode uses the O(1) build-id+inode identity — see
+    # general_build_identity_matches for the rationale; re-hashing ~240MB here
+    # a third time per invocation bought nothing beyond what that identity
+    # already authenticates through this same pinned descriptor.
+    if expected_identity.startswith("sha256:"):
+        digest = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError("short cached binary descriptor read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError("cached binary descriptor grew during read")
+        after = os.fstat(descriptor)
+        if identity(after) != identity(opened):
+            raise OSError("cached binary descriptor changed during read")
+        observed_identity = "sha256:" + digest.hexdigest()
+    else:
+        build_id = go_build_id(descriptor)
+        after = os.fstat(descriptor)
+        if identity(after) != identity(opened):
+            raise OSError("cached binary descriptor changed during read")
+        observed_identity = (
+            "binary-identity-v1:" + build_id.hex()
+            + ":" + str(after.st_dev) + ":" + str(after.st_ino)
+            + ":" + str(after.st_size) + ":" + str(after.st_mtime_ns)
+        )
+    if observed_identity != expected_identity:
+        raise OSError("cached binary identity changed before descriptor pin")
+
+    timeout_name = shutil.which("timeout")
+    if timeout_name is None:
+        raise OSError("timeout executable is unavailable")
+    timeout_name = os.path.realpath(timeout_name)
+    timeout_info = os.stat(timeout_name)
+    timeout_owner_trusted = timeout_info.st_uid in (0, os.geteuid())
+    if (
+        not timeout_owner_trusted
+        and timeout_info.st_uid == 65534
+        and not os.access(timeout_name, os.W_OK)
+    ):
+        try:
+            with open("/proc/self/uid_map", "rb") as uid_map_handle:
+                uid_map_payload = uid_map_handle.read(4096)
+        except OSError:
+            uid_map_payload = b""
+        # Mesma politica ja aplicada tres vezes neste arquivo (ancestry do
+        # timeout, toolchain cgo do build e sua revalidacao): sob user namespace
+        # com root NAO mapeado (sandbox Cowork), /usr/bin/timeout do host-root
+        # aparece como uid de overflow 65534 e e imutavel para o usuario do
+        # namespace. Este ponto de pin pre-exec tinha ficado de fora e reprovava
+        # todo comando cacheado no sandbox. Em host sem userns, 65534 continua
+        # reprovado como sempre.
+        timeout_owner_trusted = uid_map_payload != b"" and not any(
+            line.split() and line.split()[0] == "0"
+            for line in uid_map_payload.decode("ascii", errors="replace").splitlines()
+        )
+    if (
+        not stat.S_ISREG(timeout_info.st_mode)
+        or not timeout_owner_trusted
+        or timeout_info.st_mode & 0o022
+        or timeout_info.st_mode & 0o111 == 0
+    ):
+        raise OSError("unsafe timeout executable")
+
+    # Scripts need this descriptor after timeout's exec so their shebang
+    # interpreter can reopen /proc/self/fd/N. The descriptor remains bound to
+    # the authenticated inode and is never reopened through the cache pathname.
+    os.set_inheritable(descriptor, True)
+    pinned_binary = f"/proc/self/fd/{descriptor}"
+    timeout_arguments = [timeout_name, f"--kill-after={kill_after_spec}", timeout_spec]
+    if environment_wrapper:
+        timeout_arguments.append(environment_wrapper)
+    timeout_arguments.extend((pinned_binary, *command_arguments))
+    os.execve(timeout_name, timeout_arguments, os.environ)
+except (OSError, ValueError) as error:
+    print(f"run-go-cmd-cached: could not pin authenticated cached binary before exec: {error}", file=sys.stderr)
+    raise SystemExit(75)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+PY
+}
+
+tmp=""
+cleanup_build() {
+	stop_build_lock_heartbeat_renewer
+	if [[ "$BUILD_LOCK_OWNED" == "1" ]]; then
+		if [[ -n "$LOCK_METADATA_TMP" ]]; then
+			rm -f -- "$LOCK_METADATA_TMP" 2>/dev/null || true
+			LOCK_METADATA_TMP=""
+		fi
+		# 2026-07-31: liberar por rename (com unlink/rmdir apenas como fallback)
+		# -- o par rm+rmdir falhava inteiro onde DELETE e negado e cada build
+		# bem-sucedido deixava um lock permanente para tras.
+		release_build_lock || true
+		BUILD_LOCK_OWNED=0
+		BUILD_LOCK_OWNED_IDENTITY=""
+	fi
+	if [[ -n "${tmp:-}" ]]; then
+		rm -f -- "$tmp" 2>/dev/null || true
+		tmp=""
+	fi
+}
+
+if [[ "$needs_build" == "1" ]]; then
+	start_epoch="$(date +%s 2>/dev/null || printf '0')"
+	: "${start_epoch:=0}"
+	now_epoch=0
+	elapsed=0
+	active_lock_identity=""
+	trap 'cleanup_build; cleanup_build_contexts' EXIT
+	while ! acquire_build_lock; do
+		await_build_lock_metadata_initialization
+		if [[ ! -d "$LOCK_DIR" ]]; then
+			continue
+		fi
+		if reclaim_stale_build_lock; then
+			continue
+		fi
+		current_lock_identity="$(build_lock_identity)"
+		if [[ "$current_lock_identity" != "$active_lock_identity" ]]; then
+			build_lock_holder_active_analysis
+			validate_build_lock_wait_classification_or_exit "$@"
+			active_lock_identity="$current_lock_identity"
+		fi
+		now_epoch="$(date +%s 2>/dev/null || printf '0')"
+		: "${now_epoch:=0}"
+		if [[ "$start_epoch" -gt 0 && "$now_epoch" -gt 0 ]]; then
+			elapsed=$((now_epoch - start_epoch))
+			critical_timeout_ms="$(critical_build_lock_wait_timeout_ms)"
+			if [[ "$critical_timeout_ms" =~ ^[0-9]+$ && "$critical_timeout_ms" -gt 0 && $((elapsed * 1000)) -ge "$critical_timeout_ms" ]]; then
+				build_lock_holder_active_analysis
+				echo "run-go-cmd-cached: critical_dependency build lock wait timeout_ms=$critical_timeout_ms elapsed_ms=$((elapsed * 1000)) lock_scope=$(inline_token "$(build_lock_scope)") command=$(inline_token "run-go-cmd-cached $PKG $*")" >&2
+				exit 75
+			fi
+			if [[ "$elapsed" -ge "$LOCK_WAIT_SECONDS" ]]; then
+				echo "run-go-cmd-cached: build lock blocked after ${LOCK_WAIT_SECONDS}s for $NAME: $LOCK_DIR" >&2
+				exit 75
+			fi
+		fi
+		sleep 0.1
+	done
+	write_build_lock_metadata "$start_epoch" "$@"
+	# 2026-07-31: a partir daqui o detentor prova vida continuamente; se este
+	# processo morrer (inclusive por SIGKILL), o heartbeat congela e a proxima
+	# sessao recicla o lock por rename sem depender de DELETE.
+	start_build_lock_heartbeat_renewer
+	build_after_lock=0
+	if [[ "$BOOTSTRAP_CACHE_MODE" == "1" ]]; then
+		if ! validate_bootstrap_build_metadata; then
+			build_after_lock=1
+		fi
+	elif ! fast_cache_artifacts_present; then
+		build_after_lock=1
+	else
+		# Outra sessao pode ter buildado enquanto esperavamos o lock: os
+		# artefatos agora existem e merecem autenticacao. Se o snapshot ainda
+		# nao foi coletado (caminho frio), colete AGORA — com identidade
+		# autenticada, reaproveitar o binario alheio e correto e evita um build
+		# redundante de minutos.
+		ensure_general_build_context
+		if ! general_build_identity_matches; then
+			build_after_lock=1
+		fi
+	fi
+	if [[ "$build_after_lock" == "1" ]]; then
+		# O snapshot "antes" de verify_general_build_context_stable_after_build
+		# e o de write_general_build_identity nascem aqui no caminho frio: colar
+		# a coleta ao build restringe a janela vigiada ao build, em vez de
+		# arrastar a espera pelo lock (ate LOCK_WAIT_SECONDS) para dentro dela.
+		ensure_general_build_context
+		tmp="$(mktemp "$CACHE_DIR/.${NAME}.build.XXXXXX")" || {
+			echo "run-go-cmd-cached: failed to allocate private build output in cache" >&2
+			exit 75
+		}
+		cd "$BUILD_SOURCE_ROOT"
+		run_build_with_timeout "$tmp"
+		verify_bootstrap_build_context_stable_after_build
+		verify_general_build_context_stable_after_build
+		# 2026-07-30 (sandbox Cowork/virtiofs): mktemp cria o alvo com 0600 e o
+		# `go build -o` só consegue recriá-lo quando pode remover o arquivo
+		# existente. Onde unlink é negado (EPERM), o Go escreve NO LUGAR e o
+		# binário herda o 0600 do mktemp — sem bit de execução. O instalador
+		# então publicava um cache inexecutável e toda invocação seguinte morria
+		# em "unsafe authenticated cache file", reconstruindo em loop (~34s de
+		# CPU por chamada, medido). Normalizar o modo aqui é o mesmo 0500 que a
+		# autenticação do cache já exige (dono, sem escrita de grupo/outros, com
+		# execução): não afrouxa nada, apenas deixa de depender de unlink.
+		chmod 0500 -- "$tmp"
+		mv -fT -- "$tmp" "$BIN"
+		# 2026-07-29: o refresh do manifesto de dependências era exclusivo do
+		# modo bootstrap. No caminho geral, o binário era reinstalado (mv -fT
+		# atualiza o mtime) mas deps.list ficava para trás — medido ao vivo:
+		# deps.list de 22/07 contra factory de 29/07. Consequências em cadeia:
+		# (a) tools/audit_v2_pages.py itera esse manifesto para vigiar
+		# staleness do factory; manifesto velho deixa pacote novo do fecho sem
+		# vigilância (falso-FRESCO latente, exatamente o risco documentado em
+		# tools/ensure-audit-ready:127-135); (b) ensure-audit-ready compara
+		# mtime deps.list vs binário e entrava em rebuild forçado PERMANENTE
+		# (~34s de CPU por chamada, sem nunca sarar). O manifesto deve ser
+		# regenerado após TODA instalação de binário, em qualquer modo; a
+		# falha do refresh continua fail-closed (rm do manifesto → auditor
+		# recusa o factory até um rebuild+refresh completo).
+		refresh_dependency_list_after_build "$PKG"
+		write_bootstrap_build_metadata
+		write_general_build_identity
+		tmp=""
+	fi
+	trap - EXIT
+	cleanup_build
+	trap cleanup_build_contexts EXIT
+fi
+
+cd "$ROOT"
+exec_cached_binary_with_timeout "$@"

@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""measure-citation-conformance — a afirmação da página bate com o texto da lei?
+
+POR QUE EXISTE: citação legal mal atribuída é a única classe de defeito deste
+acervo com risco real sob o Provimento OAB 205/2021, aparece em ~8% das páginas
+auditadas por humano, e nenhuma medição automática do projeto a detecta. A frase
+"o art. 27 do CDC dá três anos" é gramatical, plausível e está errada.
+
+ESCOPO DELIBERADO: prazo, prescrição e decadência. É a classe de maior dano —
+quem lê "três anos" e tinha cinco desiste de pretensão viva — e a única em que a
+afirmação da página pode ser comparada mecanicamente com o texto oficial. Dizer
+se "o art. 942 estabelece solidariedade" está certo exige leitura jurídica; dizer
+se o prazo afirmado consta do dispositivo, não.
+
+QUATRO ESTADOS, e só um deles fala mal da página:
+
+  CONFERIDO_OK    o prazo afirmado consta do texto oficial do artigo
+  DIVERGENTE      a cláusula afirma prazo que NÃO consta do artigo citado
+  NAO_CONFERIVEL  o artigo não está no corpus — falta de cobertura, não defeito
+  AMBIGUO         a cláusula não isola um artigo, ou o diploma não foi resolvido
+
+NAO_CONFERIVEL nunca é acusação. O <strike> do Planalto abre e fecha fora da
+fronteira semântica e engole cabeçalho vigente (o art. 18-C da LC 123/2006 perde
+o dele assim); tratar ausência como erro acusaria a página por buraco nosso.
+
+DIVERGENTE também não é veredito: é fila de LEITURA. A conferência automática
+erra por motivos que nenhum regex resolve — o artigo mudou de redação, a página
+cita corretamente um prazo que vem de outro dispositivo do mesmo tema, a lei
+nova revogou a antiga. Nenhuma página é corrigida sem alguém ler as duas coisas.
+
+CONFIANÇA DA ATRIBUIÇÃO: cada linha registra se o diploma veio EXPLÍCITO na
+frase ("art. 1.723 do Código Civil") ou foi inferido por proximidade. A
+proximidade acerta 99,2% onde dá para medir (tools/measure-citation-diploma-
+accuracy), mas esse é um teto otimista, medido justamente no caso fácil.
+Divergência sobre diploma inferido vale menos que sobre diploma explícito.
+
+Uso:
+    tools/measure-citation-conformance
+    tools/measure-citation-conformance --lane comercial --exemplos 40
+    tools/measure-citation-conformance --autoteste
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+import unicodedata
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+INVENTARIO = os.path.join(ROOT, "data/ops/citation_inventory.jsonl")
+CORPUS = os.path.join(ROOT, "data/legal-corpus")
+EVIDENCIA = os.path.join(ROOT, "data/ops/citation_conformance.jsonl")
+RESUMO = os.path.join(ROOT, "data/ops/citation_conformance_summary.json")
+
+# NUMERAL POR EXTENSO É COMPOSTO, e ignorar isso inverte o resultado. A primeira
+# versão listava palavras soltas: "cento e oitenta dias" do art. 1.795 do Código
+# Civil virava 80 dias, "vinte e quatro meses" do art. 11 da Lei 9.656/1998
+# virava 4 meses, e "vinte e cinco dias" do art. 49 da Lei 15.040/2024 virava 5.
+# Nos três a página estava CERTA e a ferramenta a acusou — o defeito exato que
+# ela existe para não cometer. Agora as parcelas são somadas.
+UNIDADES = {
+    "um": 1, "uma": 1, "dois": 2, "duas": 2, "tres": 3, "quatro": 4,
+    "cinco": 5, "seis": 6, "sete": 7, "oito": 8, "nove": 9, "dez": 10,
+    "onze": 11, "doze": 12, "treze": 13, "quatorze": 14, "catorze": 14,
+    "quinze": 15, "dezesseis": 16, "dezessete": 17, "dezoito": 18,
+    "dezenove": 19,
+}
+DEZENAS = {
+    "vinte": 20, "trinta": 30, "quarenta": 40, "cinquenta": 50,
+    "sessenta": 60, "setenta": 70, "oitenta": 80, "noventa": 90,
+}
+CENTENAS = {
+    "cem": 100, "cento": 100, "duzentos": 200, "trezentos": 300,
+    "quatrocentos": 400, "quinhentos": 500, "seiscentos": 600,
+    "setecentos": 700, "oitocentos": 800, "novecentos": 900,
+}
+PARCELAS = {}
+PARCELAS.update(UNIDADES)
+PARCELAS.update(DEZENAS)
+PARCELAS.update(CENTENAS)
+
+# Prazos escritos como adjetivo. Só entram os que são inequivocamente prazo:
+# "mensal", "anual" e "semestral" ficaram de fora porque qualificam pagamento,
+# reajuste e indenização muito mais vezes do que prazo — "a indenização mensal
+# de 1% do art. 43-A" virava um prazo de um mês e acusava a página.
+ADJETIVO = {
+    "bienal": ("m", 24), "trienal": ("m", 36), "quadrienal": ("m", 48),
+    "quinquenal": ("m", 60), "decenal": ("m", 120), "quinzenal": ("d", 15),
+    # SUBSTANTIVO TAMBÉM: "o quinquênio do art. 27 do CDC" é o mesmo prazo que
+    # "prazo quinquenal", e sem ele a página de /sumulas/stj-412/ — que distingue
+    # corretamente o triênio do enriquecimento sem causa do quinquênio do CDC —
+    # aparecia como divergente por sobrar só o triênio.
+    "bienio": ("m", 24), "trienio": ("m", 36), "quadrienio": ("m", 48),
+    "quinquenio": ("m", 60), "decenio": ("m", 120),
+}
+
+EXTENSO_COMPOSTO = r"(?:%s)(?:\s+e\s+(?:%s))*" % (
+    "|".join(sorted(PARCELAS, key=len, reverse=True)),
+    "|".join(sorted(PARCELAS, key=len, reverse=True)))
+PRAZO_RE = re.compile(
+    r"\b(?P<quanto>\d{1,4}|%s)\s*(?:\([^)]{1,26}\)\s*)?"
+    r"(?P<unidade>dias?|meses|m[eê]s|anos?)\b" % EXTENSO_COMPOSTO,
+    re.IGNORECASE)
+ADJETIVO_RE = re.compile(r"\b(%s)\b" % "|".join(ADJETIVO), re.IGNORECASE)
+
+# O prazo tem que ser QUANTIFICADO, não apenas mencionado. Sem esta guarda,
+# "cada mês que passa é um mês antigo" (uma imagem, não um prazo) entrava como
+# prazo de um mês e divergia de qualquer artigo.
+# LISTA NEGATIVA, não positiva. A primeira versão enumerava o que PODE anteceder
+# um prazo, e a enumeração nunca fechava: "nos 12 (doze) meses subsequentes" do
+# art. 134 da CLT e "período superior a cinco anos" do art. 43, § 1º, do CDC
+# ficaram de fora, e o corpus — que estava certo — parecia não ter o prazo, o
+# que transformava páginas corretas em divergentes. O que realmente precisa ser
+# excluído é curto: verbo de ligação e distributivo, onde o número vira imagem
+# em vez de prazo ("cada mês que passa é um mês antigo").
+NAO_E_PRAZO_ANTES_RE = re.compile(
+    r"\b(?:é|são|era|eram|foi|foram|seja|sendo|cada|outro|outra)\s+$",
+    re.IGNORECASE)
+REFERENCIA_RE = re.compile(r"\b(?:arts?\.?|artigos?)\s*(\d{1,4}(?:\.\d{3})*(?:-[A-Z])?)",
+                           re.IGNORECASE)
+TEMA_PRAZO_RE = re.compile(
+    r"\b(prazo|prescri|decad|caduc|preclus|contad|conta-se|dentro de|at[ée]\b|"
+    r"expira|vence|venciment|corridos|[úu]teis|em at[ée]|no prazo|ap[óo]s)",
+    re.IGNORECASE)
+
+# Número com unidade de tempo que NÃO é prazo. A pena de "dois a cinco anos" e a
+# idade de "dezoito anos" têm a mesma forma que um prazo e estão fora do escopo
+# declarado desta ferramenta; conferi-las produziria divergência sobre coisa que
+# ela não se propôs a medir.
+FORA_DE_ESCOPO_RE = re.compile(
+    r"\b(pena|reclus[ãa]o|deten[çc][ãa]o|anos de idade|idade de|"
+    r"maiores? de|menores? de|absolutamente incapaz|relativamente incapaz)",
+    re.IGNORECASE)
+
+# Pena colada ao número. "infrações de menor potencial ofensivo, aquelas com
+# pena máxima de até dois anos" fala de PENA, e a frase inteira fala de prazo —
+# por isso a exclusão tem que ser local, não da cláusula toda.
+PENA_PERTO_RE = re.compile(
+    r"\b(pena|penas|reclus[ãa]o|deten[çc][ãa]o|apenad[oa]|condena\w*|"
+    r"anos de idade|idade)\b[^.;]{0,40}$", re.IGNORECASE)
+
+# IDADE VEM DEPOIS DO NÚMERO. "completar 65 (sessenta e cinco) anos de idade" é
+# a forma da Lei 8.213/1991, da Constituição e do CTB, e ler isso como prazo
+# encheu o texto oficial de prazos inexistentes — o art. 48, § 1º, aparecia com
+# "660, 720 e 780 meses" e fazia divergir a página que corretamente dizia
+# "reduz esses limites em cinco anos".
+IDADE_DEPOIS_RE = re.compile(r"^\s*(?:completos?\s+)?de\s+idade", re.IGNORECASE)
+
+
+def sem_acento(texto):
+    return "".join(c for c in unicodedata.normalize("NFKD", texto or "")
+                   if not unicodedata.combining(c)).lower()
+
+
+def equivalentes(afirmados, no_texto):
+    """Mesmo prazo escrito em unidade diferente: 180 dias == seis meses."""
+    def em_dias(prazo):
+        unidade, quantidade = prazo
+        return quantidade * 30 if unidade == "m" else quantidade
+    return bool({em_dias(p) for p in afirmados} & {em_dias(p) for p in no_texto})
+
+
+FIM_SENTENCA_RE = re.compile(r"\.\s+(?=[A-ZÀ-Ý])")
+
+
+def mesma_sentenca(frase, posicao_a, posicao_b):
+    """Não há fim de período entre as duas posições."""
+    inicio, fim = sorted((posicao_a, posicao_b))
+    return not FIM_SENTENCA_RE.search(frase, inicio, fim)
+
+
+def valores_extenso(bruto):
+    """Numerais por extenso contidos na expressão, respeitando a gramática.
+
+    "cento e oitenta" = [180], "vinte e quatro" = [24]. Mas "seis e vinte e
+    quatro" NÃO é 30: são dois numerais coordenados ("entre seis e vinte e
+    quatro meses"), e somá-los inventou um prazo de 30 meses que fez o art. 30
+    da Lei 9.656/1998 divergir de uma página correta. A resposta certa ali é
+    [6, 24] — a frase afirma uma faixa, e os dois extremos são prazos do artigo.
+
+    Em português a composição é estritamente decrescente em magnitude — centena,
+    depois dezena, depois unidade. Assim que a ordem sobe ou repete, aquele
+    numeral terminou e começa outro.
+    """
+    valores = []
+    total = 0
+    anterior = None
+    for parcela in re.split(r"\s+e\s+", bruto):
+        valor = PARCELAS.get(parcela)
+        if valor is None:
+            break
+        ordem = 100 if parcela in CENTENAS else (10 if parcela in DEZENAS else 1)
+        if anterior is not None and ordem >= anterior:
+            valores.append(total)
+            total, anterior = 0, None
+        total += valor
+        anterior = ordem
+    if total:
+        valores.append(total)
+    return valores
+
+
+def prazos_com_posicao(trecho):
+    """Lista de (posição, (unidade, quantidade)) para cada prazo afirmado.
+
+    Ano vira mês para que "dois anos" e "24 meses" sejam o mesmo prazo. Dia fica
+    em dia: "30 dias" e "um mês" são escritos por motivos diferentes na lei e
+    tratá-los como iguais esconderia divergência real.
+    """
+    achados = []
+    # Sem acento ANTES de casar: o dicionário de extenso é ASCII e "três anos"
+    # não casava com a entrada "tres". O autoteste pegou isso em 7 dos 12 casos.
+    # A guarda de contexto, porém, olha o texto ORIGINAL: sem acento, o verbo
+    # "é" vira a conjunção "e" e a distinção se perde.
+    original = trecho
+    trecho = sem_acento(trecho)
+    for achado in PRAZO_RE.finditer(trecho):
+        antes = original[max(0, achado.start() - 30):achado.start()]
+        if NAO_E_PRAZO_ANTES_RE.search(antes):
+            continue
+        # "pena máxima de até dois anos" é pena, não prazo, e a menção fica
+        # colada ao número — por isso a janela é curta.
+        if PENA_PERTO_RE.search(original[max(0, achado.start() - 60):achado.start()]):
+            continue
+        if IDADE_DEPOIS_RE.match(original[achado.end():achado.end() + 24]):
+            continue
+        bruto = achado.group("quanto")
+        quantidades = [int(bruto)] if bruto.isdigit() else valores_extenso(bruto)
+        unidade = achado.group("unidade")
+        for quantidade in quantidades:
+            if not quantidade:
+                continue
+            if unidade.startswith("ano"):
+                achados.append((achado.start(), ("m", quantidade * 12)))
+            elif unidade.startswith("mes") or unidade.startswith("me"):
+                achados.append((achado.start(), ("m", quantidade)))
+            else:
+                achados.append((achado.start(), ("d", quantidade)))
+    for achado in ADJETIVO_RE.finditer(trecho):
+        achados.append((achado.start(), ADJETIVO[achado.group(1)]))
+    return achados
+
+
+def prazos(trecho):
+    """Só os valores, para quando a posição não importa (texto do artigo)."""
+    return {valor for _, valor in prazos_com_posicao(trecho)}
+
+
+def prazos_atribuidos_ao_artigo(frase, artigo):
+    """Prazos da frase cuja referência de artigo MAIS PRÓXIMA é a deste artigo.
+
+    Delimitar a cláusula só pelas fronteiras vizinhas não bastava. Em "O art.
+    174 do CTN fixa em cinco anos o prazo para a Fazenda cobrar — prazo que o
+    art. 2º, § 3º, da Lei 6.830/1980 suspende por 180 dias", os cinco anos ficam
+    entre as duas referências e eram cobrados do art. 2º, que nada tem a ver com
+    eles. A página estava certa nas duas afirmações.
+
+    Cada prazo pertence à referência mais próxima. Devolve (prazos, quantas
+    referências a frase tem).
+    """
+    sem = sem_acento(frase)
+    marcas = [(m.start(), m.end(), m.group(1).replace(".", "").upper())
+              for m in REFERENCIA_RE.finditer(sem)]
+    encontrados = prazos_com_posicao(frase)
+    alvo = artigo.replace(".", "").upper()
+    if not marcas:
+        return {valor for _, valor in encontrados}, 0
+
+    # Fronteira entre duas referências: o conectivo mais forte que houver entre
+    # elas. Distância pura empatava e errava — em "pagar em três dias (art. 829)
+    # e dispõe de quinze dias para embargos (art. 915)" os quinze dias ficam
+    # mais perto do art. 829, mas pertencem ao art. 915. O " e " separa as duas
+    # orações e é onde a frase realmente vira.
+    cortes = []
+    for indice in range(len(marcas) - 1):
+        vao_inicio, vao_fim = marcas[indice][1], marcas[indice + 1][0]
+        # Conectivo procurado no texto COM acento: "é dever do comprador" vira
+        # "e dever" sem acento, e o " e " falso movia a fronteira para depois do
+        # prazo. Foi assim que os trinta dias do art. 233 do CTB foram cobrados
+        # do art. 134, numa frase que atribuía cada prazo ao artigo certo.
+        vao = frase[vao_inicio:vao_fim]
+        escolhido = None
+        for padrao in (r";", r"[—–]", r"\)\s+e\s+", r"\s+e\s+", r":", r","):
+            achado = re.search(padrao, vao)
+            if achado:
+                escolhido = vao_inicio + achado.end()
+                break
+        cortes.append(escolhido if escolhido is not None
+                      else (vao_inicio + vao_fim) // 2)
+
+    def dono_de(posicao):
+        for indice, corte in enumerate(cortes):
+            if posicao < corte:
+                return marcas[indice][2]
+        return marcas[-1][2]
+
+    minhas_marcas = [marca for marca in marcas if marca[2] == alvo]
+    meus = set()
+    for posicao, valor in encontrados:
+        if dono_de(posicao) != alvo:
+            continue
+        # MESMA SENTENÇA. O extrator de citações trata "CLT." como abreviação e
+        # cola duas frases numa só: "...a sanção do art. 477 da CLT. O prazo
+        # para ajuizar é de dois anos contados do fim do contrato." Os dois anos
+        # são a prescrição trabalhista, não o prazo do art. 477 — a página está
+        # certa nas duas afirmações.
+        if minhas_marcas and not any(
+                mesma_sentenca(frase, posicao, marca[0]) for marca in minhas_marcas):
+            continue
+        meus.add(valor)
+    return meus, len(marcas)
+
+
+def clausula_do_artigo(frase, artigo):
+    """Trecho da frase que pertence à citação deste artigo.
+
+    A fronteira é a referência VIZINHA a outro artigo. Em "o executado é citado
+    para pagar em três dias (art. 829) e dispõe de quinze dias para embargos
+    (art. 915)", o prazo do art. 915 não pode ser cobrado do art. 829.
+
+    Devolve (trecho, quantos_artigos_na_frase).
+    """
+    marcas = [(m.start(), m.end(), m.group(1).replace(".", ""))
+              for m in REFERENCIA_RE.finditer(frase)]
+    if not marcas:
+        return frase, 0
+    alvo = artigo.replace(".", "")
+    for indice, (inicio, fim, numero) in enumerate(marcas):
+        if numero != alvo:
+            continue
+        esquerda = marcas[indice - 1][1] if indice else 0
+        direita = marcas[indice + 1][0] if indice + 1 < len(marcas) else len(frase)
+        return frase[esquerda:direita], len(marcas)
+    return frase, len(marcas)
+
+
+def carregar_corpus():
+    corpus = {}
+    for caminho in glob.glob(os.path.join(CORPUS, "*.json")):
+        with open(caminho, encoding="utf-8") as handle:
+            corpus[os.path.basename(caminho)[:-5]] = json.load(handle)["articles"]
+    return corpus
+
+
+def diploma_explicito(frase, artigo):
+    """A frase escreve a lei logo depois do artigo? Então não houve inferência."""
+    alvo = artigo.replace(".", "")
+    for marca in REFERENCIA_RE.finditer(frase):
+        if marca.group(1).replace(".", "") != alvo:
+            continue
+        depois = frase[marca.end():marca.end() + 90]
+        if re.match(r"\s*[ºo°]?\s*(?:[,\s]*(?:§+\s*[\d.ºo°]+|inc(?:iso)?s?\.?\s*[IVXLC]+"
+                    r"|al[íi]neas?\s*[a-z]\)?|[IVXLC]+\b|[a-z]\)))*\s*,?\s*d[oaes]s?\s+[A-ZÀ-Ý]",
+                    depois):
+            return True
+    return False
+
+
+def avaliar(registro, corpus):
+    """Classifica uma citação nos quatro estados. Não emite veredito de página."""
+    artigo = (registro.get("article") or "").replace(".", "").upper()
+    qualificador = (registro.get("qualifier") or "").strip().upper()
+    diploma = registro.get("diploma") or ""
+    frase = registro.get("claim") or ""
+
+    if not diploma or diploma not in corpus:
+        return {"estado": "AMBIGUO", "motivo": "diploma nao resolvido no corpus"}
+
+    sufixo = ""
+    if qualificador and len(qualificador) == 1 and qualificador.isalpha():
+        sufixo = "-" + qualificador
+    texto = corpus[diploma].get(artigo + sufixo) or corpus[diploma].get(artigo)
+    if not texto:
+        return {"estado": "NAO_CONFERIVEL",
+                "motivo": "artigo ausente do corpus (cobertura, nao defeito)"}
+
+    trecho, _ = clausula_do_artigo(frase, registro.get("article") or "")
+    afirmados, quantos = prazos_atribuidos_ao_artigo(frase, registro.get("article") or "")
+    if not afirmados:
+        return {"estado": "AMBIGUO", "motivo": "a frase nao afirma prazo deste artigo"}
+    if not TEMA_PRAZO_RE.search(trecho) and FORA_DE_ESCOPO_RE.search(trecho):
+        return {"estado": "AMBIGUO",
+                "motivo": "numero com unidade de tempo que e pena ou idade, nao prazo"}
+
+    no_texto = prazos(texto)
+    if not no_texto:
+        return {"estado": "AMBIGUO",
+                "motivo": "o dispositivo nao enuncia prazo — o da pagina vem de outra fonte"}
+
+    # BASTA UM BATER. A cláusula costuma carregar mais de um número (o prazo do
+    # artigo e o do caso concreto), e exigir que todos batam produz acusação
+    # onde a página acertou. Foi assim que /digital/app-removido-loja-
+    # desenvolvedor/ foi acusado: dizia corretamente "prazo decenal do art. 205"
+    # e caiu por um "3 anos" que estava em outro ponto da frase.
+    if afirmados & no_texto:
+        return {"estado": "CONFERIDO_OK",
+                "prazo_afirmado": sorted(afirmados), "prazo_no_artigo": sorted(no_texto)}
+
+    # MESMO PRAZO, OUTRA UNIDADE. O art. 2º, § 3º, da Lei 6.830/1980 suspende a
+    # prescrição por "180 dias"; a página escreve "seis meses". É a mesma
+    # afirmação, e acusá-la seria cobrar a redação da lei, não o conteúdo. A
+    # conversão fica registrada para que ninguém confunda com conferência
+    # literal — em contagem processual, prazo em dias e em meses não são a mesma
+    # regra, ainda que aqui digam o mesmo número.
+    if equivalentes(afirmados, no_texto):
+        return {"estado": "CONFERIDO_OK", "equivalencia_por_conversao": True,
+                "prazo_afirmado": sorted(afirmados), "prazo_no_artigo": sorted(no_texto)}
+
+    return {
+        "estado": "DIVERGENTE",
+        "motivo": "prazo afirmado nao consta do dispositivo",
+        "prazo_afirmado": sorted(afirmados),
+        "prazo_no_artigo": sorted(no_texto),
+        "clausula": " ".join(trecho.split())[:240],
+        "artigos_na_frase": quantos,
+    }
+
+
+# ---------------------------------------------------------------- autoteste --
+# Cada caso foi COPIADO do dado real (frase do inventário, texto do corpus)
+# antes de a expectativa ser escrita. O check-legal-corpus-extractor reprovou um
+# corpus correto duas vezes por eu ter escrito a expectativa de memória.
+CASOS = [
+    # Divergência real e cara: fundamenta no CDC e aplica o prazo do Código Civil.
+    ("O art. 27 do CDC fixa em três anos a prescrição da pretensão de reparação "
+     "pelo fato do produto.", "27", "", "cdc", "DIVERGENTE"),
+    ("Prescreve em cinco anos a pretensão à reparação pelos danos causados por "
+     "fato do produto, na forma do art. 27 do CDC.", "27", "", "cdc", "CONFERIDO_OK"),
+    # Dois artigos, dois prazos, na mesma frase: cada um responde pelo seu.
+    ("No rito do CPC, o executado é citado para pagar em três dias (art. 829) e "
+     "dispõe de quinze dias para embargos (art. 915).", "829", "", "cpc", "CONFERIDO_OK"),
+    ("No rito do CPC, o executado é citado para pagar em três dias (art. 829) e "
+     "dispõe de quinze dias para embargos (art. 915).", "915", "", "cpc", "CONFERIDO_OK"),
+    # Prazo por extenso e por adjetivo.
+    ("O art. 205 do Código Civil fixa o prazo decenal quando a lei não marca "
+     "prazo menor.", "205", "", "codigo_civil", "CONFERIDO_OK"),
+    ("O art. 206, § 3º, inciso V, do Código Civil fixa em três anos a prescrição "
+     "da pretensão de reparação civil.", "206", "§ 3º", "codigo_civil", "CONFERIDO_OK"),
+    # Artigo com sufixo — o corpus só passou a indexá-los em 2026-08-06.
+    ("O art. 43-A da Lei 4.591/1964 admite atraso de até 180 dias corridos na "
+     "entrega do imóvel.", "43-A", "", "lei_4591_1964", "CONFERIDO_OK"),
+    # FORA DE ESCOPO, e tem que continuar fora: "pena máxima não superior a dois
+    # anos" tem a forma de um prazo e não é um. A ferramenta mede prazo,
+    # prescrição e decadência; deixar pena entrar seria medir o que ela não se
+    # propôs a medir e reportar divergência sobre isso.
+    ("Consideram-se de menor potencial ofensivo os crimes com pena máxima não "
+     "superior a dois anos, na forma do art. 61 da Lei 9.099/1995.",
+     "61", "", "lei_9099_1995", "AMBIGUO"),
+    # NÃO acusar quando o artigo não está no corpus.
+    ("O art. 18-C da Lei Complementar 123/2006 exige prazo de trinta dias.",
+     "18-C", "", "lc_123_2006", "NAO_CONFERIVEL"),
+    # NÃO acusar quando a cláusula não fala de prazo.
+    ("O art. 942 do Código Civil estabelece que, quando a ofensa tem mais de um "
+     "autor, todos respondem solidariamente pela reparação.",
+     "942", "", "codigo_civil", "AMBIGUO"),
+    # NÃO acusar quando o dispositivo não enuncia prazo nenhum: o prazo citado
+    # pela página vem de outra fonte, e o silêncio do artigo não o contradiz.
+    ("O art. 422 do Código Civil impõe boa-fé, e a plataforma tinha trinta dias "
+     "para responder.", "422", "", "codigo_civil", "AMBIGUO"),
+    # Diploma fora do corpus não vira acusação.
+    ("O art. 32 da Resolução 400 permite protestar a avaria em até sete dias.",
+     "32", "", "resolucao", "AMBIGUO"),
+
+    # ---- os seis falsos positivos que a primeira medição real produziu ----
+    # NUMERAL COMPOSTO. Nos três a página está CERTA: a ferramenta é que lia
+    # "cento e oitenta" como 80, "vinte e quatro" como 4 e "vinte e cinco"
+    # como 5.
+    ("O prazo de cento e oitenta dias para reaver a quota está no art. 1.795 do "
+     "Código Civil.", "1.795", "", "codigo_civil", "CONFERIDO_OK"),
+    ("A cobertura parcial temporária do art. 11 da Lei 9.656/1998 pode suspender "
+     "procedimentos por até vinte e quatro meses.", "11", "", "lei_9656_1998",
+     "CONFERIDO_OK"),
+    ("Pelo art. 49 da Lei 15.040/2024, a seguradora dispõe de no máximo vinte e "
+     "cinco dias para cientificar a recusa.", "49", "", "lei_15040_2024",
+     "CONFERIDO_OK"),
+    # "mensal" QUALIFICA A INDENIZAÇÃO, não é prazo de um mês.
+    ("A indenização mensal de 1% prevista no § 2º do art. 43-A da Lei 4.591/1964 "
+     "corre enquanto durar o atraso.", "43-A", "", "lei_4591_1964", "AMBIGUO"),
+    # Imagem retórica, não prazo: "cada mês que passa é um mês antigo".
+    ("A prescrição do art. 11 da CLT não espera: cada mês que passa é um mês "
+     "antigo que sai da conta pela ponta.", "11", "", "clt", "AMBIGUO"),
+    # Idade, não prazo.
+    ("Menores de 18 anos dependem de ação judicial, já que o art. 3º do Código "
+     "Civil os trata como absolutamente incapazes.", "3", "", "codigo_civil",
+     "AMBIGUO"),
+    # O PRAZO É DE OUTRO ARTIGO DA MESMA FRASE. Nas duas a página está certa: o
+    # prazo pertence à referência vizinha, não à citada.
+    ("O art. 174 do Código Tributário Nacional fixa em cinco anos, contados da "
+     "constituição definitiva do crédito, o prazo para a Fazenda cobrar "
+     "judicialmente o tributo — prazo que o art. 2º, § 3º, da Lei 6.830/1980 "
+     "suspende por 180 dias.", "2", "§ 3º", "lei_6830_1980", "CONFERIDO_OK"),
+    ("O empregado tem dois anos para reclamar, e o art. 477 da CLT dá dez dias "
+     "para o pagamento das verbas rescisórias.", "477", "", "clt",
+     "CONFERIDO_OK"),
+    # FAIXA: "entre seis e vinte e quatro meses" são dois prazos, 6 e 24, não a
+    # soma 30. A página está certa e descreve o art. 30 da Lei 9.656/1998.
+    ("O art. 30 da Lei 9.656/1998 fixa a manutenção em um terço do tempo de "
+     "contribuição, entre seis e vinte e quatro meses.", "30", "",
+     "lei_9656_1998", "CONFERIDO_OK"),
+    # O verbo introduz o prazo: sem aceitar "prevê", sobrava só o prazo do
+    # manual do proprietário e a página correta virava divergente.
+    ("Vícios de acabamento sujeitam-se a prazos entre um e dois anos conforme o "
+     "manual do proprietário, além do art. 26 do Código de Defesa do "
+     "Consumidor, que prevê noventa dias de decadência.", "26", "", "cdc",
+     "CONFERIDO_OK"),
+    # "é dever" sem acento vira "e dever": o conectivo falso movia a fronteira
+    # para depois do prazo. A página atribui cada prazo ao artigo certo — os
+    # trinta dias são do art. 233, e o art. 134 tem sessenta.
+    ("A comunicação de venda é dever do vendedor, disciplinado pelo art. 134 do "
+     "CTB, enquanto a expedição do novo CRV dentro de trinta dias é dever do "
+     "comprador, do art. 233.", "134", "", "ctb", "AMBIGUO"),
+    ("A comunicação de venda é dever do vendedor, disciplinado pelo art. 134 do "
+     "CTB, enquanto a expedição do novo CRV dentro de trinta dias é dever do "
+     "comprador, do art. 233.", "233", "", "ctb", "CONFERIDO_OK"),
+    # Duas sentenças coladas pelo extrator, porque "CLT." parece abreviação. Os
+    # dois anos são a prescrição trabalhista, não o prazo do art. 477.
+    ("A empresa é condenada a depositar diferenças, multa de 40% e a sanção do "
+     "art. 477 da CLT. O prazo para ajuizar é de dois anos contados do fim do "
+     "contrato.", "477", "", "clt", "AMBIGUO"),
+    # Mesma afirmação, outra unidade: a lei diz 180 dias, a página diz seis meses.
+    ("O art. 2º, § 3º, da Lei nº 6.830/1980 dá mais um fôlego de seis meses à "
+     "Fazenda antes de a prescrição voltar a correr.", "2", "§ 3º",
+     "lei_6830_1980", "CONFERIDO_OK"),
+]
+
+
+def autoteste(corpus):
+    falhas = []
+    print("=== AUTOTESTE: %d frases reais ===" % len(CASOS))
+    for frase, artigo, qualificador, diploma, esperado in CASOS:
+        resultado = avaliar({"article": artigo, "qualifier": qualificador,
+                             "diploma": diploma, "claim": frase}, corpus)
+        obtido = resultado["estado"]
+        marca = "ok   " if obtido == esperado else "FALHA"
+        if obtido != esperado:
+            falhas.append((frase[:70], esperado, obtido, resultado.get("motivo", "")))
+        print("  %s art. %-6s %-14s %s" % (marca, artigo, obtido, frase[:66]))
+    if falhas:
+        print("\nREPROVADO — %d caso(s):" % len(falhas))
+        for frase, esperado, obtido, motivo in falhas:
+            print("  esperado %s, obtido %s (%s)" % (esperado, obtido, motivo))
+            print("    %s" % frase)
+        return 1
+    print("\nAPROVADO — inclusive os 5 casos que NÃO podem virar acusação.")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lane", default="", choices=["", "comercial", "informativa"])
+    parser.add_argument("--exemplos", type=int, default=25)
+    parser.add_argument("--autoteste", action="store_true")
+    args = parser.parse_args()
+
+    corpus = carregar_corpus()
+    if not corpus:
+        print("corpus vazio — rode tools/generate-legal-corpus", file=sys.stderr)
+        return 1
+    if args.autoteste:
+        return autoteste(corpus)
+
+    if autoteste(corpus):
+        print("\nautoteste reprovou; medição abortada para não gerar dado falso.",
+              file=sys.stderr)
+        return 1
+    print()
+
+    estados = collections.Counter()
+    divergentes = []
+    linhas = []
+    with open(INVENTARIO, encoding="utf-8") as handle:
+        for linha in handle:
+            registro = json.loads(linha)
+            if args.lane and (registro.get("lane") or "") != args.lane:
+                continue
+            resultado = avaliar(registro, corpus)
+            estados[resultado["estado"]] += 1
+            if resultado["estado"] in ("DIVERGENTE", "CONFERIDO_OK"):
+                saida = {
+                    "intent_id": registro.get("intent_id"),
+                    "path": registro.get("path"),
+                    "lane": registro.get("lane"),
+                    "article": registro.get("article"),
+                    "qualifier": registro.get("qualifier"),
+                    "diploma": registro.get("diploma"),
+                    "diploma_explicito_na_frase": diploma_explicito(
+                        registro.get("claim") or "", registro.get("article") or ""),
+                }
+                saida.update(resultado)
+                linhas.append(saida)
+                if resultado["estado"] == "DIVERGENTE":
+                    divergentes.append(saida)
+
+    total = sum(estados.values())
+    print("=== CONFORMIDADE DA CITAÇÃO COM O TEXTO OFICIAL ===")
+    print("escopo   : prazo, prescrição e decadência%s"
+          % (" — lane %s" % args.lane if args.lane else ""))
+    print("citações : %d" % total)
+    print()
+    for estado in ("CONFERIDO_OK", "DIVERGENTE", "NAO_CONFERIVEL", "AMBIGUO"):
+        print("  %-16s %6d  (%.1f%%)"
+              % (estado, estados[estado], 100.0 * estados[estado] / max(total, 1)))
+
+    conferidas = estados["CONFERIDO_OK"] + estados["DIVERGENTE"]
+    if conferidas:
+        print("\nde %d citações efetivamente conferidas, %d divergem (%.1f%%)"
+              % (conferidas, estados["DIVERGENTE"],
+                 100.0 * estados["DIVERGENTE"] / conferidas))
+
+    explicitas = [d for d in divergentes if d["diploma_explicito_na_frase"]]
+    print("divergências com a lei ESCRITA na frase (sinal forte): %d de %d"
+          % (len(explicitas), len(divergentes)))
+
+    def formata(prazo):
+        return ", ".join("%d %s" % (q, "meses" if u == "m" else "dias") for u, q in prazo)
+
+    print("\n--- fila de LEITURA (não é veredito) ---")
+    for caso in (explicitas + [d for d in divergentes if not d["diploma_explicito_na_frase"]])[:args.exemplos]:
+        print("  %s  art. %s %s (%s)%s"
+              % (caso["path"], caso["article"], caso["qualifier"], caso["diploma"],
+                 "" if caso["diploma_explicito_na_frase"] else "  [diploma inferido]"))
+        print("      pagina diz: %s | artigo tem: %s"
+              % (formata(caso["prazo_afirmado"]), formata(caso["prazo_no_artigo"])))
+        print("      %s" % caso["clausula"][:170])
+
+    os.makedirs(os.path.dirname(EVIDENCIA), exist_ok=True)
+    with open(EVIDENCIA, "w", encoding="utf-8") as handle:
+        for linha in linhas:
+            handle.write(json.dumps(linha, ensure_ascii=False) + "\n")
+    with open(RESUMO, "w", encoding="utf-8") as handle:
+        json.dump({
+            "schema_version": "citation_conformance_v1",
+            "measured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "escopo": "prazo_prescricao_decadencia",
+            "lane": args.lane or "todas",
+            "estados": dict(estados),
+            "divergentes": len(divergentes),
+            "divergentes_com_diploma_explicito": len(explicitas),
+            "paginas_com_divergencia": len({d["path"] for d in divergentes}),
+        }, handle, ensure_ascii=False, indent=1, sort_keys=True)
+    print("\nevidência: %s" % os.path.relpath(EVIDENCIA, ROOT))
+    print("            %s" % os.path.relpath(RESUMO, ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

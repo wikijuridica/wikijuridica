@@ -1,0 +1,1117 @@
+#!/usr/bin/env bash
+# bootstrap-chain — regenera a cadeia authorial_mass do estoque ao verdict na
+# ordem topológica descoberta pela DEC-015 e fechada pela DEC-014 (ULTRAPLAN
+# E3a). Funciona em qualquer N dirigido pelo stock_manifest (ensaio N=632 e
+# produção N=10.000 usam a MESMA ordem).
+#
+# Uso:
+#   tools/bootstrap-chain            # roda a cadeia inteira, para no 1º erro
+#   tools/bootstrap-chain --list     # mostra os passos numerados
+#   tools/bootstrap-chain --from N   # retoma do passo N (1-based)
+#   tools/bootstrap-chain --until N  # para depois do passo N
+#
+# Cada passo invoca o wrapper tools/generate-* correspondente (que carrega
+# claims/budget/throttle). Um passo que falha interrompe a cadeia — corrigir o
+# elo e retomar com --from. Log com tempo por passo em stderr.
+#
+# Pré-requisitos (fora desta ferramenta):
+#   - ingestão transacional feita por tools/ingest-v2-stock, com receipt e
+#     stock_manifest pertencentes à fotografia viva dos shards v2;
+#   - LanguageTool server ativo (porta 8082 — ver mapa de portas do ULTRAPLAN)
+#     para o passo languagetool-quality em N >= mínimo do manifesto;
+#   - venvs python dos oráculos ptbr_* instalados (ops/setup-oracle-tools.sh).
+set -euo pipefail
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$ROOT"
+ORIGINAL_ARGS=("$@")
+
+STEPS=(
+	# 1. caminho frio acíclico do estoque. As assinaturas e os pares precisam
+	# existir ANTES das auditorias que os leem. Refined/queue de uma geração
+	# anterior são invalidados no reset; assinaturas são stock-only, os pares são
+	# estruturais e quality-vectors só entra no join explícito downstream da fila.
+	generate-authorial-mass-scale-shards
+	generate-authorial-mass-legal-signatures
+	generate-authorial-mass-signature-candidate-pairs
+	generate-authorial-mass-refinement-quality-report
+	generate-authorial-mass-global-similarity-audit
+	generate-authorial-mass-editorial-quality-vectors
+	generate-authorial-mass-contextual-compatibility
+	generate-authorial-mass-signature-refinement-queue
+	generate-authorial-mass-signature-shard-rewrite-plan
+	# 2. readiness -> revisão jurídica -> prosa pública. O candidato autentica a
+	# revisão legal viva; portanto nenhum output da geração anterior pode ocupar
+	# essa aresta nem servir como fallback.
+	generate-authorial-mass-publication-readiness
+	generate-authorial-mass-legal-reviews
+	generate-public-prose-candidate
+	generate-refined-public-prose
+	# Inventários colunares derivados do refined: o gate languagetool valida o
+	# sidecar parquet contra o refined vivo (visible_text por linha) — sem
+	# regenerá-los aqui, QUALQUER regeneração do refined deixa o sidecar stale e
+	# o passo languagetool reprova com visible_text_mismatch (elo quebrado fora
+	# da cadeia, corrigido 2026-07-14).
+	generate-content-inventory-parquet
+	generate-content-inventory-arrow
+	generate-public-prose-language-patterns
+	# 3. oráculos PT-BR (exigidos a partir do mínimo do manifesto — DEC-014).
+	# Todos estes produtores leem o refined; o rescoring também lê os pares de
+	# assinatura produzidos na fase fria acíclica.
+	generate-languagetool-quality-release
+	generate-vale-public-prose-lint
+	generate-simplemma-ptbr-lemma-audit
+	generate-ptbr-text-shape-release
+	generate-ptbr-pair-rescoring
+	generate-ptbr-wordfreq-quality
+	generate-ptbr-ftfy-unicode-oracle
+	generate-ptbr-lexical-diversity
+	generate-ptbr-spellcheck-evidence
+	generate-ptbr-morphsyntax-evidence
+	generate-ptbr-confusables-evidence
+	generate-ptbr-unicode-quality
+	generate-sqlite-fts5-corpus-evidence
+	# 3b. camadas exigidas pelo verdict (enumeradas pelos blockers do ensaio
+	# N=209): dedupe externo simhash/hnsw, clusters semânticos, revisão
+	# contextual de página e vivacidade de fontes.
+	generate-external-dedupe-oracle
+	generate-semantic-cluster-index
+	# A revisão legal já precedeu candidate/refined; a evidência de release
+	# PRECEDE a revisão contextual:
+	# generate-contextual-public-page-review valida contra release_evidence,
+	# que por sua vez autentica legal_reviews. Ordem topológica corrigida
+	# 2026-07-09 (ensaio N=590) — antes o contextual rodava contra evidence
+	# stale (só passava em steady-state, com outputs de ciclo anterior no disco).
+	generate-authorial-mass-release-evidence
+	# A revisão contextual e o inventário de fontes também consomem a camada
+	# legada de ensaio final; regenere-a para não juntar N atual com 360 stale.
+	generate-public-final-page-rehearsal
+	generate-contextual-public-page-review
+	# Transação de fonte: agrega o inventário, executa somente metadata HEAD/range
+	# sem copiar corpo, agrega o resultado vivo e então decide aprovação/recheck.
+	generate-official-source-url-inventory
+	generate-official-source-url-live-metadata-attempts-release
+	generate-official-source-url-live-evidence
+	generate-public-final-source-approval
+	generate-public-final-source-live-recheck
+	# 4. release -> verdict -> manifest (o manifest LÊ o verdict —
+	# ordem provada no ensaio N=209 de 2026-07-09)
+	generate-authorial-mass-release-transaction
+	generate-scaled-content-release-verdict
+	generate-authorial-mass-manifest-transaction
+)
+
+# Artefatos materiais autenticados pelo recibo de cada passo. A posição é o
+# contrato: um passo sem output explícito não pode ser pulado por --from.
+# Use | somente quando um produtor grava dois outputs necessários no mesmo
+# passo (LanguageTool evidence + cache plan).
+STEP_ARTIFACTS=(
+	data/editorial/authorial_mass_scale_shards.jsonl
+	data/editorial/authorial_mass_legal_signatures.jsonl
+	data/editorial/authorial_mass_signature_candidate_pairs.jsonl
+	data/editorial/authorial_mass_refinement_quality_report.jsonl
+	data/editorial/authorial_mass_global_similarity_audit.jsonl
+	data/editorial/authorial_mass_editorial_quality_vectors.jsonl
+	data/editorial/authorial_mass_contextual_compatibility.jsonl
+	data/editorial/authorial_mass_signature_refinement_queue.jsonl
+	data/editorial/authorial_mass_signature_shard_rewrite_plan.jsonl
+	data/editorial/authorial_mass_publication_readiness.jsonl
+	data/editorial/authorial_mass_legal_editorial_reviews.jsonl
+	data/editorial/public_prose_candidate.jsonl
+	'data/editorial/refined_public_prose.jsonl|data/ops/refined_public_prose_generation_witness.json'
+	'data/ops/content_inventory_parquet_evidence.jsonl|data/ops/content_inventory.parquet'
+	'data/ops/content_inventory_arrow_evidence.jsonl|data/ops/content_inventory.arrow'
+	'data/editorial/public_prose_language_patterns.jsonl|data/ops/public_prose_language_patterns.jsonl'
+	'data/ops/languagetool_quality_evidence.jsonl|data/ops/languagetool_quality_cache_plan.json'
+	data/ops/vale_public_prose_lint_evidence.jsonl
+	data/ops/simplemma_ptbr_lemma_audit.jsonl
+	data/ops/ptbr_text_shape_release_evidence.jsonl
+	data/ops/ptbr_pair_rescoring_evidence.jsonl
+	data/ops/ptbr_wordfreq_quality_evidence.jsonl
+	data/ops/ptbr_ftfy_unicode_oracle_evidence.jsonl
+	data/ops/ptbr_lexical_diversity_evidence.jsonl
+	data/ops/ptbr_spellcheck_evidence.jsonl
+	data/ops/ptbr_morphsyntax_evidence.jsonl
+	data/ops/ptbr_confusables_evidence.jsonl
+	data/ops/ptbr_unicode_quality_evidence.jsonl
+	data/ops/sqlite_fts5_corpus_evidence.jsonl
+	data/ops/external_dedupe_oracle.jsonl
+	data/editorial/semantic_cluster_index.jsonl
+	data/editorial/authorial_mass_release_evidence.jsonl
+	data/editorial/public_final_page_rehearsal.jsonl
+	data/editorial/contextual_public_page_review.jsonl
+	'data/source-registry/official_source_url_inventory.jsonl|data/source-registry/official_source_url_inventory_manifest.json'
+	data/source-registry/official_source_url_live_metadata_attempts.jsonl
+	data/source-registry/official_source_url_live_evidence.jsonl
+	data/editorial/public_final_source_approval.jsonl
+	data/editorial/public_final_source_live_recheck.jsonl
+	data/editorial/authorial_mass_release_transaction_evidence.jsonl
+	'data/editorial/scaled_content_release_verdict.jsonl|data/ops/scaled_content_release_verdict_input_dependencies.jsonl'
+	'data/editorial/authorial_mass_manifest_transaction_rehearsal.jsonl|data/editorial/authorial_mass_manifest_transaction_body_section_chunks.jsonl'
+)
+# Outputs que são TAMBÉM o pool de reuso idempotente do próprio produtor. Só
+# para estes o recibo preserva o parcial por CÓPIA entre tentativas (em vez de
+# mover): sem o pool, cada retomada do refined recomeçava do zero e nenhuma
+# rodada cabia no teto de 540s/passo. A testemunha de produção por rodada do
+# mesmo passo NÃO entra aqui — ela precisa continuar sendo movida, porque uma
+# testemunha stale é exatamente o que não pode sobreviver a uma retomada.
+BOOTSTRAP_REUSE_POOL_ARTIFACTS=(
+	data/editorial/refined_public_prose.jsonl
+)
+STEP_BINARIES=(
+	generate-authorial-mass-scale-shards
+	generate-authorial-mass-legal-signatures
+	generate-authorial-mass-signature-candidate-pairs
+	generate-authorial-mass-refinement-quality-report
+	generate-authorial-mass-global-similarity-audit
+	generate-authorial-mass-editorial-quality-vectors
+	generate-authorial-mass-contextual-compatibility
+	generate-authorial-mass-signature-refinement-queue
+	generate-authorial-mass-signature-shard-rewrite-plan
+	generate-authorial-mass-publication-readiness
+	generate-authorial-mass-legal-reviews
+	generate-public-prose-candidate
+	generate-refined-public-prose
+	generate-content-inventory-parquet
+	generate-content-inventory-arrow
+	generate-public-prose-language-patterns
+	generate-languagetool-quality
+	generate-vale-public-prose-lint
+	generate-simplemma-ptbr-lemma-audit
+	generate-ptbr-text-shape-release
+	generate-ptbr-pair-rescoring
+	generate-ptbr-wordfreq-quality
+	generate-ptbr-ftfy-unicode-oracle
+	generate-ptbr-lexical-diversity
+	generate-ptbr-spellcheck-evidence
+	generate-ptbr-morphsyntax-evidence
+	generate-ptbr-confusables-evidence
+	generate-ptbr-unicode-quality
+	generate-sqlite-fts5-corpus-evidence
+	generate-external-dedupe-oracle
+	generate-semantic-cluster-index
+	generate-authorial-mass-release-evidence
+	generate-public-final-page-rehearsal
+	generate-contextual-public-page-review
+	generate-official-source-url-inventory
+	generate-official-source-url-live-metadata-attempts
+	generate-official-source-url-live-evidence
+	generate-public-final-source-approval
+	generate-public-final-source-live-recheck
+	generate-authorial-mass-release-transaction
+	generate-scaled-content-release-verdict
+	generate-authorial-mass-manifest-transaction
+)
+if [[ "${#STEP_ARTIFACTS[@]}" -ne "${#STEPS[@]}" ]]; then
+	echo "bootstrap-chain: contrato de artefatos não cobre todos os passos" >&2
+	exit 3
+fi
+if [[ "${#STEP_BINARIES[@]}" -ne "${#STEPS[@]}" ]]; then
+	echo "bootstrap-chain: contrato de binários não cobre todos os passos" >&2
+	exit 3
+fi
+
+FROM=1
+UNTIL=${#STEPS[@]}
+if [[ "${1:-}" == "--list" ]]; then
+	if [[ "$#" -ne 1 ]]; then
+		echo "bootstrap-chain: --list não aceita argumentos adicionais" >&2
+		exit 2
+	fi
+	for i in "${!STEPS[@]}"; do
+		printf '%2d  %s\n' "$((i + 1))" "${STEPS[$i]}"
+	done
+	exit 0
+fi
+while [[ "$#" -gt 0 ]]; do
+	case "$1" in
+	--from)
+		if [[ "$#" -lt 2 ]]; then
+			echo "bootstrap-chain: --from exige o número do passo" >&2
+			exit 2
+		fi
+		FROM="$2"
+		shift 2
+		;;
+	--until)
+		if [[ "$#" -lt 2 ]]; then
+			echo "bootstrap-chain: --until exige o número do passo" >&2
+			exit 2
+		fi
+		UNTIL="$2"
+		shift 2
+		;;
+	*)
+		echo "bootstrap-chain: argumento desconhecido: $1 (use --list, --from N, --until N)" >&2
+		exit 2
+		;;
+	esac
+done
+
+if [[ ! "$FROM" =~ ^[0-9]+$ || "$FROM" -lt 1 || "$FROM" -gt "${#STEPS[@]}" ]]; then
+	echo "bootstrap-chain: --from deve estar entre 1 e ${#STEPS[@]}" >&2
+	exit 2
+fi
+if [[ ! "$UNTIL" =~ ^[0-9]+$ || "$UNTIL" -lt 0 || "$UNTIL" -gt "${#STEPS[@]}" ]]; then
+	echo "bootstrap-chain: --until deve estar entre 0 e ${#STEPS[@]}" >&2
+	exit 2
+fi
+if [[ "$UNTIL" -gt 0 && "$FROM" -gt "$UNTIL" ]]; then
+	echo "bootstrap-chain: --from não pode ser maior que --until" >&2
+	exit 2
+fi
+
+missing=0
+for step in "${STEPS[@]}"; do
+	if [[ ! -x "tools/$step" ]]; then
+		echo "bootstrap-chain: wrapper ausente ou não executável: tools/$step" >&2
+		missing=1
+	fi
+done
+bootstrap_process_tree_supervisor="$ROOT/tools/supervise-process-tree"
+if [[ ! -f "$bootstrap_process_tree_supervisor" || ! -x "$bootstrap_process_tree_supervisor" || -L "$bootstrap_process_tree_supervisor" ]]; then
+	echo "bootstrap-chain: supervisor de árvore ausente, não executável ou symlink: $bootstrap_process_tree_supervisor" >&2
+	missing=1
+fi
+bootstrap_stock_lease_helper="$ROOT/tools/run-with-v2-stock-read-lease"
+if [[ ! -f "$bootstrap_stock_lease_helper" || ! -x "$bootstrap_stock_lease_helper" || -L "$bootstrap_stock_lease_helper" ]]; then
+	echo "bootstrap-chain: helper canônico da lease do estoque ausente, não executável ou symlink: $bootstrap_stock_lease_helper" >&2
+	missing=1
+fi
+bootstrap_step_receipt_helper="$ROOT/tools/bootstrap-step-receipts"
+if [[ ! -f "$bootstrap_step_receipt_helper" || ! -x "$bootstrap_step_receipt_helper" || -L "$bootstrap_step_receipt_helper" ]]; then
+	echo "bootstrap-chain: helper de recibos ausente, não executável ou symlink: $bootstrap_step_receipt_helper" >&2
+	missing=1
+fi
+if [[ "$missing" -ne 0 ]]; then
+	exit 3
+fi
+
+# A execução externa entra uma única vez no holder canônico. A autoridade não
+# vem do marcador ambiental: o processo interno prova no kernel que FDs 3,4,5
+# são as três open-file-descriptions esperadas e mantêm locks READ. --list já
+# saiu acima e continua deliberadamente livre de lease, build, lock e epoch.
+# A cadeia e retomavel por recibo e, por isso, nao precisa transformar uma
+# regressao em um processo sem prazo. Dez minutos sao o teto operacional de uma
+# invocacao; ao esgotar o budget, o prefixo concluido permanece autenticado e a
+# retomada explicita parte do primeiro elo incompleto depois do RCA. O limite
+# por passo continua menor para reservar tempo a preflight/recibos/cleanup.
+bootstrap_total_timeout_seconds="${P0_BOOTSTRAP_TOTAL_TIMEOUT_SECONDS:-600}"
+bootstrap_signal_grace_seconds="${P0_BOOTSTRAP_SIGNAL_GRACE_SECONDS:-5}"
+bootstrap_step_timeout_seconds="${P0_BOOTSTRAP_STEP_TIMEOUT_SECONDS:-540}"
+bootstrap_step_kill_after_seconds="${P0_BOOTSTRAP_STEP_KILL_AFTER_SECONDS:-15}"
+if [[ ! "$bootstrap_total_timeout_seconds" =~ ^[1-9][0-9]*$ || "$bootstrap_total_timeout_seconds" -gt 600 ]]; then
+	echo "bootstrap-chain: P0_BOOTSTRAP_TOTAL_TIMEOUT_SECONDS deve ser inteiro entre 1 e 600; timeout nao e correcao de performance" >&2
+	exit 2
+fi
+if [[ ! "$bootstrap_signal_grace_seconds" =~ ^[1-9][0-9]*$ || "$bootstrap_signal_grace_seconds" -gt 300 ]]; then
+	echo "bootstrap-chain: P0_BOOTSTRAP_SIGNAL_GRACE_SECONDS deve ser inteiro entre 1 e 300" >&2
+	exit 2
+fi
+if [[ ! "$bootstrap_step_timeout_seconds" =~ ^[1-9][0-9]*$ || "$bootstrap_step_timeout_seconds" -gt 86400 ]]; then
+	echo "bootstrap-chain: P0_BOOTSTRAP_STEP_TIMEOUT_SECONDS deve ser inteiro entre 1 e 86400" >&2
+	exit 2
+fi
+if [[ ! "$bootstrap_step_kill_after_seconds" =~ ^[1-9][0-9]*$ || "$bootstrap_step_kill_after_seconds" -gt 300 ]]; then
+	echo "bootstrap-chain: P0_BOOTSTRAP_STEP_KILL_AFTER_SECONDS deve ser inteiro entre 1 e 300" >&2
+	exit 2
+fi
+
+bootstrap_stock_lease_marker="${WIKI_V2_STOCK_READ_LEASE:-}"
+bootstrap_stock_lease_marker_expected='canonical-stock-read-lease/v1;fds=3,4,5'
+if [[ -z "$bootstrap_stock_lease_marker" ]]; then
+	exec "$bootstrap_stock_lease_helper" \
+		--timeout-seconds "$bootstrap_total_timeout_seconds" \
+		-- "$ROOT/tools/bootstrap-chain" "${ORIGINAL_ARGS[@]}"
+fi
+if [[ "$bootstrap_stock_lease_marker" != "$bootstrap_stock_lease_marker_expected" ]]; then
+	echo "bootstrap-chain: marcador de lease herdada desconhecido; recusando reexec ou confiança ambiental" >&2
+	exit 75
+fi
+bootstrap_verify_inherited_stock_lease() {
+	local checkpoint="$1"
+	if ! "$bootstrap_stock_lease_helper" --verify-inherited >/dev/null; then
+		echo "bootstrap-chain: lease física herdada inválida em $checkpoint; produtor não será executado" >&2
+		exit 75
+	fi
+}
+# O marcador de supervisao pertence ao wrapper que construiu/rodou o helper
+# de lease acima de nos; qualquer invocacao de run-go-cmd-cached daqui para
+# baixo (inclusive o proprio --verify-inherited) e um processo NOVO que deve
+# supervisionar-se do zero — heranca dispara "refusing recursive supervision"
+# (regressao do guard de identidade em run-go-cmd-cached).
+unset WIKI_RUN_GO_CMD_CACHED_UNDER_TIMEOUT
+bootstrap_verify_inherited_stock_lease "chain-entry"
+
+bootstrap_total_start_epoch="$(date +%s)"
+bootstrap_total_deadline_epoch=$((bootstrap_total_start_epoch + bootstrap_total_timeout_seconds))
+case "${P0_FACTORY_CHAIN_LOCK_WAIT_SECONDS+x}:${P0_FACTORY_CHAIN_LOCK_WAIT_SECONDS:-}" in
+:)
+	# Contention is not useful work.  Fail fast unless the caller explicitly
+	# requests a short bounded wait.
+	export P0_FACTORY_CHAIN_LOCK_WAIT_SECONDS=0
+	;;
+*: | *:*[!0-9]*)
+	echo "bootstrap-chain: P0_FACTORY_CHAIN_LOCK_WAIT_SECONDS deve ser inteiro não negativo" >&2
+	exit 2
+	;;
+*)
+	if [[ "$bootstrap_total_timeout_seconds" -gt 0 && "$P0_FACTORY_CHAIN_LOCK_WAIT_SECONDS" -gt "$bootstrap_total_timeout_seconds" ]]; then
+		export P0_FACTORY_CHAIN_LOCK_WAIT_SECONDS="$bootstrap_total_timeout_seconds"
+	fi
+	;;
+esac
+
+# A cadeia inteira compartilha JSONL conectados: preflight, detox e todos os
+# passos pertencem à mesma seção crítica. Limpe qualquer token herdado e deixe
+# o helper provar os flocks reais de coordenação/snapshot nos fd 7/8; os
+# wrappers filhos reutilizam somente esses descritores validados.
+export P0_FACTORY_CHAIN_LOCK_DOMAIN="bootstrap-chain"
+unset P0_FACTORY_CHAIN_LOCK_HELD
+. "$ROOT/tools/p0-factory-chain-lock.sh"
+p0_factory_chain_lock_acquire "bootstrap-chain" --timings
+
+bootstrap_step_pid=""
+bootstrap_source_manifest_path=""
+bootstrap_source_manifest_sha256=""
+
+bootstrap_cleanup() {
+	p0_factory_chain_lock_cleanup_owned_meta
+	if [[ -n "$bootstrap_source_manifest_path" ]]; then
+		rm -f -- "$bootstrap_source_manifest_path" 2>/dev/null || true
+		bootstrap_source_manifest_path=""
+	fi
+}
+
+bootstrap_signal_step() {
+	local signal_name="$1"
+	if [[ -z "$bootstrap_step_pid" ]] || ! kill -0 "$bootstrap_step_pid" 2>/dev/null; then
+		return 0
+	fi
+	kill "-$signal_name" "$bootstrap_step_pid" 2>/dev/null || true
+}
+
+bootstrap_forward_signal() {
+	local signal_name="$1"
+	local signal_status="$2"
+	local signal_killer_pid=""
+	trap - EXIT HUP INT QUIT TERM
+	bootstrap_signal_step "$signal_name"
+	if [[ -n "$bootstrap_step_pid" ]] && kill -0 "$bootstrap_step_pid" 2>/dev/null; then
+		(
+			sleep "$bootstrap_signal_grace_seconds"
+			if kill -0 "$bootstrap_step_pid" 2>/dev/null; then
+				kill -KILL "$bootstrap_step_pid" 2>/dev/null || true
+			fi
+		) &
+		signal_killer_pid=$!
+		wait "$bootstrap_step_pid" >/dev/null 2>&1 || true
+		kill "$signal_killer_pid" >/dev/null 2>&1 || true
+		wait "$signal_killer_pid" >/dev/null 2>&1 || true
+	fi
+	bootstrap_step_pid=""
+	bootstrap_cleanup
+	exit "$signal_status"
+}
+
+# O helper genérico possui apenas o lease/fd8 e a metadata. O lifecycle da
+# árvore de cada passo pertence ao supervise-process-tree; estes traps apenas
+# encaminham o sinal ao guardian e preservam a limpeza do lease da cadeia.
+trap 'bootstrap_cleanup' EXIT
+trap 'bootstrap_forward_signal HUP 129' HUP
+trap 'bootstrap_forward_signal INT 130' INT
+trap 'bootstrap_forward_signal QUIT 131' QUIT
+trap 'bootstrap_forward_signal TERM 143' TERM
+
+bootstrap_require_remaining() {
+	local phase="$1"
+	local now_epoch remaining_seconds
+	now_epoch="$(date +%s)"
+	if [[ ! "$now_epoch" =~ ^[0-9]+$ ]]; then
+		echo "bootstrap-chain: relógio inválido ao medir deadline global phase=$phase" >&2
+		return 75
+	fi
+	remaining_seconds=$((bootstrap_total_deadline_epoch - now_epoch))
+	if [[ "$remaining_seconds" -le 0 ]]; then
+		echo "bootstrap-chain: deadline global esgotado phase=$phase budget_seconds=$bootstrap_total_timeout_seconds" >&2
+		return 124
+	fi
+	BOOTSTRAP_REMAINING_SECONDS="$remaining_seconds"
+}
+
+bootstrap_set_epoch_max_duration() {
+	local phase="$1"
+	local bounded_seconds
+	bootstrap_require_remaining "$phase" || return $?
+	bounded_seconds="$BOOTSTRAP_REMAINING_SECONDS"
+	# 120s estrangulava o preflight sob carga concorrente da fabrica (validacao
+	# full-stock de 671 shards); 300s cobre o p99 medido sob load, ainda bounded
+	# pelo orcamento global restante. O(delta) da validacao e item da Fase 1/2.
+	if [[ "$bounded_seconds" -gt 300 ]]; then
+		bounded_seconds=300
+	fi
+	BOOTSTRAP_EPOCH_MAX_DURATION="${bounded_seconds}s"
+}
+
+bootstrap_epoch_state_path=".cache/bootstrap-chain/epoch-state.json"
+bootstrap_detox_contract_sha256="sha256:$(
+	printf '%s\n' \
+		'bootstrap-chain-detox/v3-all-derived-outputs' \
+		'data/editorial/refined_public_prose.jsonl' \
+		'data/editorial/public_prose_language_patterns.jsonl' \
+		'data/editorial/contextual_public_page_review.jsonl' \
+		'data/editorial/scaled_content_release_verdict.jsonl' \
+		'data/ops/refined_public_prose_source_content_id.bbolt' \
+		'data/ops/refined_public_prose_offset_index.jsonl' \
+		"${STEPS[@]}" |
+		sha256sum | awk '{print $1}'
+)"
+
+bootstrap_stock_epoch_from_output() {
+	local output="$1"
+	local epoch
+	epoch="$(printf '%s\n' "$output" | sed -n 's/.* stock_epoch_sha256=\(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -n 1)"
+	if [[ ! "$epoch" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "bootstrap-chain: preflight verde sem stock_epoch_sha256 autenticado; recusando cache/checkpoint por contador ou comentário" >&2
+		return 75
+	fi
+	printf '%s' "$epoch"
+}
+
+bootstrap_recheck_stock_epoch() {
+	local phase="$1"
+	local output observed_epoch
+	bootstrap_set_epoch_max_duration "epoch-$phase" || return $?
+	if ! output="$(tools/check-v2-stock-epoch --max-duration "$BOOTSTRAP_EPOCH_MAX_DURATION")"; then
+		echo "bootstrap-chain: epoch do estoque deixou de validar phase=$phase" >&2
+		return 75
+	fi
+	observed_epoch="$(bootstrap_stock_epoch_from_output "$output")" || return $?
+	if [[ "$observed_epoch" != "$current_stock_epoch_sha256" ]]; then
+		echo "bootstrap-chain: epoch do estoque mudou phase=$phase esperado=$current_stock_epoch_sha256 atual=$observed_epoch" >&2
+		return 75
+	fi
+	printf '%s\n' "$output" >&2
+}
+
+bootstrap_read_epoch_state() {
+	if [[ -L .cache || -L .cache/bootstrap-chain ]]; then
+		printf 'missing\tmissing\n'
+		return 0
+	fi
+	python3 - "$bootstrap_epoch_state_path" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+except OSError:
+    print("missing\tmissing")
+    raise SystemExit(0)
+try:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_size > 8192
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o022
+    ):
+        print("missing\tmissing")
+        raise SystemExit(0)
+    payload = os.read(fd, 8193)
+finally:
+    os.close(fd)
+try:
+    record = json.loads(payload.decode("utf-8", errors="strict"))
+except (UnicodeDecodeError, json.JSONDecodeError):
+    print("missing\tmissing")
+    raise SystemExit(0)
+if record.get("schema") != "bootstrap-chain-epoch-state/v2" or record.get("state") != "detox_complete":
+    print("missing\tmissing")
+else:
+    print(f"{record.get('stock_epoch_sha256', 'missing')}\t{record.get('detox_contract_sha256', 'missing')}")
+PY
+}
+
+bootstrap_write_epoch_state() {
+	if [[ -L .cache || -L .cache/bootstrap-chain ]]; then
+		echo "bootstrap-chain: cache de epoch não pode atravessar symlink: $bootstrap_epoch_state_path" >&2
+		return 75
+	fi
+	mkdir -p "$(dirname "$bootstrap_epoch_state_path")"
+	chmod 0700 "$(dirname "$bootstrap_epoch_state_path")"
+	python3 - "$bootstrap_epoch_state_path" "$current_stock_epoch_sha256" \
+		"$bootstrap_detox_contract_sha256" <<'PY'
+import datetime
+import json
+import os
+import sys
+import tempfile
+
+path, epoch, contract = sys.argv[1:]
+record = {
+    "schema": "bootstrap-chain-epoch-state/v2",
+    "stock_epoch_sha256": epoch,
+    "detox_contract_sha256": contract,
+    "state": "detox_complete",
+    "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    "approval": False,
+    "publication_allowed": False,
+    "note": "bounded cache hint for detox only; never proof that a producer, gate, release or publication passed",
+}
+
+payload = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=".epoch-state.", dir=directory)
+try:
+    os.fchmod(fd, 0o600)
+    written = 0
+    while written < len(payload):
+        count = os.write(fd, payload[written:])
+        if count <= 0:
+            raise OSError("short write while persisting bootstrap epoch cache")
+        written += count
+    os.fsync(fd)
+    os.close(fd)
+    fd = -1
+    os.replace(temporary, path)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+bootstrap_emit_step_specs() {
+	local index
+	for index in "${!STEPS[@]}"; do
+		printf '%d\t%s\ttools/%s\t%s\n' \
+			"$((index + 1))" "${STEPS[$index]}" "${STEPS[$index]}" \
+			"${STEP_ARTIFACTS[$index]}"
+	done
+}
+
+bootstrap_compute_source_contract_sha256() {
+	[[ -n "$bootstrap_source_manifest_path" ]] || return 75
+	timeout 30s python3 - "$ROOT" "$bootstrap_source_manifest_path" "${STEPS[@]}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+manifest_path = pathlib.Path(sys.argv[2])
+steps = sys.argv[3:]
+required = {"go.mod", "go.sum"}
+required.update(f"tools/{step}" for step in steps)
+paths = set(required)
+# Todos os produtores executaveis pertencem ao contrato vivo. Limitar tools/
+# aos wrappers diretos deixava requirements, scripts Python e runners
+# transitivos fora do fingerprint e permitia retomar recibo produzido por
+# implementacao diferente. __pycache__/pyc sao cache efemero, nunca fonte.
+source_roots = ("assets", "cmd", "internal", "tools")
+# ARVORE DE GERENCIADOR DE PACOTE NAO E FONTE DA FABRICA -- e desde 2026-08-27
+# ela TRAVAVA a cadeia inteira. Naquele dia um `npm install` criou
+# tools/publicador-social/node_modules com UM link simbolico
+# (.bin/playwright-core), e a varredura aborta em qualquer link simbolico: desde
+# entao NENHUM passo conseguia autenticar o contrato de codigo. A mensagem dizia
+# "crosses symlink" -- verdadeira e inutil, porque nomeia o achado e nao a causa.
+#
+# A poda e por NOME e vem COM PROVA: o diretorio podado tem de estar ignorado
+# pelo git, isto e, nao ser fonte pela definicao do proprio repositorio. Um
+# node_modules RASTREADO aborta, porque ai ele seria fonte de verdade. Os
+# wrappers tools/<step> entram por `required` acima, fora desta varredura, entao
+# a poda nao pode esconder produtor de passo.
+podas = {"node_modules"}
+podados = []
+for base_name in source_roots:
+    base = root / base_name
+    if base_name == "assets" and not base.exists():
+        continue
+    if not base.is_dir() or base.is_symlink():
+        raise SystemExit(f"bootstrap-chain: source tree missing/unsafe: {base_name}")
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        for nome in sorted(dirnames):
+            if nome in podas:
+                podados.append((pathlib.Path(dirpath) / nome).relative_to(root).as_posix())
+        dirnames[:] = [nome for nome in dirnames if nome not in podas]
+        for nome in sorted(dirnames) + sorted(filenames):
+            path = pathlib.Path(dirpath) / nome
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise SystemExit(f"bootstrap-chain: source contract crosses symlink: {path}")
+            if stat.S_ISREG(info.st_mode):
+                relative_path = path.relative_to(root)
+                if "__pycache__" in relative_path.parts or path.suffix == ".pyc":
+                    continue
+                paths.add(relative_path.as_posix())
+if podados:
+    import subprocess
+    verificacao = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "--stdin"],
+        input="\n".join(podados) + "\n",
+        capture_output=True, text=True, timeout=10,
+    )
+    ignorados = {linha.strip() for linha in verificacao.stdout.splitlines() if linha.strip()}
+    rastreados = [caminho for caminho in podados if caminho not in ignorados]
+    if rastreados:
+        raise SystemExit(
+            "bootstrap-chain: arvore de pacote RASTREADA no contrato de codigo: "
+            + ", ".join(sorted(rastreados))
+        )
+
+digest = hashlib.sha256(b"bootstrap-chain-source-contract/v3\0")
+total = 0
+records = []
+for relative in sorted(paths):
+    path = root / pathlib.PurePosixPath(relative)
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise SystemExit(f"bootstrap-chain: required source unavailable: {relative}: {error}")
+    if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or
+            info.st_size < 0 or info.st_size > 64 * 1024 * 1024):
+        raise SystemExit(f"bootstrap-chain: required source unsafe: {relative}")
+    total += info.st_size
+    if total > 2 * 1024 * 1024 * 1024:
+        raise SystemExit("bootstrap-chain: source contract exceeds bounded size")
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    file_digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size != info.st_size:
+            raise SystemExit(f"bootstrap-chain: source changed before read: {relative}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"bootstrap-chain: source truncated: {relative}")
+            file_digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"bootstrap-chain: source grew: {relative}")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if identity(info) != identity(opened) or identity(opened) != identity(after):
+        raise SystemExit(f"bootstrap-chain: source changed during read: {relative}")
+    source_sha256 = "sha256:" + file_digest.hexdigest()
+    digest.update(relative.encode("utf-8") + b"\0")
+    digest.update(f"{stat.S_IMODE(info.st_mode):o}\0{info.st_size}\0".encode("ascii"))
+    digest.update(bytes.fromhex(source_sha256.removeprefix("sha256:")))
+    records.append({
+        "path": relative,
+        "mode": f"{stat.S_IMODE(info.st_mode):o}",
+        "size": info.st_size,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+        "sha256": source_sha256,
+    })
+contract = "sha256:" + digest.hexdigest()
+manifest = {
+    "schema": "bootstrap-chain-source-manifest/v2",
+    "contract_sha256": contract,
+    "roots": list(source_roots),
+    "records": records,
+}
+payload = (json.dumps(
+    manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+) + "\n").encode("utf-8")
+descriptor = os.open(
+    manifest_path,
+    os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
+)
+try:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        raise SystemExit("bootstrap-chain: private source manifest is unsafe")
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written < 1:
+            raise SystemExit("bootstrap-chain: source manifest write stalled")
+        view = view[written:]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+print(contract)
+PY
+}
+
+bootstrap_recheck_source_contract() {
+	local phase="$1"
+	if ! timeout 10s python3 - "$ROOT" "$bootstrap_source_manifest_path" \
+		"$bootstrap_source_contract_sha256" "$bootstrap_source_manifest_sha256" \
+		"$phase" <<'PY'; then
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+manifest_path = pathlib.Path(sys.argv[2])
+expected_contract = sys.argv[3]
+expected_manifest_sha256 = sys.argv[4]
+phase = sys.argv[5]
+try:
+    descriptor = os.open(
+        manifest_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                info.st_size <= 0 or info.st_size > 16 * 1024 * 1024):
+            raise RuntimeError("manifesto privado ausente/inseguro")
+        chunks = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("manifesto privado truncado")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("manifesto privado truncado/crescido")
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    manifest = json.loads(payload.decode("utf-8", errors="strict"))
+    canonical = (json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) + "\n").encode("utf-8")
+    if ("sha256:" + hashlib.sha256(payload).hexdigest() !=
+            expected_manifest_sha256):
+        raise RuntimeError("manifesto privado mudou")
+    if (canonical != payload or
+            set(manifest) != {"schema", "contract_sha256", "roots", "records"} or
+            manifest.get("schema") != "bootstrap-chain-source-manifest/v2" or
+            manifest.get("roots") != ["assets", "cmd", "internal", "tools"]):
+        raise RuntimeError("manifesto privado não canônico")
+    if manifest.get("contract_sha256") != expected_contract:
+        raise RuntimeError("manifesto perdeu bind do contrato")
+    records = manifest.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("manifesto não possui inventário")
+    expected_paths = []
+    digest = hashlib.sha256(b"bootstrap-chain-source-contract/v3\0")
+    previous = ""
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "path", "mode", "size", "device", "inode", "mtime_ns",
+            "ctime_ns", "sha256",
+        }:
+            raise RuntimeError("registro de fonte possui forma inválida")
+        relative = record["path"]
+        pure = pathlib.PurePosixPath(relative)
+        if (not isinstance(relative, str) or not relative or
+                pure.is_absolute() or pure.as_posix() != relative or
+                ".." in pure.parts or relative <= previous):
+            raise RuntimeError("path de fonte não canônico/ordenado")
+        previous = relative
+        expected_paths.append(relative)
+        source_sha = record["sha256"]
+        if (not isinstance(source_sha, str) or len(source_sha) != 71 or
+                not source_sha.startswith("sha256:")):
+            raise RuntimeError("SHA de fonte inválido")
+        try:
+            source_digest = bytes.fromhex(source_sha.removeprefix("sha256:"))
+        except ValueError as error:
+            raise RuntimeError("SHA de fonte não hexadecimal") from error
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(f"{record['mode']}\0{record['size']}\0".encode("ascii"))
+        digest.update(source_digest)
+        path = root.joinpath(*pure.parts)
+        current = path.lstat()
+        observed = {
+            "mode": f"{stat.S_IMODE(current.st_mode):o}",
+            "size": current.st_size,
+            "device": current.st_dev,
+            "inode": current.st_ino,
+            "mtime_ns": current.st_mtime_ns,
+            "ctime_ns": current.st_ctime_ns,
+        }
+        if (not stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode) or
+                any(observed[key] != record[key] for key in observed)):
+            raise RuntimeError(f"fonte mudou: {relative}")
+    if "sha256:" + digest.hexdigest() != expected_contract:
+        raise RuntimeError("digest do manifesto privado diverge")
+    live_paths = set()
+    for base_name in manifest.get("roots", []):
+        base = root / base_name
+        if base_name == "assets" and not base.exists():
+            continue
+        if not base.is_dir() or base.is_symlink():
+            raise RuntimeError(f"raiz de fonte mudou: {base_name}")
+        for path in base.rglob("*"):
+            current = path.lstat()
+            if stat.S_ISLNK(current.st_mode):
+                raise RuntimeError(f"árvore de fonte ganhou symlink: {path}")
+            if stat.S_ISREG(current.st_mode):
+                relative_path = path.relative_to(root)
+                if "__pycache__" in relative_path.parts or path.suffix == ".pyc":
+                    continue
+                live_paths.add(path.relative_to(root).as_posix())
+    expected_tree_paths = {
+        value for value in expected_paths
+        if value.split("/", 1)[0] in {"assets", "cmd", "internal", "tools"}
+    }
+    if live_paths != expected_tree_paths:
+        added = sorted(live_paths - expected_tree_paths)[:4]
+        missing = sorted(expected_tree_paths - live_paths)[:4]
+        raise RuntimeError(f"inventário de fonte mudou added={added} missing={missing}")
+except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as error:
+    print(
+        f"bootstrap-chain: código da fábrica mudou phase={phase}: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(75)
+PY
+		echo "bootstrap-chain: não foi possível revalidar manifesto de código phase=$phase esperado=$bootstrap_source_contract_sha256" >&2
+		return 75
+	fi
+}
+
+# Preflight read-only: nenhum elo derivado pode rodar — nem o detox abaixo pode
+# mover artefatos — se o estoque instalado não pertencer exatamente aos shards
+# v2 vivos. Isso inclui --until 0, que ainda executa o detox do passo 0.
+echo "bootstrap-chain: [preflight] frescor do estoque v2" >&2
+bootstrap_set_epoch_max_duration "stock-preflight"
+if ! bootstrap_stock_preflight_output="$(tools/check-v2-stock-epoch --max-duration "$BOOTSTRAP_EPOCH_MAX_DURATION")"; then
+	echo "bootstrap-chain: estoque v2 ausente ou stale; valide sem escrita com tools/ingest-v2-stock --prepare-only e, quando os shards estiverem estáveis, instale a fotografia canônica com tools/ingest-v2-stock antes de regenerar a cadeia" >&2
+	exit 1
+fi
+printf '%s\n' "$bootstrap_stock_preflight_output" >&2
+current_stock_epoch_sha256="$(bootstrap_stock_epoch_from_output "$bootstrap_stock_preflight_output")"
+IFS=$'\t' read -r recorded_stock_epoch_sha256 recorded_detox_contract_sha256 < <(bootstrap_read_epoch_state)
+if [[ "$recorded_stock_epoch_sha256" != "$current_stock_epoch_sha256" ||
+	"$recorded_detox_contract_sha256" != "$bootstrap_detox_contract_sha256" ]]; then
+	if [[ "$FROM" -ne 1 ]]; then
+		echo "bootstrap-chain: epoch/contrato de detox mudou ou está ausente; retomar em --from $FROM confiaria em derivado stale. Recomece em: tools/bootstrap-chain --from 1" >&2
+		exit 75
+	fi
+fi
+
+bootstrap_source_manifest_path="$(mktemp "${TMPDIR:-/tmp}/wiki-bootstrap-source-manifest.XXXXXX")" || {
+	echo "bootstrap-chain: não alocou manifesto privado de código" >&2
+	exit 75
+}
+chmod 600 "$bootstrap_source_manifest_path"
+bootstrap_source_contract_sha256="$(bootstrap_compute_source_contract_sha256)" || {
+	echo "bootstrap-chain: contrato de código da fábrica não pôde ser autenticado" >&2
+	exit 75
+}
+if [[ ! "$bootstrap_source_contract_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+	echo "bootstrap-chain: contrato de código retornou fingerprint inválido" >&2
+	exit 75
+fi
+bootstrap_source_manifest_sha256="sha256:$(sha256sum "$bootstrap_source_manifest_path" | awk '{print $1}')"
+if [[ ! "$bootstrap_source_manifest_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+	echo "bootstrap-chain: manifesto privado de código retornou fingerprint inválido" >&2
+	exit 75
+fi
+export WIKI_BOOTSTRAP_SOURCE_CONTRACT_SHA256="$bootstrap_source_contract_sha256"
+bootstrap_previous_receipt_sha256="genesis"
+bootstrap_require_remaining "receipt-prefix"
+bootstrap_receipt_timeout_seconds="$BOOTSTRAP_REMAINING_SECONDS"
+if [[ "$bootstrap_receipt_timeout_seconds" -gt 60 ]]; then
+	bootstrap_receipt_timeout_seconds=60
+fi
+if [[ "$FROM" -eq 1 ]]; then
+	if ! bootstrap_emit_step_specs |
+		timeout --signal=TERM --kill-after=2s "${bootstrap_receipt_timeout_seconds}s" \
+			"$bootstrap_step_receipt_helper" reset \
+			--root "$ROOT" --epoch "$current_stock_epoch_sha256" \
+			--detox "$bootstrap_detox_contract_sha256" \
+			--source "$bootstrap_source_contract_sha256" \
+			--invalidate-declared-outputs \
+			--optional-output data/ops/refined_public_prose_source_content_id.bbolt \
+			--optional-output data/ops/refined_public_prose_offset_index.jsonl; then
+		echo "bootstrap-chain: não foi possível invalidar progresso anterior antes do passo 1" >&2
+		exit 75
+	fi
+	# O reset e os moves recuperáveis ocorreram sob os mesmos fd7/8. Só então o
+	# cache de epoch pode registrar detox concluído; nunca antes dos moves.
+	bootstrap_recheck_stock_epoch "after-reset"
+	bootstrap_write_epoch_state
+else
+	if ! bootstrap_previous_receipt_sha256="$(
+		bootstrap_emit_step_specs | timeout --signal=TERM --kill-after=2s \
+			"${bootstrap_receipt_timeout_seconds}s" \
+			"$bootstrap_step_receipt_helper" resume \
+			--root "$ROOT" --epoch "$current_stock_epoch_sha256" \
+			--detox "$bootstrap_detox_contract_sha256" \
+			--source "$bootstrap_source_contract_sha256" \
+			--through "$((FROM - 1))"
+	)"; then
+		echo "bootstrap-chain: --from $FROM recusado; prefixo 1..$((FROM - 1)) não possui cadeia de recibos e outputs atuais autenticados" >&2
+		exit 75
+	fi
+fi
+
+total_start="$(date +%s)"
+for i in "${!STEPS[@]}"; do
+	n=$((i + 1))
+	if ((n < FROM || n > UNTIL)); then
+		continue
+	fi
+	step="${STEPS[$i]}"
+	case "$step" in
+	generate-authorial-mass-release-transaction | \
+		generate-scaled-content-release-verdict | \
+		generate-authorial-mass-manifest-transaction)
+		bootstrap_verify_inherited_stock_lease "before-$step"
+		bootstrap_recheck_stock_epoch "before-$step"
+		bootstrap_recheck_source_contract "before-$step"
+		;;
+	esac
+	case "$step" in
+	generate-public-prose-candidate)
+		# Preflight (task preflight-oraculos-liveness): o bloco 12-31
+		# (este passo até generate-semantic-cluster-index) depende de
+		# LanguageTool :8082 e dos venvs Python pinados dos oráculos PT-BR.
+		# Sem este gate, um LanguageTool morto só aparecia no passo 17 —
+		# desperdiçando os passos 12-16 — e um venv sem marker disparava
+		# reinstalação pesada (torch/spacy) no meio da cadeia. Falha aqui é
+		# fail-fast, antes de gastar CPU nos passos deste bloco.
+		if ! "$ROOT/tools/check-oracle-liveness"; then
+			echo "bootstrap-chain: PASSO $n ($step) NÃO INICIADO — preflight de oráculos externos reprovou (ver mensagens acima); corrigir os itens e retomar com: tools/bootstrap-chain --from $n" >&2
+			exit 1
+		fi
+		;;
+	esac
+	bootstrap_require_remaining "step-$n-$step"
+	bootstrap_effective_step_timeout_seconds="$BOOTSTRAP_REMAINING_SECONDS"
+	if [[ "$bootstrap_step_timeout_seconds" -lt "$bootstrap_effective_step_timeout_seconds" ]]; then
+		bootstrap_effective_step_timeout_seconds="$bootstrap_step_timeout_seconds"
+	fi
+	extra_args=()
+	if [[ "$step" == "generate-languagetool-quality-release" ]]; then
+		# Mapa de portas do ULTRAPLAN: Go :8080, nginx :8081, LanguageTool :8082.
+		# O wrapper release usa esta variável tanto no preflight de cache quanto na
+		# geração completa; mantê-la no ambiente evita endpoints divergentes.
+		export WIKI_LANGUAGETOOL_ENDPOINT="${WIKI_LANGUAGETOOL_ENDPOINT:-http://127.0.0.1:8082/v2/check}"
+	fi
+	# Orçamentos do probe curto calibrados para operação concorrente da
+	# fábrica (medidos sob agentes ativos; probe é amostra fixa de 50 — não
+	# escala com N, então regressão real de algoritmo continua estourando).
+	export WIKI_PROBE_STEP_BUDGET_MS="${WIKI_PROBE_STEP_BUDGET_MS:-12000}"
+	export WIKI_PROBE_TOTAL_BUDGET_MS="${WIKI_PROBE_TOTAL_BUDGET_MS:-18000}"
+	export WIKI_BOOTSTRAP_STEP_ARTIFACTS="${STEP_ARTIFACTS[$i]}"
+	export WIKI_BOOTSTRAP_STEP_BINARY="${STEP_BINARIES[$i]}"
+	export WIKI_BOOTSTRAP_STEP_NUMBER="$n"
+	bootstrap_require_remaining "receipt-prepare-$n-$step"
+	bootstrap_receipt_timeout_seconds="$BOOTSTRAP_REMAINING_SECONDS"
+	# prepare pode autenticar um artefato grande compartilhado por dois passos.
+	# Use o mesmo orçamento bounded do produtor; o antigo teto fixo de 60s
+	# contradizia artefatos em escala e transformava I/O linear saudável em loop
+	# de retomadas que jamais poderia concluir.
+	if [[ "$bootstrap_receipt_timeout_seconds" -gt "$bootstrap_step_timeout_seconds" ]]; then
+		bootstrap_receipt_timeout_seconds="$bootstrap_step_timeout_seconds"
+	fi
+	bootstrap_reuse_pool_args=()
+	bootstrap_reuse_pool_old_ifs="$IFS"
+	IFS='|'
+	for bootstrap_reuse_pool_artifact in ${STEP_ARTIFACTS[$i]}; do
+		for bootstrap_reuse_pool_declared in "${BOOTSTRAP_REUSE_POOL_ARTIFACTS[@]}"; do
+			if [[ "$bootstrap_reuse_pool_artifact" == "$bootstrap_reuse_pool_declared" ]]; then
+				bootstrap_reuse_pool_args+=(--reuse-pool-artifact "$bootstrap_reuse_pool_artifact")
+			fi
+		done
+	done
+	IFS="$bootstrap_reuse_pool_old_ifs"
+	if ! bootstrap_prepared_receipt_sha256="$(
+		timeout --signal=TERM --kill-after=2s "${bootstrap_receipt_timeout_seconds}s" \
+			"$bootstrap_step_receipt_helper" prepare \
+			--root "$ROOT" --epoch "$current_stock_epoch_sha256" \
+			--detox "$bootstrap_detox_contract_sha256" \
+			--source "$bootstrap_source_contract_sha256" \
+			--step "$n" --name "$step" --wrapper "tools/$step" \
+			--artifacts "${STEP_ARTIFACTS[$i]}" \
+			--previous "$bootstrap_previous_receipt_sha256" \
+			${bootstrap_reuse_pool_args[@]+"${bootstrap_reuse_pool_args[@]}"}
+	)"; then
+		echo "bootstrap-chain: não foi possível preparar recibo autenticado do passo $n ($step)" >&2
+		exit 75
+	fi
+	echo "bootstrap-chain: [$n/${#STEPS[@]}] $step — início $(date -u '+%H:%M:%SZ')" >&2
+	step_start="$(date +%s)"
+	# Execute uma única vez. Exit 75 não identifica só contenção transitória:
+	# wrappers também o usam para contrato, metadata, awareness e coordenação.
+	# Repeti-lo sem causa machine-readable mascara o elo defeituoso e cria loop.
+	# A retomada segura ocorre no mesmo passo, depois da causa ser corrigida.
+	# O bootstrap e os dois supervisores mantêm 3/4/5. O produtor recebe os
+	# locks de coordenação/snapshot (fd 7/8), portanto não pode executar LOCK_UN na
+	# mesma open-file-description que protege o snapshot do release.
+	set +e
+	"$bootstrap_process_tree_supervisor" \
+		--timeout-seconds "$bootstrap_effective_step_timeout_seconds" \
+		--kill-after-seconds "$bootstrap_step_kill_after_seconds" \
+		--term-grace-seconds 2 \
+		--kill-grace-seconds 5 \
+		--pass-fd 7 \
+		--pass-fd 8 \
+		--fail-on-descendant-cleanup \
+		-- "tools/$step" "${extra_args[@]}" &
+	bootstrap_step_pid=$!
+	wait "$bootstrap_step_pid"
+	status=$?
+	bootstrap_step_pid=""
+	set -e
+	if [[ "$status" -ne 0 ]]; then
+		if [[ "$status" -eq 75 ]]; then
+			echo "bootstrap-chain: PASSO $n ($step) FALHOU (exit=75 não classificado; sem retry cego) após $(($(date +%s) - step_start))s — ler a causa emitida pelo wrapper, corrigir o elo e retomar com: tools/bootstrap-chain --from $n" >&2
+		else
+			echo "bootstrap-chain: PASSO $n ($step) FALHOU (exit=$status) após $(($(date +%s) - step_start))s — corrigir o elo e retomar com: tools/bootstrap-chain --from $n" >&2
+		fi
+		exit "$status"
+	fi
+	bootstrap_recheck_source_contract "after-$step"
+	bootstrap_require_remaining "receipt-complete-$n-$step"
+	bootstrap_receipt_timeout_seconds="$BOOTSTRAP_REMAINING_SECONDS"
+	# O conteúdo é hasheado uma única vez na conclusão e depois retomado por
+	# identidade autenticada. Dê a essa leitura linear o orçamento do passo, não
+	# um teto arbitrário menor que a própria escala declarada do artefato.
+	if [[ "$bootstrap_receipt_timeout_seconds" -gt "$bootstrap_step_timeout_seconds" ]]; then
+		bootstrap_receipt_timeout_seconds="$bootstrap_step_timeout_seconds"
+	fi
+	if ! bootstrap_previous_receipt_sha256="$(
+		timeout --signal=TERM --kill-after=2s "${bootstrap_receipt_timeout_seconds}s" \
+			"$bootstrap_step_receipt_helper" write \
+			--root "$ROOT" --epoch "$current_stock_epoch_sha256" \
+			--detox "$bootstrap_detox_contract_sha256" \
+			--source "$bootstrap_source_contract_sha256" \
+			--step "$n" --name "$step" --wrapper "tools/$step" \
+			--artifacts "${STEP_ARTIFACTS[$i]}" \
+			--previous "$bootstrap_previous_receipt_sha256" \
+			--prepared "$bootstrap_prepared_receipt_sha256" \
+			${bootstrap_reuse_pool_args[@]+"${bootstrap_reuse_pool_args[@]}"}
+	)"; then
+		echo "bootstrap-chain: passo $n executou, mas o output não pôde ser autenticado; não avançar nem retomar do passo seguinte" >&2
+		exit 75
+	fi
+	echo "bootstrap-chain: [$n/${#STEPS[@]}] $step — ok em $(($(date +%s) - step_start))s" >&2
+done
+bootstrap_verify_inherited_stock_lease "chain-end"
+bootstrap_recheck_stock_epoch "chain-end"
+bootstrap_recheck_source_contract "chain-end"
+echo "bootstrap-chain: cadeia completa (passos $FROM..$UNTIL) em $(($(date +%s) - total_start))s" >&2

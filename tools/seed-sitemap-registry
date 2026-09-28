@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""seed-sitemap-registry — reconcilia o registry de shard contra o que está
+FISICAMENTE em disco, e adota o órfão que a semeadura original não alcançou.
+
+POR QUE ISTO EXISTE, além de `cmd/seed-sitemap-registry`
+==========================================================
+`cmd/seed-sitemap-registry --verificar` (Go, chamado abaixo por subprocesso)
+responde uma pergunta: "o registry conhece toda COORTE do plano AO VIVO?" —
+é o gate de boot, e ele continua correto e intocado.
+
+Este script responde uma pergunta DIFERENTE, medida como lacuna em 2026-09-03:
+"o registry conhece todo shard RETIRADO que ainda está em disco?" As duas
+perguntas divergem porque `SeedFromPlan` (internal/sitemap/shard_registry.go)
+só itera `plan.Shards` — o plano AO VIVO. Um shard que já estava em carência
+(`internal/sitemapgrace`) no INSTANTE em que o registry foi semeado nunca
+apareceu no plano vivo daquela vez, e por isso nunca ganhou chave em
+`assigned`. Sem chave, `Retire`/`ExpireRetired` (que só `cmd/publish-v2-direct`
+chama, e só sobre chaves que existem) NUNCA alcançam esse ordinal — ele fica
+invisível ao registry para sempre, mesmo continuando em disco, com marca de
+carência legível, servindo 200.
+
+O CASO REAL: `public/sitemaps/pages-0035.xml` está retirado desde
+2026-08-28T21:35:49Z (marca legível, carência de 8 dias ainda correndo em
+2026-09-03) e o ordinal 35 não existe em NENHUMA chave de
+`data/ops/sitemap_shard_registry.json` — nem em `assigned`, nem em
+`tombstones`. `--verificar` (abaixo) apanha exatamente este caso.
+
+O QUE CADA MODO FAZ
+====================
+--verificar        Roda a cobertura do Go (plano vivo) E a reconciliação nova
+                    (disco × assigned × retired × tombstones). REPROVA se
+                    encontrar shard retirado em disco cujo ordinal o registry
+                    não sabe explicar. Read-only nos dois passos.
+
+--adotar-orfaos     Escreve. Para cada ordinal ÓRFÃO (retirado em disco, sem
+                    NENHUMA chave em `assigned`), sintetiza uma chave estável
+                    ("@orfao-registry:pages-NNNN") e grava
+                    assigned[chave]=N + retired[chave]=<carimbo exato do
+                    disco>. A PARTIR DAÍ o ordinal está no mesmo regime de
+                    qualquer coorte retirada pelo caminho normal: o próximo
+                    `ExpireRetired` (dentro de cmd/publish-v2-direct, em
+                    qualquer publish futuro) o tomba sozinho, sem depender
+                    mais deste script. `tools/sweep-sitemap-carencia-expirada`
+                    também tomba (ordinal com OU sem chave) no instante em
+                    que remove o arquivo — este comando fecha o buraco pela
+                    ORIGEM; aquele é a rede de segurança para quando a adoção
+                    ainda não rodou.
+
+                    NÃO adota o caso "chave existe em assigned mas não em
+                    retired" (disco e registry discordando sobre uma coorte
+                    que JÁ tem identidade) — isso é conflito, não órfão, e
+                    adotar por cima seria mascarar a discordância em vez de
+                    expô-la. Fica listado à parte, sempre.
+
+                    --seco relata o que adotaria, sem escrever.
+
+                    CÓDIGO DE SAÍDA de --adotar-orfaos NÃO é simétrico com o
+                    de --verificar: exit 0 cobre tanto "nada a adotar" (zero
+                    órfãos) quanto "adotou com sucesso"; exit 1 significa
+                    especificamente "havia órfão candidato e TODOS foram
+                    recusados pelas guardas" (ordinal >= next_id, ou já em
+                    tombstones com o arquivo ainda em disco) — nunca "não
+                    havia nada para fazer". Quem lê o código de saída num
+                    script de deploy precisa dessa distinção.
+
+Read-only por padrão (`--verificar`); escreve SÓ com `--adotar-orfaos` e SÓ
+fora de `--seco`. Escrita é atômica (tmp+rename), preservando a mesma ordem
+de chave que internal/sitemap.ShardRegistry.Salva produz.
+
+Uso:
+    tools/seed-sitemap-registry --verificar
+    tools/seed-sitemap-registry --adotar-orfaos --seco
+    tools/seed-sitemap-registry --adotar-orfaos
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+SHARDS = os.path.join(ROOT, "public", "sitemaps")
+REGISTRY = os.path.join(ROOT, "data", "ops", "sitemap_shard_registry.json")
+GO_MODERN = os.path.join(ROOT, "tools", "go-modern")
+
+# Espelham internal/sitemapgrace.Marker — a MESMA marca que
+# tools/sweep-sitemap-carencia-expirada e tools/check-sitemap-shard-grace já
+# leem, cada um com o próprio espelho (divergir aqui é o mesmo risco que os
+# dois já documentam: a marca vive dentro do arquivo, não num ledger, e um
+# regex desatualizado lê silêncio onde há retirada).
+MARCA = "sitemap-shard-em-carencia"
+_RE_ORDINAL = re.compile(r"pages-(\d+)\.xml$")
+_RE_RETIRADO_EM = re.compile(r"retirado-em=(\S+)")
+
+
+def ordinal_do_nome(nome: str):
+    m = _RE_ORDINAL.search(nome)
+    return int(m.group(1)) if m else None
+
+
+def marca_de(caminho: str):
+    """Devolve o carimbo TEXTUAL de retirado-em (string, não parseado — quem
+    escreve de volta no registry preserva o formato exato que o disco tem),
+    ou None se o arquivo não carregar a marca na cabeça."""
+    with open(caminho, encoding="utf-8") as handle:
+        cabeca = handle.read(4096)
+    if MARCA not in cabeca:
+        return None
+    achado = _RE_RETIRADO_EM.search(cabeca)
+    if not achado:
+        return None
+    carimbo = achado.group(1)
+    # A marca termina em "... retirado-em=2026-08-28T21:35:49Z motivo=...-->":
+    # o regex \S+ pega até o próximo espaço, que já é exatamente o carimbo.
+    return carimbo
+
+
+def le_registry():
+    if not os.path.isfile(REGISTRY):
+        return None
+    with open(REGISTRY, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def grava_registry(registro: dict) -> None:
+    saida = {
+        "next_id": registro["next_id"],
+        "assigned": registro.get("assigned", {}),
+        "tombstones": sorted(registro.get("tombstones") or []),
+        "retired": registro.get("retired", {}),
+        "schema_version": registro.get("schema_version") or "sitemap_shard_registry_v1",
+    }
+    if registro.get("por_que"):
+        saida["por_que"] = registro["por_que"]
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(saida, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp, REGISTRY)
+
+
+def chave_sintetica(nome_arquivo: str) -> str:
+    """"pages-0035.xml" -> "@orfao-registry:pages-0035". O prefixo "@" não
+    colide com chave de coorte datada ("AAAA-MM-DD|area#k") nem com
+    "@navegacao" nem com "area:...": nenhuma delas começa por "@orfao-"."""
+    return "@orfao-registry:" + nome_arquivo[:-len(".xml")]
+
+
+def reconcilia(registro: dict):
+    """Varre public/sitemaps/ e classifica cada shard retirado em disco contra
+    o registry. Devolve (conhecidos, orfaos, inconsistentes) — três listas de
+    dict com nome/ordinal/carimbo. Read-only: não muda `registro`."""
+    if not os.path.isdir(SHARDS):
+        return [], [], []
+    assigned = registro.get("assigned", {}) if registro else {}
+    retired = registro.get("retired", {}) if registro else {}
+    tombstones = set(registro.get("tombstones") or []) if registro else set()
+    dono_do_ordinal = {}
+    for chave, valor in assigned.items():
+        dono_do_ordinal.setdefault(valor, []).append(chave)
+
+    conhecidos, orfaos, inconsistentes = [], [], []
+    for nome in sorted(os.listdir(SHARDS)):
+        if not nome.startswith("pages-") or not nome.endswith(".xml"):
+            continue
+        caminho = os.path.join(SHARDS, nome)
+        carimbo = marca_de(caminho)
+        if carimbo is None:
+            continue  # shard ativo (sem marca): fora do escopo desta reconciliação.
+        ordinal = ordinal_do_nome(nome)
+        if ordinal is None:
+            continue
+        item = {"nome": nome, "ordinal": ordinal, "retirado_em": carimbo}
+        if ordinal in tombstones:
+            conhecidos.append({**item, "via": "tombstone"})
+            continue
+        chaves = dono_do_ordinal.get(ordinal, [])
+        chaves_retiradas = [c for c in chaves if c in retired]
+        if chaves_retiradas:
+            conhecidos.append({**item, "via": "chave", "chave": chaves_retiradas[0]})
+            continue
+        if chaves:
+            # O registry TEM uma chave para este ordinal, mas nenhuma delas
+            # está marcada retired — a marca em disco e o registry discordam.
+            inconsistentes.append({**item, "chaves_nao_retiradas": chaves})
+            continue
+        orfaos.append(item)
+    return conhecidos, orfaos, inconsistentes
+
+
+def roda_cobertura_go():
+    """Delega a `cmd/seed-sitemap-registry --verificar` — a cobertura do
+    plano AO VIVO, inalterada. Devolve (ok, saida)."""
+    comando = [GO_MODERN, "run", "./cmd/seed-sitemap-registry", "--verificar"]
+    try:
+        resultado = subprocess.run(comando, cwd=ROOT, capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as erro:
+        return False, f"cmd/seed-sitemap-registry --verificar não executou: {erro}"
+    saida = (resultado.stdout or "") + (resultado.stderr or "")
+    return resultado.returncode == 0, saida.strip()
+
+
+def cmd_verificar() -> int:
+    ok_go, saida_go = roda_cobertura_go()
+    print("=== cobertura do plano vivo (cmd/seed-sitemap-registry --verificar) ===")
+    print(saida_go)
+    print()
+
+    registro = le_registry()
+    if registro is None:
+        print("registry ausente — nada a reconciliar contra disco; o plano segue posicional")
+        return 0 if ok_go else 1
+
+    conhecidos, orfaos, inconsistentes = reconcilia(registro)
+    print("=== reconciliação disco × assigned × retired × tombstones ===")
+    print(f"shards retirados em disco: {len(conhecidos) + len(orfaos) + len(inconsistentes)}")
+    print(f"  conhecidos (tombstone ou chave retirada): {len(conhecidos)}")
+    print(f"  órfãos (SEM nenhuma chave em assigned)   : {len(orfaos)}")
+    print(f"  inconsistentes (chave existe, não retired): {len(inconsistentes)}")
+
+    if not orfaos and not inconsistentes:
+        print("\nOK: todo shard retirado em disco está explicado no registry.")
+        return 0 if ok_go else 1
+
+    if orfaos:
+        print("\nREPROVADO — ordinal retirado DESCONHECIDO ao registry:")
+        for item in orfaos:
+            print(f"  {item['nome']}: ordinal {item['ordinal']}, retirado em {item['retirado_em']},"
+                  f" sem chave em assigned nem em tombstones")
+        print("  Corrija com: tools/seed-sitemap-registry --adotar-orfaos")
+    if inconsistentes:
+        print("\nREPROVADO — disco e registry discordam sobre uma coorte identificada:")
+        for item in inconsistentes:
+            print(f"  {item['nome']}: ordinal {item['ordinal']}, retirado em {item['retirado_em']},"
+                  f" chave(s) {item['chaves_nao_retiradas']} presente(s) em assigned mas ausente(s) de retired")
+        print("  Isto não se adota automaticamente — investigue por que o registry não marcou a retirada.")
+    return 1
+
+
+def cmd_adotar_orfaos(seco: bool) -> int:
+    registro = le_registry()
+    if registro is None:
+        print("REPROVADO: registry ausente em", os.path.relpath(REGISTRY, ROOT), file=sys.stderr)
+        return 1
+    _, orfaos, inconsistentes = reconcilia(registro)
+    if not orfaos:
+        print("nada a adotar: nenhum ordinal órfão encontrado em disco.")
+        if inconsistentes:
+            print(f"({len(inconsistentes)} shard(s) inconsistente(s) continuam à parte — "
+                  "não se adotam automaticamente; rode --verificar para a lista)")
+        return 0
+
+    next_id = registro.get("next_id", 1)
+    assigned = registro.get("assigned", {})
+    retired = registro.get("retired", {})
+    tombstones = set(registro.get("tombstones") or [])
+
+    adotados = []
+    for item in orfaos:
+        ordinal = item["ordinal"]
+        if ordinal >= next_id:
+            print(f"AVISO: ordinal {ordinal} ({item['nome']}) >= next_id ({next_id}) — "
+                  "NÃO adotado; seria dar identidade a um número que o registry nunca alocou.",
+                  file=sys.stderr)
+            continue
+        if ordinal in tombstones:
+            print(f"AVISO: ordinal {ordinal} ({item['nome']}) já está em tombstones mas o "
+                  "arquivo ainda existe em disco — estado incoerente, não adotado.", file=sys.stderr)
+            continue
+        chave = chave_sintetica(item["nome"])
+        adotados.append((chave, ordinal, item["retirado_em"]))
+
+    if not adotados:
+        print("nenhum órfão pôde ser adotado (todos recusados pelas guardas acima).")
+        return 1
+
+    print(f"{'--seco: adotaria' if seco else 'adotando'} {len(adotados)} ordinal(is) órfão(s):")
+    for chave, ordinal, retirado_em in adotados:
+        print(f"  {chave} -> ordinal {ordinal}, retirado em {retirado_em}")
+
+    if seco:
+        print("\n--seco: nada foi escrito.")
+        return 0
+
+    for chave, ordinal, retirado_em in adotados:
+        assigned[chave] = ordinal
+        retired[chave] = retirado_em
+    registro["assigned"] = assigned
+    registro["retired"] = retired
+    grava_registry(registro)
+    print(f"\ngravado: {os.path.relpath(REGISTRY, ROOT)}")
+    print("A partir de agora, o próximo ExpireRetired (em qualquer publish) tomba estes "
+          "ordinais sozinho, pelo caminho normal — a adoção só precisava rodar uma vez.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    modo = parser.add_mutually_exclusive_group(required=True)
+    modo.add_argument("--verificar", action="store_true",
+                       help="cobertura do plano vivo (Go) + reconciliação disco×registry; read-only")
+    modo.add_argument("--adotar-orfaos", action="store_true",
+                       help="dá chave sintética a ordinal retirado sem chave nenhuma em assigned")
+    parser.add_argument("--seco", action="store_true", help="com --adotar-orfaos: relata sem escrever")
+    args = parser.parse_args()
+
+    if args.seco and not args.adotar_orfaos:
+        print("REPROVADO: --seco só se aplica a --adotar-orfaos", file=sys.stderr)
+        return 2
+
+    if args.verificar:
+        return cmd_verificar()
+    return cmd_adotar_orfaos(args.seco)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

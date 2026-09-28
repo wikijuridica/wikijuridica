@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""check-normative-fingerprint-selftest — prova as propriedades da impressão
+normativa, sobre documento oficial REAL, e reprova se alguma cair.
+
+Read-only: não escreve nada. Importa
+`tools/generate-normative-fingerprint-baseline-20260812` e exercita a MESMA
+implementação que gera a linha de base — cópia da lógica aqui provaria a cópia,
+não o detector.
+
+As seis propriedades, e por que cada uma existe:
+
+  A. DETERMINISMO ENTRE PROCESSOS. A impressão precisa valer amanhã, noutro
+     processo. `hash()` do Python é semeado por processo e daria valor diferente
+     a cada execução; a prova roda o cálculo em dois subprocessos com
+     PYTHONHASHSEED distintos e exige o mesmo hexadecimal.
+
+  B. INVARIÂNCIA COSMÉTICA. Banner, script de WAF, comentário com data e ruído de
+     espaço mudam o sha256 do corpo e NÃO podem mudar a impressão — senão o
+     detector vira alarme permanente que ninguém atende.
+
+  C. SENSIBILIDADE NORMATIVA. Se um dispositivo some ou uma nota
+     `(Redação dada pela Lei nº …)` aparece, a impressão TEM que mudar. Sem esta,
+     a propriedade B seria satisfeita por um detector inerte que nunca acusa nada.
+
+  D. FAIL-CLOSED. Corpo ausente, status recusado, `.pdf` que devolve HTML
+     (soft-404), mídia irreconhecível e extração vazia NÃO produzem impressão, e
+     o comparador não devolve "inalterado" para nenhum deles. Este é o defeito
+     que originou a frente: quatro documentos distintos — dois PDFs vivos, uma
+     página de portal e um 404 de 724 bytes — receberam a mesma impressão
+     `d8e09da58ba1…` porque o protótipo hasheou o vazio.
+
+  E. COLISÃO NUNCA CONCLUI "IGUAL". Duas URLs distintas com a mesma impressão
+     ficam marcadas e o comparador responde `indeterminado`. O caso real está na
+     própria linha de base: a Lei 14.126/2021 e o Decreto 12.797/2025 têm as
+     mesmas duas âncoras (`art1`, `art2`) e nenhuma nota de alteração.
+
+  F. ESTABILIDADE MEDIDA EM PORTAL VIVO. Sobre os corpos de três buscas
+     consecutivas das mesmas URLs oficiais, o sha256 do corpo variou em 6 de 13
+     URLs e a impressão variou em 0. A evidência é
+     `data/ops/official_source_normative_fingerprint_pass_replay_20260812.jsonl`.
+
+Uso:
+    tools/check-normative-fingerprint-selftest
+    tools/check-normative-fingerprint-selftest --verboso
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GERADOR = ROOT / "tools/generate-normative-fingerprint-baseline-20260812"
+BASELINE = ROOT / "data/ops/official_source_normative_fingerprint_baseline.jsonl"
+REPLAY = ROOT / "data/ops/official_source_normative_fingerprint_pass_replay_20260812.jsonl"
+# O CACHE MORA NO REPO, NAO EM /tmp (2026-09-10). Ate esta data o default
+# era /tmp/wiki-planalto-cache-20260812, e /tmp nao sobrevive ao reboot: a
+# bancada diaria de hoje registrou este selftest como NAO MEDIDO com a
+# frase "sem corpo local, as propriedades B e C nao foram exercitadas" --
+# 57 das 59 verificacoes passaram e as duas que dependem de corpo ficaram
+# cegas. Cache e regeneravel, entao .cache/ (ja no .gitignore) e o lugar:
+# sobrevive ao reboot, nao entra no versionamento e acompanha o repo.
+# PLANALTO_CACHE continua vencendo, para quem quiser apontar outro.
+CACHE = Path(os.environ.get("PLANALTO_CACHE",
+                            str(ROOT / ".cache/planalto-normative-fingerprint-20260812")))
+
+
+def carrega_gerador():
+    """Importa o gerador REAL. Ele não tem extensão `.py`, então o loader é
+    explícito — `spec_from_file_location` sozinho devolve None para arquivo sem
+    extensão conhecida."""
+    if not GERADOR.is_file():
+        raise SystemExit("gerador ausente: %s" % GERADOR)
+    loader = importlib.machinery.SourceFileLoader("impressao_normativa", str(GERADOR))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise SystemExit("não consegui importar %s" % GERADOR)
+    modulo = importlib.util.module_from_spec(spec)
+    loader.exec_module(modulo)  # o guard __main__ impede rodar a coleta
+    return modulo
+
+
+def documentos_da_baseline() -> list[dict]:
+    if not BASELINE.is_file():
+        return []
+    return [json.loads(linha) for linha in BASELINE.read_text(encoding="utf-8").splitlines()
+            if linha.strip() and json.loads(linha).get("tipo") == "documento"]
+
+
+def corpo_em_cache(mod, url: str) -> bytes:
+    destino = mod.caminho_cache(CACHE, url)
+    return destino.read_bytes() if destino.is_file() else b""
+
+
+class Placar:
+    def __init__(self, verboso: bool) -> None:
+        self.falhas: list[str] = []
+        self.passos = 0
+        self.verboso = verboso
+
+    def exige(self, condicao: bool, descricao: str, detalhe: str = "") -> None:
+        self.passos += 1
+        if condicao:
+            if self.verboso:
+                print("    ok   %s %s" % (descricao, detalhe))
+            return
+        self.falhas.append("%s %s" % (descricao, detalhe))
+        print("    FALHA %s %s" % (descricao, detalhe))
+
+
+def propriedade_a(mod, placar: Placar) -> None:
+    print("A. determinismo entre processos (PYTHONHASHSEED diferente)")
+    codigo = (
+        "import importlib.machinery,importlib.util;"
+        "l=importlib.machinery.SourceFileLoader('m',%r);"
+        "s=importlib.util.spec_from_loader('m',l);"
+        "m=importlib.util.module_from_spec(s);l.exec_module(m);"
+        "p=m.preimagem('html',{'art1','art2','art14'},['Lei 14133/2021'],2021,'');"
+        "print(m.impressao_de(p))" % str(GERADOR))
+    saidas = []
+    for semente in ("0", "1", "12345"):
+        ambiente = dict(os.environ, PYTHONHASHSEED=semente)
+        resultado = subprocess.run([sys.executable, "-c", codigo], capture_output=True,
+                                   text=True, env=ambiente, check=False)
+        placar.exige(resultado.returncode == 0,
+                     "subprocesso com PYTHONHASHSEED=%s roda" % semente,
+                     resultado.stderr.strip()[:200])
+        saidas.append(resultado.stdout.strip())
+    placar.exige(len(set(saidas)) == 1,
+                 "mesma impressão nos três processos", str(sorted(set(saidas))))
+    placar.exige(bool(saidas[0]) and re.fullmatch(r"[0-9a-f]{32}", saidas[0] or "") is not None,
+                 "impressão é blake2b de 16 bytes", saidas[0])
+
+
+# As mutações COSMÉTICAS não introduzem `id`/`name` nem parênteses: âncora nova é
+# mudança material de verdade, e um parêntese poderia virar nota de alteração —
+# provar invariância com isso seria provar a coisa errada.
+COSMETICAS = [
+    ("script de WAF", lambda b: b + b"\n<script>var f5_cspm_token='9f3ac21b';</script>"),
+    ("comentario com data", lambda b: b"<!-- gerado em 2026-08-12 10:44:31 -->\n" + b),
+    ("banner de aviso", lambda b: b + b"\n<div class=\"banner\">Aviso: portal em manutencao programada</div>"),
+    ("rodape com data", lambda b: b + b"\n<p>Atualizado em 12/08/2026</p>"),
+    ("ruido de espaco", lambda b: b.replace(b"\r\n", b"\n") + b"\n\n   \n"),
+]
+
+
+def propriedade_b(mod, amostra: list[dict], placar: Placar) -> None:
+    print("B. invariância cosmética sobre documento oficial real")
+    for registro in amostra:
+        bruto = corpo_em_cache(mod, registro["url"])
+        if not bruto:
+            continue
+        base = mod.registro_do_documento(registro["url"], bruto, 200, "teste", "2026-08-12")
+        for nome, mutacao in COSMETICAS:
+            mutado = mutacao(bruto)
+            depois = mod.registro_do_documento(registro["url"], mutado, 200, "teste", "2026-08-12")
+            mudou_sha = base["sha256_documento"] != depois["sha256_documento"]
+            placar.exige(mudou_sha, "sha256 muda com %s" % nome, registro["url"][-40:])
+            placar.exige(base["impressao_normativa"] == depois["impressao_normativa"],
+                         "impressão IGNORA %s" % nome,
+                         "%s %s->%s" % (registro["url"][-40:],
+                                        (base["impressao_normativa"] or "-")[:12],
+                                        (depois["impressao_normativa"] or "-")[:12]))
+
+
+def propriedade_c(mod, amostra: list[dict], placar: Placar) -> None:
+    print("C. sensibilidade a mudança normativa")
+    for registro in amostra:
+        bruto = corpo_em_cache(mod, registro["url"])
+        if not bruto or not registro.get("ancoras_amostra"):
+            continue
+        base = mod.registro_do_documento(registro["url"], bruto, 200, "teste", "2026-08-12")
+
+        # (1) some um dispositivo: a âncora deixa de existir no documento.
+        ancora = registro["ancoras_amostra"][0].encode("utf-8")
+        sem_ancora = bruto.replace(b'"' + ancora + b'"', b'"dispositivo-removido"', 1)
+        sem_ancora = sem_ancora.replace(b"'" + ancora + b"'", b"'dispositivo-removido'", 1)
+        sem_ancora = sem_ancora.replace(b"=" + ancora + b" ", b"=dispositivo-removido ", 1)
+        depois = mod.registro_do_documento(registro["url"], sem_ancora, 200, "teste", "2026-08-12")
+        placar.exige(sem_ancora != bruto, "mutação de âncora aplicou", registro["url"][-40:])
+        placar.exige(base["impressao_normativa"] != depois["impressao_normativa"],
+                     "impressão MUDA quando dispositivo some", registro["url"][-40:])
+
+        # (2) chega nota de alteração nova. A nota entra na codificação do
+        # PRÓPRIO documento: o Planalto serve cp1252, e injetar UTF-8 aqui
+        # produziria "RedaÃ§Ã£o" depois da decodificação — o teste falharia por
+        # defeito do teste, não do detector.
+        _, codificacao = mod.decodifica(bruto)
+        nota = "\n<p>Art. 99 (Redação dada pela Lei nº 14.999, de 2026)</p>"
+        com_nota = bruto + nota.encode(codificacao.split("/")[0], errors="replace")
+        depois = mod.registro_do_documento(registro["url"], com_nota, 200, "teste", "2026-08-12")
+        placar.exige(base["impressao_normativa"] != depois["impressao_normativa"],
+                     "impressão MUDA com nota de redação nova", registro["url"][-40:])
+        placar.exige("Lei 14999/2026" in (depois["normas_alteradoras"] or []),
+                     "a norma alteradora nova aparece na evidência",
+                     str(depois["normas_alteradoras"][-2:]))
+        placar.exige(depois["ano_max_alteracao"] == 2026,
+                     "ano máximo de alteração acompanha",
+                     str(depois["ano_max_alteracao"]))
+
+
+def propriedade_d(mod, forte: dict, placar: Placar) -> None:
+    print("D. fail-closed: sem prova, sem impressão — e nunca 'inalterado'")
+    casos = [
+        ("corpo ausente", "https://www.planalto.gov.br/x.htm", b"", 200, "corpo_ausente"),
+        ("404 com corpo", "https://normativos.bcb.gov.br/x.pdf",
+         b"<html><body>Nao encontrado</body></html>", 404, "http_recusado"),
+        ("soft-404 em URL .pdf", "https://normativos.bcb.gov.br/Circ_3681_v10_P.pdf",
+         b"<html><body>Pagina nao encontrada</body></html>", 200, "corpo_nao_e_pdf"),
+        ("midia irreconhecivel", "https://exemplo.gov.br/doc",
+         bytes(range(0, 255)) * 4, 200, "midia_irreconhecivel"),
+        ("extracao vazia", "https://www.bcb.gov.br/estabilidadefinanceira/pix",
+         b"<html><body><h1>Pix</h1><p>Portal do Banco Central.</p></body></html>",
+         200, "extracao_vazia"),
+    ]
+    impressoes = []
+    for nome, url, corpo, status, motivo in casos:
+        registro = mod.registro_do_documento(url, corpo, status, "teste", "2026-08-12")
+        impressoes.append(registro["impressao_normativa"])
+        placar.exige(registro["impressao_normativa"] is None,
+                     "%s NÃO produz impressão" % nome, str(registro["impressao_normativa"]))
+        placar.exige(registro["motivo_sem_impressao"] == motivo,
+                     "%s registra o motivo" % nome,
+                     "%s != %s" % (registro["motivo_sem_impressao"], motivo))
+        contra_si = mod.veredito(registro, registro)
+        placar.exige(contra_si["veredito"].startswith("indeterminado"),
+                     "%s comparado consigo NÃO vira 'inalterado'" % nome,
+                     contra_si["veredito"])
+        if forte:
+            contra_forte = mod.veredito(forte, registro)
+            placar.exige(contra_forte["veredito"].startswith("indeterminado"),
+                         "%s contra documento forte vira indeterminado" % nome,
+                         contra_forte["veredito"])
+    placar.exige(all(i is None for i in impressoes),
+                 "nenhum dos cinco casos degenerados tem impressão comparável")
+
+
+def propriedade_e(mod, documentos: list[dict], placar: Placar) -> None:
+    print("E. colisão marcada, e colisão nunca conclui 'igual'")
+    colidentes = [d for d in documentos if d.get("colisao_de_impressao")]
+    placar.exige(bool(colidentes), "a linha de base marca colisão quando existe",
+                 "%d documento(s)" % len(colidentes))
+    for registro in colidentes[:6]:
+        placar.exige(bool(registro["colide_com"]), "colisão nomeia as URLs irmãs",
+                     registro["url"][-40:])
+        # Rebusca cosmética: mesma impressão, corpo diferente. Sem a marca de
+        # colisão isto responderia "inalterado".
+        rebusca = dict(registro)
+        rebusca["sha256_documento"] = hashlib.sha256(
+            (registro["sha256_documento"] + "cosmetico").encode()).hexdigest()
+        julgamento = mod.veredito(registro, rebusca)
+        placar.exige(julgamento["veredito"].startswith("indeterminado"),
+                     "impressão colidente responde indeterminado",
+                     "%s -> %s" % (registro["url"][-40:], julgamento["veredito"]))
+
+    # Contraprova: documento forte e SEM colisão precisa conseguir concluir.
+    forte = next((d for d in documentos
+                  if d.get("impressao_normativa") and not d.get("colisao_de_impressao")
+                  and d.get("classe_de_evidencia") == "forte"), None)
+    if forte:
+        rebusca = dict(forte)
+        rebusca["sha256_documento"] = hashlib.sha256(
+            (forte["sha256_documento"] + "cosmetico").encode()).hexdigest()
+        julgamento = mod.veredito(forte, rebusca)
+        placar.exige(julgamento["veredito"] == "inalterado_por_impressao",
+                     "documento forte e único CONCLUI inalterado por impressão",
+                     "%s -> %s" % (forte["url"][-40:], julgamento["veredito"]))
+        # Alteração real muda os bytes E a impressão: manter o mesmo sha256 aqui
+        # descreveria um documento impossível (corpo idêntico com norma nova) e o
+        # comparador responderia, corretamente, "inalterado".
+        mudado = dict(rebusca)
+        mudado["impressao_normativa"] = "0" * 32
+        mudado["normas_alteradoras"] = (forte.get("normas_alteradoras") or []) + ["Lei 14999/2026"]
+        julgamento = mod.veredito(forte, mudado)
+        placar.exige(julgamento["veredito"] == "mudou",
+                     "impressão diferente vira 'mudou' com a norma nova nomeada",
+                     str(julgamento.get("normas_novas")))
+
+
+def propriedade_f(placar: Placar) -> None:
+    print("F. estabilidade medida em portal vivo (três buscas)")
+    if not REPLAY.is_file():
+        placar.exige(False, "evidência do replay existe", str(REPLAY))
+        return
+    linhas = [json.loads(linha) for linha in REPLAY.read_text(encoding="utf-8").splitlines()
+              if linha.strip()]
+    resumo = next((linha for linha in linhas if linha.get("tipo") == "resumo_replay"), None)
+    placar.exige(resumo is not None, "resumo do replay presente")
+    if not resumo:
+        return
+    placar.exige(resumo["sha256_instavel"] >= 1,
+                 "o sha256 do corpo REALMENTE varia entre buscas",
+                 "%d URL(s)" % resumo["sha256_instavel"])
+    placar.exige(resumo["impressao_instavel"] == 0,
+                 "a impressão normativa não variou em nenhuma URL",
+                 "%d URL(s)" % resumo["impressao_instavel"])
+    for linha in linhas:
+        if linha.get("tipo") != "replay_de_buscas":
+            continue
+        impressoes = {v for v in (linha.get("impressao_por_busca") or {}).values() if v}
+        placar.exige(len(impressoes) <= 1, "impressão estável em %s" % linha["url"][-46:],
+                     str(sorted(impressoes)))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--verboso", action="store_true")
+    parser.add_argument("--amostra", type=int, default=6,
+                        help="documentos reais usados nas propriedades B e C")
+    args = parser.parse_args()
+
+    mod = carrega_gerador()
+    documentos = documentos_da_baseline()
+    if not documentos:
+        print("ABORTA: linha de base ausente ou vazia em %s"
+              % os.path.relpath(BASELINE, ROOT), file=sys.stderr)
+        return 2
+
+    com_corpo = [d for d in documentos
+                 if d.get("impressao_normativa") and d.get("midia") == "html"
+                 and corpo_em_cache(mod, d["url"])]
+    amostra = com_corpo[: max(1, args.amostra)]
+    forte = next((d for d in documentos if d.get("classe_de_evidencia") == "forte"
+                  and d.get("impressao_normativa")), {})
+
+    print("linha de base: %d documento(s) | amostra com corpo local: %d"
+          % (len(documentos), len(com_corpo)))
+    placar = Placar(args.verboso)
+    propriedade_a(mod, placar)
+    # FALTA DE CACHE É INFRA, NÃO VEREDITO (2026-09-05). Até hoje a ausência de
+    # corpo local virava `exige(False, ...)` — uma FALHA, indistinguível de
+    # propriedade violada. E o cache mora em /tmp (legítimo: é regenerável, e o
+    # contrato só proíbe /tmp para produto), o que significa que TODO REBOOT
+    # deixava este selftest vermelho sem que nada estivesse errado. Foi assim
+    # que ele apareceu na primeira execução em suíte: 58 verificações, uma
+    # "falha", e a falha era o disco vazio.
+    #
+    # Exit 75 é EX_TEMPFAIL, a mesma convenção que o resto do repositório usa
+    # para "não consegui medir" — e ela só se aplica quando NADA MAIS falhou:
+    # defeito real continua tendo precedência e sai 1, senão a infra viraria
+    # esconderijo para propriedade quebrada.
+    sem_corpo_local = not amostra
+    if amostra:
+        propriedade_b(mod, amostra, placar)
+        propriedade_c(mod, amostra, placar)
+    propriedade_d(mod, forte, placar)
+    propriedade_e(mod, documentos, placar)
+    propriedade_f(placar)
+
+    print("\n%d verificação(ões), %d falha(s)" % (placar.passos, len(placar.falhas)))
+    if placar.falhas:
+        for falha in placar.falhas[:20]:
+            print("  FALHA: %s" % falha)
+        return 1
+    if sem_corpo_local:
+        print("  INFRA: sem corpo local, as propriedades B e C não foram exercitadas.")
+        print("  cache: %s (vazio ou ausente — /tmp não sobrevive ao reboot)" % CACHE)
+        print("  Repopule com tools/generate-normative-fingerprint-baseline-20260812,")
+        print("  ou aponte PLANALTO_CACHE para um cache existente.")
+        print("  As outras %d verificações passaram." % placar.passos)
+        return 75
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

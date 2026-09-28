@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""check-tmp-product-leak — reprova produto vivendo em diretório volátil.
+
+Regra do dono (CLAUDE.md, 2026-07-29, reforçada em 2026-08-04): PRODUTO NUNCA
+MORA EM /tmp. O motivo não é estilo: /usr/lib/tmpfiles.d/tmp.conf declara
+`D /tmp 1777 root root -`, e o `D` faz o systemd APAGAR TODO O CONTEÚDO de /tmp
+A CADA BOOT. Página redigida, pesquisa de fonte, evidência coletada ou script de
+agente que ficou só ali desaparece no próximo reboot, sem aviso e sem lixeira.
+
+Precedente que originou a regra: em 2026-07-28 uma onda produziu 115 páginas /
+39.950 palavras que existiam SOMENTE em /tmp (resgatadas por pouco, commit
+63f0b56b).
+
+Este check é READ-ONLY: aponta o que está em risco e como resgatar. Quem copia
+para o repo é `tools/generate-tmp-product-rescue`.
+
+Uso:
+    ./tools/check-tmp-product-leak              # varre os voláteis conhecidos
+    ./tools/check-tmp-product-leak --json       # saída estruturada
+    ./tools/check-tmp-product-leak --root /tmp  # varre um caminho específico
+
+Saída: 0 = nenhum produto em risco; 1 = produto encontrado (com a lista).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+
+# Diretórios voláteis vigiados. /tmp é zerado no boot; /dev/shm é memória;
+# /var/tmp sobrevive ao boot mas é varrido por idade e não é versionado.
+VOLATILE_ROOTS = ("/tmp", "/dev/shm", "/var/tmp")
+
+# Ruído legítimo: cache regenerável, estado de runtime, socket, lock. Nada aqui
+# custou trabalho intelectual — perder é irrelevante.
+SKIP_DIR_PREFIXES = (
+    "go-build",
+    "node-compile-cache",
+    "systemd-private-",
+    "tmux-",
+    "tsx-",
+    "wezterm-",
+    ".X11-unix",
+    ".XIM-unix",
+    ".ICE-unix",
+    ".font-unix",
+    "pulse-",
+    "snap.",
+    "podman-run-",
+    "containers-user-",
+    "hsperfdata_",
+    "wiki-go-index-closure-u",  # workspace do gate de commit: destruído a cada run
+    "wiki-go-index-gate.",
+    "portaljuridico-contentstore-locks",
+    "__pycache__",
+)
+
+SKIP_SUFFIXES = (
+    ".lock", ".sock", ".pid", ".pyc", ".swp", ".anchor", ".sha256", ".stamp",
+)
+
+# Extensões que carregam trabalho: dado editorial, documento, código de agente.
+PRODUCT_SUFFIXES = (".jsonl", ".json", ".md", ".py", ".sh", ".go", ".txt", ".html",
+                    ".csv", ".mdx", ".yaml", ".yml", ".log", ".out")
+
+# Sufixos de escrita interrompida: um writer que morre antes do rename final
+# deixa "paginas.jsonl.tmp". Pular esses era perder exatamente o caso em que o
+# trabalho já estava em risco. Removemos a extensão transitória e reclassificamos
+# pela extensão real por baixo.
+TRANSIENT_SUFFIXES = (".tmp", ".part", ".partial", ".writing")
+
+# Compressão: ".jsonl.gz" tem suffix ".gz" e escapava da lista de produto.
+COMPRESSION_SUFFIXES = (".gz", ".bz2", ".xz", ".zst")
+
+# Acima disto, o resgate registra e NÃO copia: um dump de centenas de MB
+# entupiria o repositório e estouraria o orçamento do hook de fim de turno.
+MAX_RESCUE_BYTES = 50 * 1024 * 1024
+
+# Marcas de conteúdo do projeto dentro de JSON/JSONL. Um .json de configuração
+# de ferramenta não casa; uma página ou um registro editorial casa.
+CONTENT_MARKERS = (
+    b'"intent_id"',
+    b'"unique_intent_id"',
+    b'"meta_description"',
+    b'"body_sections"',
+    b'"official_sources"',
+    b'"source_provenance"',
+    b'"page_type"',
+    b'"record_key"',
+)
+
+MIN_PRODUCT_BYTES = 512
+MAX_SNIFF_BYTES = 65536
+
+
+def is_skippable_dir(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in SKIP_DIR_PREFIXES)
+
+
+def effective_suffix(name: str) -> str:
+    """Extensão real, ignorando compressão e sufixo de escrita interrompida.
+
+    "paginas.jsonl.gz" e "paginas.jsonl.tmp" são produto tanto quanto
+    "paginas.jsonl" — o writer que morreu no meio é justamente o caso crítico.
+    """
+    lower = name.lower()
+    for descartavel in TRANSIENT_SUFFIXES + COMPRESSION_SUFFIXES:
+        if lower.endswith(descartavel):
+            lower = lower[: -len(descartavel)]
+            break
+    return pathlib.PurePath(lower).suffix
+
+
+def classify(path: pathlib.Path) -> str | None:
+    """Devolve o motivo pelo qual o arquivo é produto, ou None se for ruído."""
+    name = path.name
+    if any(name.endswith(suffix) for suffix in SKIP_SUFFIXES):
+        return None
+    suffix = effective_suffix(name)
+    # Dotfile só é pulado quando não carrega extensão de produto: ".plan.md" é
+    # trabalho; ".bashrc_bkp" não interessa.
+    if name.startswith(".") and suffix not in PRODUCT_SUFFIXES:
+        return None
+    if suffix not in PRODUCT_SUFFIXES:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size < MIN_PRODUCT_BYTES:
+        return None
+    if size > MAX_RESCUE_BYTES:
+        return f"GRANDE DEMAIS para resgate automático ({size} bytes) — copie à mão se for produto"
+
+    if suffix in (".py", ".sh", ".go"):
+        return f"código de agente ({size} bytes)"
+    if suffix in (".md", ".txt", ".html", ".csv", ".mdx", ".yaml", ".yml", ".log", ".out"):
+        return f"documento/relatório ({size} bytes)"
+
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(MAX_SNIFF_BYTES)
+    except OSError:
+        return None
+    for marker in CONTENT_MARKERS:
+        if marker in head:
+            return f"dado editorial: contém {marker.decode()} ({size} bytes)"
+    # JSON/JSONL sem marcador do projeto AINDA é produto: índice de varredura,
+    # relatório de agente, mapa de fontes, resultado de auditoria. Exigir o
+    # marcador aqui foi um falso-negativo medido em 2026-08-04 — o índice das
+    # 8.176 escritas de agente (tmp_writes.jsonl, 1,5 MB) ficou de fora do
+    # resgate justamente por não conter campo editorial. Dado estruturado que
+    # alguém gerou custou trabalho; cache regenerável já foi excluído acima por
+    # diretório e sufixo.
+    return f"dado estruturado ({size} bytes)"
+
+
+def scan(root: pathlib.Path) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    if not root.exists():
+        return found
+    for current, dirnames, filenames in os.walk(root, onerror=lambda _: None):
+        dirnames[:] = [d for d in dirnames if not is_skippable_dir(d)]
+        for filename in filenames:
+            path = pathlib.Path(current) / filename
+            if path.is_symlink():
+                continue
+            reason = classify(path)
+            if reason:
+                found.append((str(path), reason))
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", action="append", default=None,
+                        help="caminho a varrer (repetível); padrão: /tmp, /dev/shm, /var/tmp")
+    parser.add_argument("--json", action="store_true", help="saída estruturada")
+    args = parser.parse_args()
+
+    roots = [pathlib.Path(r) for r in (args.root or VOLATILE_ROOTS)]
+    found: list[tuple[str, str]] = []
+    for root in roots:
+        found.extend(scan(root))
+    found.sort()
+
+    if args.json:
+        print(json.dumps({
+            "roots": [str(r) for r in roots],
+            "product_at_risk": [{"path": p, "reason": r} for p, r in found],
+            "count": len(found),
+        }, ensure_ascii=False, indent=1))
+        return 1 if found else 0
+
+    if not found:
+        print(f"check-tmp-product-leak: OK — nenhum produto em {', '.join(str(r) for r in roots)}")
+        return 0
+
+    print(f"check-tmp-product-leak: REPROVADO — {len(found)} arquivo(s) de produto "
+          f"em diretório volátil (some no próximo reboot):")
+    for path, reason in found[:200]:
+        print(f"  {path}  [{reason}]")
+    if len(found) > 200:
+        print(f"  ... e mais {len(found) - 200}")
+    print()
+    print("Resgate (copia para o repo, não apaga a origem):")
+    print("  ./tools/generate-tmp-product-rescue")
+    print("Depois: leia o que foi resgatado e commite por pathspec. Produto que "
+          "custou tokens não pode viver só em /tmp — o systemd zera /tmp a cada boot.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

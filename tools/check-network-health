@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""check-network-health — o uplink deste servidor esta saudavel?
+
+POR QUE EXISTE, e por que os dois vigias que ja havia nao cobrem isto:
+
+  `check-portal-health` mede a ORIGEM (127.0.0.1) — fica verde com o uplink no
+  chao. `check-tunnel-health` mede o TUNEL (metricas locais do cloudflared) —
+  enxerga a queda depois que ela ja derrubou as conexoes de borda. Nenhum dos
+  dois olha a CAMADA DE BAIXO: o WiFi, a rota, o DNS, a latencia. Em 2026-08-19
+  mediu-se o custo desse ponto cego: o servidor estava associado em 2.4 GHz a
+  72,2 Mbit/s (MCS 7, HT20) com 24.999 retransmissoes de quadro, tendo ao lado
+  um BSS de 5 GHz do MESMO roteador que negocia 433 Mbit/s com -41 dBm. Os dois
+  vigias estiveram verdes o tempo todo — porque nenhum deles mede o uplink.
+
+O QUE MEDE, tudo de fonte primaria e tudo como DERIVADA quando o contador e
+cumulativo (total desde o boot nao e taxa; citar total como se fosse taxa e o
+erro que este arquivo existe para nao repetir):
+
+  1. ASSOCIACAO   — `iw dev <if> link`: SSID, BSSID, frequencia, banda, largura,
+                    sinal em dBm, bitrate de TX e de RX.
+  2. QUALIDADE    — `iw dev <if> station dump`: retries, falhas e perda de beacon,
+                    sempre como DELTA entre execucoes, mais a taxa de retry por
+                    pacote transmitido na janela.
+  3. INTERFACE    — /sys/class/net/<if>/statistics: bytes, erros e descartes,
+                    tambem em delta.
+  4. ALCANCE      — ping ao gateway (primeiro salto: isola o WiFi do provedor) e
+                    a um destino externo (1.1.1.1). Perda, RTT medio, RTT maximo
+                    e desvio. O RTT MAXIMO no primeiro salto e o indicador que
+                    denuncia meio congestionado mesmo com 0% de perda.
+  5. TCP          — /proc/net/snmp: RetransSegs sobre OutSegs NA JANELA.
+  6. DNS          — tempo de resolucao real contra o resolvedor configurado.
+  7. ROTA         — existe rota default e ela sai pela interface esperada.
+  8. ENLACE       — placa CABEADA: velocidade negociada, duplex, portadora e
+                    quedas de portadora (delta de carrier_changes), do sysfs.
+                    Entrou em 2026-09-24, quando a maquina nova passou mais de
+                    uma hora em 100 Mbit/s com este vigia verde — ver
+                    medir_enlace_cabeado.
+
+ANTI-FRAUDE: este vigia NAO faz nenhuma requisicao ao site publico. Ele pinga o
+gateway e um resolvedor publico, e le contadores locais do kernel. Vigia que se
+conta como visita e fraude de metrica — a mesma regra que o `check-tunnel-health`
+segue ao ler so o endpoint local do cloudflared.
+
+--repair sobe uma ESCADA, e so sobe um degrau por execucao:
+    1. rescan + reativar o MESMO perfil            (corte de ~2 s)
+    2. desconectar e reconectar o dispositivo      (corte de ~5 s)
+    3. reiniciar o NetworkManager                  (corte de ~10 s)
+    4. recarregar o modulo do radio (iwlwifi)      (corte de ~20 s, ultimo caso)
+
+FRONTEIRA DE PROJETO, deliberada: o reparo restaura CONECTIVIDADE e nunca
+escolhe banda nem troca de rede. Banda se decide uma vez, por medicao, e vive em
+`connection.autoconnect-priority`. Um curador que escolhe banda entra em guerra
+de flap com a decisao de quem configurou — por isso a divergencia de banda aqui
+gera ALERTA, nunca acao.
+
+Cada degrau exige DUAS leituras degradadas seguidas (uma leitura ruim isolada e,
+na maioria das vezes, uma reassociacao que ja estava em curso) e respeita
+`--max-curas-hora` (padrao 4): curar em loop e mascarar defeito, nao consertar.
+
+Estado em data/ops/network_health_state.json, historico em
+data/ops/network_health.jsonl — no repo, versionavel, nunca em /tmp.
+
+Exit: 0 = medi e esta bom | 1 = medi e esta degradado (a unit mascara) |
+2 = NAO MEDI, defeito do instrumento (a unit deixa falhar, e o OnFailure
+alcanca o dono). Hoje saem 2: o `ip` ausente e o radio presente cujo `iw` nao
+responde. Interface nao-radio NAO e "nao medido" — e "nao se aplica", e sai 0.
+
+Uso:
+    tools/check-network-health                 # so mede; 1 se degradado, 2 se nao mediu
+    tools/check-network-health --repair        # mede, avisa o dono e cura
+    tools/check-network-health --json
+"""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+ESTADO = os.path.join(ROOT, "data/ops/network_health_state.json")
+# Exclusao mutua entre execucoes. Duas medidas reais sairam a 1,5 s de distancia
+# em 2026-08-19 (o timer de 60 s mais uma execucao manual): sem trava, a segunda
+# le o estado antes de a primeira gravar, e a contagem de curas da hora perde
+# entradas — furando exatamente o teto que impede o vigia de curar em loop.
+TRAVA = os.path.join(ROOT, "data/ops/.network_health.lock")
+HISTORICO = os.path.join(ROOT, "data/ops/network_health.jsonl")
+NOTIFICADOR = os.path.join(ROOT, "tools/notify-owner")
+
+SCHEMA = "network_health_v1"
+IW = "/usr/sbin/iw"
+# Quem classifica uma interface como radio e o KERNEL, nunca o rc do `iw`:
+# ver e_interface_de_radio(). Constante, e nao literal, para o teste apontar
+# para um diretorio de fixture em vez de reimplementar o predicado.
+SYSFS_NET = "/sys/class/net"
+
+# Limiares. Cada um veio de medicao neste host em 2026-08-19, nao de palpite:
+#   - sinal: o enlace media -33 dBm no 2.4 GHz e -41 dBm no 5 GHz. Abaixo de
+#     -70 dBm a taxa desaba; -75 e a beira da desassociacao.
+#   - RTT do primeiro salto: media medida 2,35 ms com MAXIMO de 39 ms. Um salto
+#     de LAN sem disputa fica abaixo de 10 ms; 60 ms de maximo ja e meio tomado.
+#   - retry: 24.999 retries sobre 3.459.161 quadros = 0,72% acumulado. Acima de
+#     5% na janela o meio esta disputado a ponto de doer no throughput.
+SINAL_RUIM_DBM = -70
+SINAL_CRITICO_DBM = -75
+PERDA_ALTA_PCT = 15.0
+PERDA_CRITICA_PCT = 50.0
+RTT_MAX_GATEWAY_MS = 60.0
+RTT_MEDIO_GATEWAY_MS = 20.0
+RETRY_ALTO_PCT = 5.0
+RETRANS_TCP_ALTO_PCT = 2.0
+DNS_LENTO_S = 1.5
+BITRATE_PISO_MBIT = 40.0
+# Quedas de portadora do cobre numa janela de ~60 s. Medido em 2026-09-24 na
+# maquina nova: as rajadas de oscilacao tiveram 5 quedas em ~2 min (14:19-14:20)
+# e 3 em ~1 min (18:02-18:03); uma queda isolada e compativel com reinicio do
+# roteador. Uma queda avisa como "media"; a partir de duas, "alta".
+QUEDAS_ENLACE_ALTAS = 2
+
+DEGRAUS = ["rescan-reativar", "reconectar-dispositivo", "reiniciar-networkmanager",
+           "recarregar-radio"]
+
+
+def agora():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def rodar(comando, timeout=25):
+    """Executa e devolve (rc, stdout, stderr) sem nunca levantar excecao.
+
+    Um vigia que morre porque um comando auxiliar falhou deixa de vigiar
+    exatamente quando o sistema esta pior — por isso toda falha vira dado.
+    """
+    try:
+        resultado = subprocess.run(comando, capture_output=True, text=True,
+                                   timeout=timeout)
+        return resultado.returncode, resultado.stdout, resultado.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout apos {timeout}s"
+    except OSError as erro:
+        return 127, "", str(erro)
+
+
+def abrir_trava():
+    """Segura a trava pela execucao inteira. Devolve None se nao conseguir: um
+    vigia que nao pega a trava e um vigia concorrente — ele mede e registra, mas
+    NAO cura, porque quem tem a trava e quem manda na escada."""
+    os.makedirs(os.path.dirname(TRAVA), exist_ok=True)
+    try:
+        descritor = open(TRAVA, "w", encoding="utf-8")
+        fcntl.flock(descritor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descritor
+    except (OSError, BlockingIOError):
+        return None
+
+
+def ler_estado():
+    try:
+        with open(ESTADO, encoding="utf-8") as arquivo:
+            return json.load(arquivo)
+    except (OSError, ValueError):
+        return {}
+
+
+def gravar_estado(estado):
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    temporario = ESTADO + ".tmp"
+    with open(temporario, "w", encoding="utf-8") as arquivo:
+        json.dump(estado, arquivo, ensure_ascii=False, sort_keys=True)
+    os.replace(temporario, ESTADO)
+
+
+def registrar(evento):
+    os.makedirs(os.path.dirname(HISTORICO), exist_ok=True)
+    with open(HISTORICO, "a", encoding="utf-8") as arquivo:
+        arquivo.write(json.dumps(evento, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def descobrir_interface():
+    """A interface que carrega a rota default — nao a que o nome sugere.
+
+    Fixar 'wlp2s0' no codigo quebraria no dia em que o host ganhar cabo, e o
+    vigia passaria a medir uma interface ociosa enquanto o trafego real sofre
+    em outra.
+    """
+    rc, saida, _ = rodar(["ip", "-j", "route", "show", "default"])
+    if rc == 0 and saida.strip():
+        try:
+            rotas = json.loads(saida)
+            if rotas:
+                return rotas[0].get("dev"), rotas[0].get("gateway")
+        except ValueError:
+            pass
+    rc, saida, _ = rodar(["ip", "route", "show", "default"])
+    achado = re.search(r"default via (\S+) dev (\S+)", saida)
+    if achado:
+        return achado.group(2), achado.group(1)
+    return None, None
+
+
+def e_interface_de_radio(interface):
+    """A interface e de radio? Quem responde e o kernel, nao o rc do `iw`.
+
+    MEDIDO em 2026-09-22 nesta maquina (kernel 6.1, iw 5.19), porque a leitura
+    intuitiva do rc esta errada e era exatamente o defeito:
+
+        iw dev lo         link -> rc 0   "Not connected."
+        iw dev virbr0     link -> rc 0   "Not connected."
+        iw dev wlp2s0     link -> rc 0   "Connected to e4:c0:e2:db:1d:45"
+        iw dev naoexiste0 link -> rc 237 "command failed: No such device (-19)"
+
+    Numa interface que NAO e radio — placa cabeada, bridge, tunel — o `iw link`
+    NAO falha: devolve a mesma linha de um radio de verdade que perdeu a
+    associacao. O rc so vira != 0 quando a interface nao existe. Separar "nao e
+    radio" de "radio caido" pelo rc e, portanto, impossivel — e era o que
+    medir_wifi fazia ate 2026-09-22, pelo que toda maquina cabeada colhia
+    {"associado": False} e caia na cadeia inteira, elo por elo:
+
+        check-network-health:406  avaliar() casa `wifi.get("associado") is False`
+                                  e emite a critica "radio nao associado a
+                                  nenhum BSS" no dominio "uplink"
+        check-network-health:671  `curavel` = critica de dominio "uplink" -> True
+        check-network-health:686  --repair (a unit passa a flag) sobe a escada
+        check-network-health:562  degrau 0: `nmcli connection up` no perfil ativo
+        check-network-health:565  degrau 1: `nmcli device disconnect <interface>`
+
+    Um vigia de radio derrubando a rede cabeada que ele deveria vigiar.
+
+    `phy80211` nao e proxy, e o mesmo predicado: o cfg80211 cria esse link
+    simbolico ao registrar o netdev, para exatamente os netdevs que o nl80211 —
+    o protocolo que o `iw` fala — sabe enderecar. `wireless/` acompanha por
+    CONFIG_WIRELESS_EXT (=y neste kernel) e entra como segunda evidencia, para o
+    caso de um driver expor um e nao o outro. Os dois nascem no REGISTRO da
+    interface, nunca na associacao: radio desassociado continua passando por
+    aqui, que e o que preserva a deteccao de radio caido de verdade.
+    """
+    base = os.path.join(SYSFS_NET, interface)
+    return (os.path.exists(os.path.join(base, "phy80211"))
+            or os.path.isdir(os.path.join(base, "wireless")))
+
+
+def medir_wifi(interface):
+    """Associacao e qualidade do radio, em tres formas de retorno:
+
+        {}                       a interface nao e WiFi (placa cabeada,
+                                 bridge, tunel) — nada a medir
+        {"nao_medido": motivo}   E radio, mas o `iw` nao respondeu
+                                 (ausente, ou interface removida): NAO
+                                 MEDI, que nao e veredito — sai SEM
+                                 `associado`, entao :406 nao acusa
+        {"associado": ..., ...}  radio medido, associado ou nao
+    """
+    dados = {}
+    if not e_interface_de_radio(interface):
+        # Placa cabeada, bridge ou tunel: nao ha radio a medir, e "nao ha radio"
+        # jamais pode virar "radio caido". Sai ANTES de chamar o `iw`, que numa
+        # interface nao-radio responde "Not connected." com rc 0 — ver a medicao
+        # em e_interface_de_radio (check-network-health:194). Devolver {} e o que
+        # a docstring sempre prometeu e o que o unico consumidor
+        # (check-network-health:648) repassa a avaliar, onde {} e falso em
+        # contexto booleano e a critica de :406 nao chega a ser avaliada.
+        return dados
+    rc, saida, erro = rodar([IW, "dev", interface, "link"])
+    if rc != 0:
+        # A interface E de radio (o sysfs acabou de dizer), mas o instrumento
+        # nao respondeu: `iw` ausente — rodar() devolve 127 por OSError
+        # (check-network-health:134) — ou interface removida entre a leitura do
+        # sysfs e a medida (rc 237, -ENODEV). NAO MEDI nao e veredito: a chave
+        # sai SEM `associado`, entao o `is False` de :406 nao casa com None, a
+        # critica nao sai e a escada de cura nao sobe sobre medicao cega. O
+        # motivo fica gravado no JSONL em vez de sumir num `{}` mudo — o mesmo
+        # defeito que o FALHAS_SYSTEMD do check-portal-health ja teve de
+        # consertar.
+        dados["nao_medido"] = (f"{IW} dev {interface} link rc={rc}: "
+                               f"{(erro or saida).strip()[:120]}")
+        return dados
+    if "Not connected" in saida:
+        # Radio de verdade sem associacao: ESTE e o caso que tem de continuar
+        # produzindo a critica de uplink e autorizando a escada de cura. Na
+        # maquina velha, que e WiFi 5 GHz e serve producao, e este o caminho que
+        # detecta radio caido.
+        dados["associado"] = False
+        return dados
+    dados["associado"] = True
+    for chave, padrao, conversor in [
+        ("ssid", r"SSID:\s*(.+)", str.strip),
+        ("bssid", r"Connected to ([0-9a-f:]{17})", str.strip),
+        ("freq_mhz", r"freq:\s*(\d+)", int),
+        ("sinal_dbm", r"signal:\s*(-?\d+)\s*dBm", int),
+        ("tx_bitrate_mbit", r"tx bitrate:\s*([\d.]+)\s*MBit/s", float),
+        ("rx_bitrate_mbit", r"rx bitrate:\s*([\d.]+)\s*MBit/s", float),
+    ]:
+        achado = re.search(padrao, saida)
+        if achado:
+            dados[chave] = conversor(achado.group(1))
+
+    frequencia = dados.get("freq_mhz")
+    if frequencia:
+        dados["banda"] = "5GHz" if frequencia >= 5000 else "2.4GHz"
+
+    rc, info, _ = rodar([IW, "dev", interface, "info"])
+    achado = re.search(r"channel (\d+).*width: (\d+) MHz", info)
+    if achado:
+        dados["canal"] = int(achado.group(1))
+        dados["largura_mhz"] = int(achado.group(2))
+
+    rc, estacao, _ = rodar([IW, "dev", interface, "station", "dump"])
+    for chave, padrao in [
+        ("tx_retries", r"tx retries:\s*(\d+)"),
+        ("tx_failed", r"tx failed:\s*(\d+)"),
+        ("beacon_loss", r"beacon loss:\s*(\d+)"),
+        ("tempo_associado_s", r"connected time:\s*(\d+)"),
+        ("tx_pacotes", r"tx packets:\s*(\d+)"),
+    ]:
+        achado = re.search(padrao, estacao)
+        if achado:
+            dados[chave] = int(achado.group(1))
+    return dados
+
+
+def medir_enlace_cabeado(interface):
+    """Velocidade negociada, duplex e portadora do enlace de COBRE, do sysfs.
+
+    POR QUE EXISTE (2026-09-24, maquina nova: RTL8125B na porta 2.5G de um
+    roteador Sagemcom). O enlace passou mais de uma hora em 100 Mbit/s — o
+    kernel registrou "Downshift occurred from negotiated speed 2.5Gbps to
+    actual speed 100Mbps, check cabling!" — e este vigia imprimia
+    "enp10s0 - ch- - Mbit/s - dBm" a cada minuto, saindo 0. medir_wifi devolve
+    {} para interface nao-radio, e TEM de devolver (ver e_interface_de_radio);
+    so que nada mais olhava a camada fisica. O ponto cego de 2026-08-19,
+    agora no cobre: o dono descobriu a queda por teste de velocidade.
+
+    Tres formas de retorno, como medir_wifi:
+        {}                      nao e placa fisica cabeada — radio, bridge,
+                                veth, tunel: sem `device` no sysfs. Nao se
+                                aplica, e nao "nao medido".
+        {"carrier": 0, ...}     placa fisica sem portadora; `speed` nem e
+                                legivel (o kernel responde EINVAL).
+        {"carrier": 1, "velocidade_mbit": N, "duplex": ..., ...}
+
+    `carrier_changes` e cumulativo desde o registro do netdev: vira queda so
+    como DELTA, em calcular_delta — total desde o boot nao e taxa.
+    """
+    base = os.path.join(SYSFS_NET, interface)
+    if e_interface_de_radio(interface) or not os.path.exists(os.path.join(base, "device")):
+        return {}
+    dados = {}
+    for arquivo_sysfs, chave, conversor in (("carrier", "carrier", int),
+                                            ("carrier_changes", "carrier_changes", int),
+                                            ("speed", "velocidade_mbit", int),
+                                            ("duplex", "duplex", str),
+                                            ("operstate", "operstate", str)):
+        try:
+            with open(os.path.join(base, arquivo_sysfs), encoding="utf-8") as arquivo:
+                dados[chave] = conversor(arquivo.read().strip())
+        except (OSError, ValueError):
+            # Sem portadora o kernel responde EINVAL a `speed` e `duplex`. Campo
+            # ilegivel fica AUSENTE, e nunca vira numero inventado.
+            continue
+    # speed -1 e "desconhecida" (enlace ainda subindo): nao e velocidade medida.
+    if dados.get("velocidade_mbit", 0) <= 0:
+        dados.pop("velocidade_mbit", None)
+    return dados
+
+
+def medir_ping(destino, pacotes=20, intervalo=0.2):
+    """Perda e RTT. O maximo importa tanto quanto a media: e ele que denuncia
+    disputa de meio em enlace que nao perde pacote nenhum."""
+    rc, saida, erro = rodar(
+        ["ping", "-n", "-q", "-c", str(pacotes), "-i", str(intervalo), "-W", "2", destino],
+        timeout=int(pacotes * intervalo) + 20)
+    resultado = {"destino": destino, "alcancavel": rc == 0}
+    achado = re.search(r"(\d+) packets transmitted, (\d+) received", saida)
+    if achado:
+        enviados, recebidos = int(achado.group(1)), int(achado.group(2))
+        resultado["enviados"] = enviados
+        resultado["recebidos"] = recebidos
+        resultado["perda_pct"] = round(100.0 * (enviados - recebidos) / enviados, 2) \
+            if enviados else 100.0
+    else:
+        resultado["perda_pct"] = 100.0
+        resultado["erro"] = (erro or saida).strip()[:200]
+    achado = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms", saida)
+    if achado:
+        resultado["rtt_min_ms"] = float(achado.group(1))
+        resultado["rtt_medio_ms"] = float(achado.group(2))
+        resultado["rtt_max_ms"] = float(achado.group(3))
+        resultado["rtt_desvio_ms"] = float(achado.group(4))
+    return resultado
+
+
+def ler_contadores_interface(interface):
+    base = f"/sys/class/net/{interface}/statistics"
+    contadores = {}
+    for nome in ("rx_bytes", "tx_bytes", "rx_errors", "tx_errors", "rx_dropped",
+                 "tx_dropped", "rx_packets", "tx_packets"):
+        try:
+            with open(os.path.join(base, nome), encoding="utf-8") as arquivo:
+                contadores[nome] = int(arquivo.read().strip())
+        except (OSError, ValueError):
+            pass
+    return contadores
+
+
+def ler_tcp_snmp():
+    """RetransSegs e OutSegs de /proc/net/snmp. Cumulativos desde o boot: o valor
+    so vira informacao depois de virar delta contra a leitura anterior."""
+    try:
+        with open("/proc/net/snmp", encoding="utf-8") as arquivo:
+            linhas = arquivo.read().splitlines()
+    except OSError:
+        return {}
+    for indice, linha in enumerate(linhas):
+        if linha.startswith("Tcp:") and "RetransSegs" in linha:
+            campos = linha.split()[1:]
+            valores = linhas[indice + 1].split()[1:]
+            mapa = dict(zip(campos, valores))
+            try:
+                return {"retrans_segs": int(mapa["RetransSegs"]),
+                        "out_segs": int(mapa["OutSegs"]),
+                        "in_segs": int(mapa["InSegs"])}
+            except (KeyError, ValueError):
+                return {}
+    return {}
+
+
+def medir_dns(nomes):
+    """Tempo real de resolucao. Usa getent, que percorre o mesmo caminho do
+    nsswitch que as aplicacoes percorrem — dig falaria com o servidor direto e
+    esconderia um cache local quebrado."""
+    amostras = []
+    for nome in nomes:
+        inicio = time.monotonic()
+        rc, saida, _ = rodar(["getent", "ahosts", nome], timeout=8)
+        decorrido = time.monotonic() - inicio
+        amostras.append({"nome": nome, "resolveu": rc == 0 and bool(saida.strip()),
+                         "segundos": round(decorrido, 3)})
+    return amostras
+
+
+def avaliar(medicao, delta, esperado_banda, velocidade_minima=0):
+    """Traduz medicao em problemas (severidade, descricao, DOMINIO).
+
+    O dominio existe por causa de um defeito real deste arquivo, achado em
+    revisao adversarial no dia em que ele foi escrito: sem ele, uma falha do
+    RESOLVEDOR ou perda de pacote ate um destino na internet — nenhum dos dois
+    causado pelo radio — escalavam ate `modprobe -r iwlwifi`. Derrubar o uplink
+    de producao para consertar o DNS de outra pessoa e trocar um problema por um
+    pior. So problema do dominio "uplink" autoriza a escada de cura; o resto
+    avisa, e avisar ja e o conserto certo para uma causa que nao esta aqui.""" 
+    problemas = []
+    wifi = medicao.get("wifi", {})
+    gateway = medicao.get("ping_gateway", {})
+    externo = medicao.get("ping_externo", {})
+
+    if not medicao.get("rota_default"):
+        problemas.append(("critica", "sem rota default: o host esta sem caminho de saida", "uplink"))
+    if wifi and wifi.get("associado") is False:
+        problemas.append(("critica", "radio nao associado a nenhum BSS", "uplink"))
+    if wifi.get("nao_medido"):
+        problemas.append(("critica",
+                          f"radio presente, mas nao medido: {wifi['nao_medido']}",
+                          "instrumento"))
+    # INSTRUMENTO CEGO — dominio proprio, e nao veredito sobre a rede.
+    #
+    # medir_wifi so grava `nao_medido` DEPOIS de o sysfs confirmar que a
+    # interface e de radio: e radio presente com `iw` ausente ou mudo. Interface
+    # nao-radio nao passa por aqui, porque devolve {} — "nao se aplica" nao e
+    # "nao medido", e a maquina cabeada continua saindo 0.
+    #
+    # O dominio e "instrumento", nunca "uplink", por desenho: `curavel` exige
+    # dominio "uplink", entao a escada de cura NAO sobe sobre medicao cega — a
+    # mesma doutrina do bloco de dominios e da guarda do `ip -V`. O que esta
+    # linha compra e o exit 2 no fim de main(), porque a unit mascara 0 e 1
+    # (`SuccessExitStatus=0 1`): sem ela, o vigia com `iw` ausente gravava o
+    # motivo no JSONL, saia 0 e ficava `Result=success` para sempre — cego e
+    # verde, que e o modo de falha que o terceiro estado existe para matar.
+
+    perda_gw = gateway.get("perda_pct")
+    if perda_gw is not None:
+        if perda_gw >= PERDA_CRITICA_PCT:
+            problemas.append(("critica", f"perda de {perda_gw}% ate o gateway", "uplink"))
+        elif perda_gw >= PERDA_ALTA_PCT:
+            problemas.append(("alta", f"perda de {perda_gw}% ate o gateway", "uplink"))
+
+    perda_ext = externo.get("perda_pct")
+    if perda_ext is not None and perda_ext >= PERDA_ALTA_PCT:
+        severidade = "critica" if perda_ext >= PERDA_CRITICA_PCT else "alta"
+        # Dominio "externo": o primeiro salto pode estar impecavel e este numero
+        # ruim mesmo assim — a causa esta no provedor ou no caminho, nao no radio.
+        problemas.append((severidade,
+                          f"perda de {perda_ext}% ate {externo.get('destino')}", "externo"))
+
+    rtt_max = gateway.get("rtt_max_ms")
+    if rtt_max is not None and rtt_max > RTT_MAX_GATEWAY_MS:
+        problemas.append(("media",
+                          f"RTT maximo de {rtt_max} ms no primeiro salto "
+                          f"(medio {gateway.get('rtt_medio_ms')} ms): meio disputado", "uplink"))
+    rtt_medio = gateway.get("rtt_medio_ms")
+    if rtt_medio is not None and rtt_medio > RTT_MEDIO_GATEWAY_MS:
+        problemas.append(("alta", f"RTT medio de {rtt_medio} ms no primeiro salto", "uplink"))
+
+    sinal = wifi.get("sinal_dbm")
+    if sinal is not None:
+        if sinal <= SINAL_CRITICO_DBM:
+            problemas.append(("critica", f"sinal de {sinal} dBm: beira da desassociacao", "uplink"))
+        elif sinal <= SINAL_RUIM_DBM:
+            problemas.append(("alta", f"sinal de {sinal} dBm", "uplink"))
+
+    bitrate = wifi.get("tx_bitrate_mbit")
+    if bitrate is not None and bitrate < BITRATE_PISO_MBIT:
+        problemas.append(("media", f"bitrate de TX em {bitrate} Mbit/s", "uplink"))
+
+    retry_pct = delta.get("retry_pct")
+    if retry_pct is not None and retry_pct > RETRY_ALTO_PCT:
+        problemas.append(("media",
+                          f"{retry_pct}% dos quadros transmitidos na janela exigiram "
+                          f"retransmissao de radio", "uplink"))
+
+    retrans_pct = delta.get("tcp_retrans_pct")
+    if retrans_pct is not None and retrans_pct > RETRANS_TCP_ALTO_PCT:
+        # TCP retransmite por causa do radio, do provedor ou do outro lado da
+        # conexao. Nao da para atribuir ao uplink sem mais evidencia — e cura de
+        # uplink por causa nao atribuida e chute caro.
+        problemas.append(("alta",
+                          f"{retrans_pct}% de retransmissao TCP na janela", "indefinido"))
+
+    for amostra in medicao.get("dns", []):
+        if not amostra["resolveu"]:
+            problemas.append(("alta", f"DNS nao resolveu {amostra['nome']}", "dns"))
+        elif amostra["segundos"] > DNS_LENTO_S:
+            problemas.append(("media",
+                              f"DNS levou {amostra['segundos']}s para {amostra['nome']}", "dns"))
+
+    # Divergencia de banda: ALERTA, jamais acao. Ver "fronteira de projeto".
+    banda = wifi.get("banda")
+    if esperado_banda and banda and banda != esperado_banda:
+        problemas.append(("media",
+                          f"associado em {banda}, mas a banda esperada e {esperado_banda} "
+                          f"(decisao de banda e humana; o vigia so avisa)", "banda"))
+
+    # ENLACE CABEADO — dominio proprio, "enlace", e nunca "uplink", por desenho:
+    # `curavel` exige "uplink", entao velocidade baixa e queda de portadora
+    # AVISAM e nao sobem a escada. Nenhum degrau dela (nmcli, reiniciar o
+    # NetworkManager, recarregar o iwlwifi) renegocia uma PHY; somariam um corte
+    # ao enlace ja degradado. Medido em 2026-09-24 com o enlace em 100 Mbit/s:
+    # oito intervencoes no servidor — renegociar, EEE desligado, anuncio so ate
+    # 1G, master e slave forcados, recarga do r8169, reset PCIe da placa e o
+    # driver r8125 do fabricante — cairam TODAS de volta em 100 Mbit/s, e o
+    # enlace so voltou a 2.5G num evento de portadora vindo de fora do servidor.
+    # O conserto que cabe ao vigia e tirar a queda do silencio.
+    enlace = medicao.get("enlace", {})
+    velocidade = enlace.get("velocidade_mbit")
+    if enlace.get("carrier") == 0:
+        problemas.append(("critica",
+                          "enlace cabeado sem portadora: cabo, conector ou porta do "
+                          "roteador fora (nenhum degrau de software devolve portadora)",
+                          "enlace"))
+    elif velocidade_minima and velocidade is not None and velocidade < velocidade_minima:
+        problemas.append(("alta",
+                          f"enlace cabeado negociado a {velocidade} Mbit/s, abaixo do minimo "
+                          f"de {velocidade_minima} Mbit/s: a PHY recuou de velocidade "
+                          f"(downshift; evidencia em `journalctl -k | grep Downshift`)",
+                          "enlace"))
+    transicoes = delta.get("d_carrier_changes")
+    if transicoes:
+        # Cada queda sao duas transicoes (desce e sobe); impar = terminou caido.
+        quedas = (transicoes + 1) // 2
+        problemas.append(("alta" if quedas >= QUEDAS_ENLACE_ALTAS else "media",
+                          f"enlace cabeado caiu {quedas}x na janela "
+                          f"({transicoes} transicoes de portadora)", "enlace"))
+    return problemas
+
+
+def calcular_delta(medicao, anterior):
+    """Toda taxa deste vigia nasce aqui. Sem leitura anterior, nao ha taxa —
+    e o campo fica ausente em vez de receber um numero inventado."""
+    delta = {}
+    if not anterior:
+        return delta
+    try:
+        decorrido = (datetime.datetime.fromisoformat(medicao["medido_em"])
+                     - datetime.datetime.fromisoformat(anterior["medido_em"])).total_seconds()
+    except (KeyError, ValueError):
+        return delta
+    if decorrido <= 0:
+        return delta
+    delta["janela_s"] = round(decorrido, 1)
+
+    wifi_agora = medicao.get("wifi", {})
+    wifi_antes = anterior.get("wifi", {})
+    # Reassociacao zera os contadores do radio: comparar contra a leitura
+    # anterior produziria delta negativo, e delta negativo nao e taxa.
+    # Exige BSSID legivel nas DUAS leituras: `None == None` daria "mesmo enlace"
+    # para duas leituras em que nem se sabe a qual BSS o radio estava ligado, e
+    # dai um contador zerado por reassociacao viraria taxa negativa.
+    bssid_agora = wifi_agora.get("bssid")
+    bssid_antes = wifi_antes.get("bssid")
+    mesmo_enlace = (bool(bssid_agora) and bssid_agora == bssid_antes
+                    and wifi_agora.get("tempo_associado_s", 0)
+                    >= wifi_antes.get("tempo_associado_s", 0))
+    if mesmo_enlace:
+        for chave in ("tx_retries", "tx_failed", "beacon_loss"):
+            if chave in wifi_agora and chave in wifi_antes:
+                delta[f"d_{chave}"] = wifi_agora[chave] - wifi_antes[chave]
+        pacotes_agora = medicao.get("interface", {}).get("tx_packets")
+        pacotes_antes = anterior.get("interface", {}).get("tx_packets")
+        if pacotes_agora is not None and pacotes_antes is not None:
+            d_pacotes = pacotes_agora - pacotes_antes
+            delta["d_tx_packets"] = d_pacotes
+            if d_pacotes > 0 and "d_tx_retries" in delta:
+                delta["retry_pct"] = round(100.0 * delta["d_tx_retries"] / d_pacotes, 3)
+    else:
+        delta["reassociou_na_janela"] = True
+
+    for chave in ("rx_errors", "tx_errors", "rx_dropped", "tx_dropped"):
+        agora_valor = medicao.get("interface", {}).get(chave)
+        antes_valor = anterior.get("interface", {}).get(chave)
+        if agora_valor is not None and antes_valor is not None:
+            diferenca = agora_valor - antes_valor
+            # Recarregar o modulo do radio zera os contadores do kernel. A
+            # diferenca vira negativa, e diferenca negativa nao e taxa: o campo
+            # sai do registro em vez de entrar com numero sem sentido.
+            if diferenca >= 0:
+                delta[f"d_{chave}"] = diferenca
+            else:
+                delta["contadores_zerados"] = True
+
+    # Quedas de portadora do cobre, so entre leituras da MESMA placa. Recarregar
+    # o driver re-registra o netdev e zera o contador: diferenca negativa nao e
+    # queda, e sai do registro como os contadores acima.
+    enlace_agora = medicao.get("enlace", {})
+    enlace_antes = anterior.get("enlace", {})
+    if (medicao.get("enlace_interface")
+            and medicao.get("enlace_interface") == anterior.get("enlace_interface")
+            and "carrier_changes" in enlace_agora and "carrier_changes" in enlace_antes):
+        diferenca = enlace_agora["carrier_changes"] - enlace_antes["carrier_changes"]
+        if diferenca >= 0:
+            delta["d_carrier_changes"] = diferenca
+        else:
+            delta["contadores_zerados"] = True
+
+    tcp_agora, tcp_antes = medicao.get("tcp", {}), anterior.get("tcp", {})
+    if tcp_agora and tcp_antes:
+        d_retrans = tcp_agora.get("retrans_segs", 0) - tcp_antes.get("retrans_segs", 0)
+        d_out = tcp_agora.get("out_segs", 0) - tcp_antes.get("out_segs", 0)
+        if d_retrans >= 0 and d_out > 0:
+            delta["d_retrans_segs"] = d_retrans
+            delta["d_out_segs"] = d_out
+            delta["tcp_retrans_pct"] = round(100.0 * d_retrans / d_out, 3)
+    return delta
+
+
+def curar(degrau, interface, perfil):
+    """Executa um degrau da escada. Devolve (nome, rc, detalhe)."""
+    nome = DEGRAUS[degrau]
+    if not interface and nome in ("rescan-reativar", "reconectar-dispositivo"):
+        # Estes dois degraus enderecam a interface; com None o degrau 1 montava
+        # ["nmcli", "device", "disconnect", None] e o subprocess levantava
+        # TypeError — medido em 2026-09-24 20:13:08: o vigia caiu com exit 2 e a
+        # cura NAO foi gravada, furando o teto de curas/hora. main() agora passa
+        # a ultima interface conhecida; isto cobre o vigia sem historico nenhum.
+        return nome, 1, "sem interface conhecida: degrau enderecado a interface"
+    if nome == "rescan-reativar":
+        rodar(["nmcli", "device", "wifi", "rescan"], timeout=30)
+        rc, _, erro = rodar(["nmcli", "connection", "up", perfil, "ifname", interface],
+                            timeout=60) if perfil else (1, "", "sem perfil ativo")
+    elif nome == "reconectar-dispositivo":
+        rodar(["nmcli", "device", "disconnect", interface], timeout=30)
+        time.sleep(2)
+        rc, _, erro = rodar(["nmcli", "device", "connect", interface], timeout=60)
+    elif nome == "reiniciar-networkmanager":
+        rc, _, erro = rodar(["sudo", "-n", "systemctl", "restart", "NetworkManager"],
+                            timeout=90)
+    elif nome == "recarregar-radio":
+        rodar(["sudo", "-n", "modprobe", "-r", "iwlmvm"], timeout=60)
+        rodar(["sudo", "-n", "modprobe", "-r", "iwlwifi"], timeout=60)
+        time.sleep(2)
+        rc, _, erro = rodar(["sudo", "-n", "modprobe", "iwlwifi"], timeout=60)
+    else:
+        return nome, 1, "degrau desconhecido"
+    return nome, rc, (erro or "").strip()[:200]
+
+
+def resumo_do_meio(medicao):
+    """O meio fisico em poucas palavras: cobre pelo sysfs, radio pelo `iw`.
+
+    Ate 2026-09-24 o "Normalizado" lia so o radio, e na maquina cabeada o dono
+    recebia "de volta ao normal (? a ? Mbit/s)" — medido no journal as 20:14:15.
+    """
+    enlace = medicao.get("enlace") or {}
+    if enlace:
+        return (f"cabo {enlace.get('velocidade_mbit', '?')} Mbit/s "
+                f"{enlace.get('duplex', '?')}")
+    wifi = medicao.get("wifi", {})
+    return f"{wifi.get('banda', '?')} a {wifi.get('tx_bitrate_mbit', '?')} Mbit/s"
+
+
+def avisar(chave, severidade, titulo, mensagem, evidencia, resolvido=False):
+    comando = [NOTIFICADOR, "--chave", chave, "--titulo", titulo,
+               "--mensagem", mensagem, "--origem", "check-network-health"]
+    if resolvido:
+        comando.append("--resolvido")
+    else:
+        comando += ["--severidade", severidade, "--evidencia", evidencia]
+    rc, _, _ = rodar(comando, timeout=20)
+    return rc == 0
+
+
+def main():
+    analisador = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    analisador.add_argument("--repair", action="store_true",
+                            help="sobe um degrau da escada de cura e avisa o dono")
+    analisador.add_argument("--json", action="store_true")
+    analisador.add_argument("--externo", default="1.1.1.1",
+                            help="destino externo para o teste de alcance")
+    analisador.add_argument("--pacotes", type=int, default=20)
+    analisador.add_argument("--banda-esperada", default="",
+                            help="'5GHz' ou '2.4GHz': divergencia vira alerta, nunca acao")
+    analisador.add_argument("--max-curas-hora", type=int, default=4)
+    analisador.add_argument("--dns", default="wikijuridica.com.br,api.cloudflare.com")
+    analisador.add_argument("--velocidade-minima-mbit", type=int, default=0,
+                            help="enlace cabeado abaixo disto vira alerta, nunca acao "
+                                 "(0 = nao confere)")
+    argumentos = analisador.parse_args()
+
+    instante = agora()
+    trava = abrir_trava()
+    interface, gateway = descobrir_interface()
+
+    # ---- TERCEIRO ESTADO: NAO MEDI (exit 2), e nao "degradado" (exit 1).
+    #
+    # `descobrir_interface()` devolve (None, None) em DOIS casos que ate
+    # 2026-09-16 eram indistinguiveis no exit code:
+    #
+    #   (1) nao ha rota default  -> a rede ESTA fora. E veredito medido, e a
+    #       avaliacao ja o registra (`if not medicao.get("rota_default")`, :319).
+    #   (2) o utilitario `ip` nao esta disponivel -> `rodar()` devolve rc 127 por
+    #       OSError e a funcao cai no `return None, None` por falta de INSTRUMENTO,
+    #       nao por falta de rede.
+    #
+    # Os dois saiam 1, e a unit (wikijuridica-network-health.service:60) mascara o
+    # 1: o vigia sem `ip` ficava calado para sempre, com Result=success. Uma
+    # chamada barata a `ip -V` separa as duas causas. Instrumento ausente e
+    # DEFEITO DE PROCESSO (2); rede fora e VEREDITO (1).
+    rc_ip, _, erro_ip = rodar(["ip", "-V"], timeout=5)
+    if rc_ip == 127:
+        print("NAO MEDIDO: o utilitario `ip` nao esta disponivel neste host "
+              "(%s)." % erro_ip.strip()[:120], file=sys.stderr)
+        print("  Sem ele nao ha como descobrir a interface da rota default, e tudo o que",
+              file=sys.stderr)
+        print("  depende dela (contadores, wifi, ping do gateway) fica sem medir. Isto e",
+              file=sys.stderr)
+        print("  defeito do INSTRUMENTO, nao veredito sobre a rede.", file=sys.stderr)
+        # Sai ANTES de avaliar, curar, alertar ou gravar: agir sobre medicao cega
+        # e pior que nao agir. A escada de cura chega a reiniciar o radio.
+        return 2
+    estado = ler_estado()
+    ultima = estado.get("ultima_medicao") or {}
+    # Sem rota default `interface` e None — e e justamente com o cobre caido
+    # que medir o enlace importa, e com o radio caido que a escada precisa de
+    # alvo. A ultima interface conhecida do uplink segue sendo a placa a medir
+    # e a curar; so a rota sumiu, a placa continua la.
+    interface_conhecida = (interface or ultima.get("enlace_interface")
+                           or ultima.get("interface_nome"))
+    medicao = {
+        "schema_version": SCHEMA,
+        "medido_em": instante.isoformat(),
+        "interface": {},
+        "rota_default": bool(interface and gateway),
+        "interface_nome": interface,
+        "gateway": gateway,
+    }
+    if interface:
+        medicao["interface"] = ler_contadores_interface(interface)
+        medicao["wifi"] = medir_wifi(interface)
+        if gateway:
+            medicao["ping_gateway"] = medir_ping(gateway, argumentos.pacotes)
+    if interface_conhecida:
+        medicao["enlace_interface"] = interface_conhecida
+        medicao["enlace"] = medir_enlace_cabeado(interface_conhecida)
+    medicao["ping_externo"] = medir_ping(argumentos.externo, max(8, argumentos.pacotes // 2))
+    medicao["tcp"] = ler_tcp_snmp()
+    medicao["dns"] = medir_dns([n.strip() for n in argumentos.dns.split(",") if n.strip()])
+
+    delta = calcular_delta(medicao, ultima)
+    problemas = avaliar(medicao, delta, argumentos.banda_esperada or None,
+                        argumentos.velocidade_minima_mbit)
+
+    ordem = {"critica": 3, "alta": 2, "media": 1}
+    pior = max((ordem.get(s, 0) for s, _, _ in problemas), default=0)
+    # Degradado = existe problema que compromete conectividade. "media" e desvio
+    # de qualidade: entra no historico e no alerta, mas nao autoriza cura —
+    # reiniciar a rede por causa de jitter derruba 26 conexoes de tunel para
+    # trocar um problema por outro pior.
+    degradado = pior >= 2
+    # CURAVEL e mais estreito que DEGRADADO, e a diferenca e o dominio da causa.
+    # A escada mexe no radio; entao so faz sentido subi-la quando o defeito esta
+    # NO radio. DNS lento, perda ate 1.1.1.1 e retransmissao TCP de causa
+    # indefinida degradam o servico e merecem alarme, mas recarregar o iwlwifi
+    # nao conserta nenhum dos tres — so acrescenta um outage ao problema.
+    curavel = any(ordem.get(s, 0) >= 2 and d == "uplink" for s, _, d in problemas)
+    # Cobre SEM PORTADORA: a critica "sem rota default" continua no dominio
+    # uplink, mas a causa ja esta medida e e fisica — nenhum degrau devolve
+    # portadora. Subir a escada ai so gastaria o teto de curas/hora, que falta
+    # depois, quando a portadora volta e o DHCP e que empaca.
+    if medicao.get("enlace", {}).get("carrier") == 0:
+        curavel = False
+
+    ciclos_ruins = estado.get("ciclos_ruins", 0) + 1 if degradado else 0
+    # Uma marca de cura ilegivel (estado truncado por queda de energia, formato de
+    # versao anterior) nao pode derrubar o vigia — ele e justamente o que precisa
+    # continuar de pe quando o resto esta ruim. Marca invalida e descartada.
+    curas = []
+    for marca in estado.get("curas", []):
+        try:
+            if (instante - datetime.datetime.fromisoformat(marca)).total_seconds() < 3600:
+                curas.append(marca)
+        except (TypeError, ValueError):
+            continue
+    reparo = None
+
+    if argumentos.repair and curavel and ciclos_ruins >= 2 and trava:
+        if len(curas) >= argumentos.max_curas_hora:
+            reparo = {"acao": "recusada", "motivo":
+                      f"teto de {argumentos.max_curas_hora} curas/hora atingido "
+                      f"({len(curas)} na ultima hora): curar em loop mascara defeito"}
+            avisar("rede-cura-em-loop", "critica",
+                   "Rede: cura automatica em loop",
+                   f"{len(curas)} curas na ultima hora sem estabilizar. "
+                   f"Problemas: {'; '.join(m for _, m in problemas)[:300]}",
+                   "tools/check-network-health --repair (teto atingido)")
+        else:
+            degrau = min(estado.get("degrau", 0), len(DEGRAUS) - 1)
+            # Sem rota default `interface` e None; o alvo da cura e a ultima
+            # interface conhecida — a mesma placa, que so perdeu a rota.
+            alvo_cura = interface or interface_conhecida
+            perfil = None
+            rc, saida, _ = rodar(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show",
+                                  "--active"])
+            for linha in saida.splitlines():
+                partes = linha.split(":")
+                if len(partes) >= 2 and partes[-1] == alvo_cura:
+                    perfil = ":".join(partes[:-1])
+                    break
+            nome, rc_cura, detalhe = curar(degrau, alvo_cura, perfil)
+            curas.append(instante.isoformat())
+            reparo = {"acao": nome, "degrau": degrau, "rc": rc_cura,
+                      "detalhe": detalhe, "perfil": perfil}
+            estado["degrau"] = degrau + 1
+            ciclos_ruins = 0
+
+    # UMA CHAVE POR DOMINIO, e nao uma chave para o vigia inteiro.
+    #
+    # Com chave unica, um desvio cronico e banal (banda divergente, que e escolha
+    # humana e pode durar meses) mantinha a chave em cooldown perpetuo: medido em
+    # 2026-08-19, 18 de 21 alertas sairam silenciados. O 530 real chegaria na
+    # mesma chave e seria engolido. Separando por dominio, o ruido cronico da
+    # banda nunca ocupa o canal do uplink, do DNS ou do alcance externo — e a
+    # escalacao de severidade do notify-owner cobre o caso de o MESMO dominio
+    # piorar.
+    dominios_ativos = set()
+    for dominio in {d for _, _, d in problemas}:
+        deste = [(s, m) for s, m, d in problemas if d == dominio]
+        pior_dominio = max(ordem.get(s, 0) for s, _ in deste)
+        severidade = {3: "critica", 2: "alta", 1: "media"}.get(pior_dominio, "baixa")
+        wifi = medicao.get("wifi", {})
+        enlace = medicao.get("enlace") or {}
+        if enlace:
+            # Placa cabeada: a linha do `iw` sairia "? ? Mbit/s ? dBm" — evidencia
+            # vazia no alerta que mais precisa dela.
+            evidencia = (f"{SYSFS_NET}/{interface_conhecida}/speed -> "
+                         f"{enlace.get('velocidade_mbit', '?')} Mbit/s "
+                         f"{enlace.get('duplex', '?')}, carrier {enlace.get('carrier', '?')}, "
+                         f"carrier_changes +{delta.get('d_carrier_changes', '?')} na janela; "
+                         f"ping {gateway} -> perda "
+                         f"{medicao.get('ping_gateway', {}).get('perda_pct', '?')}%")
+        else:
+            evidencia = (f"iw dev {interface} link -> {wifi.get('banda', '?')} "
+                         f"{wifi.get('tx_bitrate_mbit', '?')} Mbit/s "
+                         f"{wifi.get('sinal_dbm', '?')} dBm; "
+                         f"ping {gateway} -> perda "
+                         f"{medicao.get('ping_gateway', {}).get('perda_pct', '?')}%")
+        acao = f" Cura aplicada: {reparo['acao']}." if reparo and dominio == "uplink" else ""
+        titulo = {"uplink": "Uplink do servidor degradado",
+                  "dns": "Resolucao de nomes degradada",
+                  "externo": "Alcance externo degradado",
+                  "banda": "Uplink fora da banda esperada",
+                  "instrumento": "Vigia do uplink CEGO: instrumento ausente",
+                  "enlace": "Enlace cabeado degradado",
+                  "indefinido": "Rede degradada, causa nao atribuida"}.get(
+                      dominio, f"Rede degradada ({dominio})")
+        chave = f"rede-{dominio}"
+        dominios_ativos.add(chave)
+        avisar(chave, severidade, titulo,
+               "; ".join(m for _, m in deste)[:400] + acao, evidencia)
+
+    # Resolucao POR DOMINIO: o uplink pode normalizar enquanto o DNS segue ruim, e
+    # avisar "tudo normalizado" nesse caso seria mentir por omissao.
+    for chave in set(estado.get("dominios_abertos", [])) - dominios_ativos:
+        avisar(chave, "info", "Normalizado",
+               f"{chave.replace('rede-', '')} de volta ao normal "
+               f"({resumo_do_meio(medicao)})",
+               "", resolvido=True)
+
+    if not curavel:
+        estado["degrau"] = 0
+
+    evento = dict(medicao)
+    evento["delta"] = delta
+    evento["problemas"] = [{"severidade": s, "descricao": m, "dominio": d}
+                           for s, m, d in problemas]
+    evento["degradado"] = degradado
+    evento["curavel"] = curavel
+    evento["ciclos_ruins"] = ciclos_ruins
+    evento["reparo"] = reparo
+    evento["curas_na_hora"] = len(curas)
+    evento["tinha_trava"] = bool(trava)
+    registrar(evento)
+
+    estado.update({"ultima_medicao": medicao, "ciclos_ruins": ciclos_ruins,
+                   "degradado": degradado, "curas": curas,
+                   "dominios_abertos": sorted(dominios_ativos)})
+    gravar_estado(estado)
+
+    if trava:
+        trava.close()
+
+    if argumentos.json:
+        print(json.dumps(evento, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        wifi = medicao.get("wifi", {})
+        enlace = medicao.get("enlace") or {}
+        if enlace:
+            meio = (f"{interface_conhecida} cabo {enlace.get('velocidade_mbit', '-')} Mbit/s "
+                    f"{enlace.get('duplex', '-')} carrier {enlace.get('carrier', '-')} "
+                    f"transicoes_portadora {delta.get('d_carrier_changes', '-')}")
+        else:
+            meio = (f"{interface} {wifi.get('banda', '-')} ch{wifi.get('canal', '-')} "
+                    f"{wifi.get('tx_bitrate_mbit', '-')} Mbit/s {wifi.get('sinal_dbm', '-')} dBm")
+        print(f"{meio} | "
+              f"gw perda {medicao.get('ping_gateway', {}).get('perda_pct', '-')}% "
+              f"rtt {medicao.get('ping_gateway', {}).get('rtt_medio_ms', '-')}/"
+              f"{medicao.get('ping_gateway', {}).get('rtt_max_ms', '-')} ms | "
+              f"retry {delta.get('retry_pct', '-')}% tcp_retrans "
+              f"{delta.get('tcp_retrans_pct', '-')}%")
+        for severidade, mensagem, dominio in problemas:
+            print(f"  [{severidade}/{dominio}] {mensagem}")
+        if reparo:
+            print(f"  reparo: {reparo}")
+    # ---- TERCEIRO ESTADO, decidido no FIM e nao na hora.
+    #
+    # A guarda do `ip -V` sai por `return 2` antes de montar `medicao`, e ali
+    # isso esta certo: sem o `ip` nao ha interface, gateway nem contadores, e a
+    # medicao inteira colapsa. Com o `iw` ausente o caso e outro — rota, ping,
+    # TCP e DNS continuam mensuraveis, e joga-los fora seria trocar um ponto
+    # cego por quatro. Entao mede-se tudo, grava-se tudo no JSONL, alerta-se o
+    # dono pelo dominio "instrumento" e so aqui o exit vira 2.
+    #
+    # 2 vence 1 porque sao coisas diferentes: 1 e VEREDITO sobre a rede, que a
+    # unit mascara de proposito; 2 e DEFEITO DO MEDIDOR, que a unit deixa falhar
+    # para o OnFailure alcancar o dono.
+    if any(dominio == "instrumento" for _, _, dominio in problemas):
+        print("NAO MEDIDO: a interface %s e de radio (sysfs), mas o `iw` nao "
+              "respondeu." % interface, file=sys.stderr)
+        print("  %s" % medicao.get("wifi", {}).get("nao_medido", ""), file=sys.stderr)
+        print("  Rota, ping, TCP e DNS foram medidos e estao no registro; o que",
+              file=sys.stderr)
+        print("  ficou sem medir e o RADIO: associacao, sinal, bitrate e retry.",
+              file=sys.stderr)
+        print("  Isto e defeito do INSTRUMENTO, nao veredito sobre a rede.",
+              file=sys.stderr)
+        return 2
+    return 1 if degradado else 0
+
+
+if __name__ == "__main__":
+    # PROTECAO CRASH->2 (2026-09-16). Sem ela, uma excecao nao tratada faz o
+    # interpretador sair com 1 — o MESMO codigo que esta ferramenta usa para
+    # "medi e esta degradado". A unit que a chama mascara o 1
+    # (`SuccessExitStatus=0 1`), entao a queda virava `Result=success` e o
+    # `OnFailure` nunca disparava: instrumento quebrado indistinguivel de
+    # instrumento que disse "esta tudo bem". Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

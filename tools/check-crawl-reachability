@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Mede a ALCANCABILIDADE REAL do acervo servido, a partir do HTML em public/.
+
+Por que este medidor existe
+---------------------------
+O comentario de cabecalho de internal/internallinkmesh/mesh.go AFIRMA:
+
+    "Alcance de crawl NAO depende destes links: as hubs de area (/{area}/) ja
+     tornam todo o acervo alcancavel a poucos cliques da home."
+
+Afirmacao de comentario nao e fonte (CONTRATO_DADO_REAL R1). Este script mede o
+grafo de verdade: le todo <a href> de todo HTML publicado, monta o grafo dirigido
+de rotas internas, roda BFS a partir de "/" e responde com numero:
+
+  - quantas rotas tem ZERO link de entrada (orfas: so o sitemap as anuncia);
+  - a distancia em cliques de cada rota ate a home;
+  - quantas rotas estao ALEM de um limiar de profundidade;
+  - o cruzamento com as rotas que um crawler nunca pediu
+    (data/ops/crawl_coverage_never_requested.json).
+
+O que ele NAO faz: nao escreve nada, nao pede rede, nao adivinha. E read-only,
+como todo tools/check-*.
+
+Uso:
+    ./tools/check-crawl-reachability                 # resumo
+    ./tools/check-crawl-reachability --crawler googlebot
+    ./tools/check-crawl-reachability --json          # saida legivel por maquina
+    ./tools/check-crawl-reachability --listar-orfas 50
+    ./tools/check-crawl-reachability --max-profundidade 4
+
+Saida de status: 0 quando o acervo esta integro pelos criterios abaixo, 1 quando
+ha rota publicada inalcancavel por link (orfa) ou alem da profundidade maxima.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import html
+import json
+import os
+import re
+import sys
+from typing import Dict, Iterable, List, Set, Tuple
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PUBLIC = os.path.join(RAIZ, "public")
+NEVER_REQUESTED = os.path.join(RAIZ, "data", "ops", "crawl_coverage_never_requested.json")
+
+# href="..." ou href='...'. O acervo e gerado por string builder em
+# internal/render, sempre com aspas duplas, mas aceitar as duas formas custa
+# nada e evita que uma mudanca de emissor cegue a medicao em silencio.
+RE_HREF = re.compile(rb"""<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
+RE_ROBOTS_NOINDEX = re.compile(rb"""<meta\b[^>]*\bname\s*=\s*["']robots["'][^>]*\bcontent\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+
+BASE = "https://wikijuridica.com.br"
+
+
+def rota_do_arquivo(caminho: str) -> str:
+    """Converte public/<...>/index.html na rota servida pelo nginx.
+
+    O nginx do wiki serve diretorio com index.html sob barra final, entao
+    public/familia/index.html e a rota "/familia/". Um HTML que nao se chame
+    index.html e servido pelo proprio nome de arquivo.
+    """
+    rel = os.path.relpath(caminho, PUBLIC)
+    if os.path.basename(rel) == "index.html":
+        dir_rel = os.path.dirname(rel)
+        return "/" if dir_rel in ("", ".") else "/" + dir_rel.replace(os.sep, "/") + "/"
+    return "/" + rel.replace(os.sep, "/")
+
+
+def normalizar_href(href: str, origem: str) -> str | None:
+    """Devolve a rota interna canonica de um href, ou None se ele nao for
+    um link interno de navegacao (externo, ancora, mailto, tel, query)."""
+    href = html.unescape(href.strip())
+    if not href:
+        return None
+    if href.startswith("//"):
+        return None  # protocolo-relativo: sempre externo neste acervo
+    if href.startswith(BASE):
+        href = href[len(BASE):] or "/"
+    elif re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", href):
+        return None  # http(s) de terceiro, mailto:, tel:, javascript:
+    if href.startswith("#"):
+        return None
+    # Fragmento e query nao criam rota nova para efeito de descoberta: a rota
+    # de destino e a mesma. Cortar os dois evita contar o mesmo destino duas
+    # vezes e evita inventar rota que nao existe em public/.
+    href = href.split("#", 1)[0].split("?", 1)[0]
+    if not href:
+        return None
+    if not href.startswith("/"):
+        base_dir = origem if origem.endswith("/") else os.path.dirname(origem) + "/"
+        href = os.path.normpath(os.path.join(base_dir, href))
+        if not href.startswith("/"):
+            href = "/" + href
+        # normpath come a barra final; o acervo e todo com barra final
+        if not href.endswith("/") and "." not in os.path.basename(href):
+            href += "/"
+    return href
+
+
+def ler_acervo() -> Tuple[Dict[str, Set[str]], Set[str], Set[str]]:
+    """Le todo public/**/*.html uma vez.
+
+    Devolve (arestas, rotas_publicadas, rotas_noindex).
+    """
+    arestas: Dict[str, Set[str]] = {}
+    rotas: Set[str] = set()
+    noindex: Set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(PUBLIC):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for nome in filenames:
+            if not nome.endswith(".html"):
+                continue
+            caminho = os.path.join(dirpath, nome)
+            rota = rota_do_arquivo(caminho)
+            rotas.add(rota)
+            try:
+                with open(caminho, "rb") as fh:
+                    corpo = fh.read()
+            except OSError as err:
+                print(f"AVISO: nao consegui ler {caminho}: {err}", file=sys.stderr)
+                continue
+            m = RE_ROBOTS_NOINDEX.search(corpo)
+            if m and b"noindex" in m.group(1).lower():
+                noindex.add(rota)
+            destinos: Set[str] = set()
+            for grupo in RE_HREF.findall(corpo):
+                bruto = (grupo[0] or grupo[1]).decode("utf-8", "replace")
+                alvo = normalizar_href(bruto, rota)
+                if alvo and alvo != rota:
+                    destinos.add(alvo)
+            arestas[rota] = destinos
+    return arestas, rotas, noindex
+
+
+def medir(arestas: Dict[str, Set[str]], rotas: Set[str]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Calcula (links_de_entrada_por_rota, profundidade_em_cliques_desde_a_home).
+
+    Um link so conta como entrada quando o DESTINO existe em public/: href para
+    rota inexistente e 404, nao descoberta. Contar 404 como alcance seria
+    exatamente o falso-verde que o contrato do dado real proibe.
+    """
+    entrada: Dict[str, int] = {r: 0 for r in rotas}
+    for origem, destinos in arestas.items():
+        for d in destinos:
+            if d in entrada and d != origem:
+                entrada[d] += 1
+
+    profundidade: Dict[str, int] = {}
+    if "/" in rotas:
+        profundidade["/"] = 0
+        fila = collections.deque(["/"])
+        while fila:
+            atual = fila.popleft()
+            for d in sorted(arestas.get(atual, ())):
+                if d in rotas and d not in profundidade:
+                    profundidade[d] = profundidade[atual] + 1
+                    fila.append(d)
+    return entrada, profundidade
+
+
+def carregar_never_requested(crawler: str) -> Set[str] | None:
+    if not os.path.exists(NEVER_REQUESTED):
+        return None
+    with open(NEVER_REQUESTED, "r", encoding="utf-8") as fh:
+        dados = json.load(fh)
+    bloco = dados.get("crawlers", {}).get(crawler)
+    if not bloco:
+        return None
+    return set(bloco.get("never_requested_paths", []))
+
+
+def main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(description="Mede alcancabilidade real do acervo publicado.")
+    ap.add_argument("--crawler", default="googlebot", help="crawler do cruzamento (padrao: googlebot)")
+    ap.add_argument("--max-profundidade", type=int, default=4, help="profundidade maxima aceitavel em cliques (padrao: 4)")
+    ap.add_argument("--listar-orfas", type=int, default=0, help="lista ate N rotas sem link de entrada")
+    ap.add_argument("--listar-profundas", type=int, default=0, help="lista ate N rotas alem da profundidade maxima")
+    ap.add_argument("--json", action="store_true", help="saida JSON")
+    args = ap.parse_args(argv)
+
+    arestas, rotas, noindex = ler_acervo()
+    entrada, profundidade = medir(arestas, rotas)
+
+    # Rotas noindex nao entram no veredito: elas existem de proposito fora do
+    # indice (busca interna, contato). Continuam no grafo como ponte.
+    indexaveis = sorted(r for r in rotas if r not in noindex)
+
+    orfas = [r for r in indexaveis if entrada.get(r, 0) == 0 and r != "/"]
+    inalcancaveis = [r for r in indexaveis if r not in profundidade]
+    profundas = [r for r in indexaveis if profundidade.get(r, 10**9) > args.max_profundidade]
+
+    graus = sorted(entrada.get(r, 0) for r in indexaveis)
+    def pct(p: float) -> int:
+        if not graus:
+            return 0
+        return graus[min(len(graus) - 1, int(len(graus) * p))]
+
+    hist = collections.Counter(profundidade.get(r) for r in indexaveis)
+
+    nunca = carregar_never_requested(args.crawler)
+    cruzamento = {}
+    if nunca is not None:
+        nunca_indexaveis = [r for r in nunca if r in rotas]
+        prof_nunca = [profundidade.get(r) for r in nunca_indexaveis if r in profundidade]
+        cruzamento = {
+            "crawler": args.crawler,
+            "nunca_requisitadas": len(nunca),
+            "presentes_em_public": len(nunca_indexaveis),
+            "orfas_entre_elas": sum(1 for r in nunca_indexaveis if entrada.get(r, 0) == 0),
+            "inalcancaveis_entre_elas": sum(1 for r in nunca_indexaveis if r not in profundidade),
+            "profundidade_media": round(sum(prof_nunca) / len(prof_nunca), 2) if prof_nunca else None,
+            "grau_entrada_medio": round(
+                sum(entrada.get(r, 0) for r in nunca_indexaveis) / len(nunca_indexaveis), 2
+            ) if nunca_indexaveis else None,
+        }
+        pedidas = [r for r in indexaveis if r not in nunca]
+        if pedidas:
+            cruzamento["grau_entrada_medio_das_pedidas"] = round(
+                sum(entrada.get(r, 0) for r in pedidas) / len(pedidas), 2
+            )
+            prof_pedidas = [profundidade[r] for r in pedidas if r in profundidade]
+            cruzamento["profundidade_media_das_pedidas"] = round(
+                sum(prof_pedidas) / len(prof_pedidas), 2
+            ) if prof_pedidas else None
+
+    resultado = {
+        "html_lidos": len(rotas),
+        "indexaveis": len(indexaveis),
+        "noindex": len(noindex),
+        "arestas_internas": sum(len(v) for v in arestas.values()),
+        "orfas_sem_link_de_entrada": len(orfas),
+        "inalcancaveis_desde_a_home": len(inalcancaveis),
+        "alem_da_profundidade_maxima": len(profundas),
+        "max_profundidade_exigida": args.max_profundidade,
+        "grau_entrada_p50": pct(0.50),
+        "grau_entrada_p10": pct(0.10),
+        "grau_entrada_min": graus[0] if graus else 0,
+        "profundidade_histograma": {("inalcancavel" if k is None else str(k)): v for k, v in sorted(hist.items(), key=lambda kv: (kv[0] is None, kv[0]))},
+        "cruzamento_nunca_requisitadas": cruzamento,
+    }
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=1, sort_keys=True))
+    else:
+        print("== alcancabilidade real do acervo publicado ==")
+        for chave in (
+            "html_lidos", "indexaveis", "noindex", "arestas_internas",
+            "orfas_sem_link_de_entrada", "inalcancaveis_desde_a_home",
+            "alem_da_profundidade_maxima", "grau_entrada_min",
+            "grau_entrada_p10", "grau_entrada_p50",
+        ):
+            print(f"  {chave:34s} {resultado[chave]}")
+        print("  profundidade (cliques desde a home):")
+        for k, v in resultado["profundidade_histograma"].items():
+            print(f"    {k:>13s}: {v}")
+        if cruzamento:
+            print(f"  cruzamento com nunca-requisitadas de {args.crawler}:")
+            for k, v in cruzamento.items():
+                if k != "crawler":
+                    print(f"    {k:32s} {v}")
+        if args.listar_orfas:
+            print("  orfas (amostra):")
+            for r in orfas[: args.listar_orfas]:
+                print(f"    {r}")
+        if args.listar_profundas:
+            print("  alem da profundidade maxima (amostra):")
+            for r in sorted(profundas, key=lambda x: -profundidade.get(x, 10**9))[: args.listar_profundas]:
+                print(f"    prof={profundidade.get(r, 'inalcancavel')} {r}")
+
+    return 1 if (orfas or inalcancaveis or profundas) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

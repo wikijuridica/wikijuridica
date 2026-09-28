@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""Bounded, read-only watchdog for ``run-heavy-throttled`` commands.
+
+The watchdog never signals the observed command.  It only reads that command's
+procfs identity and runs ``check-command-progress`` through the repository's
+process-tree supervisor.  The caller must run this watchdog through that same
+supervisor so parent death and asynchronous termination clean the complete
+watchdog/probe tree.
+
+The alert protocol intentionally matches the historical inline watchdog.  In
+particular, only ``command-progress/v4`` is accepted and diagnostic failures do
+not change the producer's exit status.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import math
+import os
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+PROGRESS_SCHEMA = "command-progress/v4"
+PR_SET_PDEATHSIG = 1
+MAX_DEADLINE_SECONDS = 86_400.0
+MAX_WINDOW_SECONDS = 60
+MAX_ALERT_WINDOWS = 1_000_000
+MAX_EVIDENCE_BYTES = 16_384
+POLL_SECONDS = 0.02
+MANAGED_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+RISK_STATUSES = frozenset(
+    {
+        "idle_stall_risk",
+        "busy_loop_risk",
+        "io_without_progress_risk",
+        "observer_invalid_risk",
+        "observer_regression_risk",
+        "reported_progress_unverified_risk",
+        "unattributed_progress_risk",
+    }
+)
+IMMEDIATE_ALERT_STATUSES = frozenset(
+    {"observer_invalid_risk", "observer_regression_risk"}
+)
+
+
+class WatchdogError(RuntimeError):
+    """Raised when the watchdog cannot preserve its safety contract."""
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    start_ticks: int
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    status: int
+    first_line: str
+    stopped_by_signal: bool = False
+    watchdog_deadline_reached: bool = False
+
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_libc.prctl.argtypes = [
+    ctypes.c_int,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+    ctypes.c_ulong,
+]
+_libc.prctl.restype = ctypes.c_int
+_received_signal: int | None = None
+
+
+def _signal_handler(signal_number: int, _frame: object) -> None:
+    global _received_signal
+    if _received_signal is None:
+        _received_signal = signal_number
+
+
+def _close_extra_descriptors() -> None:
+    """Close every inherited descriptor except stdin/stdout/stderr."""
+
+    try:
+        descriptors = tuple(
+            int(name) for name in os.listdir("/proc/self/fd") if name.isdigit()
+        )
+    except OSError as exc:
+        raise WatchdogError(f"cannot enumerate inherited descriptors: {exc}") from exc
+    for descriptor in descriptors:
+        if descriptor <= 2:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError:
+            # The fd used by os.listdir can disappear before this loop reaches
+            # it.  Every persistent inherited fd is still closed.
+            pass
+
+
+def _arm_parent_death_signal(parent_pid: int) -> None:
+    if _libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise WatchdogError(
+            f"cannot arm parent-death signal: {os.strerror(error_number)}"
+        )
+    if os.getppid() != parent_pid:
+        raise WatchdogError("parent changed while arming parent-death signal")
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _nonnegative_seconds(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(value) or value < 0 or value > MAX_DEADLINE_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 0 and {MAX_DEADLINE_SECONDS:g} seconds"
+        )
+    return value
+
+
+def _positive_deadline(raw: str) -> float:
+    value = _nonnegative_seconds(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return value
+
+
+def _window_seconds(raw: str) -> int:
+    value = _positive_int(raw)
+    if value > MAX_WINDOW_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_WINDOW_SECONDS} seconds"
+        )
+    return value
+
+
+def _alert_windows(raw: str) -> int:
+    value = _positive_int(raw)
+    if value > MAX_ALERT_WINDOWS:
+        raise argparse.ArgumentTypeError(
+            f"must be between 1 and {MAX_ALERT_WINDOWS}"
+        )
+    return value
+
+
+def _parse_arguments(arguments: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="run-heavy-progress-watchdog",
+        description="observe one heavy command without signalling it",
+    )
+    parser.add_argument("--target-pid", required=True, type=_positive_int)
+    parser.add_argument(
+        "--check-command-progress", required=True, type=Path, metavar="PATH"
+    )
+    parser.add_argument(
+        "--supervise-process-tree", required=True, type=Path, metavar="PATH"
+    )
+    parser.add_argument("--lock-dir", required=True, type=Path, metavar="DIR")
+    parser.add_argument("--lock-scope", required=True)
+    parser.add_argument(
+        "--initial-delay-seconds", required=True, type=_nonnegative_seconds
+    )
+    parser.add_argument("--window-seconds", required=True, type=_window_seconds)
+    parser.add_argument("--alert-windows", required=True, type=_alert_windows)
+    parser.add_argument(
+        "--deadline-seconds", required=True, type=_positive_deadline
+    )
+    parsed = parser.parse_args(list(arguments))
+    if not parsed.lock_scope or "\x00" in parsed.lock_scope:
+        parser.error("--lock-scope must be non-empty and cannot contain NUL")
+    return parsed
+
+
+def _validate_executable(path: Path, label: str) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise WatchdogError(
+            f"{label} is unavailable: {_inline_token(str(path))}: "
+            f"{_inline_token(str(exc))}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise WatchdogError(
+            f"{label} must be a regular non-symlink file: "
+            f"{_inline_token(str(path))}"
+        )
+    if not os.access(path, os.X_OK):
+        raise WatchdogError(f"{label} is not executable: {_inline_token(str(path))}")
+    return path.absolute()
+
+
+def _validate_lock_directory(path: Path) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise WatchdogError(
+            f"lock directory is unavailable: {_inline_token(str(path))}: "
+            f"{_inline_token(str(exc))}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise WatchdogError(
+            "lock directory must be a non-symlink directory: "
+            f"{_inline_token(str(path))}"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise WatchdogError("lock directory must be owned by the current user")
+    if metadata.st_mode & 0o077:
+        raise WatchdogError("lock directory must not be accessible by group or other")
+    return path.absolute()
+
+
+def _read_identity(pid: int) -> ProcessIdentity | None:
+    try:
+        # procfs comm may contain non-UTF-8 bytes; only the ASCII numeric
+        # fields after its final ')' participate in identity validation.
+        payload = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as exc:
+        raise WatchdogError(f"cannot read target procfs identity: {exc}") from exc
+    close_paren = payload.rfind(")")
+    if close_paren < 0:
+        raise WatchdogError("target procfs identity is malformed")
+    fields = payload[close_paren + 2 :].split()
+    if len(fields) <= 19:
+        raise WatchdogError("target procfs identity is malformed")
+    try:
+        return ProcessIdentity(pid=pid, start_ticks=int(fields[19]))
+    except ValueError as exc:
+        raise WatchdogError("target procfs identity is malformed") from exc
+
+
+def _same_target(identity: ProcessIdentity) -> bool:
+    current = _read_identity(identity.pid)
+    return current is not None and current.start_ticks == identity.start_ticks
+
+
+def _inline_token(value: str) -> str:
+    """Produce one bounded terminal-safe field without changing normal tokens."""
+
+    result: list[str] = []
+    separator_pending = False
+    encoded_bytes = 0
+    for character in value:
+        safe = character.isprintable() and not character.isspace()
+        if safe:
+            candidate = character
+        else:
+            separator_pending = True
+            continue
+        if separator_pending and result and result[-1] != "_":
+            result.append("_")
+            encoded_bytes += 1
+        separator_pending = False
+        width = len(candidate.encode("utf-8", errors="replace"))
+        if encoded_bytes + width > MAX_EVIDENCE_BYTES:
+            break
+        result.append(candidate)
+        encoded_bytes += width
+    if separator_pending and result and encoded_bytes < MAX_EVIDENCE_BYTES:
+        result.append("_")
+    return "".join(result)
+
+
+def _shell_status(returncode: int) -> int:
+    return 128 + (-returncode) if returncode < 0 else returncode
+
+
+def _append_first_line(buffer: bytearray, chunk: bytes) -> bool:
+    """Append a bounded first line and report whether its newline was seen."""
+
+    if len(buffer) >= MAX_EVIDENCE_BYTES:
+        return True
+    first = chunk.split(b"\n", 1)[0]
+    remaining = MAX_EVIDENCE_BYTES - len(buffer)
+    buffer.extend(first[:remaining])
+    return b"\n" in chunk or len(buffer) >= MAX_EVIDENCE_BYTES
+
+
+def _terminate_owned_probe(process: subprocess.Popen[bytes]) -> None:
+    """Boundedly stop only the probe supervisor owned by this watchdog."""
+
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+    term_deadline = time.monotonic() + 2.0
+    while process.poll() is None and time.monotonic() < term_deadline:
+        time.sleep(POLL_SECONDS)
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    kill_deadline = time.monotonic() + 2.0
+    while process.poll() is None and time.monotonic() < kill_deadline:
+        time.sleep(POLL_SECONDS)
+    if process.poll() is None:
+        raise WatchdogError("owned probe supervisor did not exit after SIGKILL")
+
+
+def _run_probe(
+    *,
+    supervisor: Path,
+    checker: Path,
+    target_pid: int,
+    window_seconds: int,
+    watchdog_deadline: float,
+) -> ProbeResult:
+    remaining = watchdog_deadline - time.monotonic()
+    if remaining <= 0:
+        return ProbeResult(0, "", watchdog_deadline_reached=True)
+    probe_deadline = min(float(window_seconds + 5), remaining)
+    command = [
+        str(supervisor),
+        "--timeout-seconds",
+        f"{probe_deadline:.6f}",
+        "--kill-after-seconds",
+        "2",
+        "--term-grace-seconds",
+        "1",
+        "--kill-grace-seconds",
+        "2",
+        "--fail-on-descendant-cleanup",
+        "--close-fd8",
+        "--",
+        str(checker),
+        str(target_pid),
+        "--window-seconds",
+        str(window_seconds),
+        "--overrun-risk",
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise WatchdogError(
+            f"cannot start owned probe supervisor: {_inline_token(str(exc))}"
+        ) from exc
+    if process.stdout is None:
+        _terminate_owned_probe(process)
+        raise WatchdogError("owned probe has no output stream")
+    descriptor = process.stdout.fileno()
+    os.set_blocking(descriptor, False)
+    selector = selectors.DefaultSelector()
+    selector.register(descriptor, selectors.EVENT_READ)
+    captured = bytearray()
+    first_line_complete = False
+    try:
+        while process.poll() is None:
+            if _received_signal is not None:
+                _terminate_owned_probe(process)
+                return ProbeResult(
+                    _shell_status(process.returncode or 0),
+                    captured.decode("utf-8", errors="replace"),
+                    stopped_by_signal=True,
+                )
+            if time.monotonic() >= watchdog_deadline:
+                _terminate_owned_probe(process)
+                return ProbeResult(
+                    _shell_status(process.returncode or 0),
+                    captured.decode("utf-8", errors="replace"),
+                    watchdog_deadline_reached=True,
+                )
+            for key, _mask in selector.select(POLL_SECONDS):
+                try:
+                    chunk = os.read(key.fd, 65_536)
+                except BlockingIOError:
+                    continue
+                if chunk and not first_line_complete:
+                    first_line_complete = _append_first_line(captured, chunk)
+        while True:
+            try:
+                chunk = os.read(descriptor, 65_536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            if not first_line_complete:
+                first_line_complete = _append_first_line(captured, chunk)
+        return ProbeResult(
+            _shell_status(process.returncode or 0),
+            captured.decode("utf-8", errors="replace"),
+        )
+    finally:
+        selector.close()
+        if process.poll() is None:
+            _terminate_owned_probe(process)
+        process.stdout.close()
+        if process.poll() is not None:
+            process.wait()
+
+
+def _wait_initial_delay(
+    identity: ProcessIdentity, delay_seconds: float, deadline: float
+) -> bool:
+    delay_deadline = min(time.monotonic() + delay_seconds, deadline)
+    while time.monotonic() < delay_deadline:
+        if _received_signal is not None or not _same_target(identity):
+            return False
+        time.sleep(min(POLL_SECONDS, max(0.0, delay_deadline - time.monotonic())))
+    return _received_signal is None and _same_target(identity)
+
+
+def _parse_probe_field(line: str, field: str, *, anchored: bool = False) -> str:
+    prefix = "^" if anchored else r"(?:^| )"
+    match = re.search(prefix + re.escape(field) + r"=([^ ]*)", line)
+    return match.group(1) if match is not None else ""
+
+
+def _monitor(parsed: argparse.Namespace) -> int:
+    checker = _validate_executable(parsed.check_command_progress, "progress checker")
+    supervisor = _validate_executable(
+        parsed.supervise_process_tree, "process-tree supervisor"
+    )
+    _validate_lock_directory(parsed.lock_dir)
+    target = _read_identity(parsed.target_pid)
+    if target is None:
+        return 0
+
+    deadline = time.monotonic() + parsed.deadline_seconds
+    if not _wait_initial_delay(target, parsed.initial_delay_seconds, deadline):
+        return 128 + _received_signal if _received_signal is not None else 0
+
+    risk_streak = 0
+    safe_scope = _inline_token(parsed.lock_scope)
+    while (
+        _received_signal is None
+        and time.monotonic() < deadline
+        and _same_target(target)
+    ):
+        probe = _run_probe(
+            supervisor=supervisor,
+            checker=checker,
+            target_pid=target.pid,
+            window_seconds=parsed.window_seconds,
+            watchdog_deadline=deadline,
+        )
+        if probe.stopped_by_signal:
+            break
+        if probe.watchdog_deadline_reached:
+            return 0
+
+        probe_line = probe.first_line.splitlines()[0] if probe.first_line else ""
+        result_status = _parse_probe_field(probe_line, "status", anchored=True)
+        result_schema = _parse_probe_field(probe_line, "schema")
+        evidence = _inline_token(probe_line)
+        if result_schema != PROGRESS_SCHEMA:
+            print(
+                "run-heavy-throttled: progress_monitor_alert "
+                "status=monitor_failure reason=invalid_or_missing_schema "
+                f"rc={probe.status} child_pid={target.pid} "
+                f"lock_scope={safe_scope} evidence={evidence} "
+                "action=inspect_monitor_without_signalling_command",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+        if result_status == "exited" and probe.status == 0:
+            break
+        if result_status not in RISK_STATUSES or probe.status != 2:
+            print(
+                "run-heavy-throttled: progress_monitor_alert "
+                "status=monitor_failure reason=unexpected_status_or_exit "
+                f"rc={probe.status} child_pid={target.pid} "
+                f"lock_scope={safe_scope} evidence={evidence} "
+                "action=inspect_monitor_without_signalling_command",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+
+        risk_streak += 1
+        alert_threshold = (
+            1 if result_status in IMMEDIATE_ALERT_STATUSES else parsed.alert_windows
+        )
+        if risk_streak >= alert_threshold:
+            print(
+                "run-heavy-throttled: progress_monitor_alert "
+                f"status={result_status} consecutive_windows={risk_streak} "
+                f"child_pid={target.pid} lock_scope={safe_scope} "
+                f"evidence={evidence} "
+                "action=read_live_artifact_and_fix_root_cause_before_rerun",
+                file=sys.stderr,
+                flush=True,
+            )
+            risk_streak = 0
+
+    if _received_signal is not None:
+        return 128 + _received_signal
+    return 0
+
+
+def run(arguments: Iterable[str]) -> int:
+    global _received_signal
+    _received_signal = None
+    if sys.platform != "linux":
+        print("run-heavy-progress-watchdog: Linux is required", file=sys.stderr)
+        return 2
+    try:
+        _close_extra_descriptors()
+        parent_pid = os.getppid()
+        _arm_parent_death_signal(parent_pid)
+        for signal_number in MANAGED_SIGNALS:
+            signal.signal(signal_number, _signal_handler)
+        parsed = _parse_arguments(arguments)
+        return _monitor(parsed)
+    except WatchdogError as exc:
+        print(f"run-heavy-progress-watchdog: {exc}", file=sys.stderr)
+        return 2
+
+
+def main() -> None:
+    raise SystemExit(run(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()

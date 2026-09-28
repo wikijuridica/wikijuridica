@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""generate-crawl-never-requested-refresh — reconcilia a lista de URLs que
+nenhum crawler jamais pediu com a realidade corrente do disco.
+
+★ POR QUE ESTE GERADOR EXISTE (medido em 2026-08-28)
+
+`data/ops/crawl_coverage_never_requested.json` não é um relatório: é o INSUMO do
+trabalho de descoberta. A publicação de hoje leu esse arquivo e reportou
+"cobertura de rastreio: 3.060 rota(s) que o Googlebot nunca pediu" e "5.249
+aresta(s) para 2.701 destino(s) nunca rastreado(s)" — malha interna, IndexNow em
+lote e prioridade editorial saem daí. Errar a lista é apontar link para onde não
+precisa e deixar sem link o que precisa.
+
+Mas o arquivo é um SNAPSHOT com data. Quem o escreve é
+`tools/measure-crawl-coverage:592-607`, por MERGE (`consolidado.update()`,
+nunca substituição — o comentário lá explica que reescrever o arquivo inteiro já
+apagou a lista de um crawler quando outro foi medido). O merge é por crawler, e
+o timer `wikijuridica-crawl-coverage.timer` roda UMA VEZ POR DIA, às 04:10 UTC.
+
+Entre uma execução e a seguinte o mundo anda em duas direções, e o snapshot em
+nenhuma:
+
+  1. O crawler PEDE uma URL que está na lista — a lista passa a mentir por
+     excesso. Medido agora, contra o ledger de origem: 3 rotas listadas como
+     "nunca pedidas" já tinham sido pedidas (1 amazonbot, 2 oai-searchbot).
+  2. A onda editorial PUBLICA rotas novas — a lista passa a mentir por falta. A
+     unit da onda diária dispara às 04:31 −03 (07:31 UTC), **3h21 DEPOIS** do
+     timer de cobertura: toda rota publicada hoje só entra na lista amanhã.
+
+★ O QUE ESTE GERADOR NÃO É
+
+Não é um segundo medidor de cobertura, e não consulta a Cloudflare. A cobertura
+autenticada continua sendo produzida por `measure-crawl-coverage` (identidade por
+`verifiedBotCategory` = rDNS + faixa de IP do operador). Este gerador é
+RECONCILIAÇÃO local, e reusa as peças canônicas em vez de reimplementá-las:
+
+  - o universo de rotas vem de `measure_crawl_coverage.ler_sitemap_paths()`,
+    IMPORTADO do próprio produtor — parser duplicado é divergência garantida;
+  - a série diária é lida por `crawlcoverage.serie_saneada`, o leitor canônico.
+    `data/ops/crawl_coverage_daily.jsonl` é CUMULATIVO e tem múltiplas linhas por
+    (data, crawler) — 210 de 220 chaves, e `googlebot` em 2026-08-12 tem 21
+    linhas com `paths_requested_that_day` variando de 0 a 103. Somar o arquivo
+    conta o mesmo dia 21 vezes. Aqui a série entra só como CONFERÊNCIA (a
+    divergência entre o acumulado da série e o estado vai gravada), porque o
+    conjunto de paths mora no estado, não na série;
+  - a evidência de "foi pedida" que o produtor ainda não viu vem de
+    `data/ops/origin_bot_routes_daily.jsonl`, cujas linhas já carregam
+    identidade verificada por faixa oficial de IP/rDNS
+    (`tools/generate-bot-traffic-origin`).
+
+★ A REGRA DE INFERÊNCIA, E POR QUE ELA É DE MÃO ÚNICA
+
+Presença no log da origem PROVA que a rota foi pedida. Ausência NÃO prova nada:
+a borda absorve a maior parte do tráfego (`s-maxage=604800`) e o `top_routes` do
+ledger tem teto de 200 por janela. Por isso a origem só REMOVE da lista, nunca
+acrescenta — e a remoção exige `agent_key` IDÊNTICO. `googlebot-image` não
+remove nada de `googlebot`: são tokens diferentes de User-Agent e o dicionário
+CRAWLERS do produtor os separa de propósito.
+
+★ FALTA DE OPORTUNIDADE NÃO É DEFEITO
+
+Rota publicada há poucas horas e nunca pedida não é o mesmo problema que rota no
+ar há três semanas e nunca pedida. A primeira é física; a segunda é falha de
+descoberta que a malha interna tem de corrigir. A separação usa
+`data/editorial/first_published_at.json` (estreia por `unique_intent_id`,
+derivada do histórico git do manifesto) com a ponte intent → rota do
+`published_manifest`. O corte de "sem oportunidade" é `dias <= 1`, e o número
+vem do relógio das units: publicação 07:31 UTC contra medição 04:10 UTC — uma
+rota publicada hoje não teve NENHUM dia medido, e a de ontem teve no máximo um
+parcial.
+
+Rota do sitemap sem entrada no manifesto (hubs, paginação, diários — 10.336
+rotas no sitemap contra 10.111 linhas de manifesto) fica num balde próprio,
+`sem_estreia_no_manifesto`. Data inventada seria pior que ausência declarada.
+
+★ TODO PERCENTUAL VEM COM O ABSOLUTO AO LADO
+
+Regra da casa, com precedente: a cobertura deste portal já "caiu" de 72,01% para
+70,39% enquanto o numerador SUBIA 125 URLs — o denominador (o sitemap) crescia
+mais rápido. Percentual sozinho mente quando o denominador se move, e aqui ele se
+move todo dia.
+
+★ CÓDIGO DE SAÍDA
+
+0 = reconciliou (achar deriva é o caso NORMAL, não é falha);
+2 = NÃO CONSEGUIU MEDIR (sitemap vazio, estado ilegível, produtor não importável).
+Nunca 1: se esta ferramenta entrar como terceiro `ExecStart` da unit de
+cobertura, qualquer código != 0 dispara o `OnFailure=wikijuridica-alerta@%N` —
+alarme por deriva rotineira treina o dono a ignorar alarme.
+
+Uso:
+    tools/generate-crawl-never-requested-refresh
+    tools/generate-crawl-never-requested-refresh --dry-run
+    tools/generate-crawl-never-requested-refresh --json
+    tools/generate-crawl-never-requested-refresh --self-test
+    tools/generate-crawl-never-requested-refresh --unit
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+
+PRODUTOR = os.path.join(ROOT, "tools", "measure-crawl-coverage")
+NUNCA_PEDIDAS = os.path.join(ROOT, "data", "ops", "crawl_coverage_never_requested.json")
+ESTADO = os.path.join(ROOT, "data", "ops", "crawl_coverage_state.json")
+ORIGEM_ROTAS = os.path.join(ROOT, "data", "ops", "origin_bot_routes_daily.jsonl")
+MANIFESTO = os.path.join(ROOT, "data", "editorial", "published_manifest.jsonl")
+ESTREIA = os.path.join(ROOT, "data", "editorial", "first_published_at.json")
+
+# Corte de "não teve oportunidade". Ver o cabeçalho: onda diária às 07:31 UTC,
+# medição de cobertura às 04:10 UTC — a rota de hoje tem zero dias medidos.
+DIAS_SEM_OPORTUNIDADE = 1
+
+# Teto das amostras gravadas no arquivo. O arquivo já tem 2,8 MB de listas; a
+# evidência do que mudou serve para auditar, não para virar um segundo acervo.
+AMOSTRA = 20
+
+REFRESH_SCHEMA = "crawl_coverage_never_requested_refresh_v1"
+
+
+class NaoConsigoMedir(Exception):
+    """Erro que vira exit 2: instrumento quebrado, nunca veredito."""
+
+
+# ---------------------------------------------------------------- leitura ---
+
+def importar_produtor():
+    """Importa `tools/measure-crawl-coverage` como módulo.
+
+    Ele não tem extensão .py, então precisa de SourceFileLoader explícito. O
+    motivo de importar em vez de copiar `ler_sitemap_paths`: o universo de rotas
+    TEM de ser byte a byte o mesmo que o produtor usa, senão a reconciliação
+    inventa diferença onde não há. O módulo só define constantes e funções no
+    nível superior (a execução fica sob `if __name__ == "__main__"`), então
+    importar não dispara consulta nenhuma à Cloudflare.
+    """
+    try:
+        loader = importlib.machinery.SourceFileLoader("measure_crawl_coverage", PRODUTOR)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        modulo = importlib.util.module_from_spec(spec)
+        loader.exec_module(modulo)
+        return modulo
+    except Exception as erro:
+        raise NaoConsigoMedir(
+            "nao consegui importar o produtor %s: %s" % (PRODUTOR, erro))
+
+
+def ler_json(caminho, obrigatorio=True):
+    if not os.path.isfile(caminho):
+        if obrigatorio:
+            raise NaoConsigoMedir("arquivo ausente: %s" % caminho)
+        return None
+    try:
+        with open(caminho, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception as erro:
+        raise NaoConsigoMedir("JSON invalido em %s: %s" % (caminho, erro))
+
+
+def ler_evidencia_origem(caminho=ORIGEM_ROTAS):
+    """agent_key -> conjunto de rotas pedidas, e a janela coberta pelo ledger.
+
+    As linhas são INCREMENTOS por janela de cursor (~30 min), então a leitura é
+    UNIÃO de todas as linhas — pegar "a última" perderia o dia inteiro. É a
+    mesma convenção que `tools/origintelemetry.py` documenta para a soma de
+    volume; aqui o que se acumula é conjunto de rotas, não contagem.
+    """
+    por_agente: dict[str, set] = {}
+    datas = set()
+    linhas_invalidas = 0
+    if not os.path.isfile(caminho):
+        # Ausência do ledger não impede reconciliar: o estado do produtor
+        # continua sendo a base. Só perde-se a correção intradiária, e isso vai
+        # declarado na saída em vez de virar silêncio.
+        return por_agente, None, None, 0
+    with open(caminho, encoding="utf-8") as handle:
+        for bruto in handle:
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registro = json.loads(bruto)
+            except json.JSONDecodeError:
+                linhas_invalidas += 1
+                continue
+            agente = registro.get("agent_key")
+            if not agente:
+                linhas_invalidas += 1
+                continue
+            if registro.get("date"):
+                datas.add(registro["date"])
+            alvo = por_agente.setdefault(agente, set())
+            for rota in registro.get("top_routes") or []:
+                caminho_rota = (rota or {}).get("route")
+                if isinstance(caminho_rota, str) and caminho_rota:
+                    alvo.add(caminho_rota)
+    return (por_agente,
+            min(datas) if datas else None,
+            max(datas) if datas else None,
+            linhas_invalidas)
+
+
+def ler_estreia_por_rota():
+    """rota -> data de estreia (YYYY-MM-DD), pela ponte intent → rota.
+
+    O manifesto tem 10.111 linhas para 10.107 intents: a chave é
+    `unique_intent_id` e há repetição. Dedup mantendo a ÚLTIMA linha, que é a
+    convenção do próprio ledger.
+    """
+    estreias = ler_json(ESTREIA, obrigatorio=False) or {}
+    por_intent = estreias.get("first_published_at") or {}
+    rota_por_intent: dict[str, str] = {}
+    if os.path.isfile(MANIFESTO):
+        with open(MANIFESTO, encoding="utf-8") as handle:
+            for bruto in handle:
+                bruto = bruto.strip()
+                if not bruto:
+                    continue
+                try:
+                    registro = json.loads(bruto)
+                except json.JSONDecodeError:
+                    continue
+                intent = registro.get("unique_intent_id")
+                rota = registro.get("path")
+                if intent and rota:
+                    rota_por_intent[intent] = rota
+    por_rota: dict[str, str] = {}
+    for intent, rota in rota_por_intent.items():
+        data = por_intent.get(intent)
+        if data:
+            por_rota[rota] = data
+    return por_rota
+
+
+# ------------------------------------------------------------ reconciliação ---
+
+def dias_desde(data_iso, hoje):
+    try:
+        estreia = datetime.date.fromisoformat(data_iso)
+    except (TypeError, ValueError):
+        return None
+    return (hoje - estreia).days
+
+
+def classificar_maturidade(rotas, estreia_por_rota, hoje):
+    """Separa a lista pelo tempo de exposição. Absolutos, nunca só percentual."""
+    baldes = {"sem_estreia_no_manifesto": 0, "0_a_1_dia": 0, "2_a_6_dias": 0,
+              "7_a_20_dias": 0, "21_dias_ou_mais": 0}
+    sem_oportunidade = []
+    idades = []
+    for rota in rotas:
+        dias = dias_desde(estreia_por_rota.get(rota), hoje)
+        if dias is None:
+            baldes["sem_estreia_no_manifesto"] += 1
+            continue
+        idades.append(dias)
+        if dias <= DIAS_SEM_OPORTUNIDADE:
+            baldes["0_a_1_dia"] += 1
+            sem_oportunidade.append(rota)
+        elif dias <= 6:
+            baldes["2_a_6_dias"] += 1
+        elif dias <= 20:
+            baldes["7_a_20_dias"] += 1
+        else:
+            baldes["21_dias_ou_mais"] += 1
+    idades.sort()
+    baldes["dias_desde_estreia_max"] = idades[-1] if idades else None
+    baldes["dias_desde_estreia_mediana"] = idades[len(idades) // 2] if idades else None
+    return baldes, sorted(sem_oportunidade)
+
+
+def reconciliar_crawler(nome, bloco, sitemap, paths_vistos, rotas_origem):
+    """O núcleo puro: sem I/O, para o --self-test poder exercitá-lo.
+
+    Devolve (nova_lista, diagnostico). `rotas_origem` já vem filtrada pelo
+    agent_key IDÊNTICO — a filtragem fica fora de propósito, para que o teste de
+    falso positivo consiga provar que googlebot-image não vaza para googlebot.
+    """
+    anterior = set(bloco.get("never_requested_paths") or [])
+    # Evidência de origem só vale para rota que ESTÁ no sitemap: rota estranha no
+    # log (o ledger tem `/api.md):`, lixo de parser de markdown alheio) não pode
+    # entrar em conjunto nenhum.
+    origem_no_sitemap = rotas_origem & sitemap
+    nova = sorted(sitemap - paths_vistos - origem_no_sitemap)
+    nova_set = set(nova)
+
+    saiu = anterior - nova_set
+    saiu_por_ter_saido_do_sitemap = saiu - sitemap
+    saiu_por_ter_sido_pedida = saiu & sitemap
+    # Atribuição honesta: parte das remoções o produtor já teria feito na
+    # próxima execução (o path entrou no estado autenticado da Cloudflare). O que
+    # SÓ este gerador enxerga é a rota pedida na origem e ainda ausente do
+    # estado — é essa a deriva intradiária.
+    so_por_evidencia_de_origem = sorted(
+        (saiu_por_ter_sido_pedida & origem_no_sitemap) - paths_vistos)
+    entrou = sorted(nova_set - anterior)
+
+    diagnostico = {
+        "antes": len(anterior),
+        "depois": len(nova),
+        "saiu_por_ter_sido_pedida": sorted(saiu_por_ter_sido_pedida),
+        "saiu_por_ter_saido_do_sitemap": sorted(saiu_por_ter_saido_do_sitemap),
+        "saiu_so_por_evidencia_de_origem": so_por_evidencia_de_origem,
+        "entrou": entrou,
+    }
+    return nova, diagnostico
+
+
+_SERIE_CACHE = {}
+
+
+def serie_canonica():
+    """A série saneada, lida UMA vez por execução.
+
+    `crawl_coverage_daily.jsonl` já tem 1 MB e cresce todo dia; reler o arquivo
+    uma vez por crawler multiplicaria por 10 o custo do único passo de I/O
+    pesado desta ferramenta, sem mudar o resultado.
+    """
+    if "por_chave" not in _SERIE_CACHE:
+        import crawlcoverage
+        _SERIE_CACHE["por_chave"], _ = crawlcoverage.serie_saneada(ROOT)
+    return _SERIE_CACHE["por_chave"]
+
+
+def conferir_serie(nome, cobertura_estado):
+    """Confronta o estado com a série lida pelo LEITOR CANÔNICO.
+
+    Não corrige nada: registra. Se a série (cumulative_sitemap_coverage do dia
+    mais recente) discordar do conjunto de paths do estado, um dos dois está
+    desatualizado, e quem consome a lista precisa ver isso em vez de descobrir
+    por acidente.
+    """
+    por_chave = serie_canonica()
+    datas = sorted(data for (data, crawler) in por_chave if crawler == nome)
+    if not datas:
+        return {"ultima_data": None, "cumulative_sitemap_coverage": None,
+                "divergencia_vs_estado": None}
+    ultima = datas[-1]
+    registro = por_chave[(ultima, nome)]
+    acumulado = registro.get("cumulative_sitemap_coverage")
+    divergencia = None
+    if isinstance(acumulado, int):
+        divergencia = cobertura_estado - acumulado
+    return {"ultima_data": ultima,
+            "cumulative_sitemap_coverage": acumulado,
+            "divergencia_vs_estado": divergencia}
+
+
+# ------------------------------------------------------------------ escrita ---
+
+def gravar(destino, documento):
+    """Atômico e no estilo do produtor (indent=1, sort_keys, newline final),
+    para o diff do git mostrar só o que mudou de fato."""
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    tmp = destino + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(documento, handle, ensure_ascii=False, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, destino)
+
+
+# ---------------------------------------------------------------- self-test ---
+
+def self_test():
+    """Teste de FALSO POSITIVO sobre caso inocente parecido.
+
+    Regra da casa: detector novo nasce com este teste. Já houve detector neste
+    repositório que acusou 46 páginas sendo que as 46 eram falso positivo. Aqui
+    o "detector" é a regra de remoção — remover errado apaga alvo de descoberta
+    que ninguém vai repor.
+    """
+    falhas = []
+
+    def checar(nome, condicao, detalhe=""):
+        print("  %-58s %s" % (nome, "OK" if condicao else "FALHOU " + detalhe))
+        if not condicao:
+            falhas.append(nome)
+
+    sitemap = {"/a/", "/b/", "/c/", "/d/"}
+
+    # (a) Evidência de um agent_key vizinho NÃO pode remover de outro.
+    # googlebot-image e googlebot são tokens de User-Agent distintos, separados
+    # de propósito no dicionário CRAWLERS do produtor.
+    bloco = {"never_requested_paths": ["/a/", "/b/", "/c/", "/d/"]}
+    nova, diag = reconciliar_crawler("googlebot", bloco, sitemap,
+                                     paths_vistos=set(), rotas_origem=set())
+    checar("agent_key vizinho nao remove (googlebot-image != googlebot)",
+           nova == ["/a/", "/b/", "/c/", "/d/"] and diag["depois"] == 4,
+           repr(nova))
+
+    # (b) Rota-lixo do ledger da origem (o `/api.md):` real, linha 1 do arquivo)
+    # não entra em lista nenhuma, porque só se remove do que está no sitemap.
+    nova, diag = reconciliar_crawler("amazonbot", bloco, sitemap,
+                                     paths_vistos=set(),
+                                     rotas_origem={"/api.md):", "/nao-existe/"})
+    checar("rota fora do sitemap nunca entra nem remove",
+           nova == ["/a/", "/b/", "/c/", "/d/"] and not diag["entrou"], repr(nova))
+
+    # (c) Remoção legítima por evidência de origem, com atribuição correta: /a/
+    # já estava no estado autenticado (o produtor a removeria sozinho), /b/ só
+    # aparece na origem — só /b/ pode ser creditada a este gerador.
+    nova, diag = reconciliar_crawler("googlebot", bloco, sitemap,
+                                     paths_vistos={"/a/"},
+                                     rotas_origem={"/a/", "/b/"})
+    checar("remove pedida e atribui so o que a origem acrescentou",
+           nova == ["/c/", "/d/"]
+           and diag["saiu_so_por_evidencia_de_origem"] == ["/b/"], repr(diag))
+
+    # (d) Rota nova do sitemap ENTRA na lista.
+    nova, diag = reconciliar_crawler("googlebot", {"never_requested_paths": ["/a/"]},
+                                     sitemap, paths_vistos=set(), rotas_origem=set())
+    checar("rota nova publicada entra na lista",
+           diag["entrou"] == ["/b/", "/c/", "/d/"], repr(diag))
+
+    # (e) Rota que saiu do sitemap sai da lista, e é contada em balde próprio —
+    # não pode ser confundida com "o crawler pediu".
+    nova, diag = reconciliar_crawler("googlebot",
+                                     {"never_requested_paths": ["/a/", "/aposentada/"]},
+                                     sitemap, paths_vistos=set(), rotas_origem=set())
+    checar("rota aposentada sai por sitemap, nao por pedido",
+           diag["saiu_por_ter_saido_do_sitemap"] == ["/aposentada/"]
+           and diag["saiu_por_ter_sido_pedida"] == [], repr(diag))
+
+    # (f) Sitemap vazio é INSTRUMENTO QUEBRADO: recusa, nunca "todas cobertas".
+    checar("sitemap vazio e recusado (exit 2), nunca lista zerada",
+           guarda_sitemap(set()) is False)
+    checar("sitemap com rotas passa na guarda", guarda_sitemap(sitemap) is True)
+
+    # (g) Maturidade: falta de oportunidade não vira defeito consolidado.
+    hoje = datetime.date(2026, 8, 28)
+    baldes, sem_op = classificar_maturidade(
+        ["/hoje/", "/ontem/", "/semana/", "/mes/", "/sem-manifesto/"],
+        {"/hoje/": "2026-08-28", "/ontem/": "2026-08-27",
+         "/semana/": "2026-08-22", "/mes/": "2026-07-20"}, hoje)
+    checar("maturidade separa sem-oportunidade de defeito consolidado",
+           baldes["0_a_1_dia"] == 2 and baldes["2_a_6_dias"] == 1
+           and baldes["7_a_20_dias"] == 0 and baldes["21_dias_ou_mais"] == 1
+           and baldes["sem_estreia_no_manifesto"] == 1
+           and sem_op == ["/hoje/", "/ontem/"], repr(baldes))
+    checar("dias desde estreia: maximo real, nao arredondado",
+           baldes["dias_desde_estreia_max"] == 39, repr(baldes))
+
+    print("\n%d verificacao(oes), %d falha(s)" % (9, len(falhas)))
+    return 0 if not falhas else 2
+
+
+def guarda_sitemap(sitemap):
+    """Sitemap vazio significa build ausente/quebrado, não acervo coberto.
+
+    Sem esta guarda uma execução com `public/sitemaps/` vazio zeraria a lista de
+    todos os crawlers — apagando o insumo de descoberta com aparência de sucesso.
+    """
+    return bool(sitemap)
+
+
+# --------------------------------------------------------------------- main ---
+
+def executar(args):
+    modulo = importar_produtor()
+    sitemap = modulo.ler_sitemap_paths()
+    if not guarda_sitemap(sitemap):
+        raise NaoConsigoMedir(
+            "public/sitemaps/ nao produziu nenhuma <loc> — recuso reescrever a "
+            "lista, que ficaria zerada por defeito de build")
+    total_sitemap = len(sitemap)
+
+    documento = ler_json(NUNCA_PEDIDAS)
+    if not isinstance(documento, dict) or not isinstance(documento.get("crawlers"), dict):
+        raise NaoConsigoMedir(
+            "%s sem o mapa 'crawlers' — nao reconstruo o arquivo do zero, "
+            "perderia lista de crawler nao medido hoje" % NUNCA_PEDIDAS)
+
+    estado = ler_json(ESTADO)
+    verificados = (estado or {}).get("crawlers_verified")
+    if not isinstance(verificados, dict) or not verificados:
+        raise NaoConsigoMedir(
+            "%s sem 'crawlers_verified' — sem o conjunto de paths autenticados "
+            "nao ha com o que reconciliar" % ESTADO)
+
+    origem, origem_de, origem_ate, origem_invalidas = ler_evidencia_origem()
+    estreia_por_rota = ler_estreia_por_rota()
+    hoje = datetime.datetime.now(datetime.timezone.utc).date()
+    agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    resumo = {"crawlers": {}, "sitemap_total_anterior": documento.get("sitemap_total"),
+              "sitemap_total_agora": total_sitemap,
+              "origem_janela": {"de": origem_de, "ate": origem_ate,
+                                "linhas_invalidas": origem_invalidas},
+              "intocados": []}
+    total_saiu = total_entrou = total_origem = 0
+
+    for nome in sorted(documento["crawlers"]):
+        bloco = documento["crawlers"][nome]
+        if not isinstance(bloco, dict):
+            resumo["intocados"].append({"crawler": nome, "motivo": "bloco nao e objeto"})
+            continue
+        registro_estado = verificados.get(nome)
+        if not isinstance(registro_estado, dict) or "paths_first_seen" not in registro_estado:
+            # Crawler presente no arquivo e ausente do estado: NÃO se toca. A
+            # lista dele é trabalho medido; apagar por falta de contraparte
+            # repetiria o defeito que o merge do produtor existe para evitar.
+            resumo["intocados"].append({"crawler": nome, "motivo": "ausente de crawlers_verified"})
+            continue
+        paths_vistos = set(registro_estado.get("paths_first_seen") or {})
+        rotas_origem = set(origem.get(nome) or set())
+
+        nova, diag = reconciliar_crawler(nome, bloco, sitemap, paths_vistos, rotas_origem)
+        baldes, sem_oportunidade = classificar_maturidade(nova, estreia_por_rota, hoje)
+        cobertura = len(paths_vistos & sitemap)
+
+        bloco["never_requested_paths"] = nova
+        bloco["never_requested_count"] = len(nova)
+        bloco["refreshed_at"] = agora
+        bloco["refresh_schema_version"] = REFRESH_SCHEMA
+        bloco["refresh_basis"] = (
+            "sitemap em disco - paths_first_seen (estado autenticado da Cloudflare) "
+            "- top_routes do ledger da origem com agent_key identico")
+        bloco["refresh_removed_requested"] = len(diag["saiu_por_ter_sido_pedida"])
+        bloco["refresh_removed_requested_sample"] = diag["saiu_por_ter_sido_pedida"][:AMOSTRA]
+        bloco["refresh_removed_by_origin_evidence"] = len(diag["saiu_so_por_evidencia_de_origem"])
+        bloco["refresh_removed_by_origin_evidence_paths"] = diag["saiu_so_por_evidencia_de_origem"]
+        bloco["refresh_removed_off_sitemap"] = len(diag["saiu_por_ter_saido_do_sitemap"])
+        bloco["refresh_added_new_paths"] = len(diag["entrou"])
+        bloco["refresh_added_new_paths_sample"] = diag["entrou"][:AMOSTRA]
+        # Absoluto ao lado do percentual, sempre: a cobertura ja "caiu" de 72,01%
+        # para 70,39% com o numerador SUBINDO 125 URLs.
+        bloco["coverage_paths"] = cobertura
+        bloco["coverage_pct_of_sitemap"] = round(100.0 * cobertura / total_sitemap, 2)
+        bloco["never_requested_maturity"] = baldes
+        bloco["never_requested_sem_oportunidade_count"] = len(sem_oportunidade)
+        bloco["never_requested_sem_oportunidade_paths"] = sem_oportunidade
+        bloco["never_requested_maduras_count"] = len(nova) - len(sem_oportunidade)
+        bloco["serie_conferida"] = conferir_serie(nome, cobertura)
+
+        total_saiu += len(diag["saiu_por_ter_sido_pedida"]) + len(diag["saiu_por_ter_saido_do_sitemap"])
+        total_entrou += len(diag["entrou"])
+        total_origem += len(diag["saiu_so_por_evidencia_de_origem"])
+        resumo["crawlers"][nome] = {
+            "antes": diag["antes"], "depois": diag["depois"],
+            "saiu_por_ter_sido_pedida": len(diag["saiu_por_ter_sido_pedida"]),
+            "saiu_so_por_evidencia_de_origem": len(diag["saiu_so_por_evidencia_de_origem"]),
+            "saiu_por_ter_saido_do_sitemap": len(diag["saiu_por_ter_saido_do_sitemap"]),
+            "entrou": len(diag["entrou"]),
+            "cobertura_paths": cobertura,
+            "cobertura_pct": round(100.0 * cobertura / total_sitemap, 2),
+            "sem_oportunidade": len(sem_oportunidade),
+            "maduras": len(nova) - len(sem_oportunidade),
+            "maturidade": baldes,
+            "serie_conferida": bloco["serie_conferida"],
+        }
+
+    documento["sitemap_total"] = total_sitemap
+    documento["refresh"] = {
+        "schema_version": REFRESH_SCHEMA,
+        "refreshed_at": agora,
+        "tool": "tools/generate-crawl-never-requested-refresh",
+        "sitemap_total_anterior": resumo["sitemap_total_anterior"],
+        "sitemap_total_agora": total_sitemap,
+        "origem_janela": resumo["origem_janela"],
+        "total_saiu": total_saiu,
+        "total_entrou": total_entrou,
+        "total_saiu_so_por_evidencia_de_origem": total_origem,
+        "crawlers_intocados": resumo["intocados"],
+        "regra": ("presenca no log da origem PROVA que a rota foi pedida; ausencia "
+                  "nao prova nada (a borda absorve com s-maxage=604800 e top_routes "
+                  "tem teto de 200 por janela). Por isso a origem so REMOVE."),
+    }
+
+    if not args.dry_run:
+        gravar(NUNCA_PEDIDAS, documento)
+
+    if args.json:
+        print(json.dumps(resumo, ensure_ascii=False, indent=1))
+        return 0
+
+    print("reconciliacao de %s" % os.path.relpath(NUNCA_PEDIDAS, ROOT))
+    print("  sitemap: %s -> %d rota(s)" % (resumo["sitemap_total_anterior"], total_sitemap))
+    print("  ledger da origem: %s -> %s (%d linha(s) invalida(s))"
+          % (origem_de, origem_ate, origem_invalidas))
+    print("  estreia conhecida para %d de %d rota(s) do sitemap"
+          % (len(set(estreia_por_rota) & sitemap), total_sitemap))
+    print()
+    print("  %-16s %7s %7s %6s %6s %6s  %8s %8s" %
+          ("crawler", "antes", "depois", "saiu", "(orig)", "entrou", "s/oport", "maduras"))
+    for nome, dados in resumo["crawlers"].items():
+        print("  %-16s %7d %7d %6d %6d %6d  %8d %8d"
+              % (nome, dados["antes"], dados["depois"],
+                 dados["saiu_por_ter_sido_pedida"] + dados["saiu_por_ter_saido_do_sitemap"],
+                 dados["saiu_so_por_evidencia_de_origem"], dados["entrou"],
+                 dados["sem_oportunidade"], dados["maduras"]))
+        print("  %-16s   cobertura=%d/%d (%.2f%%)  idade das nunca-pedidas: max=%s mediana=%s dias  sem estreia no manifesto=%d"
+              % ("", dados["cobertura_paths"], total_sitemap, dados["cobertura_pct"],
+                 dados["maturidade"]["dias_desde_estreia_max"],
+                 dados["maturidade"]["dias_desde_estreia_mediana"],
+                 dados["maturidade"]["sem_estreia_no_manifesto"]))
+        conferida = dados["serie_conferida"]
+        if conferida["divergencia_vs_estado"] not in (None, 0):
+            print("  %-16s   ! serie saneada (%s) diz %s acumuladas; estado diz %d (delta %+d)"
+                  % ("", conferida["ultima_data"], conferida["cumulative_sitemap_coverage"],
+                     dados["cobertura_paths"], conferida["divergencia_vs_estado"]))
+    for intocado in resumo["intocados"]:
+        print("  . %s intocado: %s" % (intocado["crawler"], intocado["motivo"]))
+    print()
+    print("  TOTAL saiu=%d (dos quais %d so por evidencia da origem)  entrou=%d"
+          % (total_saiu, total_origem, total_entrou))
+    print("  %s" % ("DRY-RUN: nada gravado" if args.dry_run else "gravado"))
+    return 0
+
+
+UNIT_SUGERIDA = """\
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENDAMENTO DESTA RECONCILIACAO — texto pronto, em DOIS passos.
+# Os arquivos ficam fora do conjunto desta frente (ops/systemd/), por isso o
+# texto e impresso em vez de escrito.
+#
+# PASSO 1 — terceiro ExecStart em ops/systemd/wikijuridica-crawl-coverage.service.
+# A ordem importa pelo mesmo motivo ja documentado la para o segundo ExecStart:
+# esta ferramenta CONSOME o crawl_coverage_state.json que measure-crawl-coverage
+# acabou de atualizar. Acrescentar logo apos a linha do
+# generate-time-to-first-crawl-series:
+#
+#   ExecStart=/opt/wiki/tools/generate-crawl-never-requested-refresh
+#
+# PASSO 2 — timer proprio, porque o passo 1 nao basta. A onda diaria publica as
+# 04:31 -03 (07:31 UTC), 3h21 DEPOIS do timer de cobertura (04:10 UTC): rota
+# publicada de manha so entraria na lista no dia seguinte. E o crawler pede URL o
+# dia inteiro. Rodar tres vezes ao dia nao custa cota de API nenhuma — a
+# reconciliacao e 100% local (sitemap em disco + estado + ledger da origem) e
+# levou 1,0 s medido sobre 10.336 rotas e 10 crawlers.
+
+# ── ops/systemd/wikijuridica-never-requested-refresh.service ─────────────────
+[Unit]
+Description=WikiJuridica - reconcilia a lista de URLs nunca pedidas com o disco
+After=network-online.target
+# Falha aqui e instrumento quebrado (exit 2), nunca veredito: a ferramenta sai 0
+# mesmo achando deriva, de proposito, para nao treinar o dono a ignorar alarme.
+OnFailure=wikijuridica-alerta@%N.service
+
+[Service]
+Type=oneshot
+User=rafael
+WorkingDirectory=/opt/wiki
+ExecStart=/opt/wiki/tools/generate-crawl-never-requested-refresh
+Nice=19
+
+[Install]
+WantedBy=multi-user.target
+
+# ── ops/systemd/wikijuridica-never-requested-refresh.timer ───────────────────
+[Unit]
+Description=WikiJuridica - reconcilia as URLs nunca pedidas tres vezes ao dia
+
+[Timer]
+# 09:00 UTC pega a onda editorial (07:31 UTC) ja publicada; 15:00 e 21:00 pegam
+# o rastreio do meio e do fim do dia. Persistent recupera a execucao perdida.
+OnCalendar=*-*-* 09:00,15:00,21:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+Unit=wikijuridica-never-requested-refresh.service
+
+[Install]
+WantedBy=timers.target
+
+# ── instalacao (padrao do repo: symlink de ops/systemd/) ─────────────────────
+#   sudo ln -sf /opt/wiki/ops/systemd/wikijuridica-never-requested-refresh.service \\
+#        /etc/systemd/system/
+#   sudo ln -sf /opt/wiki/ops/systemd/wikijuridica-never-requested-refresh.timer \\
+#        /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wikijuridica-never-requested-refresh.timer
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="mede e imprime, sem gravar")
+    parser.add_argument("--json", action="store_true", help="saida para consumo por script")
+    parser.add_argument("--self-test", action="store_true",
+                        help="teste de falso positivo da regra de remocao (nao grava nada)")
+    parser.add_argument("--unit", action="store_true",
+                        help="imprime o trecho de unit systemd que agenda esta reconciliacao")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if args.unit:
+        print(UNIT_SUGERIDA)
+        return 0
+    try:
+        return executar(args)
+    except NaoConsigoMedir as erro:
+        # exit 2 = NAO CONSEGUI MEDIR. Ver o cabecalho: exit 1 esta reservado a
+        # veredito, e aqui nao ha veredito nenhum a dar.
+        print("NAO CONSEGUI MEDIR: %s" % erro, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

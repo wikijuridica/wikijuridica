@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""generate-funil-de-maquina — série diária do FUNIL das portas de máquina.
+
+POR QUE EXISTE. O mandato AI-first (§12 do contrato) diz que a métrica que vale
+é retorno e uso POR AGENTE, não cobertura de rastreio. O portal tem quatro
+portas de máquina — `/mcp`, `/a2a/v1`, `/api/v1/*` e a gêmea Markdown — e até
+2026-09-11 nenhuma série dizia o que acontece DENTRO delas. O ledger de acesso
+grava `mcp_method` e `mcp_tool` desde 2026-09-08, e ninguém os agregava; o único
+artefato sobre consumo de MCP no repositório (`data/ops/mcp_consumo_externo.jsonl`)
+é o registro MANUAL de uma janela de 12 horas de 2026-08-13, sem produtor.
+
+O QUE ELE MEDE, e é a pergunta que faltava: de quem abre sessão (`initialize`),
+quantos leem o inventário (`tools/list`), e quantos EXERCEM alguma ferramenta
+(`tools/call`). Medido na primeira passada, janela de 2026-09-08 a 2026-09-11:
+
+    initialize   1.132      tools/list   1.044      tools/call   20
+
+Vinte. E as vinte saíram de censos de MCP (`SaSame-MCP-Audit`, `maghs`,
+`rokmcp-collector`, `cracked-ai-probe`, `Vouch-Census`), não de agente fazendo
+trabalho. A conversão inventário→uso é de 1,9%. Esse número é o estado do
+mandato AI-first, e ele não existia escrito em lugar nenhum.
+
+★ COBERTURA DO INSTRUMENTO, e é por isso que ela sai em toda linha.
+
+`mcp_method` só existe no ledger INTERNO do Go (`data/ops/access/access-*.jsonl`)
+e só a partir de 2026-09-08 — o ledger do nginx (`nginx-*.jsonl`) nunca o teve.
+Um dia anterior a essa data lê "0 tools/call" e isso NÃO significa que ninguém
+chamou ferramenta: significa que o instrumento não olhava. Por isso cada linha
+carrega `cobertura_do_instrumento` (requisições `/mcp` com o campo, sobre o
+total) e `instrumentado` (verdadeiro só acima de 50%). Série que não declara a
+própria cegueira é série que mente por omissão — nesta casa isso já custou uma
+frota de 20 réplicas de túnel dimensionada sobre janela inventada.
+
+★ O QUE FICA DE FORA DA CONTA, sempre.
+
+Aquecimento (`warming`) e sonda interna (`bot_simulation`) não são audiência e
+não entram em número nenhum — mas são CONTADOS em `descartados`, para que a
+diferença entre "não houve tráfego" e "o tráfego era nosso" continue visível.
+
+DERIVADO: função pura dos ledgers de acesso, sem estado. Regenerar, nunca
+filtrar. O arquivo inteiro se reescreve a cada passada, e o cabeçalho declara de
+quando ele é e contra que bytes — `gerado_em` mais o sha256 de cada ledger lido.
+
+Uso:
+    tools/generate-funil-de-maquina                  # regrava a série inteira
+    tools/generate-funil-de-maquina --json           # imprime, não grava
+    tools/generate-funil-de-maquina --desde 2026-09-08
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import glob
+import hashlib
+import json
+import os
+import sys
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LEDGERS = os.path.join(RAIZ, "data/ops/access")
+SAIDA = os.path.join(RAIZ, "data/ops/funil_de_maquina_daily.jsonl")
+SCHEMA = "funil_de_maquina_v1"
+
+# Os três métodos que formam o funil, na ordem em que um cliente os percorre.
+ABERTURA, INVENTARIO, USO = "initialize", "tools/list", "tools/call"
+
+
+def sha256_do_arquivo(caminho: str) -> str:
+    """Hash do arquivo, ou string VAZIA quando não deu para ler.
+
+    Vazio DIZ que não foi lido. Um hash de conteúdo vazio passaria por medição
+    válida e é a mentira que este campo existe para não contar.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(caminho, "rb") as arquivo:
+            for bloco in iter(lambda: arquivo.read(1 << 20), b""):
+                digest.update(bloco)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def porta_de(rota: str) -> str | None:
+    """Classifica a rota numa das portas de máquina, ou None se não for uma."""
+    rota = (rota or "").split("?")[0]
+    if rota == "/mcp" or rota.startswith("/mcp/"):
+        return "mcp"
+    if rota.startswith("/a2a"):
+        return "a2a"
+    if rota.startswith("/api/v1"):
+        return "api"
+    if rota.endswith("/index.md") or rota.endswith(".md"):
+        return "gemea"
+    # FEED INCREMENTAL E DESCRITOR SAO PORTA NA PRATICA (2026-09-11).
+    #
+    # `/changes.json` entrega o delta do acervo com cursor — e a rota que um
+    # agente usa para nao rebaixar o acervo inteiro — e `/.well-known/*` e onde
+    # ele descobre o que este portal oferece antes de pedir qualquer coisa.
+    # Nenhuma das duas serve leitor humano. Ficaram de fora da primeira versao
+    # por omissao, nao por criterio; quem as nomeou foi a sessao par, ao
+    # importar esta funcao e precisar declarar a divergencia no docstring dela.
+    if rota == "/changes.json":
+        return "feed"
+    if rota.startswith("/.well-known/"):
+        return "descritor"
+    return None
+
+
+class FunilDoDia:
+    """Acumulador de um dia. Um objeto por data, para o teste poder alimentar
+    linha a linha sem passar por arquivo."""
+
+    def __init__(self, dia: str):
+        self.dia = dia
+        self.portas = collections.Counter()
+        self.metodos = collections.Counter()
+        self.ferramentas = collections.Counter()
+        self.status_por_metodo = collections.defaultdict(collections.Counter)
+        self.clientes = set()
+        self.clientes_que_exerceram = set()
+        self.mcp_total = 0
+        self.mcp_com_campo = 0
+        self.descartados = collections.Counter()
+
+    def registra(self, linha: dict) -> None:
+        porta = porta_de(linha.get("path"))
+        if porta is None:
+            return
+        # Aquecimento e sonda interna NUNCA entram na conta — e são contados
+        # aqui para que "zero" não se confunda com "só nós".
+        if linha.get("warming"):
+            self.descartados["aquecimento"] += 1
+            return
+        if linha.get("bot_simulation"):
+            self.descartados["sonda_interna"] += 1
+            return
+
+        self.portas[porta] += 1
+        agente = (linha.get("user_agent") or "").strip()
+        if agente:
+            self.clientes.add(agente)
+        if porta != "mcp":
+            return
+
+        self.mcp_total += 1
+        if "mcp_method" not in linha:
+            return
+        self.mcp_com_campo += 1
+        metodo = linha.get("mcp_method") or ""
+        if not metodo:
+            return
+        self.metodos[metodo] += 1
+        self.status_por_metodo[metodo][str(linha.get("status"))] += 1
+        if metodo != USO:
+            return
+        ferramenta = linha.get("mcp_tool") or "(sem nome)"
+        self.ferramentas[ferramenta] += 1
+        if agente:
+            self.clientes_que_exerceram.add(agente)
+
+    def linha(self) -> dict:
+        cobertura = (self.mcp_com_campo / self.mcp_total) if self.mcp_total else 0.0
+        inventario = self.metodos.get(INVENTARIO, 0)
+        uso = self.metodos.get(USO, 0)
+        return {
+            "schema": SCHEMA,
+            "date": self.dia,
+            "portas": dict(sorted(self.portas.items())),
+            "metodos": dict(self.metodos.most_common()),
+            "ferramentas": dict(self.ferramentas.most_common()),
+            "status_por_metodo": {m: dict(c.most_common())
+                                  for m, c in sorted(self.status_por_metodo.items())},
+            "clientes_distintos": len(self.clientes),
+            "clientes_que_exerceram_ferramenta": len(self.clientes_que_exerceram),
+            "abertura": self.metodos.get(ABERTURA, 0),
+            "inventario": inventario,
+            "uso": uso,
+            # A conversão é o número do mandato: de quem LEU o inventário,
+            # quantos exerceram alguma ferramenta. `null` quando ninguém leu —
+            # dividir por zero e gravar 0.0 diria "ninguém converteu", que é
+            # afirmação sobre um denominador que não existe.
+            "conversao_inventario_para_uso": round(uso / inventario, 4) if inventario else None,
+            "cobertura_do_instrumento": round(cobertura, 4),
+            "instrumentado": cobertura > 0.5,
+            "descartados": dict(sorted(self.descartados.items())),
+            "counts_as_audience": False,
+        }
+
+
+def agrega(caminhos: list[str], desde: str | None = None) -> list[dict]:
+    """Percorre os ledgers e devolve uma linha por dia, ordenada."""
+    dias: dict[str, FunilDoDia] = {}
+    for caminho in sorted(caminhos):
+        dia_do_arquivo = os.path.basename(caminho).split("access-")[-1][:10]
+        if desde and dia_do_arquivo < desde:
+            continue
+        with open(caminho, encoding="utf-8", errors="replace") as arquivo:
+            for bruto in arquivo:
+                bruto = bruto.strip()
+                if not bruto:
+                    continue
+                try:
+                    linha = json.loads(bruto)
+                except ValueError:
+                    # LINHA ILEGIVEL E CONTADA, NAO DESCARTADA EM SILENCIO.
+                    #
+                    # O ledger do Go rasga: 173 linhas em 37 dias (2.386.940
+                    # lidas, 0,0072%), e elas vem em RAJADA — 65 num dia, 35 em
+                    # outro —, com uma linha cortada no meio de um campo e a
+                    # cauda reaparecendo dezenas de linhas adiante. Medido pela
+                    # sessao par em 2026-09-11; a causa continua aberta (o
+                    # escritor tem consumidor unico, mutex e O_APPEND, e o
+                    # carimbo do miolo e ANTERIOR ao da cabeca, o que um FIFO de
+                    # um escritor so nao produz).
+                    #
+                    # O dia vem do NOME DO ARQUIVO, porque a linha rasgada nao
+                    # tem carimbo legivel para dar. E a contagem tem de existir
+                    # pela mesma razao que `aquecimento` e `sonda_interna`
+                    # existem: numero que some sem rastro faz "zero" e "nao
+                    # medido" parecerem a mesma coisa, e na rajada eles somem em
+                    # bloco.
+                    dias.setdefault(dia_do_arquivo,
+                                    FunilDoDia(dia_do_arquivo)).descartados["linha_ilegivel"] += 1
+                    continue
+                # O dia vem do CARIMBO da linha, não do nome do arquivo: o
+                # ledger rotaciona por hora local e a última hora do dia cai no
+                # arquivo seguinte.
+                dia = (linha.get("ts") or "")[:10] or dia_do_arquivo
+                if desde and dia < desde:
+                    continue
+                dias.setdefault(dia, FunilDoDia(dia)).registra(linha)
+    return [dias[dia].linha() for dia in sorted(dias)]
+
+
+def cabecalho(caminhos: list[str], agora: str) -> dict:
+    fontes = []
+    for caminho in sorted(caminhos):
+        try:
+            bytes_ = os.path.getsize(caminho)
+        except OSError:
+            bytes_ = 0
+        fontes.append({
+            "caminho": os.path.relpath(caminho, RAIZ),
+            "sha256": sha256_do_arquivo(caminho),
+            "bytes": bytes_,
+        })
+    return {
+        "schema": SCHEMA + "_cabecalho",
+        "medicao": "funil das portas de maquina a partir do ledger interno do Go; "
+                   "aquecimento e sonda interna fora da conta",
+        "derivado": "funcao pura dos ledgers de acesso, sem estado; regenerar, nunca filtrar",
+        "gerado_em": agora,
+        "fontes": fontes,
+        "counts_as_audience": False,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true",
+                        help="imprime a série em vez de gravar")
+    parser.add_argument("--desde", default=None,
+                        help="primeiro dia a considerar (YYYY-MM-DD)")
+    argumentos = parser.parse_args()
+
+    caminhos = glob.glob(os.path.join(LEDGERS, "access-*.jsonl"))
+    if not caminhos:
+        print("generate-funil-de-maquina: nenhum ledger em %s" % LEDGERS, file=sys.stderr)
+        return 2
+
+    serie = agrega(caminhos, argumentos.desde)
+    agora = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    linhas = [cabecalho(caminhos, agora)] + serie
+
+    if argumentos.json:
+        for linha in linhas:
+            print(json.dumps(linha, ensure_ascii=False))
+        return 0
+
+    with open(SAIDA, "w", encoding="utf-8") as arquivo:
+        for linha in linhas:
+            arquivo.write(json.dumps(linha, ensure_ascii=False) + "\n")
+
+    ultimo = serie[-1] if serie else {}
+    print("funil de maquina: %d dia(s) gravados em %s"
+          % (len(serie), os.path.relpath(SAIDA, RAIZ)))
+    print("  ultimo dia %s: abertura %d · inventario %d · uso %d · conversao %s"
+          % (ultimo.get("date"), ultimo.get("abertura", 0), ultimo.get("inventario", 0),
+             ultimo.get("uso", 0), ultimo.get("conversao_inventario_para_uso")))
+    print("  cobertura do instrumento %.1f%% (mcp_method so existe desde 2026-09-08)"
+          % (100 * ultimo.get("cobertura_do_instrumento", 0.0)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

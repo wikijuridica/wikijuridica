@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""check-social-cache — a borda guarda resposta anônima e NUNCA guarda sessão?
+
+READ-ONLY. Não escreve arquivo nenhum.
+
+DUAS METADES, e nenhuma delas basta sozinha:
+
+  ESTRUTURAL  `cmd/check social-cache` (internal/socialborda) prova sobre a
+              configuração que a location social declara proxy_cache_bypass E
+              proxy_no_cache no mesmo cookie, que o cookie se chama `wjsession`
+              nos três lugares que o declaram, e que ele nasce com Secure,
+              Path=/ e sem Domain.
+  SERVIDA     esta sonda mede o que a borda devolve: anônimo gera MISS e depois
+              HIT; a mesma URL com cookie de sessão dá BYPASS e volta com
+              `Cache-Control: private, no-store`.
+
+POR QUE A SONDA LÊ O LOG, E NÃO UM CABEÇALHO. Este nginx não expõe
+`X-Cache-Status`: o estado do cache de origem sai apenas no access log, no campo
+`ocs=$upstream_cache_status` (formato wj_main). Inferir HIT por tempo de resposta
+seria heurística — e heurística que erra para o lado errado aprova um vazamento.
+Sem acesso de leitura ao log, o veredito é INCONCLUSIVO (exit 2), nunca verde.
+
+A URL da sonda leva um nonce em `?wj_probe=`, que entra na chave de cache
+(`$request_uri`): a medição é feita sobre uma chave nova, então ela não desaloja
+objeto quente nem depende do estado anterior da zona.
+
+exit 0 medido e correto · exit 1 medido e errado (ou gate estrutural reprovado)
+· exit 2 não foi possível medir.
+"""
+import importlib.util
+import os
+import secrets
+import sys
+import time
+
+
+def carrega_sonda():
+    """Carrega tools/social_borda_probe.py sem mexer no sys.path.
+
+    O idioma usual aqui seria `sys.path.insert(...)` seguido de import, que
+    obriga a um `# noqa: E402` — e suprimir o diagnostico em vez de resolver a
+    causa e proibido neste repositorio. Carregar por caminho explicito resolve a
+    causa: nao ha import fora de ordem para o lint reclamar.
+    """
+    caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "social_borda_probe.py")
+    spec = importlib.util.spec_from_file_location("social_borda_probe", caminho)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"nao consegui carregar {caminho}")
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+sonda = carrega_sonda()
+
+NOME = "check-social-cache"
+
+# Os três estados esperados, na ordem das três requisições da sonda.
+ESPERADO = ["MISS", "HIT", "BYPASS"]
+
+# O nome do cookie NÃO é uma segunda fonte da verdade, e sim uma consequência do
+# gate que roda logo antes desta sonda: `social-cache` reprova (código
+# social_cache_nome_inesperado) qualquer nome diferente de `wjsession` nas duas
+# declarações Go, e a sonda só chega aqui depois de ele passar. Ou seja, quando
+# esta linha executa, o repositório já provou que o cookie se chama assim.
+COOKIE_DE_SESSAO = "wjsession"
+
+
+def le_estados_do_log(nonce, tentativas=10, espera=0.3):
+    """Lê os `ocs=` das linhas do nosso nonce, em ordem.
+
+    O nginx grava com buffer, então a leitura é repetida por alguns instantes.
+    Não achar as três linhas é INCONCLUSIVO, não reprovação: pode ser buffer,
+    rotação de log ou permissão — nenhum deles é veredito sobre o cache.
+    """
+    for _ in range(tentativas):
+        try:
+            with open(sonda.ACCESS_LOG, "r", encoding="utf-8", errors="replace") as f:
+                # O log tem dezenas de MB; só o fim interessa.
+                f.seek(0, os.SEEK_END)
+                tamanho = f.tell()
+                f.seek(max(0, tamanho - 400_000))
+                linhas = [linha for linha in f.read().splitlines() if nonce in linha]
+        except PermissionError as erro:
+            return None, f"sem permissao de leitura em {sonda.ACCESS_LOG}: {erro}"
+        except OSError as erro:
+            return None, f"nao consegui ler {sonda.ACCESS_LOG}: {erro}"
+        estados = []
+        for linha in linhas:
+            for campo in linha.split():
+                if campo.startswith("ocs="):
+                    estados.append(campo[len("ocs="):])
+        if len(estados) >= len(ESPERADO):
+            return estados[:len(ESPERADO)], None
+        time.sleep(espera)
+    return None, (f"achei {len(linhas)} linha(s) do nonce no access log, esperava {len(ESPERADO)}; "
+                  "o nginx pode nao ter descarregado o buffer ainda")
+
+
+def main():
+    codigo, saida = sonda.gate_estrutural("social-cache")
+    if codigo == sonda.ERRADO:
+        print(saida.rstrip())
+        return sonda.relata(NOME, sonda.ERRADO, [
+            "o gate estrutural social-cache reprovou: a configuracao que impede o vazamento de sessao "
+            "pelo cache nao esta no lugar. A sonda nao roda porque nao ha o que medir."])
+    if codigo == sonda.INCONCLUSIVO:
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [saida.strip()])
+
+    if not sonda.escuta(sonda.PORTA_NGINX):
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [
+            f"nada escutando em 127.0.0.1:{sonda.PORTA_NGINX} (nginx do wiki): "
+            "a configuracao esta correta e o comportamento servido nao pode ser medido agora"])
+    if not sonda.escuta(sonda.PORTA_SOCIAL):
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [
+            f"nada escutando em 127.0.0.1:{sonda.PORTA_SOCIAL} (cmd/social): "
+            "sem origem viva, o cache da borda nao tem o que guardar"])
+
+    nonce = secrets.token_hex(8)
+    caminho = f"/redesocial/?wj_probe={nonce}"
+    problemas = []
+    respostas = []
+
+    for i, cookie in enumerate((None, None, f"{COOKIE_DE_SESSAO}={nonce}")):
+        cabecalhos = {"Cookie": cookie} if cookie else None
+        status, headers, erro = sonda.requisita(sonda.PORTA_NGINX, caminho, cabecalhos=cabecalhos)
+        if erro:
+            return sonda.relata(NOME, sonda.INCONCLUSIVO, [f"requisicao {i + 1} falhou: {erro}"])
+        respostas.append((status, headers))
+        # Sem esta pausa, as três requisições podem chegar ao nginx antes de a
+        # primeira ser gravada, e `proxy_cache_lock` colapsaria as duas anônimas
+        # numa só — o HIT esperado não aconteceria por corrida, não por defeito.
+        time.sleep(0.4)
+
+    estados, erro = le_estados_do_log(nonce)
+    if erro:
+        return sonda.relata(NOME, sonda.INCONCLUSIVO, [erro])
+
+    for esperado, obtido, rotulo in zip(ESPERADO, estados, ("anonima 1", "anonima 2", "com cookie de sessao")):
+        if obtido != esperado:
+            problemas.append(f"requisicao {rotulo}: o cache respondeu {obtido!r}, esperava {esperado!r}")
+
+    status_sessao, headers_sessao = respostas[2]
+    cache_control = headers_sessao.get("Cache-Control", "")
+    if "no-store" not in cache_control:
+        problemas.append(
+            f"a resposta com cookie de sessao voltou com Cache-Control {cache_control!r}: "
+            "sem no-store, qualquer camada entre a origem e o visitante pode guarda-la")
+    if status_sessao != respostas[0][0]:
+        problemas.append(
+            f"a resposta com sessao veio {status_sessao} e a anonima veio {respostas[0][0]}: "
+            "o corte por cookie nao pode mudar o status da pagina")
+
+    if problemas:
+        return sonda.relata(NOME, sonda.ERRADO, problemas)
+    return sonda.relata(NOME, sonda.OK, [
+        f"anonima: {estados[0]} depois {estados[1]}; com cookie de sessao: {estados[2]} e Cache-Control {cache_control!r}"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

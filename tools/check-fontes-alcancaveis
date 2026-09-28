@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Sonda TODAS as fontes oficiais do registry e acusa a que morreu — antes de a onda quebrar.
+
+POR QUE ESTE VIGIA EXISTE (2026-09-01)
+--------------------------------------
+O canal `diarios` ficou tres dias sem coletar porque o projeto Querido Diario
+migrou de dominio, e nos so descobrimos quando a onda diaria quebrou e um gate de
+frescor reprovou. O registry tem 58 fontes em 47 hosts externos: qualquer uma pode
+migrar, sair do ar ou trocar de esquema, e ate agora nenhuma serie olhava para
+isso. Um coletor que falha e sintoma; o vigia e o instrumento.
+
+O QUE ELE MEDE, e o que deliberadamente NAO mede
+------------------------------------------------
+Mede ALCANCE: o endereco declarado no registry responde? Nao julga o CONTEUDO —
+isso e do contrato de resposta de cada coletor (internal/sourceresolve), que sabe
+quais campos so a fonte certa tem. Aqui o veredito e mais estreito e por isso mais
+confiavel: "este endereco responde algo" contra "este endereco morreu".
+
+★ E POR QUE UM 200 NAO VIRA APROVACAO CEGA: o proprio registry documenta que "o
+host do SITE devolve 200 com o HTML do SPA para qualquer caminho". Entao 200 com
+`text/html` onde se espera dado e reportado como SUSPEITO, nao como verde.
+
+★ E POR QUE 403 NAO E FALHA: varias fontes oficiais brasileiras recusam servir o
+robots.txt ou aplicam WAF a cliente automatizado enquanto servem o conteudo
+normalmente — `data.queridodiario.ok.org.br` responde 403 no robots e serve os
+arquivos. Tratar 403 como morte encheria a serie de falso positivo e treinaria
+todo mundo a ignorar o vigia.
+
+CADENCIA E EDUCACAO COM O HOST ALHEIO: uma requisicao por HOST (nao por fonte), com
+HEAD antes de GET, e um teto de concorrencia baixo. Sondar fonte publica todo dia
+e legitimo; martelar nao e.
+
+READ-ONLY sobre o registry: mede e grava a propria serie, nunca reescreve
+content/source_registry.json. Promover endereco novo e ato deliberado com evidencia.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime
+import json
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+
+RAIZ = pathlib.Path(__file__).resolve().parent.parent
+REGISTRY = RAIZ / "content/source_registry.json"
+SERIE = RAIZ / "data/ops/fontes_alcancaveis.jsonl"
+
+# Identidade canonica do portal (CLAUDE.md secao 11): nome com "j" minusculo
+# e a URL de documentacao e /bot/, nao /sobre/ -- as duas formas antigas
+# faziam o gate check-identidade-de-saida reprovar por forma incorreta.
+AGENTE = ("Mozilla/5.0 (compatible; WikijuridicaBot/1.0; "
+          "+https://wikijuridica.com.br/bot/; verificacao-de-alcance)")
+
+# Status que NAO sao morte. 403/401/405 sao politica do host contra cliente
+# automatizado, e varias fontes oficiais os devolvem enquanto servem o conteudo.
+NAO_E_MORTE = {200, 201, 202, 204, 301, 302, 303, 307, 308, 401, 403, 405, 429}
+
+
+def coleta_enderecos() -> list[dict]:
+    dados = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    fontes: list[dict] = []
+
+    def anda(no):
+        if isinstance(no, dict):
+            if any(c in no for c in ("base_url", "research_url", "robots_url")):
+                fontes.append(no)
+            for valor in no.values():
+                anda(valor)
+        elif isinstance(no, list):
+            for valor in no:
+                anda(valor)
+
+    anda(dados)
+    return fontes
+
+
+def sonda(url: str, timeout: int) -> dict:
+    resultado = {"url": url, "status": 0, "content_type": "", "erro": ""}
+    for metodo in ("HEAD", "GET"):
+        pedido = urllib.request.Request(url, method=metodo, headers={"User-Agent": AGENTE})
+        try:
+            with urllib.request.urlopen(pedido, timeout=timeout) as resposta:
+                resultado["status"] = resposta.status
+                resultado["content_type"] = resposta.headers.get("Content-Type", "")
+                resultado["erro"] = ""
+                return resultado
+        except urllib.error.HTTPError as erro:
+            # HTTPError JA E RESPOSTA: o host esta vivo e disse nao. Isso e
+            # informacao, nao falha de alcance.
+            resultado["status"] = erro.code
+            resultado["content_type"] = erro.headers.get("Content-Type", "") if erro.headers else ""
+            resultado["erro"] = ""
+            if metodo == "HEAD" and erro.code in (405, 501):
+                continue  # host que recusa HEAD merece a chance do GET
+            return resultado
+        except Exception as erro:  # URLError, timeout, TLS, DNS
+            resultado["erro"] = f"{type(erro).__name__}: {erro}"
+    return resultado
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--timeout", type=int, default=25)
+    ap.add_argument("--concorrencia", type=int, default=6,
+                    help="teto baixo de proposito: sondar fonte publica e legitimo, martelar nao")
+    ap.add_argument("--gravar", action="store_true")
+    args = ap.parse_args()
+
+    fontes = coleta_enderecos()
+    # UMA sonda por HOST, nao por fonte: 58 fontes moram em 47 hosts, e bater duas
+    # vezes no mesmo host para medir a mesma coisa e desperdicio contra terceiro.
+    por_host: dict[str, tuple[str, str]] = {}
+    for fonte in fontes:
+        alvo = fonte.get("research_url") or fonte.get("base_url") or fonte.get("robots_url") or ""
+        if not isinstance(alvo, str) or not alvo.startswith("http"):
+            continue
+        try:
+            host = urllib.parse.urlsplit(alvo).netloc
+        except Exception:
+            continue
+        if host and host not in por_host:
+            por_host[host] = (alvo, str(fonte.get("source_id") or fonte.get("name") or "?"))
+
+    # ---- TERCEIRO ESTADO: NAO MEDI (exit 2), e nao "passou" (exit 0).
+    #
+    # Ate 2026-09-16 esta ferramenta so sabia 0 e 1. Com o registry ausente,
+    # ilegivel ou vazio, `por_host` fica vazio, NENHUM host e sondado, `mortos`
+    # fica vazio -- e a ferramenta imprimia "pass" e saia 0. Zero fonte sondada
+    # nao e "todas as fontes vivas": e a ausencia de medicao se passando pelo
+    # melhor resultado possivel, que e o precedente `piso-de-volume-nao-maior-
+    # que-zero` deste repositorio.
+    #
+    # E a unit (wikijuridica-fontes-alcancaveis.service:29) mascara exit 1, entao
+    # o unico codigo que ainda alcanca o dono e o >= 2. Para esta ferramenta a
+    # mascara apagava o unico sinal que existia.
+    if not por_host:
+        print("NAO MEDIDO: o registry nao produziu nenhum host sondavel "
+              f"({len(fontes)} fonte(s) lidas, 0 com URL http utilizavel).", file=sys.stderr)
+        print("  Isto NAO e 'todas as fontes estao vivas' — e a sonda nao ter saido do lugar.",
+              file=sys.stderr)
+        print("  Confira o registry de fontes antes de acreditar em qualquer veredito daqui.",
+              file=sys.stderr)
+        return 2
+
+    print(f"sondando {len(por_host)} host(s) de {len(fontes)} fonte(s) do registry")
+
+    achados: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concorrencia) as pool:
+        futuros = {pool.submit(sonda, url, args.timeout): (host, url, ident)
+                   for host, (url, ident) in por_host.items()}
+        for futuro in concurrent.futures.as_completed(futuros):
+            host, url, ident = futuros[futuro]
+            try:
+                resultado = futuro.result()
+            except Exception as erro:
+                resultado = {"url": url, "status": 0, "content_type": "", "erro": str(erro)}
+            resultado["host"] = host
+            resultado["source_id"] = ident
+            achados.append(resultado)
+
+    mortos = [a for a in achados if a["erro"] or a["status"] not in NAO_E_MORTE]
+    suspeitos = [a for a in achados
+                 if not a["erro"] and a["status"] == 200
+                 and "html" in a["content_type"].lower()
+                 and any(p in a["url"] for p in ("/api", "api.", ".json", "/gazettes", "/dados"))]
+
+    vivos = len(achados) - len(mortos)
+    print(f"  alcancaveis: {vivos}/{len(achados)}")
+
+    if suspeitos:
+        print(f"\n  SUSPEITOS ({len(suspeitos)}): endereco de dado respondendo HTML —")
+        print("  e o padrao do SPA que devolve 200 para qualquer caminho:")
+        for a in suspeitos[:10]:
+            print(f"      {a['host']:44s} {a['status']} {a['content_type'][:30]}")
+
+    if args.gravar:
+        SERIE.parent.mkdir(parents=True, exist_ok=True)
+        linha = {
+            "schema_version": "fontes_alcancaveis_v1",
+            "medido_em": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "hosts": len(achados),
+            "alcancaveis": vivos,
+            "mortos": [{"host": a["host"], "url": a["url"], "status": a["status"],
+                        "erro": a["erro"], "source_id": a["source_id"]} for a in mortos],
+            "suspeitos": [a["host"] for a in suspeitos],
+        }
+        with SERIE.open("a", encoding="utf-8") as saida:
+            saida.write(json.dumps(linha, ensure_ascii=False, sort_keys=True) + "\n")
+        print(f"\n  gravado em {SERIE.relative_to(RAIZ)}")
+
+    if mortos:
+        print(f"\ncheck-fontes-alcancaveis: FAIL")
+        print(f"  - {len(mortos)} host(s) de fonte oficial INALCANCAVEL:")
+        for a in sorted(mortos, key=lambda x: x["host"]):
+            motivo = a["erro"] or f"status {a['status']}"
+            print(f"      {a['host']:44s} {motivo[:70]}")
+        print("  Fonte que morre em silencio vira canal parado descoberto pela onda que quebra.")
+        print("  Se foi migracao de dominio, internal/sourceresolve resolve por contrato de")
+        print("  resposta — e a promocao do endereco novo e ato deliberado, com evidencia.")
+        return 1
+
+    print("\ncheck-fontes-alcancaveis: pass")
+    return 0
+
+
+if __name__ == "__main__":
+    import os.path
+    import urllib.parse  # noqa: E402  (usado em coleta por host)
+    # PROTECAO CRASH->2 (2026-09-16): excecao nao tratada saia 1, a unit mascara
+    # o 1 como veredito e o OnFailure ficava mudo. Ver tools/lib/saida_de_medidor.py.
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+    from saida_de_medidor import main_protegido
+
+    main_protegido(main)

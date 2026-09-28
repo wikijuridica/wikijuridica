@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""generate-curated-source-hints — aplica curadoria de fontes ao catálogo com CAS.
+
+POR QUE EXISTE (frente CURADORIA 2026-07-29): o portfolio referencia 1.711
+chaves-slug de source_hint sem entrada válida no catálogo
+(data/research/source_hint_curation_worklist_20260729.json, lane1). Elas não
+são deriváveis por fórmula (órgão regulador, resolução setorial, tema de
+tribunal): exigem pesquisa editorial. Agentes de pesquisa gravam CANDIDATOS em
+data/research/source_hint_curation/*.jsonl (metadata-only: chave, nome, URL
+oficial, anchor_claim, source_kind — NUNCA conteúdo copiado) e este gerador é
+o ÚNICO caminho que promove candidato a entrada de catálogo.
+
+O QUE VALIDA (fail-closed, nada de confiança no agente):
+  1. schema exato {hint, name, url, anchor_claim, source_kind};
+  2. hint no formato slug canônico (producer._SOURCE_HINT_ID) e source_kind
+     no enum fechado do produtor;
+  3. URL aceita por producer._canonical_official_source_url — o MESMO gate da
+     fila/escrita, nunca uma cópia driftável;
+  4. probe HTTP de metadado (HEAD, UA honesto do projeto) respondendo 200 com
+     url_effective idêntica à candidata (redirect silencioso reprova — a URL
+     registrada tem de ser a final);
+  5. duplicata divergente entre arquivos de candidatos reprova as duas;
+  6. entrada JÁ válida no catálogo nunca é sobrescrita (skip explícito);
+     entrada presente porém inválida (ex.: query URN) só é substituída por
+     candidata que passe 1-5.
+
+ESCRITA: CAS por preimagem — o digest do catálogo relido imediatamente antes
+do os.replace tem de ser o mesmo da leitura inicial; divergência aborta com
+instrução de re-rodar (nunca last-writer-wins: o resolvedor Planalto e este
+gerador podem coexistir sem se sobrescreverem em silêncio).
+
+Relatório em data/ops/source_hint_curation_apply_<data>.json (no repo; regra
+do dono 2026-07-29: produto nunca mora em /tmp).
+
+Uso:
+  tools/generate-curated-source-hints --dry-run
+  tools/generate-curated-source-hints --apply [--rate 2.0] [--limit N]
+"""
+import argparse
+import datetime
+import glob
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from tools import generate_v2_review_queue as producer  # noqa: E402
+
+CATALOG = os.path.join(ROOT, "data/editorial/v2_source_hint_catalog.json")
+CANDIDATES_GLOB = os.path.join(
+    ROOT, "data/research/source_hint_curation/*.jsonl")
+REPORT_DIR = os.path.join(ROOT, "data/ops")
+UA = "Mozilla/5.0 WikiJuridicaV2SourceProvenance/1.0 metadata-only no-content-copy"
+ROW_KEYS = {"hint", "name", "url", "anchor_claim", "source_kind"}
+
+
+def _curl(url: str, timeout: int, method_args: tuple[str, ...]) -> tuple[str, str]:
+    try:
+        out = subprocess.run(
+            ["curl", "-sS", "-o", "/dev/null", *method_args, "-L", "--max-redirs", "3",
+             "--max-time", str(timeout), "-A", UA,
+             "-w", "%{http_code} %{url_effective}", url],
+            capture_output=True, text=True, timeout=timeout + 10)
+    except subprocess.TimeoutExpired:
+        return "timeout", url
+    parts = (out.stdout or "").strip().split(" ", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return parts[0] if parts and parts[0] else "erro", url
+
+
+def probe(url: str, timeout: int = 20) -> tuple[str, str]:
+    """HEAD de metadado; devolve (http_code, url_effective).
+
+    Fallback para GET (corpo sempre descartado em /dev/null — nunca lido
+    nem armazenado, mantém a política metadata-only) quando o HEAD não
+    responde 200: achado 2026-07-30, o WAF de gov.br bloqueia HEAD com 403
+    em paths que respondem 200 normalmente a GET — sem o fallback, o gate
+    fail-closed reprovava em massa e por falso-negativo candidatos
+    gov.br válidos. Sem fallback em "timeout" (evita dobrar o pior caso
+    de espera por host realmente fora do ar).
+    """
+    code, effective = _curl(url, timeout, ("-I",))
+    if code != "200" and code != "timeout":
+        code, effective = _curl(url, timeout, ("-X", "GET"))
+    return code, effective
+
+
+def load_candidates() -> tuple[dict, list]:
+    rows, defects = {}, []
+    for path in sorted(glob.glob(CANDIDATES_GLOB)):
+        rel = os.path.relpath(path, ROOT)
+        with open(path, encoding="utf-8") as handle:
+            for line_number, raw in enumerate(handle, 1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                where = f"{rel}:{line_number}"
+                try:
+                    row = json.loads(raw)
+                except ValueError as error:
+                    defects.append({"onde": where, "defeito": f"JSON inválido: {error}"})
+                    continue
+                if not isinstance(row, dict):
+                    defects.append({"onde": where, "defeito": "linha não é objeto"})
+                    continue
+                if row.get("unresolved") is True:
+                    # Pulo honesto do pesquisador: registrado, nunca aplicado.
+                    continue
+                if "freetext_key" in row:
+                    # Linha da quarentena de chaves texto-livre (mesmo dir):
+                    # nao e candidato — vira entrada so quando o normalizador
+                    # lane2 mapear o texto-livre para slug canonico.
+                    continue
+                if set(row) != ROW_KEYS:
+                    defects.append({
+                        "onde": where,
+                        "defeito": f"schema divergente: {sorted(row)} != {sorted(ROW_KEYS)}"})
+                    continue
+                hint = row["hint"]
+                if hint in rows and rows[hint][0] != row:
+                    defects.append({
+                        "onde": where,
+                        "defeito": f"candidatos divergentes para {hint!r} "
+                                   f"(também em {rows[hint][1]}) — ambos reprovados"})
+                    rows[hint] = (None, where)
+                    continue
+                if hint not in rows:
+                    rows[hint] = (row, where)
+    return {h: rw for h, (rw, _) in rows.items() if rw is not None}, defects
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--rate", type=float, default=2.0,
+                        help="probes por segundo")
+    parser.add_argument("--limit", type=int, default=0)
+    args = parser.parse_args()
+    if args.apply == bool(args.dry_run):
+        parser.error("use exatamente um de --apply / --dry-run")
+    intervalo = 1.0 / args.rate if args.rate > 0 else 0.0
+
+    with open(CATALOG, "rb") as handle:
+        catalog_bytes = handle.read()
+    catalog_digest = hashlib.sha256(catalog_bytes).hexdigest()
+    catalog = json.loads(catalog_bytes)
+    hints = catalog["source_hints"]
+
+    candidates, defects = load_candidates()
+    aceitos, reprovados, ja_cobertos = {}, [], []
+    testados = 0
+    for hint, row in sorted(candidates.items()):
+        if args.limit and testados >= args.limit:
+            break
+        existing = hints.get(hint)
+        if isinstance(existing, dict) and producer._canonical_official_source_url(
+                existing.get("url")):
+            ja_cobertos.append(hint)
+            continue
+        if producer._SOURCE_HINT_ID.fullmatch(hint) is None:
+            reprovados.append({"hint": hint, "motivo": "hint fora do formato slug"})
+            continue
+        if row["source_kind"] not in producer._CATALOG_SOURCE_KINDS:
+            reprovados.append({"hint": hint, "motivo": "source_kind fora do enum"})
+            continue
+        ok_texts = all(
+            isinstance(row[field], str) and row[field] and
+            row[field] == row[field].strip()
+            for field in ("name", "url", "anchor_claim"))
+        if not ok_texts:
+            reprovados.append({"hint": hint, "motivo": "campo textual não canônico"})
+            continue
+        if not producer._canonical_official_source_url(row["url"]):
+            reprovados.append({
+                "hint": hint,
+                "motivo": "URL reprovada pelo gate canônico "
+                          "(exige host oficial + path documental específico)",
+                "url": row["url"]})
+            continue
+        testados += 1
+        code, effective = probe(row["url"])
+        if intervalo:
+            time.sleep(intervalo)
+        if code != "200":
+            reprovados.append({
+                "hint": hint, "motivo": f"probe HTTP {code}", "url": row["url"]})
+            continue
+        if effective != row["url"]:
+            reprovados.append({
+                "hint": hint,
+                "motivo": "redirect: URL final difere da candidata — registre a final",
+                "url": row["url"], "url_effective": effective})
+            continue
+        aceitos[hint] = {
+            "name": row["name"], "url": row["url"],
+            "anchor_claim": row["anchor_claim"],
+            "source_kind": row["source_kind"]}
+
+    hoje = datetime.date.today().strftime("%Y%m%d")
+    report_path = os.path.join(
+        REPORT_DIR, f"source_hint_curation_apply_{hoje}.json")
+    report = {
+        "gerado_em": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds"),
+        "modo": "apply" if args.apply else "dry-run",
+        "candidatos": len(candidates),
+        "aceitos": sorted(aceitos),
+        "ja_cobertos": sorted(ja_cobertos),
+        "reprovados": reprovados,
+        "defeitos_de_arquivo": defects,
+    }
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=1, sort_keys=True)
+        handle.write("\n")
+    print(f"candidatos={len(candidates)} aceitos={len(aceitos)} "
+          f"ja_cobertos={len(ja_cobertos)} reprovados={len(reprovados)} "
+          f"defeitos={len(defects)}")
+    print(f"relatorio: {os.path.relpath(report_path, ROOT)}")
+
+    if not args.apply or not aceitos:
+        return 0
+    hints.update(aceitos)
+    with open(CATALOG, "rb") as handle:
+        recheck = hashlib.sha256(handle.read()).hexdigest()
+    if recheck != catalog_digest:
+        print("generate-curated-source-hints: catálogo mudou durante a "
+              "execução (outro produtor escreveu). NADA foi gravado — "
+              "re-rode para recalcular sobre a versão nova.", file=sys.stderr)
+        return 3
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(CATALOG), prefix=".curated-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(catalog, handle, ensure_ascii=False, indent=2,
+                      sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, CATALOG)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    print(f"catalogo atualizado: +{len(aceitos)} entradas curadas")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

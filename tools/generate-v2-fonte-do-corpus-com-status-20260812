@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""generate-v2-fonte-do-corpus-com-status-20260812 — a fonte do corpus nascia sem o status HTTP, e o ingest a recusava.
+
+O DEFEITO, medido. `generate-v2-second-official-source-from-corpus-20260806`
+registrou a lei que a página já citava como segunda fonte oficial e resolveu o
+`official_sources_insufficient` de 170 páginas — mas montou a fonte sem o campo
+`http_status`. O ingest só aceita 200, 203 ou 206 (internal/v2ingest/validate.go
+:686, `officialSourceHTTPStatusAllowed`), e ausência vale zero. Resultado medido
+em `data/ops/v2_ingest_report.jsonl` (run v2-ingest-20260812T100000Z):
+
+  305 fontes gravadas sem `http_status`
+  283 páginas rejeitadas por `official_source_http_status_invalid:status=0`
+  104 delas rejeitadas SÓ por isso
+
+Ou seja: o lote anterior trocou uma classe de rejeição por outra em vez de
+libertar a página. Repetir aquele gerador como está cunharia mais rejeições da
+mesma classe.
+
+O QUE ESTE GERADOR FAZ, nas duas pontas do mesmo defeito:
+
+  BACKFILL  — grava `http_status` nas fontes já escritas que nasceram sem ele,
+              usando o código HTTP REALMENTE observado hoje.
+  NOVAS     — registra a segunda fonte das páginas comerciais que ainda têm uma
+              só, já com o campo completo.
+
+DE ONDE VEM O STATUS. De observação, nunca de inferência: `generate-legal-corpus
+-live-verification-20260812` fez uma requisição por diploma confiável do corpus,
+com pausa entre elas, e gravou em `data/source-audit/legal_corpus_live_
+verification_20260812.json` o código real, a data real e o SHA-256 do documento
+de hoje. Só entra fonte cuja URL respondeu 200 nessa conferência, e `verified_at`
+recebe a data dessa conferência — que é quando a URL foi, de fato, verificada.
+
+A GUARDA DE HONESTIDADE. O `anchor_claim` é o texto do dispositivo lido na
+coleta do corpus. Se o documento de hoje difere do indexado, a conferência
+listou quais artigos mudaram de redação: esses artigos são PULADOS, não
+"corrigidos" às cegas. Ancorar em redação que a fonte já não tem seria evidência
+falsa, e é a mesma falha do caso l9099 art. 61 que motivou o campo
+`confiavel_para_acusar_divergencia` no corpus.
+
+A CITAÇÃO É LIDA DO CORPO VIVO, não de inventário. O plano do gerador anterior
+saía de `data/ops/citation_inventory.jsonl`, um retrato de outra data; entre a
+foto e a escrita a página pode ter sido reescrita, e registrar proveniência de
+citação que a página já não faz é defeito de evidência. Aqui o extrator de
+citações (`tools/generate-citation-inventory`, reaproveitado como módulo) roda
+sobre o corpo do registro que está sendo escrito, na mesma passada do CAS.
+
+O CRITÉRIO NÃO AFROUXA. Continua valendo, palavra por palavra: faixa comercial
+com exatamente uma fonte; a frase nomeia o diploma EXPLICITAMENTE depois do
+artigo, na forma possessiva (nunca inferência por proximidade); o diploma está
+no corpus com `confiavel_para_acusar_divergencia`; o artigo existe no diploma; a
+URL ainda não está entre as fontes da página. Referência anafórica ("o art. 6º",
+"do mesmo decreto-lei") continua recusada — é o que separa proveniência de
+chute.
+
+CONTRATO DE ESCRITA: lease de época do estoque canônico, lock exclusivo, CAS
+pelo sha256 da LINHA viva, páginas sob supersessão PULADAS, word_count
+reconferido pela fórmula do ingest, escrita atômica com fsync, idempotente.
+NÃO commita e NÃO republica.
+
+Uso:
+    tools/generate-v2-fonte-do-corpus-com-status-20260812 --dry-run
+    tools/generate-v2-fonte-do-corpus-com-status-20260812 --limite 60
+    tools/generate-v2-fonte-do-corpus-com-status-20260812 --apenas-backfill
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if os.fspath(ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(ROOT))
+
+from tools.v2_stock_epoch import StockEpochBusy, canonical_stock_write_lease
+
+LOCK = ROOT / "data/editorial/.fonte-do-corpus-com-status-20260812.lock"
+SHARDS = ROOT / "data/editorial/v2_pages"
+CONFERENCIA = ROOT / "data/source-audit/legal_corpus_live_verification_20260812.json"
+CONFERENCIA_URLS = ROOT / "data/source-audit/source_url_live_verification_20260812.json"
+STATUS_ACEITOS = (200, 203, 206)
+DATA_MINIMA_VALIDA = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def carregar_modulo(nome, caminho):
+    spec = importlib.util.spec_from_loader(
+        nome, importlib.machinery.SourceFileLoader(nome, os.fspath(caminho)))
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
+
+
+BASE = carregar_modulo("g20260806",
+                       ROOT / "tools/generate-v2-second-official-source-from-corpus-20260806")
+GCI = carregar_modulo("gci", ROOT / "tools/generate-citation-inventory")
+
+
+def carregar_conferencia():
+    """URL -> observação viva. Só o que respondeu status aceito entra."""
+    with open(CONFERENCIA, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    por_url, por_slug = {}, {}
+    for slug, registro in dados["diplomas"].items():
+        if registro.get("http_status") not in STATUS_ACEITOS:
+            continue
+        registro = dict(registro, artigos_alterados=set(
+            registro.get("artigos_com_texto_alterado") or []))
+        por_url[registro["url"]] = registro
+        por_slug[slug] = registro
+    return por_url, por_slug
+
+
+def carregar_conferencia_de_urls():
+    """URL de fonte já gravada -> observação viva. Sem texto de lei para comparar,
+    entra só o código HTTP; o `verified_at` existente é preservado quando válido."""
+    if not CONFERENCIA_URLS.exists():
+        return {}
+    with open(CONFERENCIA_URLS, encoding="utf-8") as handle:
+        dados = json.load(handle)
+    return {url: registro for url, registro in dados["urls"].items()
+            if registro.get("http_status") in STATUS_ACEITOS}
+
+
+def corpo_para_extrator(registro):
+    """Forma do shard -> forma que `generate-citation-inventory` lê."""
+    return {
+        "summary": registro.get("opening"),
+        "body_sections": [{"title": s.get("heading"), "body": s.get("text")}
+                          for s in registro.get("sections") or []],
+        "faq": [{"question": i.get("q"), "answer": i.get("a")}
+                for i in registro.get("faq") or []],
+    }
+
+
+ARTIGO_NO_NOME = re.compile(r"art\.\s*([\d.]+(?:-[A-Za-z])?)", re.IGNORECASE)
+
+
+def artigo_do_nome(nome):
+    achado = ARTIGO_NO_NOME.search(nome or "")
+    return achado.group(1).replace(".", "").upper() if achado else ""
+
+
+def escolher_fonte(registro, corpus, por_slug, motivos):
+    """A lei que ESTE corpo cita explicitamente, e que a conferência viva sustenta.
+
+    Quando o diploma mais citado é justamente o da fonte que a página já tem, o
+    candidato seguinte assume. Não é afrouxamento: cada candidato passou pelo
+    mesmo critério estrito — o que muda é só a ordem de escolha, e registrar de
+    novo a URL que já está lá não tiraria página nenhuma de fonte única.
+    """
+    contagem = collections.Counter()
+    artigo_de = {}
+    for citacao in GCI.extract(corpo_para_extrator(registro)):
+        diploma = citacao.get("diploma")
+        if not diploma or diploma not in corpus:
+            motivos["diploma_fora_do_corpus_confiavel"] += 1
+            continue
+        if diploma not in por_slug:
+            motivos["url_do_diploma_sem_conferencia_viva"] += 1
+            continue
+        artigo = (citacao.get("article") or "").replace(".", "").upper()
+        if not artigo or artigo not in corpus[diploma]["articles"]:
+            motivos["artigo_ausente_no_corpus"] += 1
+            continue
+        if artigo in por_slug[diploma]["artigos_alterados"]:
+            motivos["artigo_mudou_de_redacao_desde_a_coleta"] += 1
+            continue
+        if not BASE.diploma_explicito(GCI, citacao.get("claim") or "",
+                                      citacao.get("article") or ""):
+            motivos["citacao_nao_nomeia_o_diploma"] += 1
+            continue
+        contagem[diploma] += 1
+        artigo_de.setdefault(diploma, citacao.get("article"))
+    if not contagem:
+        return None
+    ja_registradas = {(s.get("url") or "").strip()
+                      for s in registro.get("official_sources") or []}
+    for diploma, _ in contagem.most_common():
+        fonte = montar_fonte(corpus, por_slug, diploma, artigo_de[diploma])
+        if fonte["url"] in ja_registradas:
+            motivos["url_ja_registrada_na_pagina"] += 1
+            continue
+        return fonte
+    return None
+
+
+def montar_fonte(corpus, por_slug, diploma, artigo):
+    fonte = BASE.montar_fonte(corpus, diploma, artigo)
+    observacao = por_slug[diploma]
+    fonte["http_status"] = observacao["http_status"]
+    fonte["verified_at"] = observacao["consultado_em"]
+    return fonte
+
+
+def backfill(registro, por_url, por_url_extra, motivos):
+    """Completa a fonte que nasceu sem `http_status`. Devolve True se mudou.
+
+    Duas origens de observação, com guardas diferentes: a URL que é diploma do
+    corpus tem o texto do artigo conferido hoje, e por isso o `verified_at` é
+    reescrito com a data da conferência; a URL que só foi requisitada tem
+    apenas disponibilidade comprovada, e aí o `verified_at` existente e válido
+    é PRESERVADO — sobrescrevê-lo alegaria uma verificação que não foi essa.
+    """
+    mudou = False
+    for fonte in registro.get("official_sources") or []:
+        if fonte.get("http_status") in STATUS_ACEITOS:
+            continue
+        url = (fonte.get("url") or "").strip()
+        observacao = por_url.get(url)
+        if observacao:
+            artigo = artigo_do_nome(fonte.get("name"))
+            if artigo and artigo in observacao["artigos_alterados"]:
+                motivos["backfill_artigo_mudou_de_redacao"] += 1
+                continue
+            fonte["http_status"] = observacao["http_status"]
+            fonte["verified_at"] = observacao["consultado_em"]
+            mudou = True
+            continue
+        observacao = por_url_extra.get(url)
+        if not observacao:
+            motivos["backfill_url_sem_conferencia_viva"] += 1
+            continue
+        fonte["http_status"] = observacao["http_status"]
+        if not DATA_MINIMA_VALIDA.match((fonte.get("verified_at") or "").strip()):
+            fonte["verified_at"] = observacao["consultado_em"]
+        mudou = True
+    return mudou
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limite", type=int, default=0,
+                        help="trata só as N primeiras páginas de fonte nova")
+    parser.add_argument("--apenas-backfill", action="store_true")
+    args = parser.parse_args()
+
+    corpus = BASE.carregar_corpus()
+    protegidos = BASE.intents_protegidos()
+    por_url, por_slug = carregar_conferencia()
+    por_url_extra = carregar_conferencia_de_urls()
+    print(f"corpus confiável        : {len(corpus)} diplomas")
+    print(f"conferidos vivos hoje   : {len(por_slug)} diplomas com status aceito")
+    print(f"URLs de fonte conferidas: {len(por_url_extra)} com status aceito")
+    print(f"intents sob supersessão : {len(protegidos)}")
+
+    motivos = collections.Counter()
+    backfilled = novas = 0
+    paginas_backfill = paginas_novas = 0
+    exemplos = []
+    try:
+        with canonical_stock_write_lease(ROOT):
+            with BASE.exclusive_lock(LOCK):
+                for caminho_texto in sorted(glob.glob(os.fspath(SHARDS / "*.jsonl"))):
+                    caminho = Path(caminho_texto)
+                    linhas = caminho.read_bytes().decode("utf-8").split("\n")
+                    fim_com_newline = bool(linhas) and linhas[-1] == ""
+                    if fim_com_newline:
+                        linhas = linhas[:-1]
+                    saida, mudou_shard = [], False
+                    for numero, raw in enumerate(linhas, 1):
+                        if not raw.strip():
+                            saida.append(raw)
+                            continue
+                        registro = json.loads(raw)
+                        intent = registro.get("intent_id")
+                        if intent in protegidos:
+                            motivos["pagina_sob_supersessao"] += 1
+                            saida.append(raw)
+                            continue
+
+                        mudou_linha = backfill(registro, por_url, por_url_extra, motivos)
+                        if mudou_linha:
+                            paginas_backfill += 1
+                            backfilled += 1
+
+                        fontes = registro.get("official_sources") or []
+                        elegivel = (registro.get("lane") == "comercial"
+                                    and len(fontes) == 1
+                                    and not args.apenas_backfill
+                                    and (not args.limite or paginas_novas < args.limite))
+                        if elegivel:
+                            fonte = escolher_fonte(registro, corpus, por_slug, motivos)
+                            if fonte is None:
+                                motivos["pagina_sem_citacao_aproveitavel"] += 1
+                            elif any((s.get("url") or "") == fonte["url"] for s in fontes):
+                                motivos["url_ja_registrada_na_pagina"] += 1
+                            elif not fonte["anchor_claim"]:
+                                motivos["dispositivo_sem_texto_no_corpus"] += 1
+                            else:
+                                registro["official_sources"] = fontes + [fonte]
+                                paginas_novas += 1
+                                novas += 1
+                                mudou_linha = True
+                                if len(exemplos) < 12:
+                                    exemplos.append((intent, fonte))
+                                print(f"  {intent} <- {fonte['name']}")
+
+                        if not mudou_linha:
+                            saida.append(raw)
+                            continue
+
+                        registro["word_count"] = BASE.word_count(registro)
+                        digest_antes = hashlib.sha256(raw.strip().encode("utf-8")).hexdigest()
+                        atual = hashlib.sha256(
+                            caminho.read_bytes().decode("utf-8").split("\n")[numero - 1]
+                            .strip().encode("utf-8")).hexdigest()
+                        if atual != digest_antes:
+                            raise SystemExit(
+                                f"CAS DE LINHA FALHOU em {caminho.name}:{numero} ({intent})")
+                        saida.append(json.dumps(registro, ensure_ascii=False, sort_keys=True))
+                        mudou_shard = True
+                    if mudou_shard and not args.dry_run:
+                        payload = "\n".join(saida) + ("\n" if fim_com_newline else "")
+                        BASE.atomic_write(caminho, payload.encode("utf-8"))
+    except StockEpochBusy as erro:
+        print(f"estoque canônico ocupado por outra frente: {erro}", file=sys.stderr)
+        return 75
+
+    print(f"\nstatus HTTP preenchido em : {backfilled} páginas")
+    print(f"segunda fonte registrada em: {novas} páginas")
+    print("\nmotivos (por citação ou por página, conforme a linha):")
+    for chave, valor in motivos.most_common():
+        print(f"  {chave:42s} {valor}")
+    if exemplos:
+        print("\namostra do que foi escrito:")
+        for intent, fonte in exemplos[:5]:
+            print(f"  {intent}\n    {fonte['name']} | {fonte['url']}")
+            print(f"    verificado {fonte['verified_at']} HTTP {fonte['http_status']}")
+            print(f"    âncora: {fonte['anchor_claim'][:150]}")
+    if args.dry_run:
+        print("\n--dry-run: nada escrito.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

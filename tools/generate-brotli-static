@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""generate-brotli-static — pré-comprime o acervo para o `brotli_static` do nginx.
+
+O DEFEITO, medido em 2026-08-26: o nginx declara `brotli_static on` e NÃO EXISTE
+UM ÚNICO arquivo `.br` em disco — zero, contra 10.298 HTMLs. A diretiva manda
+servir a versão pré-comprimida quando ela existe; sem nenhuma, o nginx recomprime
+CADA resposta, a cada requisição, para sempre.
+
+TRÊS GANHOS, os três medidos e não estimados:
+
+  1. BYTES NA REDE. A compressão dinâmica usa q5 por padrão (custo por
+     requisição), a estática pode usar q11 (custo uma vez). Numa página de
+     acervo de 25.319 bytes: q5 devolve 7.665 e q11 devolve 6.972 — 9,0% a
+     menos, em toda requisição de todo bot, para sempre.
+
+  2. CPU POR REQUISIÇÃO VAI A ZERO. Hoje o nginx comprime 10.298 páginas a cada
+     varredura de crawler. Com o `.br` em disco ele lê o arquivo.
+
+  3. O ETag VOLTA A SER FORTE — e este é o ganho que importa para bot. Medido:
+     com brotli dinâmico o nginx serve `ETag: W/"6a73ce80-62e7"`. O `W/` é
+     validador FRACO, porque o filtro de compressão alterou o corpo depois de o
+     ETag ter sido calculado. Servindo o arquivo `.br` de disco, o ETag é do
+     arquivo servido e volta a ser forte. Sem isso, `If-None-Match` é comparação
+     fraca e a revalidação perde precisão exatamente no canal que mais a usa.
+
+CUSTO: ~80 ms por arquivo em q11, ~14 minutos de CPU para o acervo inteiro. Uma
+vez, no build — não por requisição. `--jobs` paraleliza.
+
+IDEMPOTENTE: só recomprime quando o `.html` é mais novo que o `.br`. Rodar de
+novo logo depois não faz trabalho nenhum.
+
+Uso:
+    tools/generate-brotli-static --dry-run
+    tools/generate-brotli-static
+    tools/generate-brotli-static --jobs 4 --limite 100
+"""
+
+import argparse
+import concurrent.futures
+import fcntl
+import os
+import subprocess
+import sys
+import time
+
+RAIZ = os.environ.get("WIKI_ROOT", "/opt/wiki")
+PUBLIC = os.path.join(RAIZ, "public")
+BROTLI = "/usr/bin/brotli"
+# Tipos que o nginx serve de disco e que valem a pena pré-comprimir. Imagem e
+# fonte ficam de fora: já são comprimidas, e recomprimir gasta CPU para nada.
+# `.css` desde 2026-09-03: a folha de estilo externa (public/assets/wj-<hash>.css)
+# é servida do disco como qualquer outro estático, e `brotli_static` só entrega
+# o `.br` que existir.
+EXTENSOES = (".html", ".xml", ".txt", ".json", ".md", ".css")
+# Abaixo disto o overhead do brotli come o ganho, e o nginx serviria o .br maior
+# que o original.
+MINIMO_BYTES = 1024
+
+
+def alvos(limite=0):
+    saida = []
+    for raiz, _dirs, arquivos in os.walk(PUBLIC):
+        for nome in arquivos:
+            if not nome.endswith(EXTENSOES):
+                continue
+            caminho = os.path.join(raiz, nome)
+            try:
+                if os.path.getsize(caminho) < MINIMO_BYTES:
+                    continue
+            except OSError:
+                continue
+            saida.append(caminho)
+            if limite and len(saida) >= limite:
+                return sorted(saida)
+    return sorted(saida)
+
+
+def precisa(caminho):
+    """Recomprime quando o `.br` DIVERGE do fonte -- em qualquer direção.
+
+    ERA `>` ATÉ 2026-08-28, E ISSO ERA UM ALÇAPÃO. Com `>`, o `.br` só era
+    refeito quando o fonte ficava MAIS NOVO. Mas a correção do carimbo de
+    `reviewed_at` faz o mtime do acervo RETROCEDER (de 28/08 para a data
+    editorial real), e nesse instante `fonte > br` vira falso para as 10.340
+    rotas: o `.br` nunca mais seria regenerado e passaria a servir, para sempre,
+    o conteúdo do dia do carimbo -- justamente no caminho que o Googlebot usa,
+    porque ele manda `Accept-Encoding: br`.
+
+    `!=` cobre as duas direções. E é o que torna seguro remover o `+1` do
+    `os.utime` lá embaixo: o desvio de 1 segundo existia SÓ para satisfazer o
+    `>`, e era ele que fazia o ETag do `.br` divergir do ETag do identity em
+    100% dos 10.340 pares (medido em 2026-08-28), matando o 304 sempre que a
+    borda ia à origem.
+
+    As duas metades são uma correção só e não podem ser separadas: com `!=` e
+    `+1`, todo par ficaria eternamente divergente e o gerador recomprimiria o
+    acervo inteiro a cada execução.
+    """
+    br = caminho + ".br"
+    if not os.path.exists(br):
+        return True
+    try:
+        return os.path.getmtime(caminho) != os.path.getmtime(br)
+    except OSError:
+        return True
+
+
+def poda(limite=0):
+    """Apaga todo `.br` que MENTE, e faz isso ANTES de comprimir qualquer coisa.
+
+    POR QUE ANTES, e não depois: `brotli_static on` serve o `.br` sem comparar
+    frescor nenhum com o fonte. Quem pede `Accept-Encoding: br` — e a Cloudflare
+    pede, medido byte a byte no access log — recebe o corpo do `.br`, seja ele de
+    quando for. Um `.br` velho ao lado de um HTML novo não é lentidão: é o portal
+    servindo conteúdo errado, em silêncio, para o cliente que mais importa.
+
+    A ordem é a defesa. Comprimir primeiro e podar depois deixaria uma janela em
+    que a morte do processo (SIGTERM do systemd, timeout, disco cheio) congela o
+    `.br` velho no ar por tempo indeterminado. Podando primeiro, o pior caso vira
+    AUSÊNCIA de `.br` — e ausência o nginx resolve sozinho comprimindo em q5, que
+    é mais lento e está CORRETO. Errado e rápido é pior que certo e lento.
+
+    Duas classes são podadas, e a segunda é a que quase ninguém enxerga:
+
+      STALE   — `.br` mais velho que o fonte. É o caso que a onda diária cria
+                toda madrugada ao reescrever `index.html`, `feed.xml`, `rss.xml`
+                e os sitemaps sem tocar nas gêmeas comprimidas.
+
+      ÓRFÃO   — `.br` cujo fonte não existe mais. Com `brotli_static on` o nginx
+                procura `$uri.br` por conta própria, então um órfão RESSUSCITA
+                uma página que foi retirada do ar — justamente o que a coerência
+                de artefato (`public/` ⊆ sitemap ⊆ manifesto) existe para impedir.
+                Página despublicada que volta a responder 200 pelo caminho
+                comprimido é defeito de primeira ordem, não sobra de disco.
+    """
+    stale, orfaos = [], []
+    for raiz, _dirs, arquivos in os.walk(PUBLIC):
+        for nome in arquivos:
+            if not nome.endswith(".br"):
+                continue
+            br = os.path.join(raiz, nome)
+            fonte = br[:-3]
+            try:
+                if not os.path.exists(fonte):
+                    orfaos.append(br)
+                elif os.path.getmtime(br) != os.path.getmtime(fonte):
+                    stale.append(br)
+            except OSError:
+                orfaos.append(br)
+            if limite and len(stale) + len(orfaos) >= limite:
+                break
+    return sorted(stale), sorted(orfaos)
+
+
+def comprime(caminho):
+    """Devolve (ok, bytes_originais, bytes_comprimidos, erro)."""
+    br = caminho + ".br"
+    tmp = br + ".tmp"
+    try:
+        with open(tmp, "wb") as saida:
+            r = subprocess.run([BROTLI, "-q", "11", "-c", caminho],
+                               stdout=saida, stderr=subprocess.PIPE, timeout=120)
+        if r.returncode != 0:
+            os.unlink(tmp)
+            return False, 0, 0, (r.stderr or b"").decode("utf-8", "replace")[:120]
+        orig = os.path.getsize(caminho)
+        novo = os.path.getsize(tmp)
+        # Comprimido MAIOR que o original: servir isso seria regressão. O nginx
+        # cairia no .br por causa do brotli_static e mandaria mais bytes.
+        if novo >= orig:
+            os.unlink(tmp)
+            return True, orig, orig, ""
+        # ESPELHAMENTO EXATO do mtime do fonte -- nem +1, nem arredondamento.
+        #
+        # O `+1` que estava aqui existia para satisfazer o `>` de `precisa()`.
+        # Com `!=` lá em cima ele deixou de ser necessário, e mantê-lo seria
+        # pior: era ele que dava ao `.br` um `Last-Modified` e um ETag próprios,
+        # divergentes do identity em 100% dos 10.340 pares. O Googlebot que
+        # revalidava com o validador de uma variante e recebia outra levava o
+        # corpo inteiro em vez de 304.
+        os.replace(tmp, br)
+        st = os.stat(caminho)
+        os.utime(br, (st.st_atime, st.st_mtime))
+        return True, orig, novo, ""
+    except Exception as e:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False, 0, 0, str(e)[:120]
+
+
+# UMA EXECUÇÃO POR VEZ. Sem isto, duas se atropelam no mesmo arquivo temporário:
+# ambas escrevem `X.html.br.tmp`, a primeira faz `os.replace` e a segunda encontra
+# o tmp que ela mesma criou já consumido — `No such file or directory`.
+#
+# Medido em 2026-08-26: rodei o gerador em background, ele foi cortado por timeout
+# do harness, e eu disparei o segundo destacado sem verificar se o primeiro tinha
+# morrido de verdade. Os dois conviveram e colidiram 5 vezes. O resultado
+# final ficou correto — cobertura 100%, zero stale —, mas por sorte: a corrida
+# podia ter deixado um `.br` truncado se o `os.replace` de um caísse no meio da
+# escrita do outro.
+#
+# QUEM CHEGA DEPOIS ESPERA — NÃO SAI FINGINDO QUE ESTÁ FEITO.
+#
+# Até 2026-08-27 este bloco fazia `flock` não-bloqueante e `return 0`, com a
+# justificativa de que "a outra execução vai fazer exatamente o mesmo trabalho".
+# A justificativa é FALSA e custou caro. Quem detém o lock enumerou os arquivos
+# quando COMEÇOU; se o `publish-v2-direct` reescreveu HTMLs depois disso, o
+# snapshot dela é anterior aos bytes novos e as gêmeas `.br` daquelas páginas
+# ficam velhas. Como `brotli_static on` serve `$uri.br` sem comparar frescor,
+# o resultado é corpo ANTIGO com 200 e ETag válido, distribuído pela Cloudflare.
+#
+# Medido em 2026-08-27: 4 arquivos `index.html.br.tmp` de 0 byte às 07:17 (restos
+# da corrida) e cobertura de 7,0% (724 gêmeas de 10.406 comprimíveis).
+#
+# Esperar é barato: a execução que detém o lock já comprimiu quase tudo, então o
+# segundo passe só pega o que mudou depois dela. Esperar e recomprimir custa
+# segundos; servir corpo velho custa indexação.
+TRAVA = "/tmp/opt-wiki-brotli-static.lock"
+ESPERA_MAXIMA_S = 900
+
+
+def adquire_trava(trava, limite_s: int = ESPERA_MAXIMA_S) -> bool:
+    """Bloqueia até obter o lock. Devolve False se estourar o limite.
+
+    Não usa `LOCK_EX` bloqueante puro porque isso esperaria para sempre: uma
+    execução travada prenderia a publicação inteira sem diagnóstico.
+    """
+    inicio = time.monotonic()
+    avisou = False
+    while True:
+        try:
+            fcntl.flock(trava, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            decorrido = time.monotonic() - inicio
+            if decorrido >= limite_s:
+                return False
+            if not avisou:
+                print("outra execucao de generate-brotli-static esta em curso; "
+                      f"aguardando ate {limite_s}s pela vez desta — o snapshot dela "
+                      "pode ser anterior aos bytes recem-publicados.", flush=True)
+                avisou = True
+            time.sleep(2)
+
+
+def main() -> int:
+    trava = open(TRAVA, "w")
+    if not adquire_trava(trava):
+        print(f"ERRO: outra execucao de generate-brotli-static segurou a trava por "
+              f"mais de {ESPERA_MAXIMA_S}s. NAO recomprimi nada. As gemeas .br das "
+              "paginas reescritas agora estao VELHAS e o nginx as serve com 200.",
+              file=sys.stderr)
+        return 3
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--limite", type=int, default=0)
+    args = ap.parse_args()
+
+    if not os.path.exists(BROTLI):
+        print(f"brotli ausente em {BROTLI}", file=sys.stderr)
+        return 2
+
+    # PRIMEIRO a poda, depois a compressão. Ver o docstring de poda(): a ordem
+    # é o que garante que uma interrupção deixe ausência (que o nginx resolve)
+    # em vez de conteúdo velho (que ele serve como se fosse novo).
+    stale, orfaos = poda()
+    print(f"stale    : {len(stale)} .br mais velho(s) que o fonte")
+    print(f"orfaos   : {len(orfaos)} .br sem fonte (ressuscitariam pagina retirada)")
+
+    todos = alvos(args.limite)
+    pendentes = [c for c in todos if precisa(c)]
+    print(f"alvos    : {len(todos)} arquivo(s) comprimiveis em public/")
+    print(f"pendentes: {len(pendentes)} (o resto ja tem .br mais novo que o fonte)")
+    if args.dry_run:
+        for caminho in (stale + orfaos)[:5]:
+            print(f"   podaria {os.path.relpath(caminho, RAIZ)}")
+        print("\n--dry-run: nada gravado")
+        return 0
+
+    podados = 0
+    for caminho in stale + orfaos:
+        try:
+            os.unlink(caminho)
+            podados += 1
+        except OSError as e:
+            print(f"FALHA ao podar {os.path.relpath(caminho, RAIZ)}: {e}", file=sys.stderr)
+            return 1
+    if podados:
+        print(f"podados  : {podados} (o nginx volta a comprimir esses em q5 ate a recompressao)")
+
+    if not pendentes:
+        print("nada a comprimir")
+        return 0
+
+    inicio = time.monotonic()
+    orig_total = comp_total = 0
+    falhas = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        for caminho, (ok, o, c, err) in zip(pendentes, ex.map(comprime, pendentes)):
+            if not ok:
+                falhas.append((caminho, err))
+                continue
+            orig_total += o
+            comp_total += c
+    dur = time.monotonic() - inicio
+
+    print(f"\ncomprimidos: {len(pendentes) - len(falhas)} em {dur:.0f}s "
+          f"({args.jobs} jobs)")
+    if orig_total:
+        print(f"bytes      : {orig_total} -> {comp_total} "
+              f"({comp_total * 100 / orig_total:.1f}% do original)")
+    if falhas:
+        print(f"FALHAS: {len(falhas)}")
+        for c, e in falhas[:5]:
+            print(f"  {os.path.relpath(c, RAIZ)}: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+"""generate-previsao-audiencia — previsão de audiência a 30, 90 e 180 dias, com
+intervalo, e ranking de áreas por valor esperado (frente F6, 2026-09-09).
+
+O QUE RESPONDE. "Se a tendência dos últimos 60 dias continuar, quantas
+requisições orgânicas, visitantes únicos, leituras de bot de IA, impressões e
+cliques no Bing o portal terá daqui a 30, 90 e 180 dias — e com que
+incerteza?" E: "em qual área do acervo os bots de IA valiosos leem mais, por
+página publicada?" É o insumo da fila de extração e da escolha de temas do
+cérebro (plano de 2026-09-09, F6 → B7/C7).
+
+MODELO, por série diária:   log(y + 1) = a + b·t + Σ dummies(dia da semana)
+  - mínimos quadrados (numpy.linalg.lstsq); graus de liberdade = n − posto(X);
+  - intervalo de PREVISÃO a 80 % e 95 % pela distribuição t (scipy.stats.t)
+    sobre o resíduo, com a alavancagem do ponto projetado;
+  - crescimento reportado como taxa SEMANAL, (e^(7b) − 1)·100, com IC pelo
+    erro-padrão de b;
+  - ponto = e^ŷ − 1: é a MEDIANA condicional, não a média (a volta do log
+    subestima a média quando a variância é grande);
+  - previsao[h] = valor diário esperado em (último dia ajustado + h dias), com
+    o dummy daquele dia da semana; `acumulado` = Σ dos pontos diários de 1..h;
+  - r2 é o R² no espaço do log.
+
+REGRAS DE DADO — copiadas dos leitores canônicos, nunca reinterpretadas:
+  - borda: data/ops/edge_traffic_daily.jsonl, última linha por `date`; dia
+    provisório pela MESMA regra de tools/generate-painel (data ≥ hoje, nota
+    "dia em curso" ou `organic_requests_basis` começando por `provisional`)
+    fica FORA do ajuste — inclusive quando não é o último dia;
+  - bots: data/ops/edge_bot_agents_daily.jsonl SÓ via
+    tools/edgetelemetry.serie_saneada (última linha por (date, agent_key),
+    linha fisicamente impossível descartada); valor pelo `requests_sampled`
+    com a mesma escolha de campo do painel; provisório = dia posterior ao
+    último dia completo da borda (o ledger é cumulativo intradiário);
+  - Bing: data/ops/bing_webmaster_daily.jsonl, última linha por `Date`;
+    impressions/clicks de `busca_diaria`; rastreio (CrawledPages) e indexadas
+    (InIndex) de `rastreio_diario`;
+  - dia ausente é ausente, nunca zero; < 21 dias com dado = `sem_serie_suficiente`;
+    ≥ 50 % de zeros = `serie_esparsa` (relata, não projeta);
+  - áreas: ledger de origem data/ops/access/nginx-AAAA-MM-DD.jsonl, 14 dias
+    completos, só os 9 agentes valiosos, `route_class` ∈ {page, markdown},
+    `status` ∈ {200, 304}, sem `bot_simulation` e sem `warming`; área =
+    primeiro segmento do path, `/redesocial/tema/<área>/` → a área do tema;
+    páginas publicadas contadas em content/pages.json por primeiro segmento
+    (status == published). Valor esperado = leituras × (1 + taxa semanal da
+    série `bots.total`, quando ela tem ajuste).
+
+SAÍDA. Sem `--gravar` só imprime (`--dry-run` idem, explícito). Com `--gravar`:
+  data/ops/previsao_daily.jsonl   uma linha por execução; linha idêntica à
+                                  última (fora `gerado_em`) não se regrava
+  data/ops/painel/previsao.json   o mesmo objeto, sobrescrito; o painel o lê
+Exit 0 gerou (mesmo que toda série fique sem_serie_suficiente); exit 2 é
+instrumento quebrado: edgetelemetry ausente, raiz ilegível, gravação falhou.
+
+Uso:
+  tools/generate-previsao-audiencia [--dias 60] [--dry-run | --gravar]
+                                    [--raiz /opt/wiki] [--hoje AAAA-MM-DD]
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import sys
+import time
+
+import numpy as np
+from scipy import stats
+
+RAIZ_PADRAO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCHEMA = "previsao_v1"
+JANELA_PADRAO = 60
+MINIMO_DIAS = 21
+FRACAO_ZEROS_ESPARSA = 0.5
+HORIZONTES = (30, 90, 180)
+JANELA_AREAS_DIAS = 14
+# Os agentes de IA cuja leitura vale: citação, busca por IA e agente disparado
+# por usuário, mais os dois buscadores que alimentam assistentes (Bing, Google).
+AGENTES_VALIOSOS = ("perplexitybot", "oai-searchbot", "chatgpt-user", "bingbot", "amazonbot",
+                    "googlebot", "claudebot", "claude-user", "perplexity-user")
+ROUTE_CLASSES_LEITURA = ("page", "markdown")
+STATUS_LEITURA = (200, 304)
+SERIE_FATOR_AREAS = "bots.total"
+FONTES = {
+    "edge_traffic": "data/ops/edge_traffic_daily.jsonl",
+    "edge_bots": "data/ops/edge_bot_agents_daily.jsonl",
+    "bing": "data/ops/bing_webmaster_daily.jsonl",
+    "acesso_nginx": "data/ops/access/nginx-AAAA-MM-DD.jsonl",
+    "pages": "content/pages.json",
+}
+SAIDA_JSONL = "data/ops/previsao_daily.jsonl"
+SAIDA_JSON = "data/ops/painel/previsao.json"
+MODELO = "log(y+1) = a + b·t + Σ dummies(dia da semana); MQO; IC por t com df = n − posto(X)"
+VOLATEIS = frozenset({"gerado_em"})
+# Acima disto e^x estoura o float64; a projeção vira None com `estouro: true`
+# em vez de um Infinity que o JSON não representa.
+EXPOENTE_MAXIMO = 700.0
+# Bloco de leitura de content/pages.json (caracteres); cada página tem ~8 KB.
+TAMANHO_BLOCO = 1 << 22
+
+
+class InstrumentoQuebrado(Exception):
+    """Fonte ou dependência que a ferramenta não pode substituir: exit 2."""
+
+
+# ---------------------------------------------------------------------------
+# leitura
+# ---------------------------------------------------------------------------
+
+def le_jsonl(caminho):
+    registros = []
+    if not os.path.isfile(caminho):
+        return registros, False
+    with open(caminho, encoding="utf-8") as handle:
+        for bruto in handle:
+            bruto = bruto.strip()
+            if not bruto:
+                continue
+            try:
+                registro = json.loads(bruto)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(registro, dict):
+                registros.append(registro)
+    return registros, True
+
+
+def ultima_por_chave(registros, chave):
+    """Convenção dos ledgers append-only: a ÚLTIMA linha de uma chave vence."""
+    saida = {}
+    for r in registros:
+        k = chave(r)
+        if k is None:
+            continue
+        saida[k] = r
+    return saida
+
+
+def numero(v):
+    """Número ou None — string numérica do Bing vira número; lixo vira None."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s.lower() == "none":
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            try:
+                return float(s)
+            except ValueError:
+                return None
+    return None
+
+
+def provisorio_borda(r: dict, data: str, hoje_iso: str) -> bool:
+    """A regra do painel (tools/generate-painel::_provisorio), byte a byte."""
+    if data >= hoje_iso:
+        return True
+    nota = str(r.get("self_warming_note") or "")
+    base = str(r.get("organic_requests_basis") or "")
+    return "dia em curso" in nota or base.startswith("provisional")
+
+
+def borda_valor(r: dict):
+    """Mesma escolha de campo do painel e de tools/generate-cache-baseline: o
+    count (`requests_sampled`) é a contagem; a faixa de IP entra quando a
+    Cloudflare não verifica o agente; `requests_estimated` só nas linhas antigas."""
+    total = numero(r.get("requests_sampled"))
+    faixa = numero(r.get("requests_sampled_ip_range")) or 0
+    if total is not None and total > 0:
+        return total
+    if faixa > 0:
+        return faixa
+    if total is not None:
+        return 0
+    est = numero(r.get("requests_estimated"))
+    est_ip = numero(r.get("requests_estimated_ip_range")) or 0
+    if est is not None and est > 0:
+        return est
+    if est_ip > 0:
+        return est_ip
+    if est is not None:
+        return 0
+    return None
+
+
+def series_borda(raiz: str, datas: list, hoje_iso: str):
+    """organic_requests e uniques por dia, e o último dia completo da borda."""
+    registros, existe = le_jsonl(os.path.join(raiz, FONTES["edge_traffic"]))
+    por_dia = ultima_por_chave(registros, lambda r: r.get("date"))
+    organic, uniques, provisorios, completos = {}, {}, set(), []
+    for d in datas:
+        r = por_dia.get(d)
+        if r is None:
+            continue
+        if provisorio_borda(r, d, hoje_iso):
+            provisorios.add(d)
+        else:
+            completos.append(d)
+        organic[d] = numero(r.get("organic_requests"))
+        uniques[d] = numero(r.get("uniques"))
+    return {"borda.organic_requests": organic, "borda.uniques": uniques}, provisorios, \
+        (max(completos) if completos else None), existe
+
+
+def carrega_edgetelemetry():
+    tools_dir = os.path.join(RAIZ_PADRAO, "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    try:
+        import edgetelemetry  # noqa: E402
+    except ImportError as erro:
+        raise InstrumentoQuebrado("tools/edgetelemetry indisponível (%s): a série da borda só se lê saneada" % erro)
+    return edgetelemetry
+
+
+def series_bots(raiz: str, datas: list):
+    """bots.total (Σ de todos os agentes do dia), bots.valiosos (Σ dos 9) e uma
+    série por agente valioso — tudo pela série saneada, nunca pelo JSONL cru."""
+    edgetelemetry = carrega_edgetelemetry()
+    por_chave, descartadas = edgetelemetry.serie_saneada(raiz)
+    janela = set(datas)
+    total: dict = {}
+    valiosos: dict = {}
+    por_agente = {a: {} for a in AGENTES_VALIOSOS}
+    for (d, agente), r in por_chave.items():
+        if d not in janela or not agente:
+            continue
+        valor = borda_valor(r)
+        if valor is None:
+            continue
+        total[d] = total.get(d, 0) + valor
+        if agente in AGENTES_VALIOSOS:
+            valiosos[d] = valiosos.get(d, 0) + valor
+            por_agente[agente][d] = valor
+    series = {"bots.total": total, "bots.valiosos": valiosos}
+    for a in AGENTES_VALIOSOS:
+        series["bots." + a] = por_agente[a]
+    return series, len(descartadas)
+
+
+def series_bing(raiz: str, datas: list):
+    registros, existe = le_jsonl(os.path.join(raiz, FONTES["bing"]))
+    busca = ultima_por_chave([r for r in registros if r.get("tipo") == "busca_diaria"], lambda r: r.get("Date"))
+    rastreio = ultima_por_chave([r for r in registros if r.get("tipo") == "rastreio_diario"], lambda r: r.get("Date"))
+    series = {"bing.impressions": {}, "bing.clicks": {}, "bing.rastreio": {}, "bing.indexadas": {}}
+    for d in datas:
+        r = busca.get(d)
+        if r is not None:
+            series["bing.impressions"][d] = numero(r.get("Impressions"))
+            series["bing.clicks"][d] = numero(r.get("Clicks"))
+        r = rastreio.get(d)
+        if r is not None:
+            series["bing.rastreio"][d] = numero(r.get("CrawledPages"))
+            series["bing.indexadas"][d] = numero(r.get("InIndex"))
+    return series, existe
+
+
+# ---------------------------------------------------------------------------
+# modelo
+# ---------------------------------------------------------------------------
+
+def linha_x(t: int, data: dt.date) -> list:
+    """[1, t, seg..dom como dummies] — segunda-feira é a base."""
+    return [1.0, float(t)] + [1.0 if data.weekday() == k else 0.0 for k in range(1, 7)]
+
+
+def arred(v, casas=1):
+    if v is None:
+        return None
+    return round(float(v), casas)
+
+
+def _expm1_seguro(x: float):
+    if x > EXPOENTE_MAXIMO:
+        return None
+    return max(math.expm1(x), 0.0)
+
+
+def ajusta(pontos: dict, provisorios: set, datas: list, teto=None) -> dict:
+    """Ajusta uma série diária e projeta os horizontes. Nunca inventa: série
+    curta ou esparsa volta com `motivo` e sem `previsao`."""
+    inicio = datas[0]
+    fim = datas[-1]
+    d0 = dt.date.fromisoformat(inicio)
+    usados = [(d, v) for d, v in sorted(pontos.items())
+              if v is not None and inicio <= d <= fim and d not in provisorios]
+    excluidos = sorted(d for d, v in pontos.items() if v is not None and d in provisorios)
+    n = len(usados)
+    zeros = sum(1 for _d, v in usados if v == 0)
+    saida = {
+        "n": n,
+        "dias_janela": len(datas),
+        "dias_provisorios_excluidos": excluidos,
+        "primeiro_dia": usados[0][0] if usados else None,
+        "ultimo_dia": usados[-1][0] if usados else None,
+        "ultimo_valor": usados[-1][1] if usados else None,
+        "media_ultimos_7": arred(sum(v for _d, v in usados[-7:]) / len(usados[-7:]), 1) if usados else None,
+        "zeros": zeros,
+        "taxa_semanal_pct": None, "ic80": None, "ic95": None, "r2": None,
+        "sigma_log": None, "graus_de_liberdade": None,
+        "previsao": None,
+        "motivo": None, "detalhe": None,
+    }
+    if teto is not None:
+        saida["teto_fisico"] = teto
+    if n < MINIMO_DIAS:
+        saida["motivo"] = "sem_serie_suficiente"
+        saida["detalhe"] = ("%d dia(s) com dado na janela %s → %s (provisórios excluídos: %d); mínimo %d"
+                            % (n, inicio, fim, len(excluidos), MINIMO_DIAS))
+        return saida
+    if zeros / n >= FRACAO_ZEROS_ESPARSA:
+        saida["motivo"] = "serie_esparsa"
+        saida["detalhe"] = "%d de %d dia(s) com valor zero (≥ %d %%): a série se relata, não se projeta" % (
+            zeros, n, int(FRACAO_ZEROS_ESPARSA * 100))
+        return saida
+
+    X = np.array([linha_x((dt.date.fromisoformat(d) - d0).days, dt.date.fromisoformat(d)) for d, _v in usados])
+    y = np.log1p(np.array([float(v) for _d, v in usados]))
+    beta, _residuo, posto, _sv = np.linalg.lstsq(X, y, rcond=None)
+    df = n - int(posto)
+    if df < 1:
+        saida["motivo"] = "sem_serie_suficiente"
+        saida["detalhe"] = "n = %d e posto(X) = %d: sem grau de liberdade para o resíduo" % (n, int(posto))
+        return saida
+    ajustado = X @ beta
+    residuo = y - ajustado
+    ssr = float(residuo @ residuo)
+    sst = float(((y - y.mean()) ** 2).sum())
+    s2 = ssr / df
+    xtx_inv = np.linalg.pinv(X.T @ X)
+    b = float(beta[1])
+    se_b = math.sqrt(max(s2 * float(xtx_inv[1, 1]), 0.0))
+    t80 = float(stats.t.ppf(0.90, df))
+    t95 = float(stats.t.ppf(0.975, df))
+
+    def taxa(bb):
+        return (math.exp(7.0 * bb) - 1.0) * 100.0
+
+    saida["taxa_semanal_pct"] = arred(taxa(b), 2)
+    saida["ic80"] = [arred(taxa(b - t80 * se_b), 2), arred(taxa(b + t80 * se_b), 2)]
+    saida["ic95"] = [arred(taxa(b - t95 * se_b), 2), arred(taxa(b + t95 * se_b), 2)]
+    saida["r2"] = arred(1.0 - ssr / sst, 4) if sst > 0 else None
+    saida["sigma_log"] = arred(math.sqrt(s2), 4)
+    saida["graus_de_liberdade"] = df
+
+    ultimo = dt.date.fromisoformat(usados[-1][0])
+    previsao = {}
+    acumulado = 0.0
+    for h in range(1, max(HORIZONTES) + 1):
+        data = ultimo + dt.timedelta(days=h)
+        x0 = np.array(linha_x((data - d0).days, data))
+        yhat = float(x0 @ beta)
+        ponto = _expm1_seguro(yhat)
+        acumulado += ponto if ponto is not None else 0.0
+        if h not in HORIZONTES:
+            continue
+        se_pred = math.sqrt(max(s2 * (1.0 + float(x0 @ xtx_inv @ x0)), 0.0))
+        item = {
+            "data": data.isoformat(),
+            "ponto": arred(ponto, 1),
+            "ic80": [arred(_expm1_seguro(yhat - t80 * se_pred), 1), arred(_expm1_seguro(yhat + t80 * se_pred), 1)],
+            "ic95": [arred(_expm1_seguro(yhat - t95 * se_pred), 1), arred(_expm1_seguro(yhat + t95 * se_pred), 1)],
+            "acumulado": arred(acumulado, 1),
+        }
+        if ponto is None or item["ic95"][1] is None:
+            item["estouro"] = True
+        if teto is not None and ponto is not None:
+            item["acima_do_teto"] = ponto > teto
+        previsao[str(h)] = item
+    saida["previsao"] = previsao
+    return saida
+
+
+# ---------------------------------------------------------------------------
+# áreas
+# ---------------------------------------------------------------------------
+
+def area_de(path) -> str:
+    segs = [s for s in str(path or "").split("/") if s]
+    if not segs:
+        return "(raiz)"
+    if segs[0] == "redesocial" and len(segs) >= 3 and segs[1] == "tema":
+        return segs[2]
+    return segs[0]
+
+
+def paginas_por_area(caminho: str, tamanho_bloco: int | None = None) -> dict:
+    """Páginas com status == published em content/pages.json, por primeiro
+    segmento do path. Percorre a lista objeto a objeto (raw_decode sobre um
+    buffer de `TAMANHO_BLOCO` caracteres) para não materializar os 83 MB do
+    acervo em memória: medido em 2026-09-09, a leitura inteira custava 347 MB
+    de RSS; por blocos, o pico fica no bloco mais o objeto em curso."""
+    bloco = tamanho_bloco or TAMANHO_BLOCO
+    contagem: dict = {}
+    decodificador = json.JSONDecoder()
+    with open(caminho, encoding="utf-8") as handle:
+        buffer = handle.read(bloco)
+        i = 0
+        while i < len(buffer) and buffer[i] in " \t\r\n":
+            i += 1
+        if i >= len(buffer) or buffer[i] != "[":
+            raise ValueError("%s: esperava uma lista JSON de páginas" % caminho)
+        i += 1
+        while True:
+            # separadores; ao esvaziar o buffer, lê o bloco seguinte
+            while True:
+                while i < len(buffer) and buffer[i] in " \t\r\n,":
+                    i += 1
+                if i < len(buffer):
+                    break
+                proximo = handle.read(bloco)
+                if not proximo:
+                    raise ValueError("%s: lista sem fechamento" % caminho)
+                buffer, i = buffer[i:] + proximo, 0
+            if buffer[i] == "]":
+                break
+            # objeto: se o buffer acabou no meio dele, estende e tenta de novo
+            while True:
+                try:
+                    pagina, j = decodificador.raw_decode(buffer, i)
+                    break
+                except json.JSONDecodeError:
+                    proximo = handle.read(bloco)
+                    if not proximo:
+                        raise ValueError("%s: JSON truncado" % caminho)
+                    buffer, i = buffer[i:] + proximo, 0
+            i = j
+            if not isinstance(pagina, dict) or pagina.get("status") != "published":
+                continue
+            area = area_de(pagina.get("path"))
+            contagem[area] = contagem.get(area, 0) + 1
+    return contagem
+
+
+def leituras_por_area(raiz: str, inicio: dt.date, fim: dt.date, acervo: dict):
+    """Leituras de bots valiosos no ledger de origem, por área e agente."""
+    por_area: dict = {}
+    fora: dict = {}
+    dias_com_ledger, dias_sem_ledger = [], []
+    linhas_lidas = descartadas = 0
+    d = inicio
+    while d <= fim:
+        iso = d.isoformat()
+        caminho = os.path.join(raiz, "data", "ops", "access", "nginx-%s.jsonl" % iso)
+        if not os.path.isfile(caminho):
+            dias_sem_ledger.append(iso)
+            d += dt.timedelta(days=1)
+            continue
+        dias_com_ledger.append(iso)
+        with open(caminho, encoding="utf-8") as handle:
+            for bruto in handle:
+                bruto = bruto.strip()
+                if not bruto:
+                    continue
+                try:
+                    r = json.loads(bruto)
+                except json.JSONDecodeError:
+                    continue
+                linhas_lidas += 1
+                if r.get("bot_simulation") or r.get("warming"):
+                    descartadas += 1
+                    continue
+                agente = r.get("agent_key")
+                if agente not in AGENTES_VALIOSOS:
+                    continue
+                if r.get("route_class") not in ROUTE_CLASSES_LEITURA or numero(r.get("status")) not in STATUS_LEITURA:
+                    continue
+                ts = str(r.get("ts") or "")[:10]
+                if ts and ts != iso:
+                    continue
+                area = area_de(r.get("path"))
+                if area in acervo:
+                    e = por_area.setdefault(area, {})
+                    e[agente] = e.get(agente, 0) + 1
+                else:
+                    fora[area] = fora.get(area, 0) + 1
+        d += dt.timedelta(days=1)
+    return por_area, fora, dias_com_ledger, dias_sem_ledger, linhas_lidas, descartadas
+
+
+def ranking_areas(raiz: str, ultimo_dia_completo: str, taxa_total_pct, ressalvas: list) -> tuple:
+    fim = dt.date.fromisoformat(ultimo_dia_completo)
+    inicio = fim - dt.timedelta(days=JANELA_AREAS_DIAS - 1)
+    caminho_pages = os.path.join(raiz, FONTES["pages"])
+    meta = {
+        "janela": {"inicio": inicio.isoformat(), "fim": fim.isoformat(), "dias": JANELA_AREAS_DIAS},
+        "criterio": {
+            "agentes": list(AGENTES_VALIOSOS), "route_class": list(ROUTE_CLASSES_LEITURA),
+            "status": list(STATUS_LEITURA), "exclui": ["bot_simulation", "warming"],
+            "area": "primeiro segmento do path; /redesocial/tema/<área>/ → área do tema",
+            "paginas_publicadas": "content/pages.json, status == published, por primeiro segmento",
+        },
+        "fator_serie": SERIE_FATOR_AREAS,
+        "fator_taxa_semanal_pct": taxa_total_pct,
+        "fator": None if taxa_total_pct is None else round(1.0 + taxa_total_pct / 100.0, 4),
+    }
+    if not os.path.isfile(caminho_pages):
+        meta["motivo"] = "content/pages.json ausente: sem áreas do acervo para ranquear"
+        ressalvas.append("Ranking de áreas: " + meta["motivo"])
+        return [], meta
+    try:
+        acervo = paginas_por_area(caminho_pages)
+    except (OSError, ValueError) as erro:
+        meta["motivo"] = "content/pages.json ilegível (%s)" % erro
+        ressalvas.append("Ranking de áreas: " + meta["motivo"])
+        return [], meta
+    por_area, fora, com, sem, lidas, desc = leituras_por_area(raiz, inicio, fim, acervo)
+    meta.update({
+        "dias_com_ledger": com, "dias_sem_ledger": sem, "linhas_lidas": lidas,
+        "linhas_descartadas_proprias": desc,
+        "fora_do_acervo": dict(sorted(fora.items(), key=lambda kv: (-kv[1], kv[0]))[:20]),
+        "fora_do_acervo_total": sum(fora.values()),
+        "leituras_total": sum(sum(e.values()) for e in por_area.values()),
+        "areas_do_acervo": len(acervo),
+        "paginas_publicadas_total": sum(acervo.values()),
+    })
+    fator = meta["fator"]
+    itens = []
+    for area, paginas in acervo.items():
+        por_agente = por_area.get(area, {})
+        leituras = sum(por_agente.values())
+        valor = leituras * (fator if fator is not None else 1.0)
+        itens.append({
+            "area": area,
+            "paginas_publicadas": paginas,
+            "leituras_14d": leituras,
+            "por_agente": dict(sorted(por_agente.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "leituras_por_pagina": round(leituras / paginas, 4) if paginas else None,
+            "valor_esperado": round(valor, 2),
+        })
+    itens.sort(key=lambda i: (-i["valor_esperado"], -i["leituras_14d"], i["area"]))
+    for posicao, item in enumerate(itens, start=1):
+        item["posicao"] = posicao
+    if sem:
+        ressalvas.append("Ranking de áreas: %d dia(s) da janela sem ledger de origem (%s) — as leituras são piso."
+                         % (len(sem), ", ".join(sem)))
+    return itens, meta
+
+
+# ---------------------------------------------------------------------------
+# montagem
+# ---------------------------------------------------------------------------
+
+def calcula(raiz: str, hoje: dt.date, dias: int, agora: str | None = None) -> dict:
+    if not os.path.isdir(raiz):
+        raise InstrumentoQuebrado("raiz inexistente: %s" % raiz)
+    hoje_iso = hoje.isoformat()
+    datas = [(hoje - dt.timedelta(days=i)).isoformat() for i in range(dias - 1, -1, -1)]
+    ressalvas = [
+        MODELO + ". Ponto = e^ŷ − 1 (mediana condicional, não média); ic80/ic95 são intervalos de PREVISÃO "
+        "para o valor diário na data-alvo; `acumulado` soma os pontos diários até o horizonte, sem intervalo.",
+        "Dia ausente no ledger é ausente, nunca zero. Série com menos de %d dias com dado na janela fica "
+        "`sem_serie_suficiente`; com %d %% ou mais de zeros fica `serie_esparsa` — nos dois casos não há projeção."
+        % (MINIMO_DIAS, int(FRACAO_ZEROS_ESPARSA * 100)),
+        "Extrapolar 180 dias a partir de %d dias de ajuste é tendência, não destino: leia o intervalo, "
+        "e leia `r2` (no espaço do log) antes do ponto." % dias,
+    ]
+    borda, prov_borda, ultimo_completo, borda_existe = series_borda(raiz, datas, hoje_iso)
+    if ultimo_completo is None:
+        ultimo_completo = (hoje - dt.timedelta(days=1)).isoformat()
+        ressalvas.append("edge_traffic_daily sem dia completo na janela: último dia completo assumido como hoje − 1.")
+    ressalvas.append(
+        "borda.organic_requests = requests − self_warming_requests do ledger de aquecimento (edge_traffic_daily, "
+        "última linha por date). Dia marcado provisório pelo produtor (basis `provisional_…` ou nota "
+        "\"dia em curso\") fica fora do ajuste mesmo quando não é o último — a regra é a do painel.")
+    bots, bots_descartadas = series_bots(raiz, datas)
+    prov_bots = {d for d in datas if d > ultimo_completo}
+    ressalvas.append(
+        "bots.* = `requests_sampled` de edge_bot_agents_daily via tools/edgetelemetry.serie_saneada "
+        "(%d linha(s) descartada(s)); bots.total soma TODOS os agentes do dia (inclui SEO, scanner e social), "
+        "bots.valiosos soma só %s. Dia posterior ao último completo (%s) é provisório: o ledger é cumulativo."
+        % (bots_descartadas, ", ".join(AGENTES_VALIOSOS), ultimo_completo))
+    bing, bing_existe = series_bing(raiz, datas)
+    ressalvas.append(
+        "bing.impressions/clicks = busca_diaria; bing.rastreio = CrawledPages e bing.indexadas = InIndex de "
+        "rastreio_diario (última coleta por Date vence). O Bing recomputa dias recentes: o último Date pode "
+        "subir na coleta seguinte. InIndex é ESTOQUE com teto físico = páginas publicadas; a projeção acima do "
+        "teto vem marcada `acima_do_teto`.")
+
+    teto_indexadas = None
+    caminho_pages = os.path.join(raiz, FONTES["pages"])
+    if os.path.isfile(caminho_pages):
+        try:
+            teto_indexadas = sum(paginas_por_area(caminho_pages).values())
+        except (OSError, ValueError):
+            teto_indexadas = None
+
+    series = {}
+    for nome, pontos in borda.items():
+        series[nome] = ajusta(pontos, prov_borda, datas)
+    for nome, pontos in bots.items():
+        series[nome] = ajusta(pontos, prov_bots, datas)
+    for nome, pontos in bing.items():
+        series[nome] = ajusta(pontos, prov_bots, datas, teto=teto_indexadas if nome == "bing.indexadas" else None)
+
+    taxa_total = series[SERIE_FATOR_AREAS]["taxa_semanal_pct"]
+    areas, areas_meta = ranking_areas(raiz, ultimo_completo, taxa_total, ressalvas)
+    ressalvas.append(
+        "Áreas: leituras dos %d agentes valiosos no ledger de ORIGEM (nginx) em %d dias completos, só "
+        "route_class ∈ {%s} com status ∈ {%s}; a origem vê o que atravessou o cache da borda, então é piso, "
+        "não total. valor_esperado = leituras × (1 + taxa semanal de %s); sem taxa, o fator é 1."
+        % (len(AGENTES_VALIOSOS), JANELA_AREAS_DIAS, ", ".join(ROUTE_CLASSES_LEITURA),
+           ", ".join(str(s) for s in STATUS_LEITURA), SERIE_FATOR_AREAS))
+    if not borda_existe:
+        ressalvas.append("edge_traffic_daily.jsonl ausente: borda.* sem série.")
+    if not bing_existe:
+        ressalvas.append("bing_webmaster_daily.jsonl ausente: bing.* sem série.")
+
+    return {
+        "schema_version": SCHEMA,
+        "date": hoje_iso,
+        "gerado_em": agora or dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "janela_dias": dias,
+        "janela": {"inicio": datas[0], "fim": datas[-1]},
+        "ultimo_dia_completo": ultimo_completo,
+        "modelo": MODELO,
+        "horizontes": list(HORIZONTES),
+        "minimo_dias": MINIMO_DIAS,
+        "series": series,
+        "areas": areas,
+        "areas_meta": areas_meta,
+        "fontes": dict(FONTES),
+        "ressalvas": ressalvas,
+    }
+
+
+# ---------------------------------------------------------------------------
+# gravação e impressão
+# ---------------------------------------------------------------------------
+
+def _sem_volateis(obj):
+    if isinstance(obj, dict):
+        return {k: _sem_volateis(v) for k, v in obj.items() if k not in VOLATEIS}
+    if isinstance(obj, list):
+        return [_sem_volateis(v) for v in obj]
+    return obj
+
+
+def grava_atomico(caminho: str, texto: str) -> None:
+    os.makedirs(os.path.dirname(caminho) or ".", exist_ok=True)
+    tmp = caminho + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(texto)
+    os.replace(tmp, caminho)
+
+
+def ultima_linha(caminho: str):
+    if not os.path.isfile(caminho):
+        return None
+    ultima = None
+    with open(caminho, encoding="utf-8") as handle:
+        for bruto in handle:
+            if bruto.strip():
+                ultima = bruto
+    if ultima is None:
+        return None
+    try:
+        return json.loads(ultima)
+    except json.JSONDecodeError:
+        return None
+
+
+def grava(raiz: str, objeto: dict) -> dict:
+    jsonl = os.path.join(raiz, SAIDA_JSONL)
+    caminho_json = os.path.join(raiz, SAIDA_JSON)
+    anterior = ultima_linha(jsonl)
+    jsonl_gravado = False
+    if anterior is None or _sem_volateis(anterior) != _sem_volateis(objeto):
+        os.makedirs(os.path.dirname(jsonl), exist_ok=True)
+        with open(jsonl, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(objeto, ensure_ascii=False, sort_keys=False) + "\n")
+        jsonl_gravado = True
+    json_gravado = False
+    antigo = None
+    if os.path.isfile(caminho_json):
+        try:
+            with open(caminho_json, encoding="utf-8") as handle:
+                antigo = json.load(handle)
+        except (OSError, ValueError):
+            antigo = None
+    if antigo is None or _sem_volateis(antigo) != _sem_volateis(objeto):
+        grava_atomico(caminho_json, json.dumps(objeto, ensure_ascii=False, indent=1) + "\n")
+        json_gravado = True
+    return {"jsonl": jsonl, "jsonl_gravado": jsonl_gravado, "json": caminho_json, "json_gravado": json_gravado}
+
+
+def _fmt(v):
+    if v is None:
+        return "—"
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) >= 1e7:
+        return "%.2e" % v
+    if isinstance(v, float):
+        return ("%.1f" % v) if abs(v) < 1000 else ("%.0f" % v)
+    return str(v)
+
+
+def _ic(par):
+    if not par:
+        return "—"
+    return "[%s; %s]" % (_fmt(par[0]), _fmt(par[1]))
+
+
+def imprime_resumo(objeto: dict, saida=None) -> None:
+    # `saida` resolvida na CHAMADA, não na definição: com sys.stdout como default
+    # o redirecionamento de stdout (testes, journal em pipe) não a alcançaria.
+    if saida is None:
+        saida = sys.stdout
+    p = lambda s="": print(s, file=saida)  # noqa: E731
+    p("previsão de audiência — %s (janela %s → %s, %d dias; último dia completo %s)"
+      % (objeto["date"], objeto["janela"]["inicio"], objeto["janela"]["fim"], objeto["janela_dias"],
+         objeto["ultimo_dia_completo"]))
+    p("%-24s %4s %-10s %11s %10s %-18s %-18s %-14s %-14s %-14s %s"
+      % ("série", "n", "último dia", "último", "taxa/sem %", "ic80 taxa", "ic95 taxa", "30 d", "90 d", "180 d", "motivo / r2"))
+    for nome, s in objeto["series"].items():
+        prev = s.get("previsao") or {}
+        cols = [_fmt((prev.get(str(h)) or {}).get("ponto")) for h in HORIZONTES]
+        p("%-24s %4d %-10s %11s %10s %-18s %-18s %-14s %-14s %-14s %s"
+          % (nome, s["n"], s.get("ultimo_dia") or "—", _fmt(s.get("ultimo_valor")), _fmt(s.get("taxa_semanal_pct")),
+             _ic(s.get("ic80")), _ic(s.get("ic95")), cols[0], cols[1], cols[2],
+             s["motivo"] + " — " + str(s.get("detalhe")) if s.get("motivo") else "r2=%s" % _fmt(s.get("r2"))))
+    meta = objeto["areas_meta"]
+    p()
+    p("áreas por valor esperado — leituras de bots valiosos na origem, %s → %s, fator %s (%s: %s %%/semana)"
+      % (meta["janela"]["inicio"], meta["janela"]["fim"], _fmt(meta.get("fator")), meta["fator_serie"],
+         _fmt(meta.get("fator_taxa_semanal_pct"))))
+    if meta.get("motivo"):
+        p("  " + meta["motivo"])
+    p("%3s %-20s %8s %10s %10s %12s  %s" % ("#", "área", "páginas", "leituras", "por pág.", "esperado", "por agente"))
+    for item in objeto["areas"][:10]:
+        p("%3d %-20s %8d %10d %10s %12s  %s"
+          % (item["posicao"], item["area"], item["paginas_publicadas"], item["leituras_14d"],
+             _fmt(item["leituras_por_pagina"]), _fmt(item["valor_esperado"]),
+             ", ".join("%s=%d" % kv for kv in list(item["por_agente"].items())[:4])))
+    if meta.get("dias_sem_ledger"):
+        p("  dias sem ledger de origem: %s" % ", ".join(meta["dias_sem_ledger"]))
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--dias", type=int, default=JANELA_PADRAO,
+                        help="janela de ajuste em dias, terminando hoje (padrão %d)" % JANELA_PADRAO)
+    modo = parser.add_mutually_exclusive_group()
+    modo.add_argument("--dry-run", action="store_true", help="imprime e não grava (é o comportamento padrão)")
+    modo.add_argument("--gravar", action="store_true",
+                      help="acrescenta a linha em %s e reescreve %s" % (SAIDA_JSONL, SAIDA_JSON))
+    parser.add_argument("--raiz", default=RAIZ_PADRAO, help="raiz do repositório")
+    parser.add_argument("--hoje", default=None, help="data de referência AAAA-MM-DD (padrão: hoje em UTC)")
+    parser.add_argument("--json", action="store_true", help="imprime o objeto completo em JSON além do resumo")
+    args = parser.parse_args(argv)
+    if args.dias < 1:
+        parser.error("--dias precisa ser >= 1")
+    try:
+        hoje = dt.date.fromisoformat(args.hoje) if args.hoje else dt.datetime.now(dt.timezone.utc).date()
+    except ValueError:
+        parser.error("--hoje precisa ser AAAA-MM-DD")
+    raiz = os.path.abspath(args.raiz)
+    inicio = time.monotonic()
+    try:
+        objeto = calcula(raiz, hoje, args.dias)
+    except InstrumentoQuebrado as erro:
+        print("generate-previsao-audiencia: %s" % erro, file=sys.stderr)
+        return 2
+    imprime_resumo(objeto)
+    if args.json:
+        print(json.dumps(objeto, ensure_ascii=False, indent=1))
+    if not args.gravar:
+        print("(sem --gravar: nada foi escrito; %.2f s)" % (time.monotonic() - inicio))
+        return 0
+    try:
+        resultado = grava(raiz, objeto)
+    except OSError as erro:
+        print("generate-previsao-audiencia: falha ao gravar: %s" % erro, file=sys.stderr)
+        return 2
+    print("gravado: %s (%s) · %s (%s) · %.2f s"
+          % (resultado["jsonl"], "linha nova" if resultado["jsonl_gravado"] else "linha idêntica à última, não regravada",
+             resultado["json"], "reescrito" if resultado["json_gravado"] else "inalterado",
+             time.monotonic() - inicio))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""check-caracteres-de-controle — byte de controle C0 em arquivo versionado.
+
+READ-ONLY. Não escreve JSONL, manifesto, série nem nada permanente: só lê o
+índice do git e os arquivos que ele nomeia, e imprime o que achou.
+
+POR QUE ELE EXISTE (2026-09-10). Em `internal/legalfacts/norma.go` havia uma
+regex escrita dentro de crase — raw string, onde o Go NÃO interpreta escape —
+com um byte 0x08 (backspace) LITERAL colado entre `(?i)` e `arts`. A regex
+passou a exigir um backspace antes de "arts." e casou ZERO vezes desde
+2026-09-06: "os arts. 30 e 35 do Decreto 7.962/2013" rendia zero fatos de
+artigo, e isso valia por 557 das 1.144 ocorrências plurais do acervo.
+
+O defeito ficou VIVO por dias porque NENHUM instrumento deste repositório o
+enxerga:
+
+  * compila — 0x08 é um byte válido dentro de uma raw string;
+  * passa no gofmt — gofmt reescreve espaçamento, não o conteúdo de literal;
+  * passa no go vet — vet não decodifica a regex byte a byte;
+  * passa na revisão humana — o byte é INVISÍVEL no editor e no diff;
+  * passou no teste que deveria cobri-lo — o teste foi escrito com o MESMO
+    byte colado no dado de entrada, então casava e ficava verde.
+
+Esta é a família inteira, não o caso: qualquer byte de controle C0 dentro de
+literal de string, de regex, de JSON, de unit do systemd ou de vhost do nginx
+tem a mesma assinatura — invisível na tela, decisivo na execução. O gate mata a
+família varrendo o byte, que é o único lugar onde ele não pode se esconder.
+
+O QUE REPROVA. Os bytes C0 sem uso legítimo em texto: 0x00-0x08, 0x0b, 0x0c e
+0x0e-0x1f. O 0x09 (tab) e o 0x0a (LF) são separadores legítimos e nunca
+reprovam.
+
+O 0x0d (CR) TEM REGRA PRÓPRIA, e a decisão está aqui para não virar folclore:
+CR só é aceitável quando o arquivo INTEIRO é CRLF, isto é, quando todo CR é
+seguido de LF, todo LF é precedido de CR e há pelo menos um par. Arquivo
+inteiro em CRLF é uma convenção de plataforma — o gate não a julga. CR solto,
+ou arquivo com finais de linha MISTOS, reprova: mistura é o sintoma de edição
+por ferramenta que não entendeu o arquivo, e um CR sozinho no meio de uma linha
+tem exatamente o mesmo poder de esconder texto que o 0x08 teve na regex (ele
+devolve o cursor ao início da linha no terminal).
+
+O QUE FICA FORA, E POR QUE A LISTA É IMPRESSA. Arquivo binário versionado (PNG,
+ICO, PDF, fonte, .gz, pickle, parquet) é feito de bytes de controle por
+construção. Ele sai da varredura por EXTENSÃO DECLARADA, e a lista aparece na
+saída de toda execução, com quantos arquivos cada extensão pulou. Varredura
+parcial que se apresenta como completa é o defeito que este gate existe para
+combater: quem lê a saída tem de ver o buraco.
+
+A exclusão é por extensão declarada e NUNCA por farejamento de conteúdo (do
+tipo "tem NUL nos primeiros KB, então é binário"). Farejar seria deixar o
+próprio byte procurado decidir se o arquivo é examinado — o gate ficaria cego
+exatamente no arquivo mais contaminado.
+
+SÓ ARQUIVO VERSIONADO. A varredura sai de `git ls-files -s`, nunca da árvore: a
+raiz deste repositório tem centenas de clones não-versionados somando dezenas
+de GB, e `find .` neles é armadilha conhecida. Entradas de modo 120000
+(symlink) e 160000 (submódulo) são puladas e contadas — seguir um symlink
+levaria a varredura para fora do repositório.
+
+Prova: tools/test_check_caracteres_de_controle.py, descoberto pelo glob
+tools/test_*.py do run-qualidade-diaria. O teste prova por MUTAÇÃO: o mesmo
+arquivo com e sem o byte, e a diferença tem de ser exit 1 contra exit 0.
+
+Uso:
+    tools/check-caracteres-de-controle [--raiz DIR] [--limite-por-arquivo N]
+
+Exit 0 = limpo. Exit 1 = achado. Exit 2 = não foi possível varrer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+# Os bytes que reprovam sempre. 0x09 (tab) e 0x0a (LF) estão fora de propósito;
+# 0x0d (CR) tem a regra de arquivo inteiro, abaixo.
+DUROS = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+CR = 0x0D
+
+# PREFILTRO. `bytes.translate(None, delete=SEM_INTERESSE)` apaga tudo o que NÃO
+# é byte de controle candidato e devolve só os candidatos. Medido em 2026-09-10
+# sobre 64 MiB warm: 161 MiB/s contra 53,7 MiB/s da busca por regex — 3,0x. O
+# acervo versionado tem 2,6 GB e quase nenhum arquivo tem achado, então é o
+# caminho SEM achado que decide o tempo do gate. A regex continua existindo
+# para POSICIONAR o byte, que é o que ela faz melhor.
+SEM_INTERESSE = bytes(
+    b for b in range(256) if not (b < 0x20 and b not in (0x09, 0x0A))
+)
+
+# Nome de cada byte, para a mensagem dizer o que ele É e não só o hexa. Um
+# operador que lê "0x08" pensa em número; um que lê "BS (backspace)" pensa no
+# defeito da regex.
+NOMES = {
+    0x00: "NUL", 0x01: "SOH", 0x02: "STX", 0x03: "ETX", 0x04: "EOT",
+    0x05: "ENQ", 0x06: "ACK", 0x07: "BEL (bipe)", 0x08: "BS (backspace)",
+    0x0B: "VT (tabulação vertical)", 0x0C: "FF (quebra de página)",
+    0x0D: "CR (retorno de carro)",
+    0x0E: "SO", 0x0F: "SI", 0x10: "DLE", 0x11: "DC1", 0x12: "DC2",
+    0x13: "DC3", 0x14: "DC4", 0x15: "NAK", 0x16: "SYN", 0x17: "ETB",
+    0x18: "CAN", 0x19: "EM", 0x1A: "SUB", 0x1B: "ESC (sequência ANSI)",
+    0x1C: "FS", 0x1D: "GS", 0x1E: "RS", 0x1F: "US",
+}
+
+# EXTENSÕES BINÁRIAS — lista fechada, declarada e impressa a cada execução.
+# Formato binário é feito de byte de controle: examiná-lo produziria ruído que
+# afogaria o achado verdadeiro. Extensão nova de arquivo binário entra AQUI, à
+# mão, junto com o teste — nunca por heurística de conteúdo.
+EXTENSOES_BINARIAS = (
+    # imagem
+    "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "avif", "ico",
+    # documento e fonte
+    "pdf", "woff", "woff2", "ttf", "otf", "eot",
+    # compressão
+    "gz", "br", "zst", "bz2", "xz", "zip", "tar", "tgz", "7z", "rar",
+    # serialização binária e colunar
+    "pkl", "pickle", "npy", "npz", "parquet", "arrow", "feather", "bin",
+    # empacotamento, índice e banco. `fst` é o índice de termos do buscador
+    # (data/ops/fst_content_term_index.fst): 551 KB de autômato finito, medido
+    # em 2026-09-10 com 82.949 bytes de controle — o caso que prova por que a
+    # lista existe.
+    "pack", "idx", "db", "sqlite", "sqlite3", "mdb", "fst",
+    # executável e objeto
+    "wasm", "so", "dylib", "exe", "dll", "class", "jar", "o", "a",
+    # mídia
+    "mp3", "mp4", "webm", "wav", "ogg", "flac", "mov", "avi",
+)
+
+
+def escapa(texto: str) -> str:
+    """Torna VISÍVEL todo caractere de controle do trecho impresso.
+
+    Isto não é cosmético: imprimir o 0x08 cru no terminal APAGARIA o caractere
+    anterior da própria mensagem do gate — a mesma invisibilidade que escondeu
+    o defeito por dias apagaria o marcador que o denuncia. Todo caractere
+    abaixo de 0x20, mais DEL, sai como \\xNN.
+    """
+    saida = []
+    for ch in texto:
+        cod = ord(ch)
+        if cod < 0x20 or cod == 0x7F:
+            saida.append("\\x%02x" % cod)
+        else:
+            saida.append(ch)
+    return "".join(saida)
+
+
+def contexto(janela: bytes, pos: int, largura: int = 20) -> str:
+    """~40 caracteres em volta do byte, com o byte marcado por «0xNN».
+
+    A janela é cortada na LINHA do achado: contexto que atravessa a quebra de
+    linha faz o operador procurar o byte na linha errada.
+    """
+    ini_linha = janela.rfind(b"\n", 0, pos) + 1
+    fim_linha = janela.find(b"\n", pos)
+    if fim_linha < 0:
+        fim_linha = len(janela)
+    antes = janela[max(ini_linha, pos - largura):pos]
+    depois = janela[pos + 1:min(fim_linha, pos + 1 + largura)]
+    marcado = "«0x%02x»" % janela[pos]
+    return (
+        escapa(antes.decode("utf-8", "backslashreplace"))
+        + marcado
+        + escapa(depois.decode("utf-8", "backslashreplace"))
+    )
+
+
+class Achado:
+    def __init__(self, caminho, linha, byte, trecho):
+        self.caminho = caminho
+        self.linha = linha
+        self.byte = byte
+        self.trecho = trecho
+
+    def imprime(self):
+        nome = NOMES.get(self.byte, "?")
+        print(
+            "check-caracteres-de-controle: FAIL %s:%d — byte 0x%02x %s"
+            % (self.caminho, self.linha, self.byte, nome)
+        )
+        print("        %s" % self.trecho)
+
+
+DECLARACOES = "data/ops/caracteres_de_controle_declarados.jsonl"
+
+# ★ DECLARAR NAO E' MASCARAR — E O CONTRARIO, E A DIFERENCA E' O HASH.
+#
+# Tres dos arquivos sujos deste repositorio nao podem ser limpos, e o motivo e'
+# de engenharia, nao de conveniencia: o .txt do DataJud e' saida de `pdftotext`
+# e o 0x0c ali e' quebra de pagina do documento oficial; os dois testdata de
+# `internal/stjacordaos` sao lidos BRUTOS pelo parser, entao tirar os CR mudaria
+# a entrada do teste. Excluir por caminho (`.agents/`, `testdata/`) abriria o
+# buraco exato em que um `_test.go` envenenado moraria.
+#
+# Por isso a excecao e' POR CONTEUDO: a declaracao fixa o sha256 do arquivo e a
+# contagem de bytes. Mudou o conteudo, a declaracao morre e o gate reprova
+# dizendo que ela envelheceu. Ficou limpo ou sumiu, a declaracao tambem reprova,
+# porque excecao morta e' mentira que ninguem cobra.
+def le_declaracoes(caminho_abs: str):
+    """Devolve {caminho_rel: {"sha256": str, "duros": int, "crs": int, "motivo": str}}.
+
+    Ausente ⇒ dicionario vazio (o gate simplesmente nao tem excecao). CORROMPIDO
+    ⇒ erro, nunca "trata como vazio": um JSONL ilegivel viraria silenciosamente
+    "zero excecao declarada", e o gate reprovaria arquivo legitimo sem dizer que
+    perdeu o proprio registro."""
+    if not os.path.isfile(caminho_abs):
+        return {}
+    declarados = {}
+    with open(caminho_abs, "r", encoding="utf-8") as fonte:
+        for numero, linha in enumerate(fonte, 1):
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                registro = json.loads(linha)
+            except json.JSONDecodeError as erro:
+                raise RuntimeError(
+                    "%s:%d nao e' JSON: %s" % (DECLARACOES, numero, erro)
+                ) from erro
+            for campo in ("caminho", "sha256", "duros", "crs", "motivo"):
+                if campo not in registro:
+                    raise RuntimeError(
+                        "%s:%d sem o campo obrigatorio %r" % (DECLARACOES, numero, campo)
+                    )
+            declarados[registro["caminho"]] = registro
+    return declarados
+
+
+def sha256_do_arquivo(caminho_abs: str) -> str:
+    digestor = hashlib.sha256()
+    with open(caminho_abs, "rb") as fonte:
+        for pedaco in iter(lambda: fonte.read(1 << 20), b""):
+            digestor.update(pedaco)
+    return digestor.hexdigest()
+
+
+def varre_arquivo(caminho_abs: str, caminho_rel: str, limite: int):
+    """Devolve (achados, total_duros, total_cr, cr_reprova).
+
+    Uma passada só, em pedaços de 1 MiB. A decisão sobre CR precisa do arquivo
+    INTEIRO (é uma propriedade global), então os CR são anotados durante a
+    passada e só viram achado no fim, se o arquivo não for CRLF puro.
+    """
+    achados = []
+    cr_pendentes = []
+    total_duros = 0
+    total_cr = 0
+    conta_cr = 0
+    conta_lf = 0
+    conta_crlf = 0
+    cr_no_fim = False
+    linhas_antes = 0
+    cauda = b""
+
+    with open(caminho_abs, "rb") as fh:
+        while True:
+            pedaco = fh.read(1 << 20)
+            if not pedaco:
+                break
+
+            # A cauda do pedaço anterior entra só para dar CONTEXTO ao achado
+            # que cai colado na emenda; os bytes dela já foram julgados no
+            # pedaço anterior. Ela é concatenada SOB DEMANDA, dentro do ramo do
+            # achado: montar `cauda + pedaco` a cada volta copiaria o arquivo
+            # inteiro na memória — 2,6 GB de memcpy por execução sobre este
+            # acervo, para servir os poucos KB de contexto que serão impressos.
+            janela = None
+            deslocamento = len(cauda)
+            quebras = pedaco.count(b"\n")
+            conta_lf += quebras
+
+            # O prefiltro devolve SÓ os bytes candidatos do pedaço. Vazio é o
+            # caso normal e sai daqui sem tocar em regex nem em contagem fina.
+            candidatos = pedaco.translate(None, delete=SEM_INTERESSE)
+            if candidatos:
+                crs_no_pedaco = candidatos.count(b"\r")
+                total_cr += crs_no_pedaco
+                total_duros += len(candidatos) - crs_no_pedaco
+
+                if crs_no_pedaco:
+                    conta_cr += crs_no_pedaco
+                    conta_crlf += pedaco.count(b"\r\n")
+                    if cr_no_fim and pedaco.startswith(b"\n"):
+                        conta_crlf += 1
+                    if len(cr_pendentes) < limite:
+                        for m in re.finditer(b"\r", pedaco):
+                            if len(cr_pendentes) >= limite:
+                                break
+                            if janela is None:
+                                janela = cauda + pedaco
+                            pos = m.start() + deslocamento
+                            linha = linhas_antes + pedaco.count(b"\n", 0, m.start()) + 1
+                            cr_pendentes.append(
+                                Achado(caminho_rel, linha, CR, contexto(janela, pos))
+                            )
+
+                if len(candidatos) > crs_no_pedaco and len(achados) < limite:
+                    for m in DUROS.finditer(pedaco):
+                        if len(achados) >= limite:
+                            break
+                        if janela is None:
+                            janela = cauda + pedaco
+                        pos = m.start() + deslocamento
+                        linha = linhas_antes + pedaco.count(b"\n", 0, m.start()) + 1
+                        achados.append(
+                            Achado(
+                                caminho_rel, linha, janela[pos], contexto(janela, pos)
+                            )
+                        )
+
+            cr_no_fim = pedaco.endswith(b"\r")
+            linhas_antes += quebras
+            cauda = pedaco[-64:]
+
+    # Arquivo INTEIRO em CRLF: todo CR emparelhado, todo LF precedido de CR e
+    # pelo menos um par. Aí o CR é convenção de plataforma, não defeito.
+    crlf_puro = conta_cr > 0 and conta_cr == conta_crlf == conta_lf
+    if crlf_puro:
+        return achados, total_duros, total_cr, False
+    achados = (achados + cr_pendentes)[: max(limite, 1)] if cr_pendentes else achados
+    return achados, total_duros, total_cr, bool(cr_pendentes)
+
+
+def entradas_versionadas(raiz: str):
+    proc = subprocess.run(
+        ["git", "-C", raiz, "ls-files", "-s", "-z"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "git ls-files falhou em %s: %s"
+            % (raiz, proc.stderr.decode("utf-8", "replace").strip())
+        )
+    for registro in proc.stdout.split(b"\0"):
+        if not registro:
+            continue
+        meta, _, nome = registro.partition(b"\t")
+        modo = meta.split(b" ", 1)[0].decode("ascii")
+        yield modo, nome.decode("utf-8", "surrogateescape")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="byte de controle C0 em arquivo versionado (read-only)"
+    )
+    ap.add_argument(
+        "--raiz",
+        default=os.environ.get("WIKI_ROOT", os.getcwd()),
+        help="raiz do repositório a varrer (padrão: WIKI_ROOT ou o diretório atual)",
+    )
+    ap.add_argument(
+        "--limite-por-arquivo",
+        type=int,
+        default=5,
+        help="quantos achados imprimir por arquivo antes de resumir (padrão: 5)",
+    )
+    args = ap.parse_args()
+    raiz = os.path.abspath(args.raiz)
+    limite = max(1, args.limite_por_arquivo)
+
+    try:
+        declarados = le_declaracoes(os.path.join(raiz, DECLARACOES))
+    except (OSError, RuntimeError) as erro:
+        print("check-caracteres-de-controle: ERRO %s" % erro, file=sys.stderr)
+        return 2
+    declaracoes_usadas = set()
+    declaracoes_vencidas = []
+
+    inicio = time.time()
+    try:
+        entradas = list(entradas_versionadas(raiz))
+    except RuntimeError as erro:
+        print("check-caracteres-de-controle: ERRO %s" % erro, file=sys.stderr)
+        return 2
+
+    binarias = set(EXTENSOES_BINARIAS)
+    pulados_por_ext = {}
+    pulados_modo = 0
+    ausentes = []
+    ilegiveis = []
+    varridos = 0
+    bytes_lidos = 0
+    arquivos_sujos = []
+    declarados_encontrados = []
+    total_ocorrencias = 0
+
+    for modo, nome in entradas:
+        if modo not in ("100644", "100755"):
+            pulados_modo += 1
+            continue
+        base = nome.rsplit("/", 1)[-1]
+        ext = base.rsplit(".", 1)[-1].lower() if "." in base[1:] else ""
+        if ext in binarias:
+            pulados_por_ext[ext] = pulados_por_ext.get(ext, 0) + 1
+            continue
+        caminho = os.path.join(raiz, nome)
+        try:
+            tamanho = os.path.getsize(caminho)
+        except OSError:
+            ausentes.append(nome)
+            continue
+        try:
+            achados, duros, crs, cr_reprova = varre_arquivo(caminho, nome, limite)
+        except OSError as erro:
+            ilegiveis.append("%s (%s)" % (nome, erro))
+            continue
+        varridos += 1
+        bytes_lidos += tamanho
+        if duros or cr_reprova:
+            crs_contados = crs if cr_reprova else 0
+            declaracao = declarados.get(nome)
+            if declaracao is not None:
+                declaracoes_usadas.add(nome)
+                atual = sha256_do_arquivo(caminho)
+                if (
+                    atual == declaracao["sha256"]
+                    and declaracao["duros"] == duros
+                    and declaracao["crs"] == crs_contados
+                ):
+                    declarados_encontrados.append((nome, duros, crs_contados, declaracao["motivo"]))
+                    continue
+                declaracoes_vencidas.append(
+                    "%s — declarado sha256 %s com %d duro(s)/%d CR, medido %s com %d/%d"
+                    % (
+                        nome,
+                        declaracao["sha256"][:12],
+                        declaracao["duros"],
+                        declaracao["crs"],
+                        atual[:12],
+                        duros,
+                        crs_contados,
+                    )
+                )
+            total_ocorrencias += duros + crs_contados
+            arquivos_sujos.append((nome, achados, duros, crs_contados))
+
+    for nome, achados, duros, crs in arquivos_sujos:
+        for achado in achados:
+            achado.imprime()
+        mostrados = len(achados)
+        total = duros + crs
+        if total > mostrados:
+            print(
+                "        ... e mais %d ocorrência(s) em %s (limite de impressão: %d)"
+                % (total - mostrados, nome, limite)
+            )
+
+    decorrido = time.time() - inicio
+    print("")
+    print(
+        "check-caracteres-de-controle: %d arquivos versionados varridos, %.1f MiB, %.1f s"
+        % (varridos, bytes_lidos / (1 << 20), decorrido)
+    )
+    print(
+        "    fora da varredura por EXTENSÃO BINÁRIA DECLARADA (%d extensões na lista): %s"
+        % (len(EXTENSOES_BINARIAS), " ".join(EXTENSOES_BINARIAS))
+    )
+    if pulados_por_ext:
+        detalhe = ", ".join(
+            "%d .%s" % (qtd, ext)
+            for ext, qtd in sorted(pulados_por_ext.items(), key=lambda p: -p[1])
+        )
+        print("    arquivos efetivamente pulados por essa lista: %s" % detalhe)
+    else:
+        print("    arquivos efetivamente pulados por essa lista: nenhum")
+    if pulados_modo:
+        print(
+            "    fora da varredura por modo do índice (symlink 120000 / submódulo 160000): %d"
+            % pulados_modo
+        )
+    if ausentes:
+        print(
+            "    versionados AUSENTES no disco (índice à frente da worktree): %d — %s"
+            % (len(ausentes), ", ".join(ausentes[:5]))
+        )
+    if ilegiveis:
+        print("    ilegíveis: %d — %s" % (len(ilegiveis), "; ".join(ilegiveis[:5])))
+
+    if declarados_encontrados:
+        print(
+            "    byte de controle DECLARADO em %s (%d arquivo(s)) — cada um com sha256 fixado:"
+            % (DECLARACOES, len(declarados_encontrados))
+        )
+        for nome, duros, crs, motivo in declarados_encontrados:
+            print("        %s — %d duro(s), %d CR: %s" % (nome, duros, crs, motivo))
+
+    orfas = sorted(set(declarados) - declaracoes_usadas)
+
+    if declaracoes_vencidas or orfas:
+        for linha in declaracoes_vencidas:
+            print(
+                "check-caracteres-de-controle: DECLARAÇÃO VENCIDA — %s" % linha,
+                file=sys.stderr,
+            )
+        for nome in orfas:
+            print(
+                "check-caracteres-de-controle: DECLARAÇÃO ÓRFÃ — %s está declarado em %s e "
+                "hoje está limpo, ausente ou fora da varredura; retire a linha"
+                % (nome, DECLARACOES),
+                file=sys.stderr,
+            )
+        print(
+            "check-caracteres-de-controle: FAIL — %d declaração(ões) que não descrevem mais o disco"
+            % (len(declaracoes_vencidas) + len(orfas))
+        )
+        return 1
+
+    if arquivos_sujos:
+        print(
+            "check-caracteres-de-controle: FAIL — %d arquivo(s) com %d byte(s) de controle"
+            % (len(arquivos_sujos), total_ocorrencias)
+        )
+        return 1
+
+    print(
+        "check-caracteres-de-controle: pass — %d arquivos versionados varridos, "
+        "zero byte de controle C0 fora dos %d declarados"
+        % (varridos, len(declarados_encontrados))
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
